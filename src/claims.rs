@@ -23,8 +23,10 @@ use crate::tin::Tin;
 
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SUPPORTING_FILES: usize = 5;
-/// Permissions an approved TIN grants in the Buwiz apps.
+/// Permissions an approved TIN grants in the Buwiz BIR app.
 pub const PROFILE_PERMISSIONS: &[&str] = &["profile.view", "filing.prepare", "filing.submit"];
+/// What other clients (Buwiz Books, AI agents) may do with a profile.
+pub const VIEW_PERMISSIONS: &[&str] = &["profile.view"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentKind {
@@ -406,13 +408,17 @@ async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_i
 }
 
 /// `GET /api/tax-profiles`: the account's active TINs. The Buwiz apps treat
-/// any profile with permissions as a license to use their BIR tools.
+/// any profile with permissions as a license to use their BIR tools. Only
+/// the BIR app (scope `app`) sees the full TIN; everyone else gets the
+/// opaque `id` and the masked TIN.
 pub async fn tax_profiles(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "profiles": active_profiles(&state.db, bearer.account.id).await? })))
+    let full = bearer.scope == crate::oauth::SCOPE_APP;
+    Ok(Json(json!({ "profiles": active_profiles(&state.db, bearer.account.id, full).await? })))
 }
 
-/// The account's active TINs, as `/api/tax-profiles` and MCP show them.
-pub async fn active_profiles(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<Value>> {
+/// The account's active TINs. `full` adds the raw TIN and filing
+/// permissions, for the Buwiz BIR app only.
+pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::Result<Vec<Value>> {
     let rows: Vec<(Uuid, String, String, String, OffsetDateTime)> = sqlx::query_as(
         "SELECT id, tin_root, branch_code, registered_name, decided_at FROM tin_claims
          WHERE account_id = $1 AND status = 'approved' ORDER BY decided_at",
@@ -424,21 +430,42 @@ pub async fn active_profiles(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<
         .into_iter()
         .map(|(id, root, branch, registered_name, activated_at)| {
             let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
-            json!({
-                "id": id,
-                "tin": tin.to_string(),
-                "tin_masked": tin.masked(),
-                "registered_name": registered_name,
-                "activated_at": activated_at.unix_timestamp(),
-                "permissions": PROFILE_PERMISSIONS,
-            })
+            profile_json(id, &tin, &registered_name, activated_at, full)
         })
         .collect())
+}
+
+fn profile_json(id: Uuid, tin: &Tin, registered_name: &str, activated_at: OffsetDateTime, full: bool) -> Value {
+    let mut profile = json!({
+        "id": id,
+        "tin_masked": tin.masked(),
+        "registered_name": registered_name,
+        "activated_at": activated_at.unix_timestamp(),
+        "permissions": if full { PROFILE_PERMISSIONS } else { VIEW_PERMISSIONS },
+    });
+    if full {
+        profile["tin"] = json!(tin.to_string());
+    }
+    profile
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_bir_app_sees_the_full_tin() {
+        let tin = Tin::parse("123456789", "").unwrap();
+        let at = OffsetDateTime::UNIX_EPOCH;
+        let limited = profile_json(Uuid::nil(), &tin, "Juan", at, false).to_string();
+        assert!(!limited.contains("123456789") && !limited.contains("123-456-789"), "{limited}");
+        assert!(!limited.contains("\"tin\""), "{limited}");
+        assert!(limited.contains("***-***-789-00000"));
+        assert!(!limited.contains("filing."), "{limited}");
+        let full = profile_json(Uuid::nil(), &tin, "Juan", at, true);
+        assert_eq!(full["tin"], "123-456-789-00000");
+        assert_eq!(full["permissions"], json!(PROFILE_PERMISSIONS));
+    }
 
     #[test]
     fn sniffs_scans_and_photos_only() {

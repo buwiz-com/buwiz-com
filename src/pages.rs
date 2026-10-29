@@ -112,6 +112,7 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>"Buwiz"</title>
+                <link rel="icon" type="image/svg+xml" href="/assets/brand/buwiz_favicon.svg">
                 <link rel="stylesheet" href="/assets/site.css">
                 brand_styles()
                 <link rel="stylesheet" href="/assets/account.css">
@@ -144,10 +145,7 @@ async fn site_header(account: Option<Account>, admin: bool, path: String) -> Res
         <header class="home top">
             <div class="top-in">
                 <a class="top-brand" href="/">
-                    <picture>
-                        <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
-                        <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="28" height="28">
-                    </picture>
+                    brand_mark(height: 28)
                     <span class="top-name">"Buwiz"</span>
                 </a>
                 if let Some(account) = account {
@@ -174,7 +172,7 @@ async fn staff_header(account: Account, path: String, waiting: i64) -> Result<im
         <header class="home top staff-top">
             <div class="top-in staff-in">
                 <a class="top-brand" href="/staff">
-                    <span class="staff-logo"><img src="/assets/brand/buwiz_logo_light.webp" alt="" width="24" height="24"></span>
+                    brand_mark(height: 28)
                     <span class="top-name">"Buwiz"</span>
                     <span class="staff-tag">"STAFF"</span>
                 </a>
@@ -250,15 +248,19 @@ async fn icon(name: &'static str) -> Result<impl View> {
     Ok(view! { <span class="icon" aria-hidden="true">(name)</span> })
 }
 
+/// The Buwiz mark, painted in the brand color of the current theme
+/// (site.css masks it with /assets/brand/buwiz_mark.svg).
+#[component]
+async fn brand_mark(height: u32) -> Result<impl View> {
+    Ok(view! { <span class="brand-mark" aria-hidden="true" style=(format!("--mark-h: {height}px"))></span> })
+}
+
 /// The Buwiz logo and name at the top of a sign-in card.
 #[component]
 async fn auth_brand() -> Result<impl View> {
     Ok(view! {
         <a class="auth-brand" href="/" aria-label="Buwiz home">
-            <picture>
-                <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
-                <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="30" height="30">
-            </picture>
+            brand_mark(height: 30)
             <span>"BUWIZ"</span>
         </a>
     })
@@ -502,10 +504,7 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
                         <span class="consent-app">(request.client_name.chars().next().map(|first| first.to_uppercase().to_string()).unwrap_or_default())</span>
                         icon(name: "sync_alt")
                         <span class="consent-buwiz">
-                            <picture>
-                                <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
-                                <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="32" height="32">
-                            </picture>
+                            brand_mark(height: 32)
                         </span>
                     </div>
                     <h1>(request.client_name.clone()) " wants to read your Buwiz account"</h1>

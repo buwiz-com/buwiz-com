@@ -74,6 +74,8 @@ pub struct Settings {
     pub pinned_keys: Vec<String>,
     pub lab: Option<LabServer>,
     pub tls: Arc<rustls::ClientConfig>,
+    /// One upload, login to close ([`sftp::TIMEOUT`] in production).
+    pub sftp_timeout: std::time::Duration,
 }
 
 impl Settings {
@@ -151,6 +153,7 @@ pub async fn send(pipe: &Pipe, job: &Job<'_>, settings: &Settings) -> Result<Sen
         remote_path: &sent.remote_path,
         payload: &payload,
         pinned_keys: &settings.pinned_keys,
+        timeout: settings.sftp_timeout,
     };
     match sftp::upload(stream, upload).await {
         Ok(()) => Ok(sent),

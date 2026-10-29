@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::accounts::Account;
 use crate::agents::{self, AuthorizeProblem};
 use crate::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
+use crate::devices;
 use crate::notice::Notice;
 use crate::oauth;
 use crate::state::AppState;

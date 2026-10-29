@@ -28,8 +28,14 @@ Spin-based `buwiz-server`, keeping only what the apps call.
   `?include=pending` also lists TINs still being checked or sent back, with
   a `status` and no `filing.submit` permission.
 - **Submission relay**: files a return with BIR for an active TIN.
-  - The server keeps BIR's passphrases and the SFTP login, and does the IAF
-    encryption (byte-identical to eBIRForms' `Encrypt.exe`).
+  - Two processes: the public **Gatekeeper** (`buwiz-cloud`) and the
+    **Sender** (`buwiz-sender`), which alone keeps BIR's passphrases, the
+    SFTP login and the HPKE private key, and does the IAF encryption
+    (byte-identical to eBIRForms' `Encrypt.exe`).
+  - v2: the app signs requests with a registered device key, gets a
+    five-minute ticket for one return, and seals the XML to the Sender
+    (HPKE). The Gatekeeper stores the envelope without being able to open
+    it. v1 (plaintext XML over TLS) still works.
   - The traffic leaves from the taxpayer's computer, so BIR sees their own
     connection. The app is a dumb pipe that connects only to BIR's hosts.
   - SSH runs end to end through it, with BIR's host key pinned.
@@ -59,7 +65,9 @@ set -a; . ./.env; set +a
 cargo run                                  # http://localhost:3008
 ```
 
-Migrations run at start. Without `RESEND_API_KEY`, sign-in codes appear in
+Migrations run at start. Without `SENDER_URL`, the Sender runs inside this
+process (development only; see [docs/relay-protocol.md](docs/relay-protocol.md)
+§6 for running `buwiz-sender` on its own). Without `RESEND_API_KEY`, sign-in codes appear in
 the server log; with it, they are emailed. Put your email in `ADMIN_EMAILS` to see
 the staff pages at `/staff` (claims queue and users); everyone else gets a 404 there.
 
@@ -89,6 +97,10 @@ account hostname and list the API hostname in `EXTRA_ORIGINS`.
 | `POST /api/submissions`, `GET /api/submissions[/{id}]` | Create and read submissions. |
 | `GET /api/submissions/{id}/relay` (WebSocket) | The relay pipe. See [docs/relay-protocol.md](docs/relay-protocol.md). |
 | `GET /.well-known/jwks.json` | Key that verifies receipts. |
+| `POST /api/devices`, `GET /api/devices`, `POST /api/devices/{id}/revoke` | Device keys (v2). |
+| `POST /api/tickets` | A signed ticket for one return (v2, device-signed). |
+| `POST /api/v2/submissions` | `{ticket, envelope}` (v2, device-signed). |
+| `GET /.well-known/buwiz-hpke.json` | The Sender's sealing key (v2). |
 | `POST /mcp` | MCP (Streamable HTTP, JSON answers). App and agent tokens both work; tools only read. |
 | `GET /.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server` | OAuth discovery for agents. |
 | `POST /oauth/register`, `GET /oauth/authorize` | Agent registration and consent (PKCE S256). |
@@ -121,7 +133,10 @@ cargo run --bin buwiz-relay -- --server http://localhost:3008 --token <access to
 Tests: `cargo test` runs the relay end to end in one process (fake
 dispatcher, SSH server with a pinned key, the app's allow-list), and the
 account site against Postgres (`tests/account_site.rs`: each test gets its
-own database, so `DATABASE_URL` must be set, e.g. from `.env`). With
+own database, so `DATABASE_URL` must be set, e.g. from `.env`).
+`scripts/v6.sh` runs `e2e/` (its own workspace): submission v2 with the
+real buwiz-oss client, from a queued 1701Q to a verified receipt, and the
+attacks it must refuse. It needs Docker and read access to buwiz-oss. With
 `BIR_IAF_PASSPHRASE` set, `tests/iaf_golden.rs` checks the encryption
 against official `Encrypt.exe` output.
 `cargo test -- --include-ignored` also runs HTTPS through the pipe against

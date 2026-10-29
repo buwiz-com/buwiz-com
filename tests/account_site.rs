@@ -8,8 +8,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
-use buwiz_cloud::bir;
 use buwiz_cloud::config::{Config, MailConfig};
+use buwiz_cloud::link::SenderLink;
 use buwiz_cloud::state::AppState;
 use buwiz_cloud::storage::DocumentStore;
 use buwiz_cloud::{accounts, crypto, pages, web};
@@ -42,19 +42,12 @@ impl Site {
             document_key: [7; 32],
             admin_emails: vec![STAFF.into()],
             mail: MailConfig::Log,
-        };
-        let relay = bir::Settings {
-            mode: bir::Mode::DryRun,
-            iaf_passphrase: Zeroizing::new("dry-run".into()),
-            dispatcher_passphrase: Zeroizing::new(String::new()),
-            dispatchers: Vec::new(),
-            sftp_hosts: Vec::new(),
-            pinned_keys: Vec::new(),
-            lab: None,
-            tls: bir::Settings::tls_config(),
+            trust_list: None,
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
-        let state = AppState::new(config, db.clone(), relay, key, DocumentStore::Database);
+        // The account site never reaches the Sender in these tests.
+        let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
+        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender);
         Self { db, router: web::router(state.clone(), pages::router(state)) }
     }
 

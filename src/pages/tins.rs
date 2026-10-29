@@ -12,6 +12,7 @@ const ORUS: &str = "https://orus.bir.gov.ph/";
 pub async fn tins_page(cx: &Cx) -> Result<impl View> {
     let account = signed_in(cx).await?;
     let mut claims = claims::for_account(&state(cx).db, account.id).await?;
+    let devices = devices::for_account(&state(cx).db, account.id).await?;
     // Newest first. A rejected claim stays until the TIN is added again.
     let mut seen = Vec::new();
     claims.retain(|claim| {
@@ -45,8 +46,46 @@ pub async fn tins_page(cx: &Cx) -> Result<impl View> {
                         "Add another TIN"
                     </a>
                 </div>
+                <section class="devices" aria-labelledby="devices-h">
+                    <h2 id="devices-h">"My devices"</h2>
+                    <p class="page-lead">"Computers and phones that can send returns for you. Remove one you no longer use or don't recognise; it is signed out and can't send until it signs in again."</p>
+                    if devices.is_empty() {
+                        <p class="device-empty">"No devices yet. One appears here the first time you send a return from the Buwiz app."</p>
+                    } else {
+                        <ul class="device-list">
+                            #[key(device.id.as_u128())]
+                            for device in devices {
+                                device_row(device: device)
+                            }
+                        </ul>
+                    }
+                </section>
             </div>
         </main>
+    })
+}
+
+/// A device that can send returns, with a button to remove it.
+#[component]
+async fn device_row(device: devices::DeviceView) -> Result<impl View> {
+    let revoke = format!("/devices/{}/revoke", device.id);
+    let app = oauth::client_name(&device.client_id).unwrap_or("Buwiz");
+    let used = device.last_used_at.map(short_date).unwrap_or_else(|| "never".to_owned());
+    Ok(view! {
+        <li class="device-row">
+            <span class="device-icon">icon(name: "devices")</span>
+            <span class="device-text">
+                <strong>(device.name.clone())</strong>
+                <span>(format!("{app} · added {} · last used {used}", short_date(device.created_at)))</span>
+            </span>
+            if device.revoked_at.is_some() {
+                <span class="tagpill status-withdrawn">"Removed"</span>
+            } else {
+                <form method="post" action=(revoke)>
+                    <button class="btn btn-ghost device-remove" type="submit">"Remove"</button>
+                </form>
+            }
+        </li>
     })
 }
 

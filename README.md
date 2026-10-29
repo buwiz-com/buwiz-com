@@ -8,8 +8,9 @@ Spin-based `buwiz-server`, keeping only what the apps call.
 - **TIN activation**: the person uploads BIR Form 2303, a government ID and
   any supporting documents. Staff review each claim by hand. An approved
   claim makes the TIN active, and a TIN has at most one owner. Files are
-  encrypted at rest (AES-256-GCM) and deleted when the claim is decided or
-  withdrawn. Their hashes stay.
+  encrypted (AES-256-GCM) before they are stored, in Cloudflare R2 in
+  production (any S3-compatible store; Postgres in development), and
+  deleted when the claim is decided or withdrawn. Their hashes stay.
 - **App sign-in**: the desktop and mini apps use the OAuth device flow
   (RFC 8628). Refresh tokens rotate, and reusing an old one ends the whole
   sign-in.
@@ -47,8 +48,8 @@ set -a; . ./.env; set +a
 cargo run                                  # http://localhost:3008
 ```
 
-Migrations run at start. With `MAIL_TRANSPORT=log`, sign-in codes appear in
-the server log. Put your email in `ADMIN_EMAILS` to see **Review claims**.
+Migrations run at start. Without `RESEND_API_KEY`, sign-in codes appear in
+the server log; with it, they are emailed. Put your email in `ADMIN_EMAILS` to see **Review claims**.
 
 Smoke test of the whole flow (device sign-in, claim, review, licence gate,
 refresh rotation):
@@ -116,7 +117,7 @@ example.com.
 
 See [`.env.example`](.env.example). Required: `DATABASE_URL` and
 `DOCUMENT_KEY`. Public deployments must use `https://` in `ACCOUNT_ORIGIN`,
-which turns on secure cookies, and `MAIL_TRANSPORT=resend`. The server
+which turns on secure cookies, and a `RESEND_API_KEY`. The server
 refuses to start if it would print codes on a public deployment.
 
 ## Deploy

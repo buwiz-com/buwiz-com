@@ -6,6 +6,7 @@ use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::bir;
+use crate::storage::{DocumentStore, ObjectStore};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -43,7 +44,11 @@ impl Config {
             Ok(value) => value == "true",
             Err(_) => account_origin.starts_with("https://"),
         };
-        let mail = match var_or("MAIL_TRANSPORT", "log").as_str() {
+        // Without an explicit MAIL_TRANSPORT, a Resend key means send email;
+        // no key means print codes to the log.
+        let has_resend_key = std::env::var("RESEND_API_KEY").is_ok_and(|key| !key.trim().is_empty());
+        let default_transport = if has_resend_key { "resend" } else { "log" };
+        let mail = match var_or("MAIL_TRANSPORT", default_transport).as_str() {
             "log" => MailConfig::Log,
             "resend" => MailConfig::Resend { api_key: required("RESEND_API_KEY")?, from: required("MAIL_FROM")? },
             other => bail!("MAIL_TRANSPORT must be `log` or `resend`, not `{other}`"),
@@ -166,6 +171,25 @@ fn lab_server(raw: &str) -> anyhow::Result<bir::LabServer> {
         username: username.to_owned(),
         password: Zeroizing::new(password.to_owned()),
     })
+}
+
+/// Where claim documents go: object storage when `S3_ENDPOINT` is set
+/// (required on a public deployment), otherwise Postgres.
+pub fn document_store(public: bool) -> anyhow::Result<DocumentStore> {
+    let Some(endpoint) = std::env::var("S3_ENDPOINT").ok().filter(|value| !value.is_empty()) else {
+        if public {
+            bail!("S3_ENDPOINT and the other S3_* settings are required on a public deployment");
+        }
+        return Ok(DocumentStore::Database);
+    };
+    let store = ObjectStore::new(
+        &endpoint,
+        &var_or("S3_REGION", "auto"),
+        &required("S3_BUCKET")?,
+        &required("S3_ACCESS_KEY_ID")?,
+        &required("S3_SECRET_ACCESS_KEY")?,
+    )?;
+    Ok(DocumentStore::Objects(Box::new(store)))
 }
 
 /// Ed25519 key that signs receipts (`RECEIPT_SIGNING_KEY`, a base64 32-byte

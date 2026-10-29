@@ -15,6 +15,7 @@ pub mod oauth;
 pub mod pages;
 pub mod relay;
 pub mod state;
+pub mod storage;
 pub mod submissions;
 pub mod tin;
 pub mod web;
@@ -40,6 +41,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let relay = config::relay_settings()?;
     let receipt_key = config::receipt_key(config.secure_cookies)?;
+    let documents = config::document_store(config.secure_cookies)?;
     tracing::info!(mode = relay.mode.as_str(), "submission relay");
     tokio::spawn({
         let db = db.clone();
@@ -54,7 +56,7 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     let address = format!("{}:{}", config.host, config.port);
-    let state = AppState::new(config, db, relay, receipt_key);
+    let state = AppState::new(config, db, relay, receipt_key, documents);
     let app = web::router(state.clone(), pages::router(state));
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;

@@ -32,6 +32,11 @@ fly logs              # look for "listening on http://0.0.0.0:8080"
 curl https://buwiz-cloud.fly.dev/healthz
 ```
 
+The `Dockerfile` builds with `--features bir`, so deploy from a checkout
+that has the private BIR relay files restored (`src/bir/` and the rest; see
+the README). Without them the build fails rather than shipping a Sender
+that cannot send.
+
 If Fly's remote builder fails (503, `failed_precondition`), build on your
 machine instead: `fly deploy --local-only`. To change only settings, redeploy
 the last image: `fly deploy --image registry.fly.io/buwiz-cloud:<tag>`.
@@ -49,7 +54,7 @@ reaches it over Fly's private network (`SENDER_URL=http://buwiz-sender.internal:
 | `TICKET_PUBLIC_KEYS` | Public half of `TICKET_SIGNING_KEY`, base64url |
 | `SENDER_HPKE_KEY` | `openssl rand -base64 32` (X25519 private key) |
 | `RECEIPT_SIGNING_KEY` | `openssl rand -base64 32` (moves here from the Gatekeeper; keep the old value so old receipts still verify) |
-| `BIR_RELAY_MODE`, `BIR_IAF_PASSPHRASE`, `BIR_DISPATCHER_PASSPHRASE`, `BIR_SSH_HOST_KEYS` | See [relay-protocol.md](relay-protocol.md) §7 |
+| `BIR_RELAY_MODE`, `BIR_IAF_PASSPHRASE`, `BIR_DISPATCHER_PASSPHRASE`, `BIR_SSH_HOST_KEYS`, `BIR_SFTP_HOSTS` | See [relay-protocol.md](relay-protocol.md) §7; the live values are in the BIR relay's private docs |
 
 The Gatekeeper refuses to start on a public origin without `SENDER_URL`
 and `TICKET_SIGNING_KEY`. See [relay-protocol.md](relay-protocol.md) §6.
@@ -66,9 +71,12 @@ cargo run --release --bin buwiz-trust-sign -- keygen trust.key
 # prints the public key: put it in buwiz-oss crates/bir-submit/src/trust.rs TRUST_KEYS
 fly ssh console -a buwiz-sender -C "buwiz-sender public" > sender-keys.json
 cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.json \
-  birgovph.com:443 birgovph.com:80 ws2.birgovph.com:443 ws2.birgovph.com:80 ebf2.bir.gov.ph:22
+  <host:port> …   # BIR's dispatcher and upload hosts, from the BIR relay's private docs
 # prints the JWS: fly secrets set -a buwiz-cloud TRUST_LIST_JWS=<it>
 ```
+
+The `host:port` list is every host the Sender opens through the pipe: BIR's
+dispatcher (HTTPS and HTTP, primary and backup) and its SFTP upload server.
 
 Keep `trust.key` offline (password manager or hardware). The list expires
 (here after 365 days); sign a new one before then, or apps stop sending.

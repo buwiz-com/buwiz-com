@@ -45,8 +45,9 @@ pub async fn serve(
                 match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
                     Ok(Ok(tcp)) => {
                         let _ = tcp.set_nodelay(true);
-                        writers.insert(stream, forward(stream, tcp, out.clone()));
+                        // `opened` first: the far end may speak first (SSH).
                         let _ = out.send(Frame::Control(Control::Opened { stream })).await;
+                        writers.insert(stream, forward(stream, tcp, out.clone()));
                     }
                     Ok(Err(error)) => {
                         let reason = error.to_string();

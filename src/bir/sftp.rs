@@ -8,6 +8,7 @@
 //! and catch the password.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use russh::client::{self, Handle};
@@ -17,7 +18,8 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-const TIMEOUT: Duration = Duration::from_secs(60);
+/// How long one upload may take, login to close, unless settings say otherwise.
+pub const TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SftpError {
@@ -29,10 +31,13 @@ pub enum SftpError {
     Login,
     #[error("SFTP failed before the upload started: {0}")]
     BeforeUpload(String),
-    /// The file may or may not have reached the server.
+    /// The file may or may not have reached the server: anything that goes
+    /// wrong once the request to open the remote file was sent, a timeout
+    /// included.
     #[error("SFTP failed during the upload: {0}")]
     DuringUpload(String),
-    #[error("SFTP timed out")]
+    /// Timed out before the remote file was asked for: nothing reached BIR.
+    #[error("SFTP timed out before the upload started")]
     Timeout,
 }
 
@@ -74,6 +79,8 @@ pub struct Upload<'a> {
     pub payload: &'a [u8],
     /// Accepted host keys, as `SHA256:…` fingerprints.
     pub pinned_keys: &'a [String],
+    /// The whole session, login to close.
+    pub timeout: Duration,
 }
 
 /// Logs in over `stream` and writes the file.
@@ -81,10 +88,21 @@ pub async fn upload<S>(stream: S, upload: Upload<'_>) -> Result<(), SftpError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::time::timeout(TIMEOUT, upload_inner(stream, upload)).await.map_err(|_| SftpError::Timeout)?
+    // Set just before the open request goes out. From then on the server
+    // may create (or truncate) the file, so a timeout is not "nothing sent".
+    let opening = Arc::new(AtomicBool::new(false));
+    let limit = upload.timeout;
+    match tokio::time::timeout(limit, upload_inner(stream, upload, opening.clone())).await {
+        Ok(result) => result,
+        Err(_) if opening.load(Ordering::SeqCst) => Err(SftpError::DuringUpload(format!(
+            "timed out after {}s, once the remote file was asked for",
+            limit.as_secs()
+        ))),
+        Err(_) => Err(SftpError::Timeout),
+    }
 }
 
-async fn upload_inner<S>(stream: S, upload: Upload<'_>) -> Result<(), SftpError>
+async fn upload_inner<S>(stream: S, upload: Upload<'_>, opening: Arc<AtomicBool>) -> Result<(), SftpError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -106,12 +124,18 @@ where
     let channel = session.channel_open_session().await.map_err(|error| before(&error))?;
     channel.request_subsystem(true, "sftp").await.map_err(|error| before(&error))?;
     let sftp = SftpSession::new(channel.into_stream()).await.map_err(|error| before(&error))?;
+    // From the open request on, BIR may hold an empty, partial or complete
+    // file. Only a definite refusal of the open (a status answer) means
+    // nothing was created.
+    let during = |error: &dyn std::fmt::Display| SftpError::DuringUpload(error.to_string());
+    opening.store(true, Ordering::SeqCst);
     let mut file = sftp
         .open_with_flags(upload.remote_path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE)
         .await
-        .map_err(|error| before(&error))?;
-    // From here on BIR may hold a partial or complete file.
-    let during = |error: &dyn std::fmt::Display| SftpError::DuringUpload(error.to_string());
+        .map_err(|error| match error {
+            russh_sftp::client::error::Error::Status(_) => before(&error),
+            other => during(&other),
+        })?;
     file.write_all(upload.payload).await.map_err(|error| during(&error))?;
     file.flush().await.map_err(|error| during(&error))?;
     file.shutdown().await.map_err(|error| during(&error))?;
@@ -128,6 +152,16 @@ pub fn remote_path(form_type: &str, filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_failures_before_the_open_are_safe_to_resend() {
+        assert!(!SftpError::HostKey.maybe_delivered());
+        assert!(!SftpError::Login.maybe_delivered());
+        assert!(!SftpError::Ssh("x".into()).maybe_delivered());
+        assert!(!SftpError::BeforeUpload("x".into()).maybe_delivered());
+        assert!(!SftpError::Timeout.maybe_delivered());
+        assert!(SftpError::DuringUpload("timed out".into()).maybe_delivered());
+    }
 
     #[test]
     fn remote_paths_stay_in_the_form_folder() {

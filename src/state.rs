@@ -31,7 +31,7 @@ impl AppState {
         receipt_key: SigningKey,
         documents: DocumentStore,
     ) -> Self {
-        let mailer = Mailer::new(config.mail.clone());
+        let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
         Self(Arc::new(Inner { config, db, mailer, relay, receipt_key, documents }))
     }
 }

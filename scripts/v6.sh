@@ -10,7 +10,8 @@
 #                                               # instead of GitHub's goal/complete
 #
 # Nothing reaches BIR: the Sender's dispatcher and upload hosts are local
-# test servers and its passphrases are fake.
+# test servers and its passphrases are fake. e2e builds the server with the
+# `bir` feature, so the BIR relay files must be present.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root="$(pwd)"

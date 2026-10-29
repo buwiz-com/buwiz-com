@@ -5,18 +5,19 @@
 // `Result<_, Response>` is the point, not an accident.
 #![allow(clippy::result_large_err)]
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Form, Router};
-use http::{HeaderMap, HeaderValue, StatusCode, header};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::accounts::{self, Account, CodeError};
 use crate::agents;
-use crate::claims::{self, DecideError, DocumentKind, SubmitError, Upload};
+use crate::claims::{self, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload};
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
@@ -24,8 +25,8 @@ use crate::state::AppState;
 use crate::submissions;
 use crate::tin::Tin;
 
-/// Room for the largest claim: two required files and five supporting
-/// ones, 10 MB each, plus form overhead. Each file is checked on its own.
+/// Room for the largest claim: 40 MB of files, plus form overhead. Each
+/// file is also checked on its own (10 MB).
 const CLAIM_BODY_LIMIT: usize = 41 * 1024 * 1024;
 const CLAIM_TOTAL_BYTES: usize = 40 * 1024 * 1024;
 
@@ -34,6 +35,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/site.css", get(stylesheet))
         .route("/assets/home.css", get(home_stylesheet))
+        .route("/assets/account.css", get(account_stylesheet))
+        .route("/assets/account.js", get(account_script))
         .route("/assets/screens/{name}", get(screenshot))
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
@@ -66,10 +69,18 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/auth/email/verify", post(email_verify))
         .route("/logout", post(logout))
         .route("/device/decision", post(device_decision))
+        .route("/account", get(moved_to_tins))
         .route("/tins/claims", post(submit_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
         .route("/tins/claims/{claim_id}/withdraw", post(withdraw_claim))
-        .route("/admin/claims/{claim_id}/decision", post(decide_claim))
-        .route("/admin/documents/{document_id}", get(admin_document))
+        .route("/tins/claims/{claim_id}/resend", post(resend_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
+        // Staff. Everyone else gets a 404 (see `require_admin`).
+        .route("/staff/claims", get(|| async { Redirect::permanent("/staff") }))
+        .route("/staff/claims/{claim_id}/decision", post(decide_claim))
+        .route("/staff/documents/{document_id}", get(staff_document))
+        .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
+        .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
+        .route("/admin", any(moved_to_staff))
+        .route("/admin/{*rest}", any(moved_to_staff))
         .fallback(move |request: axum::extract::Request| {
             let pages = pages.clone();
             async move { render_page(&pages, request).await }
@@ -85,6 +96,14 @@ async fn stylesheet() -> Response {
 
 async fn home_stylesheet() -> Response {
     css(include_str!("home.css"))
+}
+
+async fn account_stylesheet() -> Response {
+    css(include_str!("account.css"))
+}
+
+async fn account_script() -> Response {
+    text(include_str!("account.js"), "text/javascript; charset=utf-8")
 }
 
 async fn demo_script() -> Response {
@@ -195,7 +214,7 @@ pub(crate) fn same_origin(state: &AppState, headers: &HeaderMap) -> Result<(), R
 pub fn safe_next(raw: Option<&str>) -> String {
     match raw {
         Some(next) if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') => next.to_owned(),
-        _ => "/account".to_owned(),
+        _ => "/tins".to_owned(),
     }
 }
 
@@ -214,6 +233,31 @@ pub fn link(path: &str, notice: Option<Notice>, params: &[(&str, &str)]) -> Stri
 
 fn see_other(location: String) -> Response {
     Redirect::to(&location).into_response()
+}
+
+/// Keeps the query, so an old link's notice still shows.
+fn moved(uri: &Uri, path: &str) -> Response {
+    let location = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_owned(),
+    };
+    Redirect::permanent(&location).into_response()
+}
+
+/// `/account` was the old name of My TINs.
+async fn moved_to_tins(uri: Uri) -> Response {
+    moved(&uri, "/tins")
+}
+
+/// `/admin/…` became `/staff/…`; the claims list is `/staff` itself. A
+/// permanent redirect keeps the method, so old forms still post.
+async fn moved_to_staff(uri: Uri) -> Response {
+    let rest = uri.path().strip_prefix("/admin").unwrap_or_default().trim_end_matches('/');
+    let path = match rest {
+        "" | "/claims" => "/staff".to_owned(),
+        rest => format!("/staff{rest}"),
+    };
+    moved(&uri, &path)
 }
 
 fn session_cookie(state: &AppState, value: &str, max_age: i64) -> HeaderValue {
@@ -358,31 +402,66 @@ async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipa
         Ok(form) => form,
         Err(notice) => return back(notice),
     };
-    let tin = match Tin::parse_combined(&form.tin) {
+    let Some(kind) = ClaimKind::parse(&form.kind) else {
+        return back(Notice::KindMissing);
+    };
+    let tin = match Tin::parse_fields(&form.tin, &form.branch) {
         Ok(tin) => tin,
         Err(notice) => return back(notice),
     };
-    let submitted = claims::submit(
-        &state.db,
-        &state.documents,
-        &state.config.document_key,
-        account.id,
-        &tin,
-        &form.registered_name,
-        form.uploads,
-    )
-    .await;
-    match submitted {
-        Ok(_) => see_other(link("/account", Some(Notice::ClaimSubmitted), &[])),
+    let claim = NewClaim {
+        kind,
+        tin,
+        registered_name: form.registered_name,
+        trade_name: form.trade_name,
+        uploads: form.uploads,
+    };
+    match claims::submit(&state.db, &state.documents, &state.config.document_key, account.id, claim).await {
+        Ok(_) => see_other(link("/tins", Some(Notice::ClaimSubmitted), &[])),
         Err(SubmitError::Invalid(notice)) => back(notice),
         Err(SubmitError::Internal(error)) => internal(error),
     }
 }
 
+async fn resend_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    multipart: Multipart,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let fix_page = format!("/tins/claims/{claim_id}/fix");
+    let account = match require_session(&state, &headers, &fix_page).await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    let back = |notice: Notice| see_other(link(&fix_page, Some(notice), &[]));
+    let form = match read_claim_form(multipart).await {
+        Ok(form) => form,
+        Err(notice) => return back(notice),
+    };
+    let fix = Resend { registered_name: form.registered_name, trade_name: form.trade_name, uploads: form.uploads };
+    match claims::resend(&state.db, &state.documents, &state.config.document_key, account.id, claim_id, fix).await {
+        Ok(()) => see_other(link("/tins", Some(Notice::ClaimResent), &[])),
+        Err(SubmitError::Invalid(notice @ (Notice::ClaimMissing | Notice::NotSentBack))) => {
+            see_other(link("/tins", Some(notice), &[]))
+        }
+        Err(SubmitError::Invalid(notice)) => back(notice),
+        Err(SubmitError::Internal(error)) => internal(error),
+    }
+}
+
+/// The fields of the add-a-TIN and fix forms. Files arrive in fields named
+/// after their [`DocumentKind`].
 #[derive(Default)]
 struct ClaimForm {
+    kind: String,
     tin: String,
+    branch: String,
     registered_name: String,
+    trade_name: String,
     uploads: Vec<Upload>,
 }
 
@@ -391,19 +470,20 @@ async fn read_claim_form(mut multipart: Multipart) -> Result<ClaimForm, Notice> 
     let mut total = 0usize;
     while let Some(field) = multipart.next_field().await.map_err(|_| Notice::BadUpload)? {
         let name = field.name().unwrap_or_default().to_owned();
-        let kind = match name.as_str() {
-            "tin" => {
-                form.tin = field.text().await.map_err(|_| Notice::BadUpload)?;
-                continue;
-            }
-            "registered_name" => {
-                form.registered_name = field.text().await.map_err(|_| Notice::BadUpload)?;
-                continue;
-            }
-            "form_2303" => DocumentKind::Form2303,
-            "government_id" => DocumentKind::GovernmentId,
-            "supporting" => DocumentKind::Supporting,
-            _ => continue,
+        let text = match name.as_str() {
+            "kind" => Some(&mut form.kind),
+            "tin" => Some(&mut form.tin),
+            "branch" => Some(&mut form.branch),
+            "registered_name" => Some(&mut form.registered_name),
+            "trade_name" => Some(&mut form.trade_name),
+            _ => None,
+        };
+        if let Some(text) = text {
+            *text = field.text().await.map_err(|_| Notice::BadUpload)?;
+            continue;
+        }
+        let Some(kind) = DocumentKind::parse(&name) else {
+            continue;
         };
         let filename = field.file_name().unwrap_or_default().to_owned();
         let bytes = field.bytes().await.map_err(|_| Notice::FileTooBig)?;
@@ -424,13 +504,13 @@ async fn withdraw_claim(State(state): State<AppState>, headers: HeaderMap, Path(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let account = match require_session(&state, &headers, "/account").await {
+    let account = match require_session(&state, &headers, "/tins").await {
         Ok(account) => account,
         Err(redirect) => return redirect,
     };
     match claims::withdraw(&state.db, &state.documents, claim_id, account.id).await {
-        Ok(true) => see_other(link("/account", Some(Notice::ClaimWithdrawn), &[])),
-        Ok(false) => see_other(link("/account", Some(Notice::AlreadyDecided), &[])),
+        Ok(true) => see_other(link("/tins", Some(Notice::ClaimWithdrawn), &[])),
+        Ok(false) => see_other(link("/tins", Some(Notice::AlreadyDecided), &[])),
         Err(error) => internal(error),
     }
 }
@@ -445,41 +525,48 @@ async fn require_admin(state: &AppState, headers: &HeaderMap, back_to: &str) -> 
     }
 }
 
-#[derive(Deserialize)]
-struct Decision {
-    decision: String,
-    #[serde(default)]
-    note: String,
-}
-
+/// `decision` (approve, fix or reject), `note`, and for a fix any number
+/// of `reasons`, so the body is read by hand: a form struct cannot hold a
+/// repeated field.
 async fn decide_claim(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(claim_id): Path<Uuid>,
-    Form(form): Form<Decision>,
+    body: Bytes,
 ) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/admin/claims/{claim_id}");
+    let back_to = format!("/staff/claims/{claim_id}");
     let reviewer = match require_admin(&state, &headers, &back_to).await {
         Ok(reviewer) => reviewer,
         Err(response) => return response,
     };
-    let approve = match form.decision.as_str() {
-        "approve" => true,
-        "reject" => false,
+    let (mut decision, mut note, mut reasons) = (String::new(), String::new(), Vec::new());
+    for (key, value) in form_urlencoded::parse(&body) {
+        match key.as_ref() {
+            "decision" => decision = value.into_owned(),
+            "note" => note = value.into_owned(),
+            "reasons" => reasons.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    let decision = match decision.as_str() {
+        "approve" => Decision::Approve,
+        "reject" => Decision::Reject,
+        "fix" => Decision::SendBack(reasons),
         _ => return (StatusCode::BAD_REQUEST, "unknown decision").into_response(),
     };
-    match claims::decide(&state.db, &state.documents, claim_id, reviewer.id, approve, &form.note).await {
-        Ok(()) => see_other(link("/admin/claims", Some(Notice::ClaimDecided), &[])),
+    match claims::decide(&state.db, &state.documents, claim_id, reviewer.id, &decision, &note).await {
+        Ok(notice) => see_other(link("/staff", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }
 }
 
-async fn admin_document(State(state): State<AppState>, headers: HeaderMap, Path(document_id): Path<Uuid>) -> Response {
-    if let Err(response) = require_admin(&state, &headers, "/admin/claims").await {
+/// A claim document, shown inline to staff only.
+async fn staff_document(State(state): State<AppState>, headers: HeaderMap, Path(document_id): Path<Uuid>) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/staff").await {
         return response;
     }
     let document =
@@ -499,6 +586,40 @@ async fn admin_document(State(state): State<AppState>, headers: HeaderMap, Path(
     response
 }
 
+/// Staff end every sign-in of an account.
+async fn sign_out_user(State(state): State<AppState>, headers: HeaderMap, Path(account_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/users/{account_id}");
+    if let Err(response) = require_admin(&state, &headers, &back_to).await {
+        return response;
+    }
+    match accounts::sign_out_everywhere(&state.db, account_id).await {
+        Ok(()) => see_other(link(&back_to, Some(Notice::SignedOutEverywhere), &[])),
+        Err(error) => internal(error),
+    }
+}
+
+/// Staff end one app's or agent's sign-in.
+async fn sign_out_user_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, grant_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/users/{account_id}");
+    if let Err(response) = require_admin(&state, &headers, &back_to).await {
+        return response;
+    }
+    match accounts::sign_out_app(&state.db, account_id, grant_id).await {
+        Ok(_) => see_other(link(&back_to, Some(Notice::AppSignedOut), &[])),
+        Err(error) => internal(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,10 +627,10 @@ mod tests {
     #[test]
     fn next_stays_on_this_site() {
         assert_eq!(safe_next(Some("/device?user_code=BCDF-GHJK")), "/device?user_code=BCDF-GHJK");
-        assert_eq!(safe_next(Some("//evil.example")), "/account");
-        assert_eq!(safe_next(Some("https://evil.example")), "/account");
-        assert_eq!(safe_next(Some("/\\evil.example")), "/account");
-        assert_eq!(safe_next(None), "/account");
+        assert_eq!(safe_next(Some("//evil.example")), "/tins");
+        assert_eq!(safe_next(Some("https://evil.example")), "/tins");
+        assert_eq!(safe_next(Some("/\\evil.example")), "/tins");
+        assert_eq!(safe_next(None), "/tins");
     }
 
     #[test]

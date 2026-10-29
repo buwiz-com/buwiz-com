@@ -1,14 +1,20 @@
-//! TIN claims: an account proves it owns a TIN with Form 2303, an ID and any
-//! supporting documents. Staff review each claim by hand. An approved claim
-//! is an active tax profile, and active tax profiles are what license the
-//! Buwiz apps (`GET /api/tax-profiles`).
+//! TIN claims: an account proves it owns a TIN. A personal TIN is proved
+//! with a TIN ID (a selfie and a National ID photo make the check
+//! stronger); a business TIN with Form 2303 and a government ID, plus proof
+//! of authority when the 2303 is in a company's name. Staff review each
+//! claim by hand. An approved claim is an active tax profile, and active
+//! tax profiles are what license the Buwiz apps (`GET /api/tax-profiles`).
 //!
-//! Lifecycle: `pending` → `approved` | `rejected` (staff) | `withdrawn`
-//! (claimant). One TIN has at most one approved owner. Document bytes are
-//! dropped when a claim ends; the hash and metadata stay.
+//! Lifecycle: `pending` → `approved` | `rejected` | `needs_fix` (staff) |
+//! `withdrawn` (claimant). A claim sent back (`needs_fix`) is resent with
+//! new files and is `pending` again. One TIN has at most one approved
+//! owner. Document bytes are dropped when a claim ends; the hash and
+//! metadata stay.
+
+use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -26,32 +32,142 @@ pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SUPPORTING_FILES: usize = 5;
 /// Permissions an approved TIN grants in the Buwiz BIR app.
 pub const PROFILE_PERMISSIONS: &[&str] = &["profile.view", "filing.prepare", "filing.submit"];
+/// What a TIN still being checked allows in the BIR app: preparing
+/// returns, not sending them.
+pub const OPEN_PERMISSIONS: &[&str] = &["profile.view", "filing.prepare"];
 /// What other clients (Buwiz Books, AI agents) may do with a profile.
 pub const VIEW_PERMISSIONS: &[&str] = &["profile.view"];
+
+/// Whose TIN it is, which decides the documents that prove it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// An employee or individual taxpayer: a TIN ID.
+    Personal,
+    /// Any TIN with a Form 2303: the 2303 and a government ID.
+    Business,
+}
+
+impl ClaimKind {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "personal" => Some(Self::Personal),
+            "business" => Some(Self::Business),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Business => "business",
+        }
+    }
+
+    pub fn label(kind: &str) -> &'static str {
+        if kind == "personal" { "Personal" } else { "Business" }
+    }
+
+    /// The documents a claim of this kind cannot do without.
+    pub fn required(self) -> &'static [DocumentKind] {
+        match self {
+            Self::Personal => &[DocumentKind::TinId],
+            Self::Business => &[DocumentKind::Form2303, DocumentKind::GovernmentId],
+        }
+    }
+
+    /// The documents a claim of this kind may carry.
+    pub fn accepts(self, document: DocumentKind) -> bool {
+        use DocumentKind::*;
+        match self {
+            Self::Personal => matches!(document, TinId | Selfie | NationalId | Supporting),
+            Self::Business => matches!(document, Form2303 | GovernmentId | Authority | Supporting),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentKind {
     Form2303,
     GovernmentId,
     Supporting,
+    /// The TIN ID card or the digital TIN ID from ORUS.
+    TinId,
+    Selfie,
+    /// A photo of the National ID (PhilSys). Its QR signature is not
+    /// checked yet.
+    NationalId,
+    /// Secretary's certificate, board resolution or SPA, for a 2303 in a
+    /// company's name.
+    Authority,
 }
 
 impl DocumentKind {
+    pub const ALL: [Self; 7] = [
+        Self::TinId,
+        Self::Selfie,
+        Self::NationalId,
+        Self::Form2303,
+        Self::GovernmentId,
+        Self::Authority,
+        Self::Supporting,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Form2303 => "form_2303",
             Self::GovernmentId => "government_id",
             Self::Supporting => "supporting",
+            Self::TinId => "tin_id",
+            Self::Selfie => "selfie",
+            Self::NationalId => "national_id",
+            Self::Authority => "authority",
         }
+    }
+
+    /// The upload field with this name, which is also the stored kind.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == raw)
     }
 
     pub fn label(kind: &str) -> &'static str {
         match kind {
-            "form_2303" => "BIR Form 2303",
+            "form_2303" => "Form 2303",
             "government_id" => "Government ID",
-            _ => "Supporting document",
+            "tin_id" => "TIN ID",
+            "selfie" => "Selfie",
+            "national_id" => "National ID",
+            "authority" => "Proof of authority",
+            _ => "Other papers",
         }
     }
+
+    pub fn icon(kind: &str) -> &'static str {
+        match kind {
+            "form_2303" => "description",
+            "government_id" | "tin_id" => "badge",
+            "selfie" => "face",
+            "national_id" => "id_card",
+            "authority" => "gavel",
+            _ => "attach_file",
+        }
+    }
+}
+
+/// Why staff send a claim back: (code, chip label, what the claimant reads).
+pub const FIX_REASONS: &[(&str, &str, &str)] = &[
+    ("blurry", "Blurry photo", "A photo is too blurry to read."),
+    ("name_mismatch", "Name doesn't match", "The name you typed doesn't match the document."),
+    ("wrong_document", "Wrong document", "A file isn't the document we asked for."),
+    ("tin_mismatch", "TIN doesn't match", "The TIN you typed doesn't match the document."),
+    (
+        "authority_missing",
+        "Proof of authority missing",
+        "The Form 2303 is in a company's name: add proof you can act for it.",
+    ),
+];
+
+pub fn fix_reason(code: &str) -> Option<(&'static str, &'static str)> {
+    FIX_REASONS.iter().find(|(known, ..)| *known == code).map(|(_, label, message)| (*label, *message))
 }
 
 /// A file as uploaded, before it is stored.
@@ -93,46 +209,75 @@ fn clean_filename(raw: &str) -> String {
     if name.is_empty() { "document".to_owned() } else { name.to_owned() }
 }
 
+/// A new claim as the person sent it.
+pub struct NewClaim {
+    pub kind: ClaimKind,
+    pub tin: Tin,
+    pub registered_name: String,
+    pub trade_name: String,
+    pub uploads: Vec<Upload>,
+}
+
+/// Trimmed registered and trade names, or why they cannot be used.
+fn check_names(registered_name: &str, trade_name: &str) -> Result<(String, Option<String>), Notice> {
+    let registered_name = registered_name.trim();
+    let trade_name = trade_name.trim();
+    if registered_name.is_empty() || registered_name.len() > 200 || trade_name.len() > 200 {
+        return Err(Notice::NameMissing);
+    }
+    Ok((registered_name.to_owned(), Some(trade_name.to_owned()).filter(|name| !name.is_empty())))
+}
+
+/// Checks each file against the claim's kind, its size and its real type.
+fn check_uploads(kind: ClaimKind, uploads: Vec<Upload>) -> Result<Vec<(Upload, &'static str)>, Notice> {
+    if uploads.iter().any(|upload| !kind.accepts(upload.kind)) {
+        return Err(Notice::WrongDocuments);
+    }
+    if uploads.iter().filter(|upload| upload.kind == DocumentKind::Supporting).count() > MAX_SUPPORTING_FILES {
+        return Err(Notice::TooManySupporting);
+    }
+    let mut checked = Vec::with_capacity(uploads.len());
+    for upload in uploads {
+        if upload.bytes.len() > MAX_FILE_BYTES {
+            return Err(Notice::FileTooBig);
+        }
+        let Some(content_type) = sniff(&upload.bytes) else {
+            return Err(Notice::FileType);
+        };
+        checked.push((upload, content_type));
+    }
+    Ok(checked)
+}
+
+fn missing_notice(document: DocumentKind) -> Notice {
+    match document {
+        DocumentKind::TinId => Notice::NeedTinId,
+        DocumentKind::Form2303 => Notice::Need2303,
+        _ => Notice::NeedId,
+    }
+}
+
 /// Opens a claim with its files. Errors are messages for the person.
 pub async fn submit(
     db: &PgPool,
     store: &DocumentStore,
     key: &[u8; 32],
     account_id: Uuid,
-    tin: &Tin,
-    registered_name: &str,
-    uploads: Vec<Upload>,
+    claim: NewClaim,
 ) -> Result<Uuid, SubmitError> {
-    let registered_name = registered_name.trim();
-    if registered_name.is_empty() || registered_name.len() > 200 {
-        return Err(SubmitError::Invalid(Notice::NameMissing));
-    }
-    for required in [DocumentKind::Form2303, DocumentKind::GovernmentId] {
-        if !uploads.iter().any(|upload| upload.kind == required) {
-            return Err(SubmitError::Invalid(match required {
-                DocumentKind::Form2303 => Notice::Need2303,
-                _ => Notice::NeedId,
-            }));
+    let NewClaim { kind, tin, registered_name, trade_name, uploads } = claim;
+    let (registered_name, trade_name) = check_names(&registered_name, &trade_name).map_err(SubmitError::Invalid)?;
+    for required in kind.required() {
+        if !uploads.iter().any(|upload| upload.kind == *required) {
+            return Err(SubmitError::Invalid(missing_notice(*required)));
         }
     }
-    if uploads.iter().filter(|upload| upload.kind == DocumentKind::Supporting).count() > MAX_SUPPORTING_FILES {
-        return Err(SubmitError::Invalid(Notice::TooManySupporting));
-    }
-    let mut checked = Vec::with_capacity(uploads.len());
-    for upload in uploads {
-        if upload.bytes.len() > MAX_FILE_BYTES {
-            return Err(SubmitError::Invalid(Notice::FileTooBig));
-        }
-        let Some(content_type) = sniff(&upload.bytes) else {
-            return Err(SubmitError::Invalid(Notice::FileType));
-        };
-        checked.push((upload, content_type));
-    }
+    let checked = check_uploads(kind, uploads).map_err(SubmitError::Invalid)?;
 
     let mut tx = db.begin().await?;
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT status FROM tin_claims
-         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status IN ('pending', 'approved')",
+         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status IN ('pending', 'needs_fix', 'approved')",
     )
     .bind(account_id)
     .bind(tin.root())
@@ -145,13 +290,15 @@ pub async fn submit(
         None => {}
     }
     let inserted = sqlx::query_scalar(
-        "INSERT INTO tin_claims (account_id, tin_root, branch_code, registered_name, status)
-         VALUES ($1, $2, $3, $4, 'pending') RETURNING id",
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, trade_name, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id",
     )
     .bind(account_id)
+    .bind(kind.as_str())
     .bind(tin.root())
     .bind(tin.branch())
-    .bind(registered_name)
+    .bind(&registered_name)
+    .bind(&trade_name)
     .fetch_one(&mut *tx)
     .await;
     let claim_id: Uuid = match inserted {
@@ -172,8 +319,91 @@ pub async fn submit(
         store.delete_all(&uploaded).await;
         return Err(error);
     }
-    tracing::info!(%claim_id, %account_id, "tin claim submitted");
+    tracing::info!(%claim_id, %account_id, kind = kind.as_str(), "tin claim submitted");
     Ok(claim_id)
+}
+
+/// What the claimant changes on a claim sent back to them.
+pub struct Resend {
+    pub registered_name: String,
+    pub trade_name: String,
+    /// New files. Each replaces the files of its kind; other papers are
+    /// added.
+    pub uploads: Vec<Upload>,
+}
+
+/// The claimant fixes a claim staff sent back, and it waits for review
+/// again. Replaced files are deleted like those of a decided claim.
+pub async fn resend(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    account_id: Uuid,
+    claim_id: Uuid,
+    fix: Resend,
+) -> Result<(), SubmitError> {
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT status, kind, registered_name, trade_name FROM tin_claims
+         WHERE id = $1 AND account_id = $2 FOR UPDATE",
+    )
+    .bind(claim_id)
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, kind, old_name, old_trade)) = row else {
+        return Err(SubmitError::Invalid(Notice::ClaimMissing));
+    };
+    if status != "needs_fix" {
+        return Err(SubmitError::Invalid(Notice::NotSentBack));
+    }
+    let kind = ClaimKind::parse(&kind).expect("stored kinds are valid");
+    let (registered_name, trade_name) =
+        check_names(&fix.registered_name, &fix.trade_name).map_err(SubmitError::Invalid)?;
+    if fix.uploads.is_empty() && registered_name == old_name && trade_name == old_trade {
+        return Err(SubmitError::Invalid(Notice::FixNeedsChange));
+    }
+    let checked = check_uploads(kind, fix.uploads).map_err(SubmitError::Invalid)?;
+
+    let mut replaced: Vec<&str> = checked
+        .iter()
+        .map(|(upload, _)| upload.kind)
+        .filter(|kind| *kind != DocumentKind::Supporting)
+        .map(DocumentKind::as_str)
+        .collect();
+    replaced.sort_unstable();
+    replaced.dedup();
+    let purged: Vec<Option<String>> = sqlx::query_scalar(
+        "UPDATE claim_documents SET ciphertext = NULL, nonce = NULL, purged_at = now()
+         WHERE claim_id = $1 AND kind = ANY($2) AND purged_at IS NULL
+         RETURNING object_key",
+    )
+    .bind(claim_id)
+    .bind(&replaced)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE tin_claims SET status = 'pending', resent_at = now(), registered_name = $2, trade_name = $3
+         WHERE id = $1",
+    )
+    .bind(claim_id)
+    .bind(&registered_name)
+    .bind(&trade_name)
+    .execute(&mut *tx)
+    .await?;
+    let mut uploaded = Vec::new();
+    let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
+    let committed = match stored {
+        Ok(()) => tx.commit().await.map_err(SubmitError::from),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = committed {
+        store.delete_all(&uploaded).await;
+        return Err(error);
+    }
+    store.delete_all(&purged.into_iter().flatten().collect::<Vec<_>>()).await;
+    tracing::info!(%claim_id, %account_id, "tin claim resent");
+    Ok(())
 }
 
 async fn store_documents(
@@ -238,23 +468,42 @@ fn document_context(claim_id: Uuid, document_id: Uuid) -> Vec<u8> {
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ClaimRow {
     pub id: Uuid,
+    pub account_id: Uuid,
     pub email: String,
+    pub kind: String,
     pub tin_root: String,
     pub branch_code: String,
     pub registered_name: String,
+    pub trade_name: Option<String>,
     pub status: String,
     pub decision_note: Option<String>,
+    pub fix_reasons: Vec<String>,
+    pub fix_note: Option<String>,
     pub created_at: OffsetDateTime,
+    pub sent_back_at: Option<OffsetDateTime>,
+    pub resent_at: Option<OffsetDateTime>,
+    pub decided_at: Option<OffsetDateTime>,
 }
 
 impl ClaimRow {
     pub fn tin(&self) -> Tin {
         Tin::parse(&self.tin_root, &self.branch_code).expect("stored TINs are valid")
     }
+
+    /// Waiting for staff or for the claimant's fix.
+    pub fn is_open(&self) -> bool {
+        matches!(self.status.as_str(), "pending" | "needs_fix")
+    }
+
+    /// When it last went into the review queue.
+    pub fn waiting_since(&self) -> OffsetDateTime {
+        self.resent_at.unwrap_or(self.created_at)
+    }
 }
 
-const CLAIM_COLUMNS: &str =
-    "c.id, a.email, c.tin_root, c.branch_code, c.registered_name, c.status, c.decision_note, c.created_at";
+pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
+     c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
+     c.decided_at";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -262,15 +511,6 @@ pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<Clai
          WHERE c.account_id = $1 ORDER BY c.created_at DESC"
     ))
     .bind(account_id)
-    .fetch_all(db)
-    .await
-}
-
-pub async fn pending(db: &PgPool) -> sqlx::Result<Vec<ClaimRow>> {
-    sqlx::query_as(&format!(
-        "SELECT {CLAIM_COLUMNS} FROM tin_claims c JOIN accounts a ON a.id = c.account_id
-         WHERE c.status = 'pending' ORDER BY c.created_at"
-    ))
     .fetch_all(db)
     .await
 }
@@ -284,11 +524,13 @@ pub async fn find(db: &PgPool, claim_id: Uuid) -> sqlx::Result<Option<ClaimRow>>
     .await
 }
 
-/// Other claims on the same TIN: the reviewer must see a dispute.
+/// Other open or approved claims on the same TIN: the reviewer must see a
+/// dispute.
 pub async fn rivals(db: &PgPool, claim: &ClaimRow) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
         "SELECT {CLAIM_COLUMNS} FROM tin_claims c JOIN accounts a ON a.id = c.account_id
-         WHERE c.tin_root = $1 AND c.branch_code = $2 AND c.id <> $3 AND c.status IN ('pending', 'approved')
+         WHERE c.tin_root = $1 AND c.branch_code = $2 AND c.id <> $3
+           AND c.status IN ('pending', 'needs_fix', 'approved')
          ORDER BY c.created_at"
     ))
     .bind(&claim.tin_root)
@@ -298,21 +540,47 @@ pub async fn rivals(db: &PgPool, claim: &ClaimRow) -> sqlx::Result<Vec<ClaimRow>
     .await
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct DocumentRow {
     pub id: Uuid,
+    pub claim_id: Uuid,
     pub kind: String,
     pub filename: String,
+    pub content_type: String,
     pub size_bytes: i32,
     pub purged_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
 }
 
+impl DocumentRow {
+    /// Still stored, and a photo a browser can show in `<img>`.
+    pub fn is_viewable_image(&self) -> bool {
+        self.purged_at.is_none() && matches!(self.content_type.as_str(), "image/jpeg" | "image/png" | "image/webp")
+    }
+}
+
+const DOCUMENT_COLUMNS: &str =
+    "d.id, d.claim_id, d.kind, d.filename, d.content_type, d.size_bytes, d.purged_at, d.created_at";
+
+/// A claim's files in the order a reviewer reads them, required ones first.
 pub async fn documents(db: &PgPool, claim_id: Uuid) -> sqlx::Result<Vec<DocumentRow>> {
-    sqlx::query_as(
-        "SELECT id, kind, filename, size_bytes, purged_at FROM claim_documents
-         WHERE claim_id = $1 ORDER BY kind, created_at",
-    )
+    let mut rows: Vec<DocumentRow> = sqlx::query_as(&format!(
+        "SELECT {DOCUMENT_COLUMNS} FROM claim_documents d WHERE d.claim_id = $1 ORDER BY d.created_at"
+    ))
     .bind(claim_id)
+    .fetch_all(db)
+    .await?;
+    rows.sort_by_key(|row| DocumentKind::ALL.iter().position(|kind| kind.as_str() == row.kind));
+    Ok(rows)
+}
+
+/// Every file sent with the account's claims, newest first.
+pub async fn account_documents(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<DocumentRow>> {
+    sqlx::query_as(&format!(
+        "SELECT {DOCUMENT_COLUMNS} FROM claim_documents d JOIN tin_claims c ON c.id = d.claim_id
+         WHERE c.account_id = $1 ORDER BY d.created_at DESC"
+    ))
+    .bind(account_id)
     .fetch_all(db)
     .await
 }
@@ -374,15 +642,27 @@ impl From<sqlx::Error> for DecideError {
     }
 }
 
-/// Staff approve or reject a pending claim.
+/// What staff decide about a claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// The account becomes the TIN's only owner.
+    Approve,
+    Reject,
+    /// Back to the claimant with reason codes from [`FIX_REASONS`].
+    SendBack(Vec<String>),
+}
+
+/// Staff approve, reject or send back a claim. Approving and rejecting end
+/// it (also a claim waiting for a fix that never came); only a claim
+/// waiting for review can be sent back.
 pub async fn decide(
     db: &PgPool,
     store: &DocumentStore,
     claim_id: Uuid,
     reviewer_id: Uuid,
-    approve: bool,
+    decision: &Decision,
     note: &str,
-) -> Result<(), DecideError> {
+) -> Result<Notice, DecideError> {
     let mut tx = db.begin().await?;
     let row: Option<(Uuid, String)> =
         sqlx::query_as("SELECT account_id, status FROM tin_claims WHERE id = $1 FOR UPDATE")
@@ -395,10 +675,36 @@ pub async fn decide(
     if claimant == reviewer_id {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
-    if status != "pending" {
+    let note = note.trim();
+    if let Decision::SendBack(reasons) = decision {
+        if status != "pending" {
+            return Err(DecideError::Refused(Notice::AlreadyDecided));
+        }
+        if reasons.iter().any(|reason| fix_reason(reason).is_none()) {
+            return Err(DecideError::Refused(Notice::FixNeedsReason));
+        }
+        if reasons.is_empty() && note.is_empty() {
+            return Err(DecideError::Refused(Notice::FixNeedsReason));
+        }
+        sqlx::query(
+            "UPDATE tin_claims SET status = 'needs_fix', fix_reasons = $2, fix_note = NULLIF($3, ''),
+                 sent_back_at = now(), sent_back_by = $4
+             WHERE id = $1",
+        )
+        .bind(claim_id)
+        .bind(reasons)
+        .bind(note)
+        .bind(reviewer_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!(%claim_id, %reviewer_id, "tin claim sent back");
+        return Ok(Notice::ClaimSentBack);
+    }
+    if !matches!(status.as_str(), "pending" | "needs_fix") {
         return Err(DecideError::Refused(Notice::AlreadyDecided));
     }
-    let note = note.trim();
+    let approve = *decision == Decision::Approve;
     if !approve && note.is_empty() {
         return Err(DecideError::Refused(Notice::RejectNeedsNote));
     }
@@ -425,15 +731,15 @@ pub async fn decide(
     tx.commit().await?;
     store.delete_all(&objects).await;
     tracing::info!(%claim_id, %reviewer_id, status, "tin claim decided");
-    Ok(())
+    Ok(Notice::ClaimDecided)
 }
 
-/// The claimant gives up a pending claim.
+/// The claimant gives up a claim that is still open.
 pub async fn withdraw(db: &PgPool, store: &DocumentStore, claim_id: Uuid, account_id: Uuid) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
     let updated = sqlx::query(
         "UPDATE tin_claims SET status = 'withdrawn', decided_at = now()
-         WHERE id = $1 AND account_id = $2 AND status = 'pending'",
+         WHERE id = $1 AND account_id = $2 AND status IN ('pending', 'needs_fix')",
     )
     .bind(claim_id)
     .bind(account_id)
@@ -463,9 +769,24 @@ async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_i
 /// any profile with permissions as a license to use their BIR tools. Only
 /// the BIR app (scope `app`) sees the full TIN; everyone else gets the
 /// opaque `id` and the masked TIN.
-pub async fn tax_profiles(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
+///
+/// `?include=pending` also lists TINs still being checked or sent back for
+/// a fix, and adds `status` to every profile. Those can prepare returns
+/// but not send them; their `id` stays the same once approved.
+pub async fn tax_profiles(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    bearer: Bearer,
+) -> Result<Json<Value>, ApiError> {
     let full = bearer.scope == crate::oauth::SCOPE_APP;
-    Ok(Json(json!({ "profiles": active_profiles(&state.db, bearer.account.id, full).await? })))
+    let include_open =
+        query.get("include").is_some_and(|include| include.split(',').any(|item| item.trim() == "pending"));
+    let profiles = if include_open {
+        profiles_with_open(&state.db, bearer.account.id, full).await?
+    } else {
+        active_profiles(&state.db, bearer.account.id, full).await?
+    };
+    Ok(Json(json!({ "profiles": profiles })))
 }
 
 /// The account's active TINs. `full` adds the raw TIN and filing
@@ -487,6 +808,26 @@ pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx:
         .collect())
 }
 
+/// Active TINs, then open claims, each with its `status`.
+async fn profiles_with_open(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::Result<Vec<Value>> {
+    let mut profiles = active_profiles(db, account_id, full).await?;
+    for profile in &mut profiles {
+        profile["status"] = json!("approved");
+    }
+    let open: Vec<(Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, tin_root, branch_code, registered_name, status FROM tin_claims
+         WHERE account_id = $1 AND status IN ('pending', 'needs_fix') ORDER BY created_at",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    profiles.extend(open.into_iter().map(|(id, root, branch, registered_name, status)| {
+        let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+        open_profile_json(id, &tin, &registered_name, &status, full)
+    }));
+    Ok(profiles)
+}
+
 fn profile_json(id: Uuid, tin: &Tin, registered_name: &str, activated_at: OffsetDateTime, full: bool) -> Value {
     let mut profile = json!({
         "id": id,
@@ -494,6 +835,21 @@ fn profile_json(id: Uuid, tin: &Tin, registered_name: &str, activated_at: Offset
         "registered_name": registered_name,
         "activated_at": activated_at.unix_timestamp(),
         "permissions": if full { PROFILE_PERMISSIONS } else { VIEW_PERMISSIONS },
+    });
+    if full {
+        profile["tin"] = json!(tin.to_string());
+    }
+    profile
+}
+
+fn open_profile_json(id: Uuid, tin: &Tin, registered_name: &str, status: &str, full: bool) -> Value {
+    let mut profile = json!({
+        "id": id,
+        "tin_masked": tin.masked(),
+        "registered_name": registered_name,
+        "activated_at": null,
+        "permissions": if full { OPEN_PERMISSIONS } else { VIEW_PERMISSIONS },
+        "status": status,
     });
     if full {
         profile["tin"] = json!(tin.to_string());
@@ -517,6 +873,31 @@ mod tests {
         let full = profile_json(Uuid::nil(), &tin, "Juan", at, true);
         assert_eq!(full["tin"], "123-456-789-00000");
         assert_eq!(full["permissions"], json!(PROFILE_PERMISSIONS));
+    }
+
+    #[test]
+    fn open_profiles_prepare_but_never_submit() {
+        let tin = Tin::parse("123456789", "").unwrap();
+        let open = open_profile_json(Uuid::nil(), &tin, "Juan", "pending", true);
+        assert_eq!(open["status"], "pending");
+        assert!(open["activated_at"].is_null());
+        assert!(!open["permissions"].to_string().contains("filing.submit"), "{open}");
+        let limited = open_profile_json(Uuid::nil(), &tin, "Juan", "needs_fix", false);
+        assert_eq!(limited["permissions"], json!(VIEW_PERMISSIONS));
+        assert!(limited.get("tin").is_none());
+    }
+
+    #[test]
+    fn each_kind_requires_and_accepts_its_own_papers() {
+        assert_eq!(ClaimKind::Personal.required(), &[DocumentKind::TinId]);
+        assert_eq!(ClaimKind::Business.required(), &[DocumentKind::Form2303, DocumentKind::GovernmentId]);
+        assert!(ClaimKind::Personal.accepts(DocumentKind::NationalId));
+        assert!(!ClaimKind::Personal.accepts(DocumentKind::Form2303));
+        assert!(ClaimKind::Business.accepts(DocumentKind::Authority));
+        assert!(!ClaimKind::Business.accepts(DocumentKind::Selfie));
+        for kind in DocumentKind::ALL {
+            assert_eq!(DocumentKind::parse(kind.as_str()), Some(kind));
+        }
     }
 
     #[test]

@@ -43,6 +43,16 @@ impl Tin {
         }
     }
 
+    /// The TIN and branch code fields of a form. The TIN field may carry the
+    /// branch too, as printed on Form 2303; then the branch field is ignored.
+    pub fn parse_fields(tin: &str, branch: &str) -> Result<Self, Notice> {
+        if digits(tin).len() > 9 || digits(branch).is_empty() {
+            Self::parse_combined(tin)
+        } else {
+            Self::parse(tin, branch)
+        }
+    }
+
     pub fn root(&self) -> &str {
         &self.root
     }
@@ -86,6 +96,14 @@ mod tests {
         assert_eq!(Tin::parse_combined("123-456-789-000").unwrap().branch(), "00000");
         assert_eq!(Tin::parse_combined("123 456 789").unwrap().branch(), "00000");
         assert!(Tin::parse_combined("123-456-78").is_err());
+    }
+
+    #[test]
+    fn parses_separate_tin_and_branch_fields() {
+        assert_eq!(Tin::parse_fields("987-654-321", "00002").unwrap().to_string(), "987-654-321-00002");
+        assert_eq!(Tin::parse_fields("987654321", "").unwrap().branch(), "00000");
+        assert_eq!(Tin::parse_fields("987-654-321-00004", "00000").unwrap().branch(), "00004");
+        assert!(Tin::parse_fields("987-654-321", "12").is_err());
     }
 
     #[test]

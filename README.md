@@ -30,6 +30,11 @@ Spin-based `buwiz-server`, keeping only what the apps call.
   - SSH runs end to end through it, with BIR's host key pinned.
   - Each send ends in a signed receipt. See
     [docs/relay-protocol.md](docs/relay-protocol.md).
+  - The BIR-specific code (BIR's dispatcher, the IAF encryption, the SFTP
+    upload, BIR's host list, the v1 reference client) is behind the `bir`
+    cargo feature, in files kept out of the public repository. BIR's hosts
+    and the other BIR details are documented with those files. See
+    [Builds with and without BIR](#builds-with-and-without-bir).
 - **MCP for AI agents**: `POST /mcp` with four read-only tools: active TINs,
   TIN claims, sent returns, and one return with its receipt.
   - Agents find the sign-in through the 401's `WWW-Authenticate` metadata
@@ -56,7 +61,8 @@ cargo run                                  # http://localhost:3008
 
 Migrations run at start. Without `SENDER_URL`, the Sender runs inside this
 process (development only; see [docs/relay-protocol.md](docs/relay-protocol.md)
-§6 for running `buwiz-sender` on its own). Without `RESEND_API_KEY`, sign-in codes appear in
+§6 for running `buwiz-sender` on its own). Built without the `bir` feature,
+that Sender answers every send with `failed`, "relay not built in". Without `RESEND_API_KEY`, sign-in codes appear in
 the server log; with it, they are emailed. Put your email in `ADMIN_EMAILS` to see **Review claims**.
 
 Smoke test of the whole flow (device sign-in, claim, review, licence gate,
@@ -96,7 +102,21 @@ account hostname and list the API hostname in `EXTRA_ORIGINS`.
 Browser pages the apps open: `/login?next=…`, `/signup?next=…`,
 `/device?user_code=…`.
 
+## Builds with and without BIR
+
+| | `cargo build` (public) | `cargo build --features bir` (production) |
+|---|---|---|
+| Needs the private BIR files (`src/bir/`, `src/relay/client.rs`, `examples/iaf-decrypt.rs`, `tests/relay.rs`, `tests/iaf_golden.rs`, `tests/fixtures/iaf/`) | No | Yes |
+| Accounts, TIN claims, devices, tickets, HPKE sealing, trust list, receipts | Yes | Yes |
+| Sender (`buwiz-sender` and the in-process development Sender) | Checks tickets and opens envelopes, then answers every send `failed`, "relay not built in". Nothing reaches BIR, so it is safe to retry. | Sends through the relay |
+| `buwiz-relay`, `iaf-decrypt`, the relay tests | Not built | Built |
+
+The `Dockerfile` builds with `--features bir`. CI builds, lints and tests
+without it.
+
 ## Relay modes
+
+These need a build with `--features bir`.
 
 `BIR_RELAY_MODE` decides how far a submission goes:
 
@@ -111,21 +131,23 @@ Lab test with a real OpenSSH server:
 docker run -d -p 127.0.0.1:2222:22 atmoz/sftp lab:labpass:1001::1601Cv2018
 ssh-keyscan -p 2222 -t ed25519 127.0.0.1 | ssh-keygen -lf -      # pin this
 BIR_RELAY_MODE=lab BIR_LAB_SFTP=lab:labpass@127.0.0.1:2222 \
-  BIR_SSH_HOST_KEYS=SHA256:… BIR_IAF_PASSPHRASE=lab cargo run
+  BIR_SSH_HOST_KEYS=SHA256:… BIR_IAF_PASSPHRASE=lab cargo run --features bir
 # Sign in, get a TIN approved, then act as the app:
-cargo run --bin buwiz-relay -- --server http://localhost:3008 --token <access token> \
+cargo run --features bir --bin buwiz-relay -- --server http://localhost:3008 --token <access token> \
   --file return.xml --filename '12345678900000-1601Cv2018-062025#you@example.com#.xml' \
   --allow 127.0.0.1:2222
 ```
 
-Tests: `cargo test` runs the relay end to end in one process (fake
+Tests: `cargo test` runs everything that needs no BIR code.
+`cargo test --features bir` adds the relay end to end in one process (fake
 dispatcher, SSH server with a pinned key, the app's allow-list).
 `scripts/v6.sh` runs `e2e/` (its own workspace): submission v2 with the
 real buwiz-oss client, from a queued 1701Q to a verified receipt, and the
-attacks it must refuse. It needs Docker and read access to buwiz-oss. With
-`BIR_IAF_PASSPHRASE` set, `tests/iaf_golden.rs` checks the encryption
-against official `Encrypt.exe` output.
-`cargo test -- --include-ignored` also runs HTTPS through the pipe against
+attacks it must refuse. It needs Docker, read access to buwiz-oss and the BIR files (e2e builds
+the server with `bir`). With `--features bir` and `BIR_IAF_PASSPHRASE` set,
+`tests/iaf_golden.rs` checks the encryption against official `Encrypt.exe`
+output.
+`cargo test --features bir -- --include-ignored` also runs HTTPS through the pipe against
 example.com.
 
 ## Configuration
@@ -137,8 +159,8 @@ refuses to start if it would print codes on a public deployment.
 
 ## Deploy
 
-The `Dockerfile` builds a small image that listens on `$PORT` (8080 in the
-image). Any container host with Postgres works.
+The `Dockerfile` builds a small image, with `--features bir`, that listens
+on `$PORT` (8080 in the image). Any container host with Postgres works.
 
 **Wasmer** is the long-term target, but it can't run this yet (tested
 2026-10-29 with Wasmer 7.5 and the WASIX toolchain `v2026-09-18.1`, Rust 1.97):

@@ -19,8 +19,18 @@ The server is two processes:
   and the HPKE private key. It has no public address; the Gatekeeper
   reaches it on a private network (section 6).
 
-`src/relay/client.rs` and `src/bin/buwiz-relay.rs` are the reference v1
-client; buwiz-oss `bir-submit` is the v2 client.
+buwiz-oss `bir-submit` is the v2 client. The reference v1 client
+(`src/relay/client.rs`, `src/bin/buwiz-relay.rs`) is part of the BIR relay
+code.
+
+The BIR relay code itself (`src/bir/`: BIR's dispatcher, the IAF
+encryption, the SFTP upload, BIR's host list) is behind the `bir` cargo
+feature and kept in private files. BIR's hostnames, ports, dispatcher path,
+client version and upload-host fingerprints live there and in that code's
+own docs, not here. A build without the feature runs everything else in this
+document, and its Sender answers every send with `failed`, `"relay not
+built in"` (section 3): nothing reaches BIR, so the send can be retried
+against a full build. Production builds use `--features bir`.
 
 ## 1. Create the submission
 
@@ -68,20 +78,21 @@ same `Authorization: Bearer` header. The app then forwards bytes:
 
 The app must:
 
-- **Connect only to BIR's hosts**: `birgovph.com:443`, `birgovph.com:80`,
-  `ws2.birgovph.com:443`, `ws2.birgovph.com:80` and `ebf2.bir.gov.ph:22`.
-  The v1 reference client hard-codes this list and refuses anything else
-  with `refused`. This keeps the server from using a taxpayer's computer as
-  a general proxy. v2 apps take the list from the signed relay trust list
-  instead (section 5.4) and name no host in their source.
+- **Connect only to BIR's hosts**: BIR's dispatcher (HTTPS and HTTP, on a
+  primary and a backup host) and its SFTP upload server. The list is in the
+  private BIR relay files. The v1 reference client hard-codes it and
+  refuses anything else with `refused`. This keeps the server from using a
+  taxpayer's computer as a general proxy. v2 apps take the list from the
+  signed relay trust list instead (section 5.4) and name no host in their
+  source.
 - Forward bytes unchanged. Never terminate TLS or SSH. Everything the app
   sees is TLS or SSH ciphertext, or the dispatcher's wrapped fields.
 - Keep the socket open until `result`.
 
 What the server does over the pipe:
 
-1. Asks BIR's dispatcher (`/tinDispatcherSFTP.php`), trying HTTPS first,
-   then HTTP, on `birgovph.com`, then `ws2.birgovph.com`.
+1. Asks BIR's dispatcher for the upload server and its login, trying HTTPS
+   first, then HTTP, on the primary host, then the backup.
 2. Unwraps the upload server and login on the server side.
 3. Checks the upload host against its own list.
 4. Runs SSH to it, refusing any host key that is not pinned.
@@ -94,7 +105,7 @@ What the server does over the pipe:
 |---|---|---|
 | `sent` | BIR's server accepted the file. `receipt` is a signed receipt. | Mark the return **Sent** and store the receipt. |
 | `dry_run` | The server is in dry-run mode. Nothing reached BIR. | Treat as a test. |
-| `failed` | Nothing reached BIR. `error` says why. | Retry later by opening the relay again (same submission, within 24 h). |
+| `failed` | Nothing reached BIR. `error` says why (`relay not built in` from a server built without the `bir` feature). | Retry later by opening the relay again (same submission, within 24 h). |
 | `unknown` | The connection broke during the upload. BIR may have the file. | Do **not** resend automatically. Ask the person to check for BIR's confirmation email. |
 
 Opening the relay again for a submission that is already `sent` returns
@@ -325,14 +336,16 @@ Sender (`buwiz-sender`):
 | `BIR_IAF_PASSPHRASE` | IAF encryption passphrase (lab, live) |
 | `BIR_DISPATCHER_PASSPHRASE` | Unwraps dispatcher answers (live) |
 | `BIR_SSH_HOST_KEYS` | Comma-separated `SHA256:…` fingerprints accepted for upload servers (lab, live) |
-| `BIR_SFTP_HOSTS` | Upload hosts the dispatcher may name (default `ebf2.bir.gov.ph`) |
+| `BIR_SFTP_HOSTS` | Comma-separated upload hosts the dispatcher may name. No default; required in live, where the Sender refuses to start without it. |
 | `BIR_LAB_SFTP` | `user:password@host:port` of a test SFTP server (lab) |
 
 The ticket public key is the Ed25519 public half of `TICKET_SIGNING_KEY`,
 base64url without padding.
 
-Get the upload server's fingerprint from a trusted network and check it
-against a second source before pinning it:
-`ssh-keyscan -t ed25519 ebf2.bir.gov.ph | ssh-keygen -lf -`. When BIR
-rotates its key, uploads stop with "host key is not pinned" and the log
-shows the new fingerprint. Verify it before adding it.
+The `BIR_*` settings other than `BIR_RELAY_MODE` take effect only in a
+build with the `bir` feature. The values for live (upload hosts, how to get
+and check the upload server's host-key fingerprint) are in the BIR relay's
+private docs. Take a fingerprint from a trusted network and check it
+against a second source before pinning it. When BIR rotates its key,
+uploads stop with "host key is not pinned" and the log shows the new
+fingerprint. Verify it before adding it.

@@ -163,6 +163,7 @@ pub fn relay_settings() -> anyhow::Result<bir::Settings> {
         pinned_keys,
         lab,
         tls: bir::Settings::tls_config(),
+        sftp_timeout: bir::sftp::TIMEOUT,
     })
 }
 

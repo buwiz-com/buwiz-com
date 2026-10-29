@@ -44,7 +44,11 @@ impl Config {
             Ok(value) => value == "true",
             Err(_) => account_origin.starts_with("https://"),
         };
-        let mail = match var_or("MAIL_TRANSPORT", "log").as_str() {
+        // Without an explicit MAIL_TRANSPORT, a Resend key means send email;
+        // no key means print codes to the log.
+        let has_resend_key = std::env::var("RESEND_API_KEY").is_ok_and(|key| !key.trim().is_empty());
+        let default_transport = if has_resend_key { "resend" } else { "log" };
+        let mail = match var_or("MAIL_TRANSPORT", default_transport).as_str() {
             "log" => MailConfig::Log,
             "resend" => MailConfig::Resend { api_key: required("RESEND_API_KEY")?, from: required("MAIL_FROM")? },
             other => bail!("MAIL_TRANSPORT must be `log` or `resend`, not `{other}`"),

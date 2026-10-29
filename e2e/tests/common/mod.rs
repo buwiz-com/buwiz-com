@@ -58,17 +58,21 @@ pub type Received = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 /// SFTP server: accepts `lab`/`lab-password` and keeps uploaded files.
 struct SftpServer {
     received: Received,
+    /// When set, writes are never answered: a server that stalls after the
+    /// remote file was opened.
+    stall: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl russh::server::Server for SftpServer {
     type Handler = SshSession;
     fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> SshSession {
-        SshSession { received: self.received.clone(), channels: HashMap::new() }
+        SshSession { received: self.received.clone(), stall: self.stall.clone(), channels: HashMap::new() }
     }
 }
 
 struct SshSession {
     received: Received,
+    stall: Arc<std::sync::atomic::AtomicBool>,
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
@@ -99,7 +103,8 @@ impl russh::server::Handler for SshSession {
         match self.channels.remove(&channel) {
             Some(open) if name == "sftp" => {
                 session.channel_success(channel)?;
-                let handler = SftpFiles { received: self.received.clone(), open: HashMap::new() };
+                let handler =
+                    SftpFiles { received: self.received.clone(), stall: self.stall.clone(), open: HashMap::new() };
                 russh_sftp::server::run(open.into_stream(), handler).await;
             }
             _ => session.channel_failure(channel)?,
@@ -110,6 +115,7 @@ impl russh::server::Handler for SshSession {
 
 struct SftpFiles {
     received: Received,
+    stall: Arc<std::sync::atomic::AtomicBool>,
     open: HashMap<String, (String, Vec<u8>)>,
 }
 
@@ -145,6 +151,9 @@ impl russh_sftp::server::Handler for SftpFiles {
     }
 
     async fn write(&mut self, id: u32, handle: String, _offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+        if self.stall.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if let Some((_, buffer)) = self.open.get_mut(&handle) {
             buffer.extend_from_slice(&data);
         }
@@ -162,13 +171,18 @@ impl russh_sftp::server::Handler for SftpFiles {
 /// Starts the SFTP server. Returns its port, its key fingerprint and the
 /// files it receives.
 pub async fn sftp_server() -> (u16, String, Received) {
+    sftp_server_with(Arc::default()).await
+}
+
+/// Starts the SFTP server; `stall` makes it stop answering writes.
+pub async fn sftp_server_with(stall: Arc<std::sync::atomic::AtomicBool>) -> (u16, String, Received) {
     let key = PrivateKey::new(KeypairData::Ed25519(Ed25519Keypair::from_seed(&[0x42; 32])), "test").unwrap();
     let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
     let config = Arc::new(russh::server::Config { keys: vec![key], ..Default::default() });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let received: Received = Arc::default();
-    let mut server = SftpServer { received: received.clone() };
+    let mut server = SftpServer { received: received.clone(), stall };
     tokio::spawn(async move {
         loop {
             let (socket, peer) = listener.accept().await.unwrap();
@@ -240,6 +254,8 @@ pub struct Harness {
     pub sender: Arc<Sender>,
     pub sftp_port: u16,
     pub dispatcher_port: u16,
+    /// Set it to make the SFTP server stall after the remote file is opened.
+    pub stall_sftp: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A fresh database on `DATABASE_URL`'s server, migrated.
@@ -264,7 +280,8 @@ impl Harness {
     /// `customize` may change the signed trust list before it is signed.
     pub async fn start_with(customize: impl FnOnce(&mut TrustSpec)) -> Self {
         let db = fresh_database().await;
-        let (sftp_port, fingerprint, received) = sftp_server().await;
+        let stall_sftp: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let (sftp_port, fingerprint, received) = sftp_server_with(stall_sftp.clone()).await;
         let dispatcher_port = dispatcher_server("127.0.0.1", sftp_port).await;
 
         // The Sender, with fake passphrases and local hosts only.
@@ -279,6 +296,7 @@ impl Harness {
                 pinned_keys: vec![fingerprint],
                 lab: None,
                 tls: bir::Settings::tls_config(),
+                sftp_timeout: std::time::Duration::from_secs(3),
             },
             sealing_key: SealingKey::from_bytes(&[0x22; 32]).unwrap(),
             receipt_key: SigningKey::from_bytes(&[0x33; 32]),
@@ -344,7 +362,7 @@ impl Harness {
         .execute(&db)
         .await
         .unwrap();
-        Self { db, base, account_id, ticket_key, received, sender, sftp_port, dispatcher_port }
+        Self { db, base, account_id, ticket_key, received, sender, sftp_port, dispatcher_port, stall_sftp }
     }
 
     /// The app's client config: this server, with the test trust key

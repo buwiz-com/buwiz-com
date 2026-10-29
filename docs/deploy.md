@@ -37,9 +37,12 @@ the last image: `fly deploy --image registry.fly.io/buwiz-cloud:<tag>`.
 
 ## Domains
 
-`account.buwiz.com` and `api.buwiz.com` have A and AAAA records in Cloudflare
-pointing at the app's IPs (`fly ips list`). The records are **DNS only**
-(grey cloud), because Fly issues the certificates (`fly certs check <name>`).
+`buwiz.com`, `www.buwiz.com`, `account.buwiz.com` and `api.buwiz.com` have
+A and AAAA records in Cloudflare pointing at the app's IPs (`fly ips list`).
+The records are **DNS only** (grey cloud), because Fly issues the
+certificates (`fly certs check <name>`). The app sends any `www.` host to the
+bare domain with a permanent redirect. MX, SPF and site-verification records
+on `buwiz.com` belong to email; leave them alone.
 
 ## Switch the mini app
 

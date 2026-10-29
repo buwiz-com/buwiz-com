@@ -15,6 +15,14 @@ Spin-based `buwiz-server`, keeping only what the apps call.
   sign-in.
 - **Licence gate**: `GET /api/tax-profiles` lists the account's active TINs.
   The apps unlock their BIR tools when any profile has permissions.
+- **Submission relay**: files a return with BIR for an active TIN.
+  - The server keeps BIR's passphrases and the SFTP login, and does the IAF
+    encryption (byte-identical to eBIRForms' `Encrypt.exe`).
+  - The traffic leaves from the taxpayer's computer, so BIR sees their own
+    connection. The app is a dumb pipe that connects only to BIR's hosts.
+  - SSH runs end to end through it, with BIR's host key pinned.
+  - Each send ends in a signed receipt. See
+    [docs/relay-protocol.md](docs/relay-protocol.md).
 
 Built with [axum](https://github.com/tokio-rs/axum) for the API and
 [Topcoat](https://github.com/tokio-rs/topcoat) for the account site, on
@@ -58,9 +66,41 @@ account hostname and list the API hostname in `EXTRA_ORIGINS`.
 | `GET /me` | `{"user_id","email"}`. 401 means signed out. |
 | `GET /api/tax-profiles` | `{"profiles":[{"id","tin","tin_masked","registered_name","activated_at","permissions"}]}`. Link by `id`, not the TIN. |
 | `POST /api/auth/logout` | Ends this app's sign-in. |
+| `POST /api/submissions`, `GET /api/submissions[/{id}]` | Create and read submissions. |
+| `GET /api/submissions/{id}/relay` (WebSocket) | The relay pipe. See [docs/relay-protocol.md](docs/relay-protocol.md). |
+| `GET /.well-known/jwks.json` | Key that verifies receipts. |
 
 Browser pages the apps open: `/login?next=…`, `/signup?next=…`,
 `/device?user_code=…`.
+
+## Relay modes
+
+`BIR_RELAY_MODE` decides how far a submission goes:
+
+- `dry_run` (default) encrypts and checks everything, sends nothing, and
+  returns a receipt marked `dry_run`.
+- `lab` uploads to a test SFTP server from `BIR_LAB_SFTP`.
+- `live` files with BIR.
+
+Lab test with a real OpenSSH server:
+
+```sh
+docker run -d -p 127.0.0.1:2222:22 atmoz/sftp lab:labpass:1001::1601Cv2018
+ssh-keyscan -p 2222 -t ed25519 127.0.0.1 | ssh-keygen -lf -      # pin this
+BIR_RELAY_MODE=lab BIR_LAB_SFTP=lab:labpass@127.0.0.1:2222 \
+  BIR_SSH_HOST_KEYS=SHA256:… BIR_IAF_PASSPHRASE=lab cargo run
+# Sign in, get a TIN approved, then act as the app:
+cargo run --bin buwiz-relay -- --server http://localhost:3008 --token <access token> \
+  --file return.xml --filename '12345678900000-1601Cv2018-062025#you@example.com#.xml' \
+  --allow 127.0.0.1:2222
+```
+
+Tests: `cargo test` runs the relay end to end in one process (fake
+dispatcher, SSH server with a pinned key, the app's allow-list). With
+`BIR_IAF_PASSPHRASE` set, `tests/iaf_golden.rs` checks the encryption
+against official `Encrypt.exe` output.
+`cargo test -- --include-ignored` also runs HTTPS through the pipe against
+example.com.
 
 ## Configuration
 
@@ -87,8 +127,8 @@ patch) do work under WASIX. Revisit when WASIX tokio catches up.
 
 ## Next
 
-1. Submission relay for buwiz-oss: tickets bound to an active TIN, BIR
-   secrets kept on the server, SSH run end-to-end through a pipe from the
-   user's computer (see buwiz-oss `internal/PLAN.md` §5).
-2. MCP endpoint and OAuth for AI agents (PKCE, dynamic client registration).
-3. Port the full marketing home page.
+1. MCP endpoint and OAuth for AI agents (PKCE, dynamic client registration).
+2. Port the full marketing home page.
+3. The relay client in buwiz-oss (`bir-submit`), following
+   [docs/relay-protocol.md](docs/relay-protocol.md).
+4. Validate returns with buwiz-oss `bir-core` before sending.

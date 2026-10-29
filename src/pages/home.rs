@@ -155,7 +155,7 @@ const AGENT_PROMISES: [(&str, &str, &str); 3] = [
 ];
 
 /// (question, answer)
-const FAQS: [(&str, &str); 5] = [
+const FAQS: [(&str, &str); 6] = [
     (
         "Do I need a Buwiz account?",
         "Yes. The desktop app asks you to sign in or create a free account the first time it opens. Your account is how Buwiz knows which TINs are yours and keeps each TIN with a single owner.",
@@ -173,19 +173,36 @@ const FAQS: [(&str, &str); 5] = [
         "Yes, after that first sign-in, and it stays signed in until you sign out. You need a connection to file a return and to add a TIN.",
     ),
     (
+        "Is there a mobile app?",
+        "Android and iOS apps are coming soon, with the same Buwiz account. Today the Buwiz app runs on Windows, macOS and Linux.",
+    ),
+    (
         "Can an AI agent file for me?",
         "No. An agent you approve can read your active TINs, your TIN claims and the returns you sent, with their receipts. Its access is read-only; filing stays in the Buwiz app, with you.",
     ),
 ];
 
-/// (icon, label)
-const TRUST: [(&str, &str); 5] = [
-    ("devices", "Windows · macOS · Linux"),
-    ("description", "All 43 BIR forms"),
-    ("cloud_off", "Works offline after sign-in"),
-    ("account_tree", "Every branch under one TIN"),
-    ("approval", "You approve every filing"),
+/// Where the Buwiz app runs: (icon, platform, coming soon).
+const PLATFORMS: [(&str, &str, bool); 5] = [
+    ("desktop_windows", "Windows", false),
+    ("laptop_mac", "macOS", false),
+    ("terminal", "Linux", false),
+    ("android", "Android", true),
+    ("phone_iphone", "iOS", true),
 ];
+
+/// (figure, what it counts)
+const HERO_STATS: [(&str, &str); 4] = [
+    ("43", "BIR forms, every one"),
+    ("2,007", "official validation rules"),
+    ("30 days", "of deadlines in view"),
+    ("Offline", "after one sign-in"),
+];
+
+/// The hero's phone shows `/assets/screens/{name}_light.webp` and
+/// `_dark.webp` once there are mobile screenshots to serve; until then, a
+/// drawn mock-up of the app's home.
+const MOBILE_SCREEN: Option<&str> = None;
 
 #[page("/")]
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
@@ -195,6 +212,7 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home">
             hero(signed_in: signed_in)
+            month()
             tour()
             account_section(signed_in: signed_in)
             agents_section()
@@ -223,22 +241,126 @@ async fn account_actions(signed_in: bool) -> Result<impl View> {
 async fn hero(signed_in: bool) -> Result<impl View> {
     Ok(view! {
         <section id="hero" class="hero-wrap">
-            <div class="hero-copy">
-                <span class="pill rise">icon(name: "volunteer_activism") "Ease of Paying Taxes"</span>
-                <h1 class="rise d1">"Filing your taxes, "<span class="accent">"finally easy."</span></h1>
-                <p class="hero-lead rise d2">
-                    "Buwiz fills in your BIR returns, checks each one against the official rules, reminds you before every deadline, then files it with BIR from your own connection. One TIN, every branch under it, all 43 forms."
-                </p>
-                <div class="hero-actions rise d3">account_actions(signed_in: signed_in)</div>
-                <p class="hero-note rise d3">"Free account · the Buwiz app runs on Windows, macOS and Linux"</p>
+            <div class="hero-glow" aria-hidden="true"></div>
+            <div class="hero-grid">
+                <div class="hero-copy">
+                    <span class="pill rise">icon(name: "volunteer_activism") "Ease of Paying Taxes"</span>
+                    <h1 class="rise d1" aria-label="BIR filing, finally easy.">
+                        <span aria-hidden="true">"BIR filing,"</span>
+                        <span class="hero-rotator" aria-hidden="true">
+                            <span class="hero-words">
+                                <span>"finally easy."</span>
+                                <span>"on time."</span>
+                                <span>"error-free."</span>
+                                <span>"anywhere."</span>
+                                <span>"finally easy."</span>
+                            </span>
+                        </span>
+                    </h1>
+                    <p class="hero-lead rise d2">
+                        "Buwiz fills in your BIR returns, checks every one against the official eBIRForms rules, reminds you before each deadline, then files it with BIR from your own connection. One TIN, every branch under it, all 43 forms."
+                    </p>
+                    <div class="hero-actions rise d3">account_actions(signed_in: signed_in)</div>
+                    <ul class="platforms rise d3" aria-label="Where Buwiz runs">
+                        for (name, platform, soon) in PLATFORMS {
+                            <li class=(if soon { "platform soon" } else { "platform" })>
+                                icon(name: name)
+                                (platform)
+                                if soon {
+                                    <span class="soon-tag">"Soon"</span>
+                                }
+                            </li>
+                        }
+                    </ul>
+                </div>
+                <div class="hero-visual rise d2">
+                    <div class="device-desktop">
+                        <div class="device-bar" aria-hidden="true">
+                            <span class="device-dots"><i></i><i></i><i></i></span>
+                            <span class="device-title">"Buwiz · 1601-C · October 2026"</span>
+                        </div>
+                        <picture>
+                            <source srcset="/assets/screens/side_by_side_dark.webp" media="(prefers-color-scheme: dark)">
+                            <img
+                                src="/assets/screens/side_by_side_light.webp"
+                                alt="The Buwiz desktop app: a BIR return beside its live print preview"
+                                width="1440"
+                                height="1129"
+                            >
+                        </picture>
+                    </div>
+                    <div class="device-phone">
+                        <span class="phone-notch" aria-hidden="true"></span>
+                        phone_screen()
+                    </div>
+                    <div class="float-chip chip-check" aria-hidden="true">
+                        icon(name: "verified")
+                        <span><b>"0 errors"</b><small>"2,007 checks passed"</small></span>
+                    </div>
+                    <div class="float-chip chip-due" aria-hidden="true">
+                        icon(name: "event_upcoming")
+                        <span><b>"1601-C due Nov 10"</b><small>"Reminder · 17 days left"</small></span>
+                    </div>
+                    <div class="float-chip chip-filed" aria-hidden="true">
+                        icon(name: "mark_email_read")
+                        <span><b>"Received by BIR"</b><small>"3 Nov · 10:43 AM"</small></span>
+                    </div>
+                </div>
             </div>
-            <div class="journey-wrap rise d3">
-                journey()
-            </div>
-            <div class="trust">
-                for (name, label) in TRUST {
-                    <span>icon(name: name) (label)</span>
+            <dl class="hero-stats">
+                for (figure, label) in HERO_STATS {
+                    <div>
+                        <dt>(figure)</dt>
+                        <dd>(label)</dd>
+                    </div>
                 }
+            </dl>
+        </section>
+    })
+}
+
+/// The phone in the hero: a mobile screenshot when there is one, else a
+/// drawn mock-up of the app's home with this month's returns.
+#[component]
+async fn phone_screen() -> Result<impl View> {
+    Ok(view! {
+        if let Some(name) = MOBILE_SCREEN {
+            <picture class="phone-shot">
+                <source srcset=(format!("/assets/screens/{name}_dark.webp")) media="(prefers-color-scheme: dark)">
+                <img src=(format!("/assets/screens/{name}_light.webp")) alt="The Buwiz mobile app">
+            </picture>
+        } else {
+            <div class="phone-ui" role="img" aria-label="The Buwiz mobile app, coming soon: this month's returns and the next deadline">
+                <div class="phone-status"><span>"9:41"</span><span class="phone-status-icons"><i></i><i></i><i></i></span></div>
+                <div class="phone-head">
+                    <span class="phone-brand">"Buwiz"</span>
+                    <span class="phone-avatar">"JD"</span>
+                </div>
+                <div class="phone-due">
+                    <span class="phone-due-label">"Due soon"</span>
+                    <b>"1601-C · October"</b>
+                    <span class="phone-due-sub">"Nov 10 · 3 branches"</span>
+                    <span class="phone-chip">"17 days"</span>
+                </div>
+                <div class="phone-label">"This month"</div>
+                <div class="phone-row"><span class="mono">"00001"</span><span>"₱5,598.60"</span><span class="phone-ok"></span></div>
+                <div class="phone-row"><span class="mono">"00002"</span><span>"₱830.10"</span><span class="phone-ok"></span></div>
+                <div class="phone-row"><span class="mono">"00003"</span><span>"₱0.00"</span><span class="phone-ok"></span></div>
+                <div class="phone-cta">"Review and file"</div>
+                <div class="phone-tabs"><i class="on"></i><i></i><i></i><i></i></div>
+            </div>
+        }
+    })
+}
+
+/// One month with Buwiz, under the hero: the journey card.
+#[component]
+async fn month() -> Result<impl View> {
+    Ok(view! {
+        <section class="month">
+            <p class="month-label">"One month with Buwiz, from the deadline to BIR's receipt"</p>
+            <div class="journey-wrap">
+                journey()
             </div>
         </section>
     })
@@ -482,10 +604,9 @@ async fn footer() -> Result<impl View> {
             <div class="home-footer-inner">
                 <div>
                     <p class="home-footer-name">"Buwiz"</p>
-                    <p class="home-footer-note">"© 2026 Buwiz by Goldcoders. Philippine tax filing, made modern."</p>
+                    <p class="home-footer-note">"© 2026 Buwiz. Philippine tax filing, made modern."</p>
                 </div>
                 <nav class="home-footer-links" aria-label="Footer">
-                    <a href="https://goldcoders.dev/legalities">"Legalities"</a>
                     <a href="mailto:support@buwiz.com">"support@buwiz.com"</a>
                     <a href="https://github.com/hexuria/buwiz-forms" target="_blank" rel="noopener noreferrer">"GitHub"</a>
                 </nav>

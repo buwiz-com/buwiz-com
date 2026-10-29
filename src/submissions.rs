@@ -15,28 +15,28 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::bir::{self, Job, SendError};
-use crate::crypto;
+use crate::devices::{self, Signed};
+use crate::envelope::Envelope;
 use crate::error::ApiError;
 use crate::oauth::Bearer;
-use crate::relay::{Control, Frame, Pipe};
+use crate::relay::{Control, Frame};
+use crate::sender::Job;
 use crate::state::AppState;
+use crate::tickets::{self, TicketError};
 use crate::tin::Tin;
+use crate::{crypto, jws};
 
 const MAX_XML_BYTES: usize = 2 * 1024 * 1024;
 pub const BODY_LIMIT: usize = 3 * MAX_XML_BYTES;
@@ -226,17 +226,116 @@ pub async fn recent(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<Submissio
         .collect())
 }
 
-/// `GET /api/submissions/{id}/relay`: upgrades to the relay pipe.
+#[derive(Deserialize)]
+pub struct NewSubmissionV2 {
+    ticket: String,
+    envelope: Envelope,
+}
+
+#[derive(sqlx::FromRow)]
+struct SpentTicket {
+    claim_id: Uuid,
+    form_type: String,
+    period: String,
+    payload_sha256: Vec<u8>,
+}
+
+/// `POST /api/v2/submissions`: a ticket and the return sealed for the
+/// Sender. The envelope is stored as it came; this server cannot open it.
+pub async fn create_v2(State(state): State<AppState>, signed: Signed<NewSubmissionV2>) -> Result<Response, ApiError> {
+    let Signed { bearer, device, body: request } = signed;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let claims = match tickets::verify(&[state.ticket_key.verifying_key()], &request.ticket, now) {
+        Ok(claims) => claims,
+        Err(TicketError::Expired) => {
+            return Err(ApiError::forbidden("ticket_expired", "the ticket expired; ask for a new one"));
+        }
+        Err(TicketError::Invalid(_)) => return Err(ApiError::forbidden("ticket_invalid", "the ticket is not valid")),
+    };
+    if claims.account_id != bearer.account.id || claims.device_id != device.id {
+        return Err(ApiError::forbidden("ticket_mismatch", "the ticket was issued to another device"));
+    }
+    let envelope = serde_json::to_string(&request.envelope).map_err(anyhow::Error::from)?;
+    let mut tx = state.db.begin().await?;
+    let spent: Option<SpentTicket> = sqlx::query_as(
+        "UPDATE tickets SET used_at = now()
+         WHERE jti = $1 AND account_id = $2 AND device_id = $3 AND used_at IS NULL AND expires_at > now()
+         RETURNING claim_id, form_type, period, payload_sha256",
+    )
+    .bind(claims.jti)
+    .bind(bearer.account.id)
+    .bind(device.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(spent) = spent else {
+        return Err(ApiError::conflict("ticket_used", "this ticket was already used; ask for a new one"));
+    };
+    let active: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tin_claims WHERE id = $1 AND status = 'approved')")
+            .bind(spent.claim_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !active {
+        return Err(ApiError::forbidden("tin_not_active", "this TIN is not active on your account"));
+    }
+    let id = Uuid::new_v4();
+    let filename = claims.filename();
+    sqlx::query(
+        "INSERT INTO submissions (id, account_id, claim_id, form_type, period, filename, xml_sha256, status,
+             ticket_jti, device_id, envelope)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'ready', $8, $9, $10)",
+    )
+    .bind(id)
+    .bind(bearer.account.id)
+    .bind(spent.claim_id)
+    .bind(&spent.form_type)
+    .bind(&spent.period)
+    .bind(&filename)
+    .bind(&spent.payload_sha256)
+    .bind(claims.jti)
+    .bind(device.id)
+    .bind(&envelope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE tickets SET submission_id = $2 WHERE jti = $1")
+        .bind(claims.jti)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    tracing::info!(submission = %id, jti = %claims.jti, account = %bearer.account.id, "sealed submission stored");
+    let view = find(&state.db, bearer.account.id, id).await?.ok_or_else(ApiError::not_found)?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// `GET /api/submissions/{id}/relay`: upgrades to the relay pipe. A v2
+/// submission also needs its device's signature on this request.
 pub async fn relay(
     State(state): State<AppState>,
     bearer: Bearer,
     Path(id): Path<Uuid>,
-    upgrade: WebSocketUpgrade,
+    request: axum::extract::Request,
 ) -> Result<Response, ApiError> {
     bearer.require_app()?;
-    if find(&state.db, bearer.account.id, id).await?.is_none() {
+    let device_id: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT device_id FROM submissions WHERE id = $1 AND account_id = $2")
+            .bind(id)
+            .bind(bearer.account.id)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some(device_id) = device_id else {
         return Err(ApiError::not_found());
+    };
+    let (mut parts, _body) = request.into_parts();
+    if let Some(expected) = device_id {
+        let device = devices::verify(&state.db, &parts, &bearer, b"").await?;
+        if device.id != expected {
+            return Err(ApiError::forbidden("ticket_mismatch", "this return was sealed on another device"));
+        }
     }
+    let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &state)
+        .await
+        .map_err(|_| ApiError::bad_request("websocket_required", "open this path as a WebSocket"))?;
     let account_id = bearer.account.id;
     Ok(upgrade.on_upgrade(move |socket| async move {
         if let Err(error) = run_relay(state, socket, account_id, id).await {
@@ -250,31 +349,30 @@ struct Locked {
     form_type: String,
     period: String,
     filename: String,
-    xml_sha256: Vec<u8>,
-    xml_nonce: Vec<u8>,
-    xml_ciphertext: Vec<u8>,
+    xml_nonce: Option<Vec<u8>>,
+    xml_ciphertext: Option<Vec<u8>>,
+    envelope: Option<String>,
+    ticket: Option<String>,
     tin_root: String,
     branch_code: String,
 }
 
-async fn run_relay(state: AppState, socket: WebSocket, account_id: Uuid, id: Uuid) -> anyhow::Result<()> {
-    let (to_app, from_server) = mpsc::channel::<Frame>(64);
-    let (to_server, from_app) = mpsc::channel::<Frame>(64);
-    let pump = tokio::spawn(pump_socket(socket, from_server, to_server));
-    let pipe = Pipe::new(to_app, from_app);
-
-    // Only one send at a time, and never after `sent` or `unknown`.
+async fn run_relay(state: AppState, mut socket: WebSocket, account_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+    // Only one send at a time, and never after `sent` or `unknown`. A v2
+    // submission gets one attempt: its ticket works once.
     let locked: Option<Locked> = sqlx::query_as(
-        "UPDATE submissions s SET status = 'sending', sending_since = now(), attempts = attempts + 1, mode = $3
+        "UPDATE submissions s SET status = 'sending', sending_since = now(), attempts = attempts + 1
          FROM tin_claims c
          WHERE s.id = $1 AND s.account_id = $2 AND c.id = s.claim_id AND c.status = 'approved'
-           AND s.status IN ('ready', 'failed') AND s.xml_ciphertext IS NOT NULL
-         RETURNING s.form_type, s.period, s.filename, s.xml_sha256, s.xml_nonce, s.xml_ciphertext,
+           AND ((s.xml_ciphertext IS NOT NULL AND s.status IN ('ready', 'failed'))
+             OR (s.envelope IS NOT NULL AND s.status = 'ready'))
+           AND (s.device_id IS NULL OR EXISTS (SELECT 1 FROM devices d WHERE d.id = s.device_id AND d.revoked_at IS NULL))
+         RETURNING s.form_type, s.period, s.filename, s.xml_nonce, s.xml_ciphertext, s.envelope,
+                   (SELECT t.jws FROM tickets t WHERE t.jti = s.ticket_jti) AS ticket,
                    c.tin_root, c.branch_code",
     )
     .bind(id)
     .bind(account_id)
-    .bind(state.relay.mode.as_str())
     .fetch_optional(&state.db)
     .await?;
     let Some(locked) = locked else {
@@ -289,160 +387,244 @@ async fn run_relay(state: AppState, socket: WebSocket, account_id: Uuid, id: Uui
             }
             None => ("missing".to_owned(), Some("not found".to_owned()), None),
         };
-        pipe.finish(Control::Result { status, error, receipt }).await;
-        drop(pipe);
-        let _ = pump.await;
+        let result = Control::Result { status, error, receipt };
+        let _ = socket.send(Message::Text(serde_json::to_string(&result)?.into())).await;
+        let _ = socket.send(Message::Close(None)).await;
         return Ok(());
     };
 
-    let xml = crypto::open(&state.config.document_key, &xml_context(id), &locked.xml_nonce, &locked.xml_ciphertext)?;
-    let job = Job { tin_root: &locked.tin_root, form_type: &locked.form_type, filename: &locked.filename, xml: &xml };
-    let outcome = bir::send(&pipe, &job, &state.relay).await;
-    let result = match outcome {
-        Ok(sent) => {
-            let status = if state.relay.mode == bir::Mode::DryRun { "dry_run" } else { "sent" };
-            let sent_at = OffsetDateTime::now_utc();
-            let tin = Tin::parse(&locked.tin_root, &locked.branch_code).expect("stored TINs are valid");
-            let claims = json!({
-                "iss": state.config.account_origin,
-                "sub": id,
-                "account_id": account_id,
-                "tin": tin.to_string(),
-                "form_type": locked.form_type,
-                "period": locked.period,
-                "filename": locked.filename,
-                "xml_sha256": bir::hex(&locked.xml_sha256),
-                "payload_sha256": sent.payload_sha256,
-                "remote_path": sent.remote_path,
-                "mode": state.relay.mode.as_str(),
-                "status": status,
-                "iat": sent_at.unix_timestamp(),
-            });
-            let jws = sign_receipt(&state.receipt_key, &claims);
+    let v2 = locked.envelope.is_some();
+    let job = match (&locked.envelope, &locked.ticket, &locked.xml_nonce, &locked.xml_ciphertext) {
+        (Some(envelope), Some(ticket), _, _) => {
+            Job::V2 { submission_id: id, account_id, ticket: ticket.clone(), envelope: serde_json::from_str(envelope)? }
+        }
+        (None, _, Some(nonce), Some(ciphertext)) => {
+            let xml = crypto::open(&state.config.document_key, &xml_context(id), nonce, ciphertext)?;
+            Job::V1 {
+                submission_id: id,
+                account_id,
+                tin_root: locked.tin_root.clone(),
+                branch_code: locked.branch_code.clone(),
+                form_type: locked.form_type.clone(),
+                period: locked.period.clone(),
+                filename: locked.filename.clone(),
+                xml: base64::engine::general_purpose::STANDARD.encode(xml),
+            }
+        }
+        _ => anyhow::bail!("submission {id} has nothing to send"),
+    };
+    bridge(&state, socket, &job, id, v2).await?;
+    Ok(())
+}
+
+/// Stores the outcome of one send.
+async fn record(
+    db: &PgPool,
+    id: Uuid,
+    v2: bool,
+    status: &str,
+    error: Option<&str>,
+    receipt: Option<&str>,
+) -> anyhow::Result<()> {
+    match (status, receipt) {
+        ("sent" | "dry_run", Some(receipt)) => {
+            let claims = jws::claims_unverified(receipt).unwrap_or_default();
             sqlx::query(
-                "UPDATE submissions SET status = $2, sent_at = $3, remote_path = $4, payload_sha256 = $5,
-                     receipt_jws = $6, error = NULL, xml_nonce = NULL, xml_ciphertext = NULL, purged_at = now()
+                "UPDATE submissions SET status = $2, sent_at = now(), remote_path = $3, payload_sha256 = $4,
+                     receipt_jws = $5, mode = $6, error = NULL, xml_nonce = NULL, xml_ciphertext = NULL,
+                     envelope = NULL, purged_at = now()
                  WHERE id = $1",
             )
             .bind(id)
             .bind(status)
-            .bind(sent_at)
-            .bind(&sent.remote_path)
-            .bind(&sent.payload_sha256)
-            .bind(&jws)
-            .execute(&state.db)
+            .bind(claims["remote_path"].as_str())
+            .bind(claims["payload_sha256"].as_str())
+            .bind(receipt)
+            .bind(claims["mode"].as_str())
+            .execute(db)
             .await?;
-            tracing::info!(submission = %id, status, remote_path = %sent.remote_path, "submission sent");
-            Control::Result { status: status.to_owned(), error: None, receipt: Some(Value::String(jws)) }
+            tracing::info!(submission = %id, status, "submission sent");
         }
-        Err(SendError::NotSent(reason)) => {
-            sqlx::query("UPDATE submissions SET status = 'failed', error = $2 WHERE id = $1")
-                .bind(id)
-                .bind(&reason)
-                .execute(&state.db)
-                .await?;
-            tracing::warn!(submission = %id, %reason, "submission not sent");
-            Control::Result { status: "failed".to_owned(), error: Some(reason), receipt: None }
-        }
-        Err(SendError::MaybeSent(reason)) => {
+        // A v1 submission may be tried again; a v2 one needs a new ticket.
+        ("failed", _) => {
             sqlx::query(
-                "UPDATE submissions SET status = 'unknown', error = $2, xml_nonce = NULL, xml_ciphertext = NULL,
-                     purged_at = now()
+                "UPDATE submissions SET status = 'failed', error = $2,
+                     envelope = NULL, purged_at = CASE WHEN $3 THEN now() ELSE purged_at END
                  WHERE id = $1",
             )
             .bind(id)
-            .bind(&reason)
-            .execute(&state.db)
+            .bind(error)
+            .bind(v2)
+            .execute(db)
             .await?;
-            tracing::error!(submission = %id, %reason, "submission may have reached BIR; not retrying");
-            let error = format!(
-                "{reason}. BIR may have received this return; check for its confirmation email before sending again."
-            );
-            Control::Result { status: "unknown".to_owned(), error: Some(error), receipt: None }
+            tracing::warn!(submission = %id, reason = error.unwrap_or_default(), "submission not sent");
         }
-    };
-    pipe.finish(result).await;
-    drop(pipe);
-    let _ = pump.await;
+        _ => {
+            sqlx::query(
+                "UPDATE submissions SET status = 'unknown', error = $2, xml_nonce = NULL, xml_ciphertext = NULL,
+                     envelope = NULL, purged_at = now()
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(error.unwrap_or("the send ended without an outcome"))
+            .execute(db)
+            .await?;
+            tracing::error!(submission = %id, "submission may have reached BIR; not retrying");
+        }
+    }
     Ok(())
 }
 
-/// Moves frames between the WebSocket and the pipe until either ends. The
-/// pipe ends after the server's `result`.
-async fn pump_socket(socket: WebSocket, mut from_server: mpsc::Receiver<Frame>, to_server: mpsc::Sender<Frame>) {
-    let (mut sink, mut stream) = socket.split();
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = from_server.recv().await {
-            let message = match frame {
-                Frame::Control(control) => {
-                    Message::Text(serde_json::to_string(&control).expect("controls serialize").into())
-                }
-                Frame::Data { stream, bytes } => Message::Binary(Frame::encode_data(stream, &bytes).into()),
-            };
-            if sink.send(message).await.is_err() {
-                return;
-            }
+/// How long to wait for the Sender's outcome after the app is gone.
+const OUTCOME_WAIT: Duration = Duration::from_secs(60);
+
+/// Records `result`; the app hears it only after that, so the submission
+/// reads the same when it asks.
+async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control) -> anyhow::Result<String> {
+    let Control::Result { status, error, receipt } = result else {
+        anyhow::bail!("not a result");
+    };
+    let receipt = receipt.as_ref().and_then(Value::as_str);
+    record(db, id, v2, status, error.as_deref(), receipt).await?;
+    Ok(serde_json::to_string(result)?)
+}
+
+/// Hands `job` to the Sender and forwards frames between it and the app
+/// until the Sender's `result`, which it records, then passes on.
+async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bool) -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite::Message as Up;
+
+    let (mut app_tx, mut app_rx) = socket.split();
+    let finish =
+        |status: &str, error: String| Control::Result { status: status.to_owned(), error: Some(error), receipt: None };
+    let upstream = match state.sender.open().await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            tracing::error!(error = ?error, "the Sender is not reachable");
+            let result = finish("failed", "the sending service is not reachable; try again later".into());
+            let text = conclude(&state.db, id, v2, &result).await?;
+            let _ = app_tx.send(Message::Text(text.into())).await;
+            let _ = app_tx.send(Message::Close(None)).await;
+            return Ok(());
         }
-        let _ = sink.send(Message::Close(None)).await;
-    });
-    while let Some(Ok(message)) = stream.next().await {
-        let frame = match message {
-            Message::Text(text) => Frame::decode_text(&text),
-            Message::Binary(bytes) => Frame::decode_data(&bytes),
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => continue,
-        };
-        match frame {
-            Some(frame) => {
-                if to_server.send(frame).await.is_err() {
+    };
+    let (mut up_tx, mut up_rx) = upstream.split();
+    if up_tx.send(Up::Text(serde_json::to_string(job).expect("json").into())).await.is_err() {
+        let result = finish("failed", "the sending service is not reachable; try again later".into());
+        let text = conclude(&state.db, id, v2, &result).await?;
+        let _ = app_tx.send(Message::Text(text.into())).await;
+        let _ = app_tx.send(Message::Close(None)).await;
+        return Ok(());
+    }
+    // Streams the Sender asked the app to open, so they can be ended if the
+    // app goes away.
+    let mut streams: Vec<u8> = Vec::new();
+    let mut app_gone = false;
+    let mut result = None;
+    let deadline = tokio::time::sleep(Duration::from_secs(24 * 3600));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            message = app_rx.next(), if !app_gone => {
+                let forward = match message {
+                    Some(Ok(Message::Text(text))) => Some(Up::Text(text.as_str().into())),
+                    Some(Ok(Message::Binary(bytes))) => Some(Up::Binary(bytes)),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                        // Tell the Sender every stream is gone, then wait
+                        // for its own verdict.
+                        app_gone = true;
+                        for &stream in &streams {
+                            let refused = Control::Refused { stream, reason: "the app disconnected".into() };
+                            for control in [refused, Control::Close { stream }] {
+                                let _ = up_tx.send(Up::Text(serde_json::to_string(&control).expect("json").into())).await;
+                            }
+                        }
+                        deadline.as_mut().reset(tokio::time::Instant::now() + OUTCOME_WAIT);
+                        None
+                    }
+                };
+                if let Some(forward) = forward && up_tx.send(forward).await.is_err() {
                     break;
                 }
             }
-            None => tracing::warn!("relay: unreadable frame from the app"),
+            message = up_rx.next() => match message {
+                Some(Ok(Up::Text(text))) => {
+                    match Frame::decode_text(&text) {
+                        Some(Frame::Control(Control::Open { stream, .. })) => streams.push(stream),
+                        Some(Frame::Control(outcome @ Control::Result { .. })) => {
+                            result = Some(outcome);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    if !app_gone {
+                        let _ = app_tx.send(Message::Text(text.as_str().into())).await;
+                    }
+                }
+                Some(Ok(Up::Binary(bytes))) => {
+                    if !app_gone {
+                        let _ = app_tx.send(Message::Binary(bytes)).await;
+                    }
+                }
+                Some(Ok(Up::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            _ = &mut deadline => break,
         }
     }
-    drop(to_server);
-    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    let _ = up_tx.send(Up::Close(None)).await;
+    let result = result.unwrap_or_else(|| {
+        if streams.is_empty() {
+            finish("failed", "the sending service stopped before connecting to BIR".into())
+        } else {
+            finish("unknown", "the send ended without an outcome; BIR may have received this return".into())
+        }
+    });
+    let text = conclude(&state.db, id, v2, &result).await?;
+    if !app_gone {
+        let _ = app_tx.send(Message::Text(text.into())).await;
+    }
+    let _ = app_tx.send(Message::Close(None)).await;
+    Ok(())
 }
 
-/// Key id: the first 8 bytes of SHA-256 of the public key, hex.
+/// Key id of a receipt key. See [`jws::key_id`].
 pub fn key_id(key: &SigningKey) -> String {
-    bir::hex(&Sha256::digest(key.verifying_key().as_bytes())[..8])
+    jws::key_id(&key.verifying_key())
 }
 
-/// A compact JWS (EdDSA) over `claims`.
+/// A compact JWS (EdDSA) receipt over `claims`.
 pub fn sign_receipt(key: &SigningKey, claims: &Value) -> String {
-    let header = json!({ "alg": "EdDSA", "kid": key_id(key), "typ": "buwiz-receipt+jwt" });
-    let signing_input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("json")),
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("json")),
-    );
-    let signature = key.sign(signing_input.as_bytes());
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    jws::sign(key, crate::sender::RECEIPT_TYP, claims)
 }
 
-/// `GET /.well-known/jwks.json`: the key that verifies receipts.
-pub async fn jwks(State(state): State<AppState>) -> Json<Value> {
-    let public = state.receipt_key.verifying_key();
-    Json(json!({ "keys": [{
-        "kty": "OKP",
-        "crv": "Ed25519",
-        "x": URL_SAFE_NO_PAD.encode(public.as_bytes()),
-        "kid": key_id(&state.receipt_key),
-        "alg": "EdDSA",
-        "use": "sig",
-    }] }))
+/// `GET /.well-known/jwks.json`: the keys that verify receipts.
+pub async fn jwks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let public = state.sender.public().await?;
+    Ok(Json(json!({ "keys": public["receipt_keys"] })))
+}
+
+/// `GET /.well-known/buwiz-hpke.json`: the key apps seal returns to.
+pub async fn hpke_key(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let public = state.sender.public().await?;
+    Ok(Json(public["hpke"].clone()))
 }
 
 /// Startup and hourly upkeep: a send stuck in `sending` for 10 minutes
 /// ended with its server, so its outcome is unknown; XML older than 24 hours
-/// is deleted.
+/// is deleted, and so is a sealed return whose ticket ran out unsent.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE submissions SET status = 'unknown', error = 'the server stopped while sending',
-             xml_nonce = NULL, xml_ciphertext = NULL, purged_at = now()
+             xml_nonce = NULL, xml_ciphertext = NULL, envelope = NULL, purged_at = now()
          WHERE status = 'sending' AND sending_since < now() - interval '10 minutes'",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE submissions SET status = 'expired', envelope = NULL, purged_at = now()
+         WHERE envelope IS NOT NULL AND status = 'ready' AND created_at < now() - interval '10 minutes'",
     )
     .execute(db)
     .await?;
@@ -454,12 +636,14 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     ))
     .execute(db)
     .await?;
+    crate::devices::upkeep(db).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::{Signature, Verifier};
 
     #[test]

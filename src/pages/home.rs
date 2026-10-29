@@ -191,11 +191,7 @@ const TRUST: [(&str, &str); 5] = [
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let signed_in = current(cx).await?.is_some();
     Ok(view! {
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=block">
-        <link rel="stylesheet" href="/assets/home.css">
+        brand_styles()
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home">
             hero(signed_in: signed_in)
@@ -207,11 +203,6 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
         </main>
         <script src="/assets/demo.js" defer=(true)></script>
     })
-}
-
-#[component]
-async fn icon(name: &'static str) -> Result<impl View> {
-    Ok(view! { <span class="icon" aria-hidden="true">(name)</span> })
 }
 
 /// Create account and sign in, or the way into the account when signed in.

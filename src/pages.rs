@@ -87,7 +87,13 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
             </head>
             <body>
                 <header class="site">
-                    <a class="brand" href="/">"Buwiz"</a>
+                    <a class="brand" href="/">
+                        <picture>
+                            <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
+                            <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="24" height="24">
+                        </picture>
+                        "Buwiz"
+                    </a>
                     <nav>
                         if let Some(account) = &account {
                             <a href="/account">"My TINs"</a>
@@ -119,23 +125,94 @@ async fn notice_banner(notice: Option<Notice>) -> Result<impl View> {
     })
 }
 
+/// The fonts and stylesheet of the home page's look, shared by the sign-in
+/// pages.
 #[component]
-async fn email_form(cx: &Cx, title: &'static str, intro: &'static str) -> Result<impl View> {
+async fn brand_styles() -> Result<impl View> {
+    Ok(view! {
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=block">
+        <link rel="stylesheet" href="/assets/home.css">
+    })
+}
+
+#[component]
+async fn icon(name: &'static str) -> Result<impl View> {
+    Ok(view! { <span class="icon" aria-hidden="true">(name)</span> })
+}
+
+/// The Buwiz logo and name at the top of a sign-in card.
+#[component]
+async fn auth_brand() -> Result<impl View> {
+    Ok(view! {
+        <a class="auth-brand" href="/" aria-label="Buwiz home">
+            <picture>
+                <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
+                <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="30" height="30">
+            </picture>
+            <span>"BUWIZ"</span>
+        </a>
+    })
+}
+
+/// A notice on a sign-in card, with an icon for its tone.
+#[component]
+async fn auth_notice(notice: Option<Notice>) -> Result<impl View> {
+    Ok(view! {
+        if let Some(notice) = notice {
+            <p class=(if notice.is_error() { "auth-notice error" } else { "auth-notice" }) role="status">
+                icon(name: if notice.is_error() { "error" } else { "check_circle" })
+                <span>(notice.message())</span>
+            </p>
+        }
+    })
+}
+
+/// Sign in and sign up: both email a code. `switch_*` links to the other.
+#[component]
+async fn email_form(
+    cx: &Cx,
+    title: &'static str,
+    intro: &'static str,
+    switch_prompt: &'static str,
+    switch_label: &'static str,
+    switch_path: &'static str,
+) -> Result<impl View> {
     let next = safe_next(query(cx, "next").as_deref());
     let email = query(cx, "email").unwrap_or_default();
+    let switch = link(switch_path, None, &[("next", &next)]);
     Ok(view! {
-        <main>
-            <h1>(title)</h1>
-            <p class="lead">(intro)</p>
-            notice_banner(notice: notice(cx))
-            <form class="card" method="post" action="/auth/email/start">
-                <input type="hidden" name="next" value=(next)>
-                <label for="email">"Email address"</label>
-                <input id="email" type="email" name="email" value=(email) autocomplete="email" required=(true) autofocus=(true)>
-                <div class="actions">
-                    <button type="submit">"Email me a code"</button>
-                </div>
-            </form>
+        brand_styles()
+        <main class="home auth">
+            <section class="auth-card">
+                auth_brand()
+                <h1>(title)</h1>
+                <p class="auth-lead">(intro)</p>
+                auth_notice(notice: notice(cx))
+                <form class="auth-form" method="post" action="/auth/email/start">
+                    <input type="hidden" name="next" value=(next)>
+                    <label class="auth-label" for="email">"Email address"</label>
+                    <div class="auth-field">
+                        icon(name: "mail")
+                        <input
+                            id="email"
+                            type="email"
+                            name="email"
+                            value=(email)
+                            placeholder="you@example.com"
+                            autocomplete="email"
+                            required=(true)
+                            autofocus=(true)
+                        >
+                    </div>
+                    <button class="btn btn-solid auth-submit" type="submit">"Email me a code" icon(name: "arrow_forward")</button>
+                </form>
+                <p class="auth-hint">icon(name: "lock") "No password to remember. Each code works once, for 10 minutes."</p>
+                <p class="auth-switch">(switch_prompt) " " <a href=(switch)>(switch_label)</a></p>
+            </section>
+            <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
         </main>
     })
 }
@@ -146,7 +223,13 @@ async fn login_page(cx: &Cx) -> Result<impl View> {
         return Err(redirect(safe_next(query(cx, "next").as_deref())).into());
     }
     Ok(view! {
-        email_form(title: "Sign in to Buwiz", intro: "We will email you a 6-digit code.")
+        email_form(
+            title: "Sign in to Buwiz",
+            intro: "Enter your email and we will send you a 6-digit code.",
+            switch_prompt: "New to Buwiz?",
+            switch_label: "Create an account",
+            switch_path: "/signup"
+        )
     })
 }
 
@@ -158,7 +241,10 @@ async fn signup_page(cx: &Cx) -> Result<impl View> {
     Ok(view! {
         email_form(
             title: "Create your Buwiz account",
-            intro: "Enter your email. We will send a code to confirm it; that is all you need."
+            intro: "Enter your email. We will send a code to confirm it; that is all you need.",
+            switch_prompt: "Already have an account?",
+            switch_label: "Sign in",
+            switch_path: "/login"
         )
     })
 }
@@ -169,20 +255,41 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
     let email = query(cx, "email").unwrap_or_default();
     let restart = link("/login", None, &[("next", &next), ("email", &email)]);
     Ok(view! {
-        <main>
-            <h1>"Enter your code"</h1>
-            <p class="lead">"We sent a 6-digit code to " <strong>(email.clone())</strong> "."</p>
-            notice_banner(notice: notice(cx))
-            <form class="card" method="post" action="/auth/email/verify">
-                <input type="hidden" name="next" value=(next)>
-                <input type="hidden" name="email" value=(email)>
-                <label for="code">"Code"</label>
-                <input id="code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required=(true) autofocus=(true)>
-                <div class="actions">
-                    <button type="submit">"Sign in"</button>
-                    <a class="button secondary" href=(restart)>"Use a different email"</a>
-                </div>
-            </form>
+        brand_styles()
+        <main class="home auth">
+            <section class="auth-card">
+                auth_brand()
+                <span class="auth-badge">icon(name: "mark_email_unread")</span>
+                <h1>"Check your email"</h1>
+                <p class="auth-lead">"We sent a 6-digit code to " <strong>(email.clone())</strong> "."</p>
+                auth_notice(notice: notice(cx))
+                <form class="auth-form" method="post" action="/auth/email/verify">
+                    <input type="hidden" name="next" value=(next.clone())>
+                    <input type="hidden" name="email" value=(email.clone())>
+                    <label class="auth-label" for="code">"Code"</label>
+                    <input
+                        id="code"
+                        class="auth-code"
+                        type="text"
+                        name="code"
+                        inputmode="numeric"
+                        autocomplete="one-time-code"
+                        maxlength="7"
+                        placeholder="000000"
+                        required=(true)
+                        autofocus=(true)
+                    >
+                    <button class="btn btn-solid auth-submit" type="submit">"Sign in" icon(name: "arrow_forward")</button>
+                </form>
+                <form class="auth-resend" method="post" action="/auth/email/start">
+                    <input type="hidden" name="next" value=(next)>
+                    <input type="hidden" name="email" value=(email)>
+                    <span>"No code? Check spam, or"</span>
+                    <button class="auth-link" type="submit">"send a new one"</button>
+                </form>
+                <p class="auth-switch"><a href=(restart)>"Use a different email"</a></p>
+            </section>
+            <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
         </main>
     })
 }
@@ -206,35 +313,47 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
     }
     let bad_code = !finished && request.is_none() && !raw_code.is_empty();
     Ok(view! {
-        <main>
-            <h1>"Sign in to the app"</h1>
-            notice_banner(notice: shown)
-            if bad_code {
-                notice_banner(notice: Some(Notice::DeviceInvalid))
-            }
-            if finished {
-            } else if let Some((code, name)) = request {
-                <div class="card">
-                    <p>"Check that this code matches the one shown in " <strong>(name)</strong> ":"</p>
-                    <p class="code">(code.clone())</p>
-                    <p class="muted">"Approve only if you started this sign-in yourself. The app will act as " (email) "."</p>
-                    <form method="post" action="/device/decision">
+        brand_styles()
+        <main class="home auth">
+            <section class="auth-card">
+                auth_brand()
+                <span class="auth-badge">icon(name: "devices")</span>
+                <h1>"Sign in to the app"</h1>
+                auth_notice(notice: shown)
+                if bad_code {
+                    auth_notice(notice: Some(Notice::DeviceInvalid))
+                }
+                if finished {
+                } else if let Some((code, name)) = request {
+                    <p class="auth-lead">"Check that this code matches the one shown in " <strong>(name)</strong> ":"</p>
+                    <p class="auth-device-code">(code.clone())</p>
+                    <p class="auth-hint">icon(name: "shield_person") "Approve only if you started this sign-in yourself. The app will act as " (email) "."</p>
+                    <form class="auth-form" method="post" action="/device/decision">
                         <input type="hidden" name="user_code" value=(code)>
-                        <div class="actions">
-                            <button type="submit" name="decision" value="approve">"Approve"</button>
-                            <button class="secondary" type="submit" name="decision" value="deny">"Decline"</button>
+                        <div class="auth-actions">
+                            <button class="btn btn-solid" type="submit" name="decision" value="approve">icon(name: "check") "Approve"</button>
+                            <button class="btn btn-ghost" type="submit" name="decision" value="deny">"Decline"</button>
                         </div>
                     </form>
-                </div>
-            } else {
-                <form class="card" method="get" action="/device">
-                    <label for="user_code">"Code shown in the app"</label>
-                    <input id="user_code" type="text" name="user_code" placeholder="ABCD-EFGH" autocomplete="off" required=(true) autofocus=(true)>
-                    <div class="actions">
-                        <button type="submit">"Continue"</button>
-                    </div>
-                </form>
-            }
+                } else {
+                    <p class="auth-lead">"Enter the code the Buwiz app shows you."</p>
+                    <form class="auth-form" method="get" action="/device">
+                        <label class="auth-label" for="user_code">"Code shown in the app"</label>
+                        <input
+                            id="user_code"
+                            class="auth-code auth-code-letters"
+                            type="text"
+                            name="user_code"
+                            placeholder="ABCD-EFGH"
+                            autocomplete="off"
+                            required=(true)
+                            autofocus=(true)
+                        >
+                        <button class="btn btn-solid auth-submit" type="submit">"Continue" icon(name: "arrow_forward")</button>
+                    </form>
+                }
+            </section>
+            <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
         </main>
     })
 }

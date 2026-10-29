@@ -43,6 +43,12 @@ fn ticket_body(tin: &str, xml: &[u8], key: &str) -> Value {
     })
 }
 
+/// The Sender's sealing key, as the app takes it: from the signed list.
+async fn sealing_key(submitter: &Submitter) -> seal::SealingKey {
+    let list = submitter.trust_list().await.unwrap();
+    submitter.sealing_key(&list).await.unwrap()
+}
+
 /// A pipe whose app has gone: any connection the Sender asks for fails at
 /// once, so nothing can be sent through it.
 fn no_app() -> Pipe {
@@ -89,7 +95,7 @@ async fn submit(submitter: &Submitter, xml_for_ticket: &[u8], sealed: &[u8], key
     let ticket = submitter.signed("POST", "/api/tickets", &ticket_body(TIN, xml_for_ticket, key)).await.unwrap();
     let jti = ticket["jti"].as_str().unwrap().to_owned();
     let jws = ticket["ticket"].as_str().unwrap().to_owned();
-    let envelope = seal::seal(&submitter.sealing_key(false).await.unwrap(), &jti, sealed).unwrap();
+    let envelope = seal::seal(&sealing_key(submitter).await, &jti, sealed).unwrap();
     let view =
         submitter.signed("POST", "/api/v2/submissions", &json!({ "ticket": jws, "envelope": envelope })).await.unwrap();
     (jti, jws, view)
@@ -132,7 +138,7 @@ async fn a_ticket_works_once() {
     let (jti, jws, _) = submit(submitter, &body, &body, "once").await;
 
     // Again at the Gatekeeper, with a fresh signature.
-    let envelope = seal::seal(&submitter.sealing_key(false).await.unwrap(), &jti, &body).unwrap();
+    let envelope = seal::seal(&sealing_key(submitter).await, &jti, &body).unwrap();
     let again = submitter.signed("POST", "/api/v2/submissions", &json!({ "ticket": jws, "envelope": envelope })).await;
     assert_eq!(server_code(again), "ticket_used");
 
@@ -217,7 +223,7 @@ async fn an_expired_ticket_is_refused_by_gatekeeper_and_sender() {
     claims.iat -= 600;
     claims.exp -= 600;
     let expired = tickets::sign(&harness.ticket_key, &claims);
-    let envelope = seal::seal(&submitter.sealing_key(false).await.unwrap(), &claims.jti.to_string(), &body).unwrap();
+    let envelope = seal::seal(&sealing_key(submitter).await, &claims.jti.to_string(), &body).unwrap();
     let posted =
         submitter.signed("POST", "/api/v2/submissions", &json!({ "ticket": expired, "envelope": envelope })).await;
     assert_eq!(server_code(posted), "ticket_expired");
@@ -244,7 +250,7 @@ async fn a_tampered_envelope_does_not_open() {
     let body = xml(TIN);
     let ticket = submitter.signed("POST", "/api/tickets", &ticket_body(TIN, &body, "tamper")).await.unwrap();
     let jti = ticket["jti"].as_str().unwrap();
-    let mut envelope = seal::seal(&submitter.sealing_key(false).await.unwrap(), jti, &body).unwrap();
+    let mut envelope = seal::seal(&sealing_key(submitter).await, jti, &body).unwrap();
     let mut ct = URL_SAFE_NO_PAD.decode(&envelope.ct).unwrap();
     ct[10] ^= 0x01;
     envelope.ct = URL_SAFE_NO_PAD.encode(ct);
@@ -344,23 +350,23 @@ async fn a_revoked_device_is_refused_everywhere() {
 }
 
 #[tokio::test]
-async fn a_list_signed_by_another_key_is_refused_and_the_pipe_opens_nothing() {
+async fn a_trust_list_signed_by_another_key_is_refused_and_the_pipe_opens_nothing() {
     let harness = Harness::start().await;
     // A good client stores a sealed return...
     let (submission, _) = harness.signed_in().await;
     let body = xml(TIN);
-    let (_, _, view) = submit(submission.submitter(), &body, &body, "egress").await;
+    let (_, _, view) = submit(submission.submitter(), &body, &body, "trust").await;
 
-    // ...but an app that pins another egress key trusts no list this
+    // ...but an app that pins another trust key trusts no list this
     // server serves: it sends nothing and opens no pipe.
     let mut config = harness.client_config();
-    config.egress_keys = vec![common::egress_public(&[0x66; 32])];
+    config.trust_keys = vec![common::trust_public(&[0x66; 32])];
     let (stranger, _) = harness.signed_in_with(config).await;
     let refused = stranger.submitter().send(&format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"), &body).await;
     assert_eq!(
         refused.err(),
         Some(bir_submit::SendError::NotSent(
-            "Can't send: the server's egress list is not signed by a pinned key.".into()
+            "Can't send: the server's trust list is not signed by a pinned key.".into()
         ))
     );
     let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();
@@ -377,15 +383,70 @@ async fn a_list_signed_by_another_key_is_refused_and_the_pipe_opens_nothing() {
 #[tokio::test]
 async fn a_host_off_the_signed_list_is_refused() {
     // The list names the dispatcher but not the SFTP server.
-    let harness = Harness::start_with(|dispatcher, _| vec![format!("127.0.0.1:{dispatcher}")]).await;
+    let harness =
+        Harness::start_with(|spec| spec.contents.hosts = vec![format!("127.0.0.1:{}", spec.dispatcher_port)]).await;
     let (submission, _) = harness.signed_in().await;
     let body = xml(TIN);
     let (_, _, view) = submit(submission.submitter(), &body, &body, "off-list").await;
     let ended = submission.submitter().relay(view["relay_path"].as_str().unwrap()).await.unwrap();
     assert!(
         matches!(&ended, Ended::Result { status, error: Some(error), .. }
-            if status == "failed" && error.contains("is not on the signed egress list")),
+            if status == "failed" && error.contains("is not on the signed trust list")),
         "{ended:?}"
     );
     assert!(harness.received.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_sealing_key_not_in_the_signed_list_is_refused_and_nothing_is_sealed() {
+    // The Gatekeeper names the Sender's real key, but the signed list
+    // carries another one: as if the Gatekeeper served a key of its own.
+    let harness = Harness::start_with(|spec| {
+        let other = buwiz_cloud::envelope::SealingKey::from_bytes(&[0x77; 32]).unwrap();
+        spec.contents.sealing_keys = other.public_document()["keys"].as_array().unwrap().clone();
+    })
+    .await;
+    let (submission, _) = harness.signed_in().await;
+    let body = xml(TIN);
+    let refused = submission.submitter().send(&format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"), &body).await;
+    assert_eq!(
+        refused.err(),
+        Some(bir_submit::SendError::NotSent(
+            "Can't send: the server's sealing key is not in the signed trust list.".into()
+        ))
+    );
+    let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();
+    let submissions: i64 = sqlx::query_scalar("SELECT count(*) FROM submissions").fetch_one(&harness.db).await.unwrap();
+    assert_eq!((tickets, submissions), (0, 0), "no ticket asked for, no envelope posted");
+    assert!(harness.received.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_receipt_signed_by_a_key_not_in_the_signed_list_does_not_make_the_return_sent() {
+    // The signed list vouches for another receipt key than the one the
+    // Sender signs with: a forged "Sent" must not be believed.
+    let harness = Harness::start_with(|spec| {
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x78; 32]);
+        spec.contents.receipt_keys = vec![buwiz_cloud::jws::jwk(&other.verifying_key())];
+    })
+    .await;
+    let (submission, _) = harness.signed_in().await;
+    let body = xml(TIN);
+    let transport = submission.transport();
+    let outcome = bir_core::background_cron::SubmissionTransport::store_session_reported(
+        transport.as_ref(),
+        (),
+        &format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"),
+        &body,
+    )
+    .await;
+    match outcome {
+        Err(bir_core::background_cron::StoreFailure::MaybeSent(error)) => assert!(
+            error.0.contains("its receipt does not check out")
+                && error.0.contains("signed by a key not in the signed trust list"),
+            "{error}"
+        ),
+        Ok(report) => panic!("the queue would mark it Sent: {report:?}"),
+        Err(other) => panic!("expected needs-attention, got {other:?}"),
+    }
 }

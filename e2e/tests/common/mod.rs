@@ -42,11 +42,12 @@ pub const TIN_ROOT: &str = "000123453";
 pub const TIN: &str = "00012345300000";
 pub const EMAIL: &str = "juana@example.com";
 pub const TICKET_SEED: [u8; 32] = [0x11; 32];
-/// The test egress key. The real one is made offline and never on a server.
-pub const EGRESS_SEED: [u8; 32] = [0x55; 32];
+/// The test trust-list key. The real one is made offline and never on a
+/// server.
+pub const TRUST_SEED: [u8; 32] = [0x55; 32];
 
 /// The base64url public half of `seed`, as an app pins it.
-pub fn egress_public(seed: &[u8; 32]) -> String {
+pub fn trust_public(seed: &[u8; 32]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(seed).verifying_key().as_bytes())
 }
@@ -223,6 +224,13 @@ impl SecretStore for SharedStore {
     }
 }
 
+/// What the harness signs into the trust list.
+pub struct TrustSpec {
+    pub dispatcher_port: u16,
+    pub sftp_port: u16,
+    pub contents: buwiz_cloud::trust::Contents,
+}
+
 pub struct Harness {
     pub db: PgPool,
     pub base: String,
@@ -247,25 +255,17 @@ async fn fresh_database() -> PgPool {
 }
 
 impl Harness {
-    /// The egress list names the fake dispatcher and the SFTP server.
+    /// The trust list names the fake dispatcher, the SFTP server and the
+    /// Sender's own keys.
     pub async fn start() -> Self {
-        Self::start_with(|dispatcher, sftp| vec![format!("127.0.0.1:{dispatcher}"), format!("127.0.0.1:{sftp}")]).await
+        Self::start_with(|_| {}).await
     }
 
-    /// `egress` picks the signed list's hosts from the dispatcher and SFTP
-    /// ports.
-    pub async fn start_with(egress: impl FnOnce(u16, u16) -> Vec<String>) -> Self {
+    /// `customize` may change the signed trust list before it is signed.
+    pub async fn start_with(customize: impl FnOnce(&mut TrustSpec)) -> Self {
         let db = fresh_database().await;
         let (sftp_port, fingerprint, received) = sftp_server().await;
         let dispatcher_port = dispatcher_server("127.0.0.1", sftp_port).await;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let egress_list = buwiz_cloud::egress::sign_list(
-            &SigningKey::from_bytes(&EGRESS_SEED),
-            &egress(dispatcher_port, sftp_port),
-            now,
-            now + 3600,
-        )
-        .unwrap();
 
         // The Sender, with fake passphrases and local hosts only.
         let ticket_key = SigningKey::from_bytes(&TICKET_SEED);
@@ -286,6 +286,20 @@ impl Harness {
             secret: Zeroizing::new(SENDER_SECRET.into()),
             issuer: "http://buwiz.test".into(),
         });
+        let mut spec = TrustSpec {
+            dispatcher_port,
+            sftp_port,
+            contents: buwiz_cloud::trust::Contents {
+                hosts: vec![format!("127.0.0.1:{dispatcher_port}"), format!("127.0.0.1:{sftp_port}")],
+                ..Default::default()
+            },
+        };
+        spec.contents.add_sender(&sender.public_info()).unwrap();
+        customize(&mut spec);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let trust_list =
+            buwiz_cloud::trust::sign_list(&SigningKey::from_bytes(&TRUST_SEED), &spec.contents, now, now + 3600)
+                .unwrap();
         let sender_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sender_url = format!("http://{}", sender_listener.local_addr().unwrap());
         tokio::spawn(buwiz_cloud::sender::serve(sender_listener, sender.clone()));
@@ -303,7 +317,7 @@ impl Harness {
             document_key: [0x44; 32],
             admin_emails: Vec::new(),
             mail: MailConfig::Log,
-            egress_list: Some(egress_list),
+            trust_list: Some(trust_list),
         };
         let state = AppState::new(
             config,
@@ -333,12 +347,12 @@ impl Harness {
         Self { db, base, account_id, ticket_key, received, sender, sftp_port, dispatcher_port }
     }
 
-    /// The app's client config: this server, with the test egress key
+    /// The app's client config: this server, with the test trust key
     /// pinned through the override.
     pub fn client_config(&self) -> SubmitConfig {
         let mut config = SubmitConfig::new(Some(&self.base));
         config.server_url = self.base.clone();
-        config.egress_keys = vec![egress_public(&EGRESS_SEED)];
+        config.trust_keys = vec![trust_public(&TRUST_SEED)];
         config.device_name = "Juana's laptop".into();
         config
     }

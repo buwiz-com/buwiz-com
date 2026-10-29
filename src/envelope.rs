@@ -55,7 +55,7 @@ impl SealingKey {
 
     /// The first 8 bytes of SHA-256 of the public key, hex.
     pub fn kid(&self) -> String {
-        crate::bir::hex(&Sha256::digest(self.public_bytes())[..8])
+        crate::crypto::hex(&Sha256::digest(self.public_bytes())[..8])
     }
 
     /// `/.well-known/buwiz-hpke.json`.

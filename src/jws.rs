@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 /// Key id: the first 8 bytes of SHA-256 of the public key, hex.
 pub fn key_id(key: &VerifyingKey) -> String {
-    crate::bir::hex(&Sha256::digest(key.as_bytes())[..8])
+    crate::crypto::hex(&Sha256::digest(key.as_bytes())[..8])
 }
 
 /// A compact JWS over `claims` with header `typ`.

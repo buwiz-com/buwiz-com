@@ -1,0 +1,44 @@
+# Fly.io: one container, Postgres attached through DATABASE_URL.
+# Secrets (fly secrets): DATABASE_URL, DOCUMENT_KEY, RECEIPT_SIGNING_KEY,
+# RESEND_API_KEY, MAIL_FROM. See docs/deploy.md.
+app = "buwiz-cloud"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  RUST_LOG = "info"
+  MAIL_TRANSPORT = "resend"
+  # Change to https://account.buwiz.com (and add https://api.buwiz.com to
+  # EXTRA_ORIGINS) once DNS points here.
+  ACCOUNT_ORIGIN = "https://buwiz-cloud.fly.dev"
+  EXTRA_ORIGINS = ""
+  ADMIN_EMAILS = "support@buwiz.com"
+  BIR_RELAY_MODE = "dry_run"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Device sign-in polls every few seconds; keep one machine warm.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

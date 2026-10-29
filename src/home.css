@@ -233,8 +233,7 @@
   letter-spacing: 0.08em;
 }
 
-/* The devices. What is inside the phone is sized in the phone's width
- * (cqi), so it scales with it. */
+/* The devices. */
 .home .hero-visual { position: relative; width: 100%; max-width: 720px; margin: 0 auto; padding-bottom: 10%; }
 .home .device-desktop {
   width: 88%;
@@ -267,117 +266,232 @@
   right: 0;
   bottom: 0;
   width: 30%;
-  aspect-ratio: 9 / 19;
+  aspect-ratio: 280 / 580;
   container-type: inline-size;
-  border: 4px solid #111;
-  border-radius: 22px;
-  background: #111;
-  box-shadow: 0 30px 50px -18px rgba(0, 0, 0, 0.5);
   animation: hero-float 7s ease-in-out infinite;
 }
-@media (min-width: 768px) { .home .device-phone { border-width: 6px; border-radius: 34px; } }
 @media (min-width: 1024px) { .home .device-phone { width: 27%; } }
-.home .phone-notch {
-  position: absolute;
-  top: 2.5cqi;
-  left: 50%;
-  z-index: 2;
-  width: 30cqi;
-  height: 7cqi;
-  border-radius: 999px;
-  background: #111;
-  transform: translateX(-50%);
-}
-.home .phone-shot, .home .phone-ui { display: block; width: 100%; height: 100%; overflow: hidden; border-radius: 13cqi; background: var(--bg); }
-.home .phone-shot img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
-.home .phone-ui {
-  display: flex;
-  flex-direction: column;
-  gap: 0.55em;
-  padding: 1.1em 0.85em 0.8em;
-  color: var(--text);
-  font-size: 6cqi;
-  line-height: 1.25;
+
+/* The phone app's Home, from its approved mobile design: a 280 × 580
+ * frame (--u is one of its pixels, so it scales with the hero) in the
+ * app's theme colours, light and dark. Display type is Bricolage
+ * Grotesque, labels and codes JetBrains Mono, the rest Figtree. */
+.home .ph {
+  --u: calc(100cqi / 280);
+  --paper: #ffffff;
+  --raised: #ebebee;
+  --ink: #18181b;
+  --muted: #71717a;
+  --line: #e2e2e6;
+  --accent: #2557d6;
+  --on-accent: #ffffff;
+  --warn: #a5520a;
+  --warn-soft: rgb(196 110 10 / 0.129);
+  --dock: #18181b;
+  --on-dock: #ffffff;
+  --phone: #0b0b0d;
+  width: 100%;
+  height: 100%;
+  padding: calc(var(--u) * 10);
+  border-radius: calc(var(--u) * 44);
+  background: var(--phone);
+  box-shadow: 0 34px 60px -32px rgba(10, 20, 40, 0.55), inset 0 0 0 calc(var(--u) * 2) rgba(255, 255, 255, 0.06);
+  color: var(--ink);
+  font-family: "Figtree", -apple-system, "SF Pro Text", Roboto, system-ui, sans-serif;
+  font-size: calc(var(--u) * 13);
+  line-height: 1.3;
   text-align: left;
 }
-.home .phone-status { display: flex; justify-content: space-between; align-items: center; padding: 0 0.5em; font-size: 0.75em; font-weight: 700; }
-.home .phone-status-icons { display: flex; gap: 0.25em; }
-.home .phone-status-icons i { width: 0.9em; height: 0.55em; border-radius: 0.15em; background: var(--text); opacity: 0.8; }
-.home .phone-head { display: flex; align-items: center; justify-content: space-between; margin-top: 0.4em; }
-.home .phone-brand { font-size: 1.3em; font-weight: 800; letter-spacing: -0.03em; }
-.home .phone-avatar {
-  display: grid;
-  place-items: center;
-  width: 2.5em;
-  height: 2.5em;
-  border-radius: 50%;
-  background: #1884fc;
-  color: #fff;
-  font-size: 0.65em;
-  font-weight: 700;
+@media (prefers-color-scheme: dark) {
+  .home .ph {
+    --paper: #161619;
+    --raised: #232328;
+    --ink: #f3f3f5;
+    --muted: #8b8b95;
+    --line: #25252a;
+    --accent: #7ea2ff;
+    --on-accent: #111113;
+    --warn: #f3b44a;
+    --warn-soft: rgb(243 180 74 / 0.129);
+    --dock: #f3f3f5;
+    --on-dock: #111113;
+    --phone: #000000;
+  }
 }
-.home .phone-due {
+.home .ph-screen {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 0.15em;
-  padding: 0.75em;
-  border: 1px solid rgba(245, 158, 11, 0.3);
-  border-radius: 0.9em;
-  background: var(--warn-soft);
+  height: 100%;
+  overflow: hidden;
+  border-radius: calc(var(--u) * 35);
+  background: var(--paper);
 }
-.home .phone-due-label { font-size: 0.68em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--warn); }
-.home .phone-due b { font-size: 0.95em; }
-.home .phone-due-sub { font-size: 0.72em; color: var(--muted); }
-.home .phone-chip {
-  position: absolute;
-  top: 0.65em;
-  right: 0.65em;
-  padding: 0.2em 0.55em;
-  border-radius: 999px;
-  background: rgba(245, 158, 11, 0.15);
-  color: var(--warn);
-  font-size: 0.6em;
+.home .ph-i {
+  width: calc(var(--u) * 18);
+  height: calc(var(--u) * 18);
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.home .ph-sb {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  height: calc(var(--u) * 36);
+  padding: calc(var(--u) * 5) calc(var(--u) * 22) 0;
+  font-size: calc(var(--u) * 12);
+  font-weight: 600;
+}
+.home .ph-island { width: calc(var(--u) * 80); height: calc(var(--u) * 23); border-radius: 99px; background: var(--phone); }
+.home .ph-sig { display: flex; align-items: flex-end; gap: calc(var(--u) * 1.5); width: calc(var(--u) * 34); justify-content: flex-end; }
+.home .ph-sig i { width: calc(var(--u) * 3); border-radius: calc(var(--u) * 1); background: var(--ink); }
+.home .ph-sig i:nth-child(1) { height: calc(var(--u) * 4); }
+.home .ph-sig i:nth-child(2) { height: calc(var(--u) * 6); }
+.home .ph-sig i:nth-child(3) { height: calc(var(--u) * 8); }
+.home .ph-sig b {
+  width: calc(var(--u) * 17);
+  height: calc(var(--u) * 8);
+  margin-left: calc(var(--u) * 3);
+  border: calc(var(--u) * 1.2) solid var(--ink);
+  border-radius: calc(var(--u) * 2.5);
+  box-shadow: inset 0 0 0 calc(var(--u) * 1) var(--paper), inset 0 0 0 calc(var(--u) * 6) var(--ink);
+}
+.home .ph-top { display: flex; justify-content: flex-end; padding: calc(var(--u) * 2) calc(var(--u) * 14) calc(var(--u) * 6); }
+.home .ph-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--u) * 6);
+  padding: calc(var(--u) * 4) calc(var(--u) * 10) calc(var(--u) * 4) calc(var(--u) * 4);
+  border-radius: 99px;
+  background: var(--raised);
+  font-size: calc(var(--u) * 12);
+  font-weight: 600;
+}
+.home .ph-av {
+  display: grid;
+  place-items: center;
+  width: calc(var(--u) * 24);
+  height: calc(var(--u) * 24);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: calc(var(--u) * 10);
   font-weight: 700;
 }
-.home .phone-label { margin-top: 0.3em; font-size: 0.66em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--faint); }
-.home .phone-row {
+.home .ph-lt {
+  padding: calc(var(--u) * 4) calc(var(--u) * 16) calc(var(--u) * 10);
+  font: 600 calc(var(--u) * 25) / 1.1 "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+}
+.home .ph-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin: calc(var(--u) * 6) calc(var(--u) * 14) calc(var(--u) * 10);
+  padding: calc(var(--u) * 14);
+  border-radius: calc(var(--u) * 18);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.home .ph-hero small { font-size: calc(var(--u) * 13); opacity: 0.75; }
+.home .ph-hero b {
+  margin: calc(var(--u) * 2) 0;
+  font: 600 calc(var(--u) * 22) / 1.15 "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+}
+.home .ph-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--u) * 6);
+  margin-top: calc(var(--u) * 10);
+  padding: calc(var(--u) * 8) calc(var(--u) * 14);
+  border-radius: calc(var(--u) * 12);
+  background: var(--on-accent);
+  color: var(--accent);
+  font-size: calc(var(--u) * 12.5);
+  font-weight: 700;
+}
+.home .ph-btn .ph-i { width: calc(var(--u) * 14); height: calc(var(--u) * 14); stroke-width: 2.2; }
+.home .ph-sec {
+  padding: calc(var(--u) * 10) calc(var(--u) * 16) calc(var(--u) * 6);
+  color: var(--muted);
+  font: 500 calc(var(--u) * 10) "JetBrains Mono", ui-monospace, Menlo, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.home .ph-row {
   display: flex;
   align-items: center;
-  gap: 0.5em;
-  padding: 0.55em 0.7em;
-  border: 1px solid var(--line);
-  border-radius: 0.7em;
-  background: var(--surface);
-  font-size: 0.8em;
+  gap: calc(var(--u) * 10);
+  padding: calc(var(--u) * 10) calc(var(--u) * 16);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
 }
-.home .phone-row .mono { flex: 1; color: var(--muted); }
-.home .phone-row span:nth-child(2) { font-weight: 700; font-variant-numeric: tabular-nums; }
-.home .phone-ok { position: relative; width: 1.1em; height: 1.1em; border-radius: 50%; background: var(--brand); }
-.home .phone-ok::after {
-  content: "";
-  position: absolute;
-  left: 0.38em;
-  top: 0.2em;
-  width: 0.25em;
-  height: 0.5em;
-  border: solid var(--brand-ink);
-  border-width: 0 0.12em 0.12em 0;
-  transform: rotate(45deg);
-}
-.home .phone-cta {
-  margin-top: auto;
-  padding: 0.75em;
-  border-radius: 0.8em;
-  background: var(--brand);
-  color: var(--brand-ink);
-  font-size: 0.85em;
-  font-weight: 700;
+.home .ph-row .ph-i { width: calc(var(--u) * 13); height: calc(var(--u) * 13); }
+.home .ph-code {
+  flex: none;
+  width: calc(var(--u) * 46);
+  padding: calc(var(--u) * 5) 0;
+  border-radius: calc(var(--u) * 8);
+  background: var(--raised);
+  color: var(--ink);
+  font: 700 calc(var(--u) * 10.5) "JetBrains Mono", ui-monospace, Menlo, monospace;
   text-align: center;
 }
-.home .phone-tabs { display: flex; justify-content: space-around; padding-top: 0.4em; }
-.home .phone-tabs i { width: 1.1em; height: 1.1em; border-radius: 0.3em; background: var(--line-strong); }
-.home .phone-tabs i.on { background: var(--brand); }
+.home .ph-m { flex: 1; min-width: 0; }
+.home .ph-m b { display: block; overflow: hidden; color: var(--ink); font-size: calc(var(--u) * 13.5); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.home .ph-m small { display: block; font-size: calc(var(--u) * 11.5); }
+.home .ph-tag {
+  padding: calc(var(--u) * 2) calc(var(--u) * 8);
+  border-radius: 99px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: calc(var(--u) * 10.5);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.home .ph-fill { flex: 1; }
+.home .ph-tabs {
+  display: grid;
+  flex: none;
+  grid-template-columns: repeat(4, 1fr);
+  padding: calc(var(--u) * 6) calc(var(--u) * 6) calc(var(--u) * 20);
+  border-top: 1px solid var(--line);
+  background: var(--paper);
+}
+.home .ph-tabs span {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(var(--u) * 2);
+  color: var(--muted);
+  font-size: calc(var(--u) * 10);
+  font-weight: 600;
+}
+.home .ph-tabs .on { color: var(--accent); }
+.home .ph-toast {
+  position: absolute;
+  top: calc(var(--u) * 90);
+  left: 50%;
+  padding: calc(var(--u) * 8) calc(var(--u) * 14);
+  border-radius: 99px;
+  background: var(--dock);
+  color: var(--on-dock);
+  font-size: calc(var(--u) * 11.5);
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 calc(var(--u) * 14) calc(var(--u) * 28) calc(var(--u) * -14) rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transform: translate(-50%, calc(var(--u) * -8));
+  animation: ph-toast 12s ease-in-out 3s infinite;
+}
+@keyframes ph-toast {
+  0%, 62%, 100% { opacity: 0; transform: translate(-50%, calc(var(--u) * -8)); }
+  66%, 88% { opacity: 1; transform: translate(-50%, 0); }
+}
 
 .home .float-chip {
   position: absolute;
@@ -446,7 +560,7 @@
   to { transform: translate(-3%, 4%) scale(1.08); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .home .hero-words, .home .float-chip, .home .device-phone, .home .hero-glow::after { animation: none; }
+  .home .hero-words, .home .float-chip, .home .device-phone, .home .hero-glow::after, .home .ph-toast { animation: none; }
 }
 
 /* One month with Buwiz: the journey card under the hero. */

@@ -125,7 +125,7 @@ const DEMOS: [Demo; 6] = [
         tab: "Submit",
         eyebrow: "SUBMIT",
         title: "Say “submit”. Approve it. It is queued.",
-        lead: "The co-worker checks the form again, asks for permission to publish if you never gave it, and shows you exactly what will be filed. Nothing leaves until you approve.",
+        lead: "The co-worker checks the form again, asks for permission to publish if you never gave it, and shows you exactly what will be filed. Nothing leaves until you approve, and then it goes to BIR from the Buwiz app on your computer.",
     },
     Demo {
         film: "confirm",
@@ -139,19 +139,27 @@ const DEMOS: [Demo; 6] = [
         tab: "Pay",
         eyebrow: "PAY",
         title: "Paid online through LandBank, with your OK.",
-        lead: "A second routine waits for the confirmation, then opens the bank's payment site on the co-worker's computer and fills in BIR, the form, the period, the ATC and the amount. You log in with Touch ID and approve the amount.",
+        lead: "A second routine waits for the confirmation, then opens the bank's payment site on the co-worker's computer and fills in BIR, the form, the period, the ATC and the amount. You log in with Touch ID and approve the amount; the payment itself is made on the bank's page.",
     },
 ];
 
 /// (icon, title, body)
 const AGENT_PROMISES: [(&str, &str, &str); 3] = [
-    ("approval", "Asks before it acts", "Filing and paying always wait for your approval, every time."),
     (
-        "key",
-        "You choose what it may do",
-        "Approve the co-worker on your Buwiz account: which profiles, and which actions.",
+        "approval",
+        "You approve every filing and payment",
+        "Buwiz does the work, then stops and asks. Nothing is filed or paid until you confirm.",
     ),
-    ("link_off", "End it anytime", "Remove the co-worker under Tax profiles, Connected agents, and its access stops."),
+    (
+        "verified",
+        "Re-checked before it is sent",
+        "Every return runs through BIR's rules again right before it leaves your computer.",
+    ),
+    (
+        "visibility",
+        "Masked TINs, read-only access",
+        "Agents connected to your Buwiz account see masked TINs only, and can read it but never change it.",
+    ),
 ];
 
 /// (question, answer)
@@ -178,7 +186,7 @@ const FAQS: [(&str, &str); 6] = [
     ),
     (
         "Can an AI agent file for me?",
-        "No. An agent you approve can read your active TINs, your TIN claims and the returns you sent, with their receipts. Its access is read-only; filing stays in the Buwiz app, with you.",
+        "Buwiz, your AI co-worker, does the work and you approve it. Nothing is filed or paid until you confirm: returns are filed from the Buwiz app on your computer, and payments are made on your bank's own page. Agents connected to your Buwiz account can only read it, and see masked TINs.",
     ),
 ];
 
@@ -199,16 +207,12 @@ const HERO_STATS: [(&str, &str); 4] = [
     ("Offline", "after one sign-in"),
 ];
 
-/// The hero's phone shows `/assets/screens/{name}_light.webp` and
-/// `_dark.webp` once there are mobile screenshots to serve; until then, a
-/// drawn mock-up of the app's home.
-const MOBILE_SCREEN: Option<&str> = None;
-
 #[page("/")]
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let signed_in = current(cx).await?.is_some();
     Ok(view! {
         brand_styles()
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600&family=Figtree:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap">
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home">
             hero(signed_in: signed_in)
@@ -289,10 +293,7 @@ async fn hero(signed_in: bool) -> Result<impl View> {
                             >
                         </picture>
                     </div>
-                    <div class="device-phone">
-                        <span class="phone-notch" aria-hidden="true"></span>
-                        phone_screen()
-                    </div>
+                    <div class="device-phone">phone_screen()</div>
                     <div class="float-chip chip-check" aria-hidden="true">
                         icon(name: "verified")
                         <span><b>"0 errors"</b><small>"2,007 checks passed"</small></span>
@@ -319,39 +320,68 @@ async fn hero(signed_in: bool) -> Result<impl View> {
     })
 }
 
-/// The phone in the hero: a mobile screenshot when there is one, else a
-/// drawn mock-up of the app's home with this month's returns.
+/// The phone in the hero: the Buwiz phone app's Home tab, drawn from its
+/// approved mobile design (280 × 580 frame) in the app's theme colours:
+/// the taxpayer pill, the greeting, the Due next card, a draft to pick up,
+/// a return waiting to send, and the four tabs. Now and then the toast the
+/// app shows after queueing a return slides in.
 #[component]
 async fn phone_screen() -> Result<impl View> {
     Ok(view! {
-        if let Some(name) = MOBILE_SCREEN {
-            <picture class="phone-shot">
-                <source srcset=(format!("/assets/screens/{name}_dark.webp")) media="(prefers-color-scheme: dark)">
-                <img src=(format!("/assets/screens/{name}_light.webp")) alt="The Buwiz mobile app">
-            </picture>
-        } else {
-            <div class="phone-ui" role="img" aria-label="The Buwiz mobile app, coming soon: this month's returns and the next deadline">
-                <div class="phone-status"><span>"9:41"</span><span class="phone-status-icons"><i></i><i></i><i></i></span></div>
-                <div class="phone-head">
-                    <span class="phone-brand">"Buwiz"</span>
-                    <span class="phone-avatar">"JD"</span>
+        <div class="ph" role="img" aria-label="The Buwiz mobile app, coming soon: Home, with the next return due, a draft to pick up and a return waiting to send">
+            <div class="ph-screen">
+                <div class="ph-sb">
+                    <span>"9:41"</span>
+                    <i class="ph-island"></i>
+                    <span class="ph-sig"><i></i><i></i><i></i><b></b></span>
                 </div>
-                <div class="phone-due">
-                    <span class="phone-due-label">"Due soon"</span>
-                    <b>"1601-C · October"</b>
-                    <span class="phone-due-sub">"Nov 10 · 3 branches"</span>
-                    <span class="phone-chip">"17 days"</span>
+                <div class="ph-top"><span class="ph-pill"><span class="ph-av">"JS"</span>"Juana"</span></div>
+                <div class="ph-lt">"Good morning"</div>
+                <div class="ph-hero">
+                    <small>"Due next · in 17 days"</small>
+                    <b>"1701Q · Q3 2026"</b>
+                    <small>"Nov 15 · quarterly income tax"</small>
+                    <span class="ph-btn">"Start return" phone_icon(d: "M4 10h12M11 5l5 5-5 5")</span>
                 </div>
-                <div class="phone-label">"This month"</div>
-                <div class="phone-row"><span class="mono">"00001"</span><span>"₱5,598.60"</span><span class="phone-ok"></span></div>
-                <div class="phone-row"><span class="mono">"00002"</span><span>"₱830.10"</span><span class="phone-ok"></span></div>
-                <div class="phone-row"><span class="mono">"00003"</span><span>"₱0.00"</span><span class="phone-ok"></span></div>
-                <div class="phone-cta">"Review and file"</div>
-                <div class="phone-tabs"><i class="on"></i><i></i><i></i><i></i></div>
+                <div class="ph-sec">"Pick up where you left off"</div>
+                <div class="ph-row">
+                    <span class="ph-code">"2551Q"</span>
+                    <span class="ph-m"><b>"Percentage tax · Q3"</b><small>"Draft · 2 left to fill"</small></span>
+                    phone_icon(d: "M8 5l5 5-5 5")
+                </div>
+                <div class="ph-sec">"Sending"</div>
+                <div class="ph-row">
+                    <span class="ph-code">"1701Q"</span>
+                    <span class="ph-m"><b>"Income tax · Q2"</b><small>"Queued · sends when online"</small></span>
+                    <span class="ph-tag">"Waiting"</span>
+                </div>
+                <div class="ph-fill"></div>
+                <div class="ph-tabs">
+                    for (i, (label, d)) in PHONE_TABS.iter().enumerate() {
+                        <span class=(if i == 0 { "on" } else { "" })>phone_icon(d: d) (*label)</span>
+                    }
+                </div>
+                <div class="ph-toast">"✓ Queued. It sends when you're online."</div>
             </div>
-        }
+        </div>
     })
 }
+
+/// One of the phone app's 20 × 20 stroke icons.
+#[component]
+async fn phone_icon(d: &'static str) -> Result<impl View> {
+    Ok(view! {
+        <svg class="ph-i" viewBox="0 0 20 20" aria-hidden="true"><path d=(d)></path></svg>
+    })
+}
+
+/// The phone app's four tabs: (label, icon path).
+const PHONE_TABS: [(&str, &str); 4] = [
+    ("Home", "M3 9l7-6 7 6v8H3z M8 17v-5h4v5"),
+    ("Forms", "M5 2.5h7l3 3v12H5z M12 2.5v3h3 M7.5 10h5 M7.5 13h5"),
+    ("Filings", "M3 5h14v11H3z M3 9h14 M7 2.5v3 M13 2.5v3"),
+    ("Calendar", "M3 4.5h14v12H3z M3 8.5h14 M7 2.5v3 M13 2.5v3"),
+];
 
 /// One month with Buwiz, under the hero: the journey card.
 #[component]
@@ -526,7 +556,7 @@ async fn agents_section() -> Result<impl View> {
                 <span class="eyebrow">icon(name: "smart_toy") "AI Co-worker"</span>
                 <h2>"AI Native Tax Filing"</h2>
                 <p class="section-lead">
-                    "Give the paperwork to an AI Co-worker. It installs Buwiz from the chat, reads your tax profiles, turns your accountant's spreadsheet into a finished BIR form, files it when you approve, watches for BIR's confirmation and pays online. You stay in charge: every step that files or pays waits for your OK."
+                    "Give the paperwork to Buwiz, your AI co-worker. It works in your apps on your computer: it reads your tax profiles, turns your accountant's spreadsheet into a finished BIR form and checks it, watches your inbox for BIR's confirmation and fills in the bank's payment page. Then it stops and asks. Returns are filed from the Buwiz app and paid on your bank's own page, each only after you confirm."
                 </p>
             </div>
             <div class="demos">

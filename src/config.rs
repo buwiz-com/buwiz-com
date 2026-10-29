@@ -195,22 +195,49 @@ pub fn document_store(public: bool) -> anyhow::Result<DocumentStore> {
 /// Ed25519 key that signs receipts (`RECEIPT_SIGNING_KEY`, a base64 32-byte
 /// seed). Without one, development servers make a throwaway key.
 pub fn receipt_key(public: bool) -> anyhow::Result<SigningKey> {
-    match std::env::var("RECEIPT_SIGNING_KEY").ok().filter(|value| !value.is_empty()) {
+    signing_key("RECEIPT_SIGNING_KEY", public)
+}
+
+/// Ed25519 key that signs tickets (`TICKET_SIGNING_KEY`). The Sender trusts
+/// its public half (`TICKET_PUBLIC_KEYS`).
+pub fn ticket_key(public: bool) -> anyhow::Result<SigningKey> {
+    signing_key("TICKET_SIGNING_KEY", public)
+}
+
+fn signing_key(name: &str, required: bool) -> anyhow::Result<SigningKey> {
+    match std::env::var(name).ok().filter(|value| !value.is_empty()) {
         Some(raw) => {
-            let seed: [u8; 32] = base64::engine::general_purpose::STANDARD
-                .decode(raw.trim())
-                .context("RECEIPT_SIGNING_KEY must be base64")?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("RECEIPT_SIGNING_KEY must be 32 bytes"))?;
+            let seed: Zeroizing<Vec<u8>> = Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(raw.trim())
+                    .with_context(|| format!("{name} must be base64"))?,
+            );
+            let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| anyhow::anyhow!("{name} must be 32 bytes"))?;
             Ok(SigningKey::from_bytes(&seed))
         }
-        None if public => bail!("RECEIPT_SIGNING_KEY is required on a public deployment"),
+        None if required => bail!("{name} is required on a public deployment"),
         None => {
             let mut seed = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
-            tracing::warn!("RECEIPT_SIGNING_KEY is not set; receipts are signed with a throwaway key");
+            tracing::warn!("{name} is not set; signing with a throwaway key");
             Ok(SigningKey::from_bytes(&seed))
         }
+    }
+}
+
+/// Where the Sender is: `SENDER_URL` and `SENDER_SECRET`. `None` when
+/// unset, which only a development server accepts.
+pub fn sender_url(public: bool) -> anyhow::Result<Option<(String, Zeroizing<String>)>> {
+    match std::env::var("SENDER_URL").ok().filter(|value| !value.is_empty()) {
+        Some(url) => {
+            let secret = Zeroizing::new(required("SENDER_SECRET")?);
+            if secret.len() < 32 {
+                bail!("SENDER_SECRET must be at least 32 characters");
+            }
+            Ok(Some((url, secret)))
+        }
+        None if public => bail!("SENDER_URL and SENDER_SECRET are required on a public deployment"),
+        None => Ok(None),
     }
 }
 

@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -196,6 +198,44 @@ impl Pipe {
     pub async fn finish(&self, result: Control) {
         let _ = self.out.send(Frame::Control(result)).await;
     }
+}
+
+/// Moves frames between the WebSocket and the pipe until either ends. The
+/// pipe ends after the server's `result`.
+pub async fn pump_socket(socket: WebSocket, mut from_server: mpsc::Receiver<Frame>, to_server: mpsc::Sender<Frame>) {
+    let (mut sink, mut stream) = socket.split();
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = from_server.recv().await {
+            let message = match frame {
+                Frame::Control(control) => {
+                    Message::Text(serde_json::to_string(&control).expect("controls serialize").into())
+                }
+                Frame::Data { stream, bytes } => Message::Binary(Frame::encode_data(stream, &bytes).into()),
+            };
+            if sink.send(message).await.is_err() {
+                return;
+            }
+        }
+        let _ = sink.send(Message::Close(None)).await;
+    });
+    while let Some(Ok(message)) = stream.next().await {
+        let frame = match message {
+            Message::Text(text) => Frame::decode_text(&text),
+            Message::Binary(bytes) => Frame::decode_data(&bytes),
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
+        };
+        match frame {
+            Some(frame) => {
+                if to_server.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            None => tracing::warn!("relay: unreadable frame from the app"),
+        }
+    }
+    drop(to_server);
+    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
 }
 
 #[cfg(test)]

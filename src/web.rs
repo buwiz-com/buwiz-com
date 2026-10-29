@@ -362,9 +362,16 @@ async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipa
         Ok(tin) => tin,
         Err(notice) => return back(notice),
     };
-    let submitted =
-        claims::submit(&state.db, &state.config.document_key, account.id, &tin, &form.registered_name, form.uploads)
-            .await;
+    let submitted = claims::submit(
+        &state.db,
+        &state.documents,
+        &state.config.document_key,
+        account.id,
+        &tin,
+        &form.registered_name,
+        form.uploads,
+    )
+    .await;
     match submitted {
         Ok(_) => see_other(link("/account", Some(Notice::ClaimSubmitted), &[])),
         Err(SubmitError::Invalid(notice)) => back(notice),
@@ -421,7 +428,7 @@ async fn withdraw_claim(State(state): State<AppState>, headers: HeaderMap, Path(
         Ok(account) => account,
         Err(redirect) => return redirect,
     };
-    match claims::withdraw(&state.db, claim_id, account.id).await {
+    match claims::withdraw(&state.db, &state.documents, claim_id, account.id).await {
         Ok(true) => see_other(link("/account", Some(Notice::ClaimWithdrawn), &[])),
         Ok(false) => see_other(link("/account", Some(Notice::AlreadyDecided), &[])),
         Err(error) => internal(error),
@@ -464,7 +471,7 @@ async fn decide_claim(
         "reject" => false,
         _ => return (StatusCode::BAD_REQUEST, "unknown decision").into_response(),
     };
-    match claims::decide(&state.db, claim_id, reviewer.id, approve, &form.note).await {
+    match claims::decide(&state.db, &state.documents, claim_id, reviewer.id, approve, &form.note).await {
         Ok(()) => see_other(link("/admin/claims", Some(Notice::ClaimDecided), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
@@ -475,11 +482,12 @@ async fn admin_document(State(state): State<AppState>, headers: HeaderMap, Path(
     if let Err(response) = require_admin(&state, &headers, "/admin/claims").await {
         return response;
     }
-    let document = match claims::open_document(&state.db, &state.config.document_key, document_id).await {
-        Ok(Some(document)) => document,
-        Ok(None) => return (StatusCode::GONE, "This document was deleted when its claim ended.").into_response(),
-        Err(error) => return internal(error),
-    };
+    let document =
+        match claims::open_document(&state.db, &state.documents, &state.config.document_key, document_id).await {
+            Ok(Some(document)) => document,
+            Ok(None) => return (StatusCode::GONE, "This document was deleted when its claim ended.").into_response(),
+            Err(error) => return internal(error),
+        };
     let disposition = format!("inline; filename=\"{}\"", document.filename);
     let mut response = document.bytes.into_response();
     let headers = response.headers_mut();

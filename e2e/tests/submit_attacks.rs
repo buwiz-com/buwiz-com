@@ -450,3 +450,40 @@ async fn a_receipt_signed_by_a_key_not_in_the_signed_list_does_not_make_the_retu
         Err(other) => panic!("expected needs-attention, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_stall_after_the_remote_file_is_opened_is_unknown_and_never_resent() {
+    let harness = Harness::start().await;
+    harness.stall_sftp.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (submission, _) = harness.signed_in().await;
+    let body = xml(TIN);
+    let filename = format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml");
+    let transport = submission.transport();
+    let outcome = bir_core::background_cron::SubmissionTransport::store_session_reported(
+        transport.as_ref(),
+        (),
+        &filename,
+        &body,
+    )
+    .await;
+    match outcome {
+        Err(bir_core::background_cron::StoreFailure::MaybeSent(error)) => {
+            assert!(error.0.contains("once the remote file was asked for"), "{error}")
+        }
+        Ok(report) => panic!("a stalled upload became Sent: {report:?}"),
+        Err(other) => panic!("a stalled upload must need attention, not a retry: {other:?}"),
+    }
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM submissions").fetch_one(&harness.db).await.unwrap();
+    assert_eq!(status, "unknown", "{error:?}");
+
+    // Trying again, as a retry would, gets no new ticket.
+    let again = submission.submitter().send(&filename, &body).await;
+    assert!(
+        matches!(&again, Err(bir_submit::SendError::MaybeSent(message)) if message.contains("already handed over")),
+        "{again:?}"
+    );
+    let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();
+    assert_eq!(tickets, 1, "no second ticket for a return that may be at BIR");
+    assert!(harness.received.lock().await.is_empty());
+}

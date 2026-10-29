@@ -398,7 +398,7 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
                         <li>"the returns you sent through Buwiz and their receipts"</li>
                     </ul>
                     <p><strong>"It cannot file returns or change anything."</strong>" Returns are filed only from the Buwiz app on your computer, after you confirm."</p>
-                    <p class="muted">"After you answer, you go back to " (agents::redirect_host(&request.redirect_uri)) ". You can sign the agent out any time by signing out of Buwiz everywhere."</p>
+                    <p class="muted">"After you answer, you go back to " (agents::redirect_host(&request.redirect_uri)) "."</p>
                     <form method="post" action="/oauth/authorize/decision">
                         for (name, value) in fields {
                             <input type="hidden" name=(name) value=(value)>

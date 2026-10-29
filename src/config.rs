@@ -2,6 +2,10 @@
 
 use anyhow::{Context, bail};
 use base64::Engine;
+use ed25519_dalek::SigningKey;
+use zeroize::Zeroizing;
+
+use crate::bir;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -108,9 +112,95 @@ fn document_key(raw: &str) -> anyhow::Result<[u8; 32]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("DOCUMENT_KEY must be 32 bytes"))
 }
 
+/// Relay settings: `BIR_RELAY_MODE` is `dry_run` (default), `lab` or `live`.
+pub fn relay_settings() -> anyhow::Result<bir::Settings> {
+    let mode = match var_or("BIR_RELAY_MODE", "dry_run").as_str() {
+        "dry_run" => bir::Mode::DryRun,
+        "lab" => bir::Mode::Lab,
+        "live" => bir::Mode::Live,
+        other => bail!("BIR_RELAY_MODE must be dry_run, lab or live, not `{other}`"),
+    };
+    let secret = |name: &str| -> anyhow::Result<Zeroizing<String>> {
+        match std::env::var(name).ok().filter(|value| !value.is_empty()) {
+            Some(value) => Ok(Zeroizing::new(value)),
+            // A dry run encrypts with a placeholder: nothing is sent.
+            None if mode == bir::Mode::DryRun => Ok(Zeroizing::new("dry-run".to_owned())),
+            None => bail!("{name} is required when BIR_RELAY_MODE={}", mode.as_str()),
+        }
+    };
+    let pinned_keys = list("BIR_SSH_HOST_KEYS");
+    if mode != bir::Mode::DryRun && pinned_keys.is_empty() {
+        bail!("BIR_SSH_HOST_KEYS must list the upload server's SHA256:… host-key fingerprints");
+    }
+    let lab = match mode {
+        bir::Mode::Lab => Some(lab_server(&required("BIR_LAB_SFTP")?)?),
+        _ => None,
+    };
+    let sftp_hosts = match list("BIR_SFTP_HOSTS") {
+        hosts if hosts.is_empty() => vec!["ebf2.bir.gov.ph".to_owned()],
+        hosts => hosts,
+    };
+    Ok(bir::Settings {
+        mode,
+        iaf_passphrase: secret("BIR_IAF_PASSPHRASE")?,
+        dispatcher_passphrase: match mode {
+            bir::Mode::Live => secret("BIR_DISPATCHER_PASSPHRASE")?,
+            _ => Zeroizing::new(String::new()),
+        },
+        dispatchers: bir::bir_dispatchers(),
+        sftp_hosts,
+        pinned_keys,
+        lab,
+        tls: bir::Settings::tls_config(),
+    })
+}
+
+/// `user:password@host:port`.
+fn lab_server(raw: &str) -> anyhow::Result<bir::LabServer> {
+    let (login, address) = raw.rsplit_once('@').context("BIR_LAB_SFTP is user:password@host:port")?;
+    let (username, password) = login.split_once(':').context("BIR_LAB_SFTP is user:password@host:port")?;
+    let (host, port) = address.rsplit_once(':').context("BIR_LAB_SFTP is user:password@host:port")?;
+    Ok(bir::LabServer {
+        host: host.to_owned(),
+        port: port.parse().context("BIR_LAB_SFTP port")?,
+        username: username.to_owned(),
+        password: Zeroizing::new(password.to_owned()),
+    })
+}
+
+/// Ed25519 key that signs receipts (`RECEIPT_SIGNING_KEY`, a base64 32-byte
+/// seed). Without one, development servers make a throwaway key.
+pub fn receipt_key(public: bool) -> anyhow::Result<SigningKey> {
+    match std::env::var("RECEIPT_SIGNING_KEY").ok().filter(|value| !value.is_empty()) {
+        Some(raw) => {
+            let seed: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(raw.trim())
+                .context("RECEIPT_SIGNING_KEY must be base64")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("RECEIPT_SIGNING_KEY must be 32 bytes"))?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        None if public => bail!("RECEIPT_SIGNING_KEY is required on a public deployment"),
+        None => {
+            let mut seed = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+            tracing::warn!("RECEIPT_SIGNING_KEY is not set; receipts are signed with a throwaway key");
+            Ok(SigningKey::from_bytes(&seed))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lab_servers_parse_with_a_colon_in_the_password() {
+        let lab = lab_server("lab:pa:ss@127.0.0.1:2222").unwrap();
+        assert_eq!((lab.username.as_str(), lab.password.as_str()), ("lab", "pa:ss"));
+        assert_eq!((lab.host.as_str(), lab.port), ("127.0.0.1", 2222));
+        assert!(lab_server("127.0.0.1:22").is_err());
+    }
 
     #[test]
     fn origins_drop_the_trailing_slash_and_refuse_paths() {

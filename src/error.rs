@@ -9,12 +9,32 @@ use serde_json::json;
 /// `{"error":{"code":"…","message":"…"}}`.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    #[error("{message}")]
+    Client { status: StatusCode, code: &'static str, message: &'static str },
     /// Missing, expired or revoked access token. Answers 401 with
     /// `WWW-Authenticate`.
     #[error("sign in again")]
     InvalidToken,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+impl ApiError {
+    pub fn bad_request(code: &'static str, message: &'static str) -> Self {
+        Self::Client { status: StatusCode::BAD_REQUEST, code, message }
+    }
+
+    pub fn forbidden(code: &'static str, message: &'static str) -> Self {
+        Self::Client { status: StatusCode::FORBIDDEN, code, message }
+    }
+
+    pub fn conflict(code: &'static str, message: &'static str) -> Self {
+        Self::Client { status: StatusCode::CONFLICT, code, message }
+    }
+
+    pub fn not_found() -> Self {
+        Self::Client { status: StatusCode::NOT_FOUND, code: "not_found", message: "not found" }
+    }
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -26,6 +46,9 @@ impl From<sqlx::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
+            Self::Client { status, code, message } => {
+                (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+            }
             Self::InvalidToken => {
                 let body = json!({ "error": { "code": "invalid_token", "message": "sign in again" } });
                 let mut response = (StatusCode::UNAUTHORIZED, Json(body)).into_response();

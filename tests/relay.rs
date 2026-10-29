@@ -27,17 +27,21 @@ type Received = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 /// SFTP server: accepts `lab`/`lab-password` and keeps uploaded files.
 struct SftpServer {
     received: Received,
+    /// When set, writes are never answered: a server that stalls after the
+    /// remote file was opened.
+    stall: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl russh::server::Server for SftpServer {
     type Handler = SshSession;
     fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> SshSession {
-        SshSession { received: self.received.clone(), channels: HashMap::new() }
+        SshSession { received: self.received.clone(), stall: self.stall.clone(), channels: HashMap::new() }
     }
 }
 
 struct SshSession {
     received: Received,
+    stall: Arc<std::sync::atomic::AtomicBool>,
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
@@ -68,7 +72,8 @@ impl russh::server::Handler for SshSession {
         match self.channels.remove(&channel) {
             Some(open) if name == "sftp" => {
                 session.channel_success(channel)?;
-                let handler = SftpFiles { received: self.received.clone(), open: HashMap::new() };
+                let handler =
+                    SftpFiles { received: self.received.clone(), stall: self.stall.clone(), open: HashMap::new() };
                 russh_sftp::server::run(open.into_stream(), handler).await;
             }
             _ => session.channel_failure(channel)?,
@@ -79,6 +84,7 @@ impl russh::server::Handler for SshSession {
 
 struct SftpFiles {
     received: Received,
+    stall: Arc<std::sync::atomic::AtomicBool>,
     open: HashMap<String, (String, Vec<u8>)>,
 }
 
@@ -114,6 +120,9 @@ impl russh_sftp::server::Handler for SftpFiles {
     }
 
     async fn write(&mut self, id: u32, handle: String, _offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+        if self.stall.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if let Some((_, buffer)) = self.open.get_mut(&handle) {
             buffer.extend_from_slice(&data);
         }
@@ -131,13 +140,18 @@ impl russh_sftp::server::Handler for SftpFiles {
 /// Starts the SFTP server. Returns its port, its key fingerprint and the
 /// files it receives.
 async fn sftp_server() -> (u16, String, Received) {
+    sftp_server_with(Arc::default()).await
+}
+
+/// Starts the SFTP server; `stall` makes it stop answering writes.
+async fn sftp_server_with(stall: Arc<std::sync::atomic::AtomicBool>) -> (u16, String, Received) {
     let key = PrivateKey::new(KeypairData::Ed25519(Ed25519Keypair::from_seed(&[0x42; 32])), "test").unwrap();
     let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
     let config = Arc::new(russh::server::Config { keys: vec![key], ..Default::default() });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let received: Received = Arc::default();
-    let mut server = SftpServer { received: received.clone() };
+    let mut server = SftpServer { received: received.clone(), stall };
     tokio::spawn(async move {
         loop {
             let (socket, peer) = listener.accept().await.unwrap();
@@ -187,6 +201,7 @@ fn settings(mode: Mode, dispatcher_port: u16, sftp_hosts: &[&str], pinned: &str)
         pinned_keys: vec![pinned.to_owned()],
         lab: None,
         tls: Settings::tls_config(),
+        sftp_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -220,6 +235,25 @@ async fn a_return_reaches_the_upload_server_through_the_pipe() {
     assert_eq!(iaf::decrypt(uploaded, IAF_PASS).unwrap(), XML, "BIR gets the IAF-encrypted return");
     assert_ne!(uploaded.as_slice(), XML);
     assert!(matches!(app.await.unwrap(), Some(Control::Result { status, .. }) if status == "sent"));
+}
+
+/// A server that stalls once the remote file is open: BIR may hold part
+/// of the file, so the send is "maybe sent", never "not sent".
+#[tokio::test]
+async fn a_stall_after_the_remote_file_is_opened_may_have_reached_bir() {
+    let (sftp_port, fingerprint, received) = sftp_server_with(Arc::new(true.into())).await;
+    let dispatcher_port = dispatcher_server("127.0.0.1", sftp_port).await;
+    let allowed = vec![("127.0.0.1".to_owned(), dispatcher_port), ("127.0.0.1".to_owned(), sftp_port)];
+    let (pipe, _app) = pipe(allowed);
+    let mut settings = settings(Mode::Live, dispatcher_port, &["127.0.0.1"], &fingerprint);
+    settings.sftp_timeout = std::time::Duration::from_secs(3);
+
+    let error = bir::send(&pipe, &job(), &settings).await.expect_err("stalled");
+    assert!(
+        matches!(&error, SendError::MaybeSent(message) if message.contains("once the remote file was asked for")),
+        "{error}"
+    );
+    assert!(received.lock().await.is_empty(), "the file never closed");
 }
 
 #[tokio::test]

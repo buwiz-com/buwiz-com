@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::accounts::Account;
 use crate::agents::{self, AuthorizeProblem};
 use crate::claims::{self, ClaimRow, DocumentKind};
+use crate::devices;
 use crate::notice::Notice;
 use crate::oauth;
 use crate::state::AppState;
@@ -437,6 +438,7 @@ fn date(at: time::OffsetDateTime) -> String {
 async fn account_page(cx: &Cx) -> Result<impl View> {
     let account = signed_in(cx).await?;
     let claims = claims::for_account(&state(cx).db, account.id).await?;
+    let devices = devices::for_account(&state(cx).db, account.id).await?;
     Ok(view! {
         <main>
             <h1>"My TINs"</h1>
@@ -461,7 +463,48 @@ async fn account_page(cx: &Cx) -> Result<impl View> {
                     </table>
                 </div>
             }
+            <h2>"My devices"</h2>
+            <p class="muted">"Computers and phones that can send returns for you. Remove one you no longer use or don't recognise; it is signed out and can't send until it signs in again."</p>
+            if devices.is_empty() {
+                <p class="card muted">"No devices yet. One appears here the first time you send a return from the Buwiz app."</p>
+            } else {
+                <div class="card">
+                    <table>
+                        <thead>
+                            <tr><th>"Device"</th><th>"Added"</th><th>"Last used"</th><th>"Status"</th></tr>
+                        </thead>
+                        <tbody>
+                            for device in devices {
+                                device_row(device: device)
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
         </main>
+    })
+}
+
+#[component]
+async fn device_row(device: devices::DeviceView) -> Result<impl View> {
+    let revoke = format!("/devices/{}/revoke", device.id);
+    let app = oauth::client_name(&device.client_id).unwrap_or("Buwiz");
+    Ok(view! {
+        <tr>
+            <td>(device.name.clone()) <span class="hint">(format!(" ({app})"))</span></td>
+            <td>(date(device.created_at))</td>
+            <td>(device.last_used_at.map(date).unwrap_or_else(|| "Never".to_owned()))</td>
+            <td>
+                if device.revoked_at.is_some() {
+                    <span class="status rejected">"Removed"</span>
+                } else {
+                    <span class="status approved">"Active"</span>
+                    <form method="post" action=(revoke)>
+                        <button class="link" type="submit">"Remove"</button>
+                    </form>
+                }
+            </td>
+        </tr>
     })
 }
 

@@ -26,16 +26,15 @@ fly logs              # look for "listening on http://0.0.0.0:8080"
 curl https://buwiz-cloud.fly.dev/healthz
 ```
 
-## Custom domains
+If Fly's remote builder fails (503, `failed_precondition`), build on your
+machine instead: `fly deploy --local-only`. To change only settings, redeploy
+the last image: `fly deploy --image registry.fly.io/buwiz-cloud:<tag>`.
 
-```sh
-fly certs add account.buwiz.com
-fly certs add api.buwiz.com
-fly ips list          # then point both names at the app's IPs (A and AAAA) or CNAME buwiz-cloud.fly.dev
-```
+## Domains
 
-Then set `ACCOUNT_ORIGIN = "https://account.buwiz.com"` and
-`EXTRA_ORIGINS = "https://api.buwiz.com"` in `fly.toml`, and deploy.
+`account.buwiz.com` and `api.buwiz.com` have A and AAAA records in Cloudflare
+pointing at the app's IPs (`fly ips list`). The records are **DNS only**
+(grey cloud), because Fly issues the certificates (`fly certs check <name>`).
 
 ## Switch the mini app
 

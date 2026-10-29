@@ -12,10 +12,10 @@ primary_region = "sin"
   PORT = "8080"
   RUST_LOG = "info"
   MAIL_TRANSPORT = "resend"
-  # Change to https://account.buwiz.com (and add https://api.buwiz.com to
-  # EXTRA_ORIGINS) once DNS points here.
-  ACCOUNT_ORIGIN = "https://buwiz-cloud.fly.dev"
-  EXTRA_ORIGINS = ""
+  # Device sign-in links point at ACCOUNT_ORIGIN. The mini app calls
+  # api.buwiz.com; both names and fly.dev serve the same app.
+  ACCOUNT_ORIGIN = "https://account.buwiz.com"
+  EXTRA_ORIGINS = "https://api.buwiz.com,https://buwiz-cloud.fly.dev"
   ADMIN_EMAILS = "support@buwiz.com"
   BIR_RELAY_MODE = "dry_run"
 

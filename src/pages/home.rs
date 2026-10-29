@@ -182,7 +182,7 @@ const FAQS: [(&str, &str); 6] = [
     ),
     (
         "Is there a mobile app?",
-        "Android and iOS apps are coming soon, with the same Buwiz account. Today the Buwiz app runs on Windows, macOS and Linux.",
+        "Yes, it's coming soon. The Buwiz app is coming to Windows, macOS, Linux, Android and iOS, all with the same Buwiz account.",
     ),
     (
         "Can an AI agent file for me?",
@@ -192,9 +192,9 @@ const FAQS: [(&str, &str); 6] = [
 
 /// Where the Buwiz app runs: (icon, platform, coming soon).
 const PLATFORMS: [(&str, &str, bool); 5] = [
-    ("desktop_windows", "Windows", false),
-    ("laptop_mac", "macOS", false),
-    ("terminal", "Linux", false),
+    ("desktop_windows", "Windows", true),
+    ("laptop_mac", "macOS", true),
+    ("terminal", "Linux", true),
     ("android", "Android", true),
     ("phone_iphone", "iOS", true),
 ];
@@ -638,7 +638,6 @@ async fn footer() -> Result<impl View> {
                 </div>
                 <nav class="home-footer-links" aria-label="Footer">
                     <a href="mailto:support@buwiz.com">"support@buwiz.com"</a>
-                    <a href="https://github.com/hexuria/buwiz-forms" target="_blank" rel="noopener noreferrer">"GitHub"</a>
                 </nav>
             </div>
         </footer>

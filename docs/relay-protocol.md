@@ -72,7 +72,7 @@ The app must:
   `ws2.birgovph.com:443`, `ws2.birgovph.com:80` and `ebf2.bir.gov.ph:22`.
   The v1 reference client hard-codes this list and refuses anything else
   with `refused`. This keeps the server from using a taxpayer's computer as
-  a general proxy. v2 apps take the list from the signed egress list
+  a general proxy. v2 apps take the list from the signed relay trust list
   instead (section 5.4) and name no host in their source.
 - Forward bytes unchanged. Never terminate TLS or SSH. Everything the app
   sees is TLS or SSH ciphertext, or the dispatcher's wrapped fields.
@@ -235,20 +235,34 @@ included).
 
 ### 5.4 Relay
 
-Before it opens the pipe, the app fetches `GET /.well-known/buwiz-egress.json`:
-a compact JWS (`alg: EdDSA`, `typ: buwiz-egress+jwt`, `kid`) over
+Before it asks for a ticket, a v2 app fetches the **relay trust list**,
+`GET /.well-known/buwiz-trust.json`: a compact JWS (`alg: EdDSA`,
+`typ: buwiz-trust+jwt`, `kid`) over
 
 ```json
-{"hosts": ["host:port", …], "iat": 1767225600, "exp": 1798761600}
+{"hosts": ["host:port", …],
+ "sealing_keys": [<entries of /.well-known/buwiz-hpke.json "keys">],
+ "receipt_keys": [<Ed25519 JWKs of the Sender's receipt keys>],
+ "iat": 1767225600, "exp": 1798761600}
 ```
 
-It is signed **offline** with the egress key (`buwiz-egress-sign`, see
+It is signed **offline** with the trust key (`buwiz-trust-sign`, see
 [deploy.md](deploy.md)); this server never holds that key and only serves
-the blob in `EGRESS_LIST_JWS` (`503 egress_list_missing` without one). The
-app pins the egress public key, checks signature, `typ` and `exp`, and lets
-the pipe open exactly those `host:port` pairs; anything else is `refused`.
-No valid list means no send, so even a compromised server can't widen
-where an app connects.
+the blob in `TRUST_LIST_JWS` (`503 trust_list_missing` without one). The
+app pins the trust public key and checks signature, `typ` and `exp`; no
+valid list means no send. Then:
+
+- the pipe may open exactly the listed `host:port` pairs; anything else is
+  `refused`;
+- the app seals only to the sealing key `/.well-known/buwiz-hpke.json`
+  names as current **if** the list carries that `kid` with the same key;
+  otherwise it seals nothing and asks for no ticket;
+- receipts are verified only against the listed receipt keys.
+
+So a compromised Gatekeeper can't widen where an app connects, can't make
+it seal to a key of its own (and read the return), and can't forge "Sent".
+`/.well-known/buwiz-hpke.json` and `/.well-known/jwks.json` stay, unsigned,
+for v1 clients and to name the current key; v2 apps trust neither alone.
 
 Then it opens `relay_path` as in section 2, with the bearer token **and** a
 device signature over `GET` and the path. The frames are those of section 2.
@@ -272,7 +286,8 @@ and `sent` mean as in section 3. The receipt carries the ticket's `jti`.
 The Gatekeeper reaches the Sender at `SENDER_URL` and presents
 `Authorization: Bearer $SENDER_SECRET`:
 
-- `GET /internal/public`: `{"receipt_keys":[JWK],"hpke":{…}}`, which the
+- `GET /internal/public`: `{"receipt_keys":[JWK],"hpke":{…}}` (also what
+  `buwiz-sender public` prints, for `buwiz-trust-sign`), which the
   Gatekeeper serves as `/.well-known/jwks.json` and
   `/.well-known/buwiz-hpke.json`.
 - `GET /internal/relay` (WebSocket): the Gatekeeper sends one job as a text
@@ -294,7 +309,7 @@ Gatekeeper (`buwiz-cloud`):
 | `TICKET_SIGNING_KEY` | Base64 32-byte Ed25519 seed that signs tickets. Required on public deployments. |
 | `SENDER_URL` | `http(s)://host:port` of the Sender on the private network. Required on public deployments. |
 | `SENDER_SECRET` | Shared with the Sender, 32+ characters |
-| `EGRESS_LIST_JWS` | The offline-signed egress list served at `/.well-known/buwiz-egress.json` |
+| `TRUST_LIST_JWS` | The offline-signed relay trust list served at `/.well-known/buwiz-trust.json` |
 
 Sender (`buwiz-sender`):
 

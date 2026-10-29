@@ -107,12 +107,14 @@ fn text(body: &'static str, content_type: &'static str) -> Response {
     response
 }
 
-/// Other files the pages load: the Buwiz logo, and for the home page's AI
+/// Other files the pages load: the Buwiz logo (WebP for pages, PNG for the
+/// sign-in code email), and for the home page's AI
 /// agent demos the two printed 1601-C documents their Computer screen shows
 /// and the font those use. (path under /assets, content type, bytes)
 pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
     ("brand/buwiz_logo_light.webp", "image/webp", include_bytes!("assets/brand/buwiz_logo_light.webp")),
     ("brand/buwiz_logo_dark.webp", "image/webp", include_bytes!("assets/brand/buwiz_logo_dark.webp")),
+    ("brand/buwiz_logo_email.png", "image/png", include_bytes!("assets/brand/buwiz_logo_email.png")),
     ("demo/1601c-october-2026.html", "text/html; charset=utf-8", include_bytes!("assets/demo/1601c-october-2026.html")),
     (
         "demo/1601c-october-2026-confirmation.html",

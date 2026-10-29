@@ -6,8 +6,12 @@
 //! For each send the Gatekeeper opens `GET /internal/relay` (WebSocket,
 //! `Authorization: Bearer $SENDER_SECRET`), sends one [`Job`] as a text
 //! frame, then bridges the app's relay pipe to it frame for frame. The
-//! Sender runs the send through the pipe (see [`crate::bir`]) and ends with
+//! Sender runs the send through the pipe (see `crate::bir`) and ends with
 //! the pipe's `result`, carrying a receipt it signed.
+//!
+//! The BIR relay is behind the `bir` cargo feature. Without it the Sender
+//! still checks tickets and opens envelopes, then answers every send with
+//! `failed` and [`NOT_BUILT_IN`]: nothing reaches BIR.
 //!
 //! A v2 job carries the app's ticket and sealed envelope. The Sender checks
 //! the ticket (signature, expiry, single use), opens the envelope, and
@@ -15,6 +19,9 @@
 //! ticket's. The file name comes from the ticket.
 
 pub mod identity;
+mod outcome;
+
+pub use outcome::{Mode, NOT_BUILT_IN, RelaySettings, SendError, Sent};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,7 +44,6 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::bir::{self, SendError};
 use crate::envelope::{Envelope, SealingKey};
 use crate::relay::{self, Control, Pipe};
 use crate::tickets;
@@ -67,7 +73,7 @@ pub enum Job {
 }
 
 pub struct SenderConfig {
-    pub relay: bir::Settings,
+    pub relay: RelaySettings,
     pub sealing_key: SealingKey,
     pub receipt_key: SigningKey,
     /// Keys whose tickets the Sender accepts (the Gatekeeper's).
@@ -84,7 +90,7 @@ impl SenderConfig {
     /// `RECEIPT_ISSUER`. Throwaway keys are allowed only in `dry_run`.
     pub fn from_env() -> anyhow::Result<Self> {
         let relay = config::relay_settings()?;
-        let throwaway_ok = relay.mode == bir::Mode::DryRun;
+        let throwaway_ok = relay.mode == Mode::DryRun;
         let ticket_keys = std::env::var("TICKET_PUBLIC_KEYS")
             .unwrap_or_default()
             .split(',')
@@ -116,7 +122,7 @@ impl SenderConfig {
     /// `SENDER_HPKE_KEY` and `RECEIPT_SIGNING_KEY` settings.
     pub fn embedded(ticket_key: VerifyingKey, issuer: &str) -> anyhow::Result<Self> {
         let relay = config::relay_settings()?;
-        let throwaway_ok = relay.mode == bir::Mode::DryRun;
+        let throwaway_ok = relay.mode == Mode::DryRun;
         Ok(Self {
             relay,
             sealing_key: sealing_key(!throwaway_ok)?,
@@ -215,7 +221,7 @@ impl Sender {
                     Ok(xml) => xml,
                     Err(reason) => return failed(reason.into()),
                 };
-                if bir::hex(&crypto::sha256(&xml)) != claims.payload_sha256 {
+                if crypto::hex(&crypto::sha256(&xml)) != claims.payload_sha256 {
                     return failed("the sealed return is not the one the ticket names".into());
                 }
                 if let Err(reason) = identity::check(&xml, &claims) {
@@ -239,17 +245,29 @@ impl Sender {
         }
     }
 
-    async fn send(&self, pipe: &Pipe, send: Send) -> Control {
-        let job = bir::Job {
+    /// Hands the return to the BIR relay.
+    #[cfg(feature = "bir")]
+    async fn deliver(&self, pipe: &Pipe, send: &Send) -> Result<Sent, SendError> {
+        let job = crate::bir::Job {
             tin_root: send.tin.root(),
             form_type: &send.form_type,
             filename: &send.filename,
             xml: &send.xml,
         };
+        crate::bir::send(pipe, &job, &self.config.relay).await
+    }
+
+    /// Built without the BIR relay: nothing is sent.
+    #[cfg(not(feature = "bir"))]
+    async fn deliver(&self, _pipe: &Pipe, _send: &Send) -> Result<Sent, SendError> {
+        Err(SendError::NotSent(NOT_BUILT_IN.to_owned()))
+    }
+
+    async fn send(&self, pipe: &Pipe, send: Send) -> Control {
         let mode = self.config.relay.mode;
-        match bir::send(pipe, &job, &self.config.relay).await {
+        match self.deliver(pipe, &send).await {
             Ok(sent) => {
-                let status = if mode == bir::Mode::DryRun { "dry_run" } else { "sent" };
+                let status = if mode == Mode::DryRun { "dry_run" } else { "sent" };
                 let mut claims = json!({
                     "iss": self.config.issuer,
                     "sub": send.submission_id,
@@ -258,7 +276,7 @@ impl Sender {
                     "form_type": send.form_type,
                     "period": send.period,
                     "filename": send.filename,
-                    "xml_sha256": bir::hex(&crypto::sha256(&send.xml)),
+                    "xml_sha256": crypto::hex(&crypto::sha256(&send.xml)),
                     "payload_sha256": sent.payload_sha256,
                     "remote_path": sent.remote_path,
                     "mode": mode.as_str(),
@@ -357,4 +375,42 @@ async fn run_job(sender: Arc<Sender>, mut socket: WebSocket) {
 pub async fn serve(listener: tokio::net::TcpListener, sender: Arc<Sender>) -> anyhow::Result<()> {
     axum::serve(listener, router(sender)).await?;
     Ok(())
+}
+
+#[cfg(all(test, not(feature = "bir")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn without_the_bir_feature_every_send_fails_unsent() {
+        let config = SenderConfig {
+            relay: RelaySettings { mode: Mode::Live },
+            sealing_key: SealingKey::from_bytes(&[7; 32]).unwrap(),
+            receipt_key: SigningKey::from_bytes(&[8; 32]),
+            ticket_keys: vec![SigningKey::from_bytes(&[9; 32]).verifying_key()],
+            secret: Zeroizing::new("x".repeat(32)),
+            issuer: "http://localhost:3008".into(),
+        };
+        let (to_app, mut from_server) = mpsc::channel(8);
+        let (_to_server, from_app) = mpsc::channel(8);
+        let pipe = Pipe::new(to_app, from_app);
+        let job = Job::V1 {
+            submission_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            tin_root: "123456789".into(),
+            branch_code: "00000".into(),
+            form_type: "1601Cv2018".into(),
+            period: "062025".into(),
+            filename: "12345678900000-1601Cv2018-062025#juan@example.com#.xml".into(),
+            xml: STANDARD.encode("<return/>"),
+        };
+        let result = Sender::new(config).handle(&pipe, job).await;
+        assert_eq!(
+            result,
+            Control::Result { status: "failed".into(), error: Some(NOT_BUILT_IN.into()), receipt: None }
+        );
+        // Nothing was opened through the pipe.
+        drop(pipe);
+        assert!(from_server.try_recv().is_err());
+    }
 }

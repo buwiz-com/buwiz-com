@@ -25,8 +25,8 @@ pub struct Config {
     /// Accounts allowed to review TIN claims.
     pub admin_emails: Vec<String>,
     pub mail: MailConfig,
-    /// The offline-signed egress list apps fetch (`EGRESS_LIST_JWS`).
-    pub egress_list: Option<String>,
+    /// The offline-signed relay trust list apps fetch (`TRUST_LIST_JWS`).
+    pub trust_list: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +68,7 @@ impl Config {
             document_key: document_key(&required("DOCUMENT_KEY")?)?,
             admin_emails: list("ADMIN_EMAILS").into_iter().map(|email| email.to_lowercase()).collect(),
             mail,
-            egress_list: std::env::var("EGRESS_LIST_JWS")
+            trust_list: std::env::var("TRUST_LIST_JWS")
                 .ok()
                 .map(|raw| raw.trim().to_owned())
                 .filter(|raw| !raw.is_empty()),

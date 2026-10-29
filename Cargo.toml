@@ -16,8 +16,8 @@ name = "buwiz-relay"
 path = "src/bin/buwiz-relay.rs"
 
 [[bin]]
-name = "buwiz-egress-sign"
-path = "src/bin/buwiz-egress-sign.rs"
+name = "buwiz-trust-sign"
+path = "src/bin/buwiz-trust-sign.rs"
 
 [[bin]]
 name = "buwiz-sender"

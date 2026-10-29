@@ -1,0 +1,130 @@
+/*
+ * Source of src/demo.css, the styles of the home page's AI Co-worker demos
+ * (src/demo.js). The demos keep the old server's Tailwind classes, so their
+ * stylesheet is compiled from this file with the Tailwind v4 CLI:
+ *
+ *   tailwindcss -i src/demo.tw.css -o src/demo.css
+ *
+ * Rebuild after changing classes in demo.js. Everything is nested under
+ * `.demo`, so the utilities touch nothing else on the page and win over the
+ * element rules in site.css and home.css. There is no Tailwind preflight;
+ * the few resets the demos need are at the bottom.
+ */
+@import "tailwindcss/theme.css" layer(theme);
+@source "./demo.js";
+
+/* The page's own palette (site.css, home.css) for the controls over each window. */
+@theme inline {
+  --color-gc-bg: var(--bg);
+  --color-gc-text: var(--text);
+  --color-gc-text-muted: var(--muted);
+  --color-gc-text-faint: var(--faint);
+  --color-gc-border: var(--line);
+  --color-gc-accent: var(--brand);
+}
+
+.demo {
+  @tailwind utilities;
+}
+
+/*
+ * The desktop app window, after its own light and dark palettes
+ * (dark: sidebar #0e0e0e, chat #121212, pane #161616; light: #f5f5f5, #fff, #fcfcfc).
+ * After the utilities, so these win where both set a property, as they did
+ * in the old server's build.
+ */
+.demo {
+  :where(*, ::before, ::after) { box-sizing: border-box; margin: 0; padding: 0; border: 0 solid; }
+  :is(button, p, table, th, td, iframe) {
+    margin: 0;
+    padding: 0;
+    border: 0 solid;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: inherit;
+    vertical-align: inherit;
+  }
+  svg { display: block; vertical-align: middle; }
+
+  .gs-win {
+    --gs-side: #f5f5f5;
+    --gs-chat: #ffffff;
+    --gs-pane: #fcfcfc;
+    --gs-bubble: #1c1c1c0f;
+    --gs-card: #ffffff;
+    --gs-hover: #1c1c1c0f;
+    --gs-border: #1c1c1c1a;
+    --gs-text: #1c1c1c;
+    --gs-dim: #1c1c1c8f;
+    --gs-faint: #1c1c1c66;
+    --gs-user: #0d9655;
+    border: 1px solid var(--gs-border);
+    box-shadow: 0 24px 60px rgb(15 23 42 / 0.14);
+  }
+  @media (prefers-color-scheme: dark) {
+    .gs-win {
+      --gs-side: #0e0e0e;
+      --gs-chat: #121212;
+      --gs-pane: #161616;
+      --gs-bubble: #1f1f1f;
+      --gs-card: #1a1a1a;
+      --gs-hover: #242424;
+      --gs-border: rgb(245 245 245 / 0.08);
+      --gs-text: #f5f5f5;
+      --gs-dim: rgb(245 245 245 / 0.56);
+      --gs-faint: rgb(245 245 245 / 0.36);
+      --gs-user: #0e9f5a;
+      box-shadow: 0 32px 80px rgb(0 0 0 / 0.5);
+    }
+  }
+  .gs-side { background: var(--gs-side); }
+  .gs-fade { background: linear-gradient(var(--gs-chat) 45%, transparent); }
+  .gs-chat { background: var(--gs-chat); }
+  .gs-pane { background: var(--gs-pane); }
+  .gs-bubble { background: var(--gs-bubble); }
+  .gs-card { background: var(--gs-card); border: 1px solid var(--gs-border); }
+  .gs-hover { background: var(--gs-hover); }
+  .gs-line { border-color: var(--gs-border); }
+  .gs-t { color: var(--gs-text); }
+  .gs-d { color: var(--gs-dim); }
+  .gs-f { color: var(--gs-faint); }
+  .gs-user { background: var(--gs-user); color: #fff; }
+  .gs-btn { background: var(--gs-text); color: var(--gs-chat); }
+
+  .material-symbols-outlined {
+    font-family: "Material Symbols Outlined";
+    font-weight: normal;
+    font-style: normal;
+    line-height: 1;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
+    direction: ltr;
+    font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+    vertical-align: middle;
+    font-feature-settings: "liga";
+  }
+
+  .gc-card-in { animation: gc-card-in 0.3s ease-out both; }
+  .gc-caret {
+    display: inline-block;
+    width: 1px;
+    height: 15px;
+    margin-left: 1px;
+    background: currentColor;
+    vertical-align: -2px;
+    animation: gc-blink 1s steps(1) infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .gc-card-in, .gc-caret { animation: none; }
+  }
+}
+
+@keyframes gc-card-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes gc-blink {
+  50% { opacity: 0; }
+}

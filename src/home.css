@@ -445,30 +445,79 @@
 .home .steps-grid p { font-size: 14px; line-height: 1.65; color: var(--muted); }
 .home .row-actions { display: flex; flex-wrap: wrap; gap: 12px; }
 
-/* AI agents */
-.home .agent-card { padding: 20px; }
-@media (min-width: 768px) { .home .agent-card { padding: 28px; } }
-.home .agent-url {
+/* AI Co-worker demos: radios pick the demo, like the tour. The windows
+ * themselves are drawn by demo.js and styled by demo.css. */
+.home .demos { display: grid; gap: 24px; min-width: 0; }
+.home .demo-radio { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.home .demo-tabs {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin-bottom: 20px;
-  padding: 12px 14px;
-  border-radius: 8px;
-  background: var(--bg);
-  border: 1px solid var(--line);
+  gap: 8px;
+  overflow-x: auto;
+  margin: 0 calc(-1 * var(--gutter));
+  padding: 0 var(--gutter) 4px;
+  scrollbar-width: none;
 }
-.home .agent-url-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; color: var(--brand); }
-.home .agent-url code { min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--text); }
-.home .agent-tools { display: grid; grid-template-columns: 1fr; gap: 12px; margin: 0; padding: 0; list-style: none; }
-@media (min-width: 768px) { .home .agent-tools { grid-template-columns: repeat(2, 1fr); } }
-.home .agent-tools li { min-width: 0; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--line); }
-.home .agent-tool-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; margin-bottom: 4px; }
-.home .agent-tool-title { font-size: 14px; font-weight: 700; color: var(--text); }
-.home .agent-tools code { font-size: 11px; color: var(--faint); overflow-wrap: anywhere; }
-.home .agent-tools p { font-size: 12px; line-height: 1.6; color: var(--muted); }
-.home .promises { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 24px; }
+.home .demo-tabs::-webkit-scrollbar { display: none; }
+.home .demo-tab {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.home .demo-tab:hover { border-color: var(--line-strong); color: var(--text); }
+.home .demo-tab-num { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--faint); }
+.home .demo-panel { display: none; min-width: 0; }
+.home .demo-copy { max-width: 68ch; margin-bottom: 24px; }
+.home .demo-copy .eyebrow { margin-bottom: 12px; }
+.home .demo-copy h3 { margin-bottom: 8px; font-size: 24px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.2; }
+@media (min-width: 768px) { .home .demo-copy h3 { font-size: 30px; } }
+
+#demo-0:checked ~ .demo-panel-0,
+#demo-1:checked ~ .demo-panel-1,
+#demo-2:checked ~ .demo-panel-2,
+#demo-3:checked ~ .demo-panel-3,
+#demo-4:checked ~ .demo-panel-4,
+#demo-5:checked ~ .demo-panel-5 { display: block; }
+
+#demo-0:checked ~ .demo-tabs .demo-tab-0,
+#demo-1:checked ~ .demo-tabs .demo-tab-1,
+#demo-2:checked ~ .demo-tabs .demo-tab-2,
+#demo-3:checked ~ .demo-tabs .demo-tab-3,
+#demo-4:checked ~ .demo-tabs .demo-tab-4,
+#demo-5:checked ~ .demo-tabs .demo-tab-5 {
+  border-color: var(--brand);
+  background: var(--soft);
+  color: var(--brand);
+}
+#demo-0:checked ~ .demo-tabs .demo-tab-0 .demo-tab-num,
+#demo-1:checked ~ .demo-tabs .demo-tab-1 .demo-tab-num,
+#demo-2:checked ~ .demo-tabs .demo-tab-2 .demo-tab-num,
+#demo-3:checked ~ .demo-tabs .demo-tab-3 .demo-tab-num,
+#demo-4:checked ~ .demo-tabs .demo-tab-4 .demo-tab-num,
+#demo-5:checked ~ .demo-tabs .demo-tab-5 .demo-tab-num { color: var(--brand); }
+
+#demo-0:focus-visible ~ .demo-tabs .demo-tab-0,
+#demo-1:focus-visible ~ .demo-tabs .demo-tab-1,
+#demo-2:focus-visible ~ .demo-tabs .demo-tab-2,
+#demo-3:focus-visible ~ .demo-tabs .demo-tab-3,
+#demo-4:focus-visible ~ .demo-tabs .demo-tab-4,
+#demo-5:focus-visible ~ .demo-tabs .demo-tab-5 {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.home .promises { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 48px; }
 @media (min-width: 768px) { .home .promises { grid-template-columns: repeat(3, 1fr); } }
 .home .promise { display: flex; align-items: flex-start; gap: 14px; padding: 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); }
 .home .promise-icon {

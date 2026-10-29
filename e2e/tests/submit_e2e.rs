@@ -89,15 +89,6 @@ async fn a_queued_1701q_is_sent_through_the_gatekeeper_and_sender() {
     let uploaded = files.get(&format!("/1701Qv2018/{filename}")).expect("the file reached the SFTP server");
     let xml = iaf::decrypt(uploaded, IAF_PASS).expect("IAF-encrypted with the Sender's passphrase");
     let xml_sha256 = hex(&Sha256::digest(&xml));
-    let receipt =
-        submission.submitter().verify_receipt(&receipt_jws, &xml_sha256, None).await.expect("receipt verifies");
-    assert_eq!(receipt.filename, filename);
-    assert_eq!(receipt.tin, "000-123-453-00000");
-    assert_eq!((receipt.form_type.as_str(), receipt.period.as_str()), ("1701Qv2018", "2026Q1"));
-    assert_eq!(receipt.status, "sent");
-    let jti = receipt.jti.clone().expect("the receipt names its ticket");
-    assert!(std::str::from_utf8(&xml).unwrap().contains("frm1701q:txtTIN3=453"));
-
     // The Gatekeeper kept only the envelope, and dropped it after the send.
     let (status, envelope, ticket_jti): (String, Option<String>, Option<uuid::Uuid>) =
         sqlx::query_as("SELECT status, envelope, ticket_jti FROM submissions WHERE account_id = $1")
@@ -107,7 +98,19 @@ async fn a_queued_1701q_is_sent_through_the_gatekeeper_and_sender() {
             .unwrap();
     assert_eq!(status, "sent");
     assert_eq!(envelope, None);
-    assert_eq!(ticket_jti.map(|id| id.to_string()), Some(jti));
+    let ticket_jti = ticket_jti.expect("a v2 submission names its ticket").to_string();
+    // The receipt names that same ticket: verified with the jti required.
+    let receipt = submission
+        .submitter()
+        .verify_receipt(&receipt_jws, &xml_sha256, Some(&ticket_jti))
+        .await
+        .expect("receipt verifies for this XML and this ticket");
+    assert_eq!(receipt.jti.as_deref(), Some(ticket_jti.as_str()));
+    assert_eq!(receipt.filename, filename);
+    assert_eq!(receipt.tin, "000-123-453-00000");
+    assert_eq!((receipt.form_type.as_str(), receipt.period.as_str()), ("1701Qv2018", "2026Q1"));
+    assert_eq!(receipt.status, "sent");
+    assert!(std::str::from_utf8(&xml).unwrap().contains("frm1701q:txtTIN3=453"));
     let _ = worker;
     println!("V6 e2e: 1701Q for {TIN} sent; receipt {} verified", receipt.sub);
 }

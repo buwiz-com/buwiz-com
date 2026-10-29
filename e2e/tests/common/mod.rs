@@ -42,6 +42,14 @@ pub const TIN_ROOT: &str = "000123453";
 pub const TIN: &str = "00012345300000";
 pub const EMAIL: &str = "juana@example.com";
 pub const TICKET_SEED: [u8; 32] = [0x11; 32];
+/// The test egress key. The real one is made offline and never on a server.
+pub const EGRESS_SEED: [u8; 32] = [0x55; 32];
+
+/// The base64url public half of `seed`, as an app pins it.
+pub fn egress_public(seed: &[u8; 32]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(seed).verifying_key().as_bytes())
+}
 const SENDER_SECRET: &str = "e2e-sender-secret-0123456789abcdef";
 
 pub type Received = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -239,10 +247,25 @@ async fn fresh_database() -> PgPool {
 }
 
 impl Harness {
+    /// The egress list names the fake dispatcher and the SFTP server.
     pub async fn start() -> Self {
+        Self::start_with(|dispatcher, sftp| vec![format!("127.0.0.1:{dispatcher}"), format!("127.0.0.1:{sftp}")]).await
+    }
+
+    /// `egress` picks the signed list's hosts from the dispatcher and SFTP
+    /// ports.
+    pub async fn start_with(egress: impl FnOnce(u16, u16) -> Vec<String>) -> Self {
         let db = fresh_database().await;
         let (sftp_port, fingerprint, received) = sftp_server().await;
         let dispatcher_port = dispatcher_server("127.0.0.1", sftp_port).await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let egress_list = buwiz_cloud::egress::sign_list(
+            &SigningKey::from_bytes(&EGRESS_SEED),
+            &egress(dispatcher_port, sftp_port),
+            now,
+            now + 3600,
+        )
+        .unwrap();
 
         // The Sender, with fake passphrases and local hosts only.
         let ticket_key = SigningKey::from_bytes(&TICKET_SEED);
@@ -280,6 +303,7 @@ impl Harness {
             document_key: [0x44; 32],
             admin_emails: Vec::new(),
             mail: MailConfig::Log,
+            egress_list: Some(egress_list),
         };
         let state = AppState::new(
             config,
@@ -309,12 +333,12 @@ impl Harness {
         Self { db, base, account_id, ticket_key, received, sender, sftp_port, dispatcher_port }
     }
 
-    /// The app's client config: this server, BIR's hosts plus the two
-    /// local test servers.
+    /// The app's client config: this server, with the test egress key
+    /// pinned through the override.
     pub fn client_config(&self) -> SubmitConfig {
         let mut config = SubmitConfig::new(Some(&self.base));
         config.server_url = self.base.clone();
-        config.allow = config.allow.with("127.0.0.1", self.dispatcher_port).with("127.0.0.1", self.sftp_port);
+        config.egress_keys = vec![egress_public(&EGRESS_SEED)];
         config.device_name = "Juana's laptop".into();
         config
     }
@@ -322,8 +346,12 @@ impl Harness {
     /// Device-flow sign-in with the real client; Juana approves on the
     /// account site (here: straight in the database layer).
     pub async fn signed_in(&self) -> (Submission, SharedStore) {
+        self.signed_in_with(self.client_config()).await
+    }
+
+    pub async fn signed_in_with(&self, config: SubmitConfig) -> (Submission, SharedStore) {
         let store = SharedStore::default();
-        let submission = Submission::with(self.client_config(), Box::new(store.clone()));
+        let submission = Submission::with(config, Box::new(store.clone()));
         let code = submission.start_sign_in().await.expect("device flow starts");
         assert!(code.verification_uri_complete.contains(&code.user_code));
         assert!(

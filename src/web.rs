@@ -19,6 +19,7 @@ use crate::claims::{self, DecideError, DocumentKind, SubmitError, Upload};
 use crate::notice::Notice;
 use crate::oauth;
 use crate::state::AppState;
+use crate::submissions;
 use crate::tin::Tin;
 
 /// Room for the largest claim: two required files and five supporting
@@ -38,6 +39,14 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/me", get(oauth::me))
         .route("/api/auth/logout", post(oauth::logout))
         .route("/api/tax-profiles", get(claims::tax_profiles))
+        // Submission relay.
+        .route(
+            "/api/submissions",
+            post(submissions::create).get(submissions::list).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+        )
+        .route("/api/submissions/{id}", get(submissions::show))
+        .route("/api/submissions/{id}/relay", get(submissions::relay))
+        .route("/.well-known/jwks.json", get(submissions::jwks))
         // Account site forms.
         .route("/auth/email/start", post(email_start))
         .route("/auth/email/verify", post(email_verify))

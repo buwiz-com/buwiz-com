@@ -1387,10 +1387,10 @@
       approveCard(
         r,
         "shield_person",
-        "Allow the Buwiz agent on your account?",
+        "Allow Buwiz to work in the Buwiz app on this computer?",
         [
           h("div", { class: "gs-d mb-1 text-[11px]" }, "Profiles"),
-          h("div", { class: "mb-2" }, "JUAN DELA CRUZ · 123-456-788 · all 4 branches"),
+          h("div", { class: "mb-2" }, "JUAN DELA CRUZ · ***-***-788 · all 4 branches"),
           h("div", { class: "gs-d mb-1 text-[11px]" }, "What it may do"),
           h(
             "div",
@@ -1441,7 +1441,7 @@
       s.then(() => f.login.set(2)).wait(700);
       r.tap(s, f.loginBtn, LIT_LOGIN, () => f.login.set(3));
       s.wait(600)
-        .then(() => r.act(3, "Buwiz asks what the co-worker may do. You choose; publishing to BIR stays off."))
+        .then(() => r.act(3, "The Buwiz app asks what the co-worker may do on this computer. You choose; publishing to BIR stays off."))
         .wait(300)
         .then(() => c.push(allow))
         .wait(1800);
@@ -1449,7 +1449,7 @@
       s.wait(500)
         .then(() => c.push(ai("Connected to Buwiz. I can see 3 tax profiles on your account. What should we work on?")))
         .wait(400);
-      r.end(s, "Installed, logged in with Touch ID, and allowed. Change or end it any time in Buwiz.");
+      r.end(s, "Installed, logged in with Touch ID, and allowed. Publishing to BIR still asks you first.");
     };
     return film(r, STEPS, idleDesktop, ["Buwiz setup", "Weekly bookkeeping"], c);
   }
@@ -1497,7 +1497,7 @@
         h(
           "div",
           { class: "gs-d -mt-0.5 mb-2 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11.5px]" },
-          h("span", { class: "font-mono" }, "TIN 123-456-788"),
+          h("span", { class: "font-mono" }, "TIN ***-***-788"),
           h("span", null, "·"),
           h("span", null, "Mixed income earner"),
           h("span", null, "·"),
@@ -1533,7 +1533,7 @@
         "Dela Cruz Bakeshop · 00001",
         "Branch",
         rows([
-          ["TIN", "123-456-788-00001"],
+          ["TIN", "***-***-788-00001"],
           ["Registered to", "JUAN DELA CRUZ"],
           ["RDO", "047 · East Makati"],
           ["Address", "12 Rizal St., Makati City"],
@@ -1917,7 +1917,7 @@
           ["Period", "October 2026"],
           ["Taxpayer", "JUAN DELA CRUZ"],
           ["Branch", "00001 · Dela Cruz Bakeshop, Makati"],
-          ["TIN", "123-456-788-00001"],
+          ["TIN", "***-***-788-00001"],
           ["Tax due", "₱5,598.60"],
         ]),
         "Submit",
@@ -1977,7 +1977,7 @@
         .then(() => c.push(confirm))
         .wait(2000);
       r.tap(s, f.submitBtn, LIT_SUBMIT, () => f.submitted.set(true));
-      s.wait(300).then(() => r.act(4, "Approved. The return joins the filing queue and Buwiz sends it to BIR."));
+      s.wait(300).then(() => r.act(4, "Approved. The return joins the Buwiz app's filing queue and goes to BIR from your computer."));
       tool(s, r, c, "buwiz", "submit_filing", 900);
       s.then(() => c.push(queued))
         .wait(1300)
@@ -2387,7 +2387,7 @@
         .then(() => {
           f.page.set("receipt");
           f.note.set("Paid ₱5,598.60 · done");
-          r.act(5, "Paid. The receipt goes back to the chat and onto the return in Buwiz.");
+          r.act(5, "Paid on the bank's page. The receipt goes back to the chat and onto the return in Buwiz.");
         })
         .wait(2200)
         .then(() => r.screen.shrink())

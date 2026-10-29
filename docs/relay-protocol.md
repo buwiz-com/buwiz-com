@@ -70,8 +70,10 @@ The app must:
 
 - **Connect only to BIR's hosts**: `birgovph.com:443`, `birgovph.com:80`,
   `ws2.birgovph.com:443`, `ws2.birgovph.com:80` and `ebf2.bir.gov.ph:22`.
-  Hard-code this list and refuse anything else with `refused`. This keeps
-  the server from using a taxpayer's computer as a general proxy.
+  The v1 reference client hard-codes this list and refuses anything else
+  with `refused`. This keeps the server from using a taxpayer's computer as
+  a general proxy. v2 apps take the list from the signed egress list
+  instead (section 5.4) and name no host in their source.
 - Forward bytes unchanged. Never terminate TLS or SSH. Everything the app
   sees is TLS or SSH ciphertext, or the dispatcher's wrapped fields.
 - Keep the socket open until `result`.
@@ -233,9 +235,23 @@ included).
 
 ### 5.4 Relay
 
-Open `relay_path` as in section 2, with the bearer token **and** a device
-signature over `GET` and the path. The frames are those of section 2, and
-the app's allow-list is the same: BIR's hosts and nothing else.
+Before it opens the pipe, the app fetches `GET /.well-known/buwiz-egress.json`:
+a compact JWS (`alg: EdDSA`, `typ: buwiz-egress+jwt`, `kid`) over
+
+```json
+{"hosts": ["host:port", …], "iat": 1767225600, "exp": 1798761600}
+```
+
+It is signed **offline** with the egress key (`buwiz-egress-sign`, see
+[deploy.md](deploy.md)); this server never holds that key and only serves
+the blob in `EGRESS_LIST_JWS` (`503 egress_list_missing` without one). The
+app pins the egress public key, checks signature, `typ` and `exp`, and lets
+the pipe open exactly those `host:port` pairs; anything else is `refused`.
+No valid list means no send, so even a compromised server can't widen
+where an app connects.
+
+Then it opens `relay_path` as in section 2, with the bearer token **and** a
+device signature over `GET` and the path. The frames are those of section 2.
 
 For a v2 submission the Sender, before anything reaches the network:
 
@@ -278,6 +294,7 @@ Gatekeeper (`buwiz-cloud`):
 | `TICKET_SIGNING_KEY` | Base64 32-byte Ed25519 seed that signs tickets. Required on public deployments. |
 | `SENDER_URL` | `http(s)://host:port` of the Sender on the private network. Required on public deployments. |
 | `SENDER_SECRET` | Shared with the Sender, 32+ characters |
+| `EGRESS_LIST_JWS` | The offline-signed egress list served at `/.well-known/buwiz-egress.json` |
 
 Sender (`buwiz-sender`):
 

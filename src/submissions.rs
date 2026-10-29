@@ -238,7 +238,6 @@ struct SpentTicket {
     form_type: String,
     period: String,
     payload_sha256: Vec<u8>,
-    email: String,
 }
 
 /// `POST /api/v2/submissions`: a ticket and the return sealed for the
@@ -261,7 +260,7 @@ pub async fn create_v2(State(state): State<AppState>, signed: Signed<NewSubmissi
     let spent: Option<SpentTicket> = sqlx::query_as(
         "UPDATE tickets SET used_at = now()
          WHERE jti = $1 AND account_id = $2 AND device_id = $3 AND used_at IS NULL AND expires_at > now()
-         RETURNING claim_id, form_type, period, payload_sha256, email",
+         RETURNING claim_id, form_type, period, payload_sha256",
     )
     .bind(claims.jti)
     .bind(bearer.account.id)
@@ -304,7 +303,6 @@ pub async fn create_v2(State(state): State<AppState>, signed: Signed<NewSubmissi
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    let _ = spent.email;
     tracing::info!(submission = %id, jti = %claims.jti, account = %bearer.account.id, "sealed submission stored");
     let view = find(&state.db, bearer.account.id, id).await?.ok_or_else(ApiError::not_found)?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
@@ -415,14 +413,7 @@ async fn run_relay(state: AppState, mut socket: WebSocket, account_id: Uuid, id:
         }
         _ => anyhow::bail!("submission {id} has nothing to send"),
     };
-    let (status, error, receipt) = match bridge(&state, socket, &job).await {
-        Control::Result { status, error, receipt } => {
-            (status, error, receipt.and_then(|r| r.as_str().map(str::to_owned)))
-        }
-        _ => unreachable!("bridge answers a result"),
-    };
-    record(&state.db, id, v2, &status, error.as_deref(), receipt.as_deref()).await?;
-    let _ = (&locked.form_type, &locked.period);
+    bridge(&state, socket, &job, id, v2).await?;
     Ok(())
 }
 
@@ -487,9 +478,20 @@ async fn record(
 /// How long to wait for the Sender's outcome after the app is gone.
 const OUTCOME_WAIT: Duration = Duration::from_secs(60);
 
+/// Records `result`; the app hears it only after that, so the submission
+/// reads the same when it asks.
+async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control) -> anyhow::Result<String> {
+    let Control::Result { status, error, receipt } = result else {
+        anyhow::bail!("not a result");
+    };
+    let receipt = receipt.as_ref().and_then(Value::as_str);
+    record(db, id, v2, status, error.as_deref(), receipt).await?;
+    Ok(serde_json::to_string(result)?)
+}
+
 /// Hands `job` to the Sender and forwards frames between it and the app
-/// until the Sender's `result`, which it also returns.
-async fn bridge(state: &AppState, socket: WebSocket, job: &Job) -> Control {
+/// until the Sender's `result`, which it records, then passes on.
+async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bool) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message as Up;
 
     let (mut app_tx, mut app_rx) = socket.split();
@@ -500,16 +502,19 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job) -> Control {
         Err(error) => {
             tracing::error!(error = ?error, "the Sender is not reachable");
             let result = finish("failed", "the sending service is not reachable; try again later".into());
-            let _ = app_tx.send(Message::Text(serde_json::to_string(&result).expect("json").into())).await;
+            let text = conclude(&state.db, id, v2, &result).await?;
+            let _ = app_tx.send(Message::Text(text.into())).await;
             let _ = app_tx.send(Message::Close(None)).await;
-            return result;
+            return Ok(());
         }
     };
     let (mut up_tx, mut up_rx) = upstream.split();
     if up_tx.send(Up::Text(serde_json::to_string(job).expect("json").into())).await.is_err() {
         let result = finish("failed", "the sending service is not reachable; try again later".into());
-        let _ = app_tx.send(Message::Text(serde_json::to_string(&result).expect("json").into())).await;
-        return result;
+        let text = conclude(&state.db, id, v2, &result).await?;
+        let _ = app_tx.send(Message::Text(text.into())).await;
+        let _ = app_tx.send(Message::Close(None)).await;
+        return Ok(());
     }
     // Streams the Sender asked the app to open, so they can be ended if the
     // app goes away.
@@ -547,14 +552,14 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job) -> Control {
                 Some(Ok(Up::Text(text))) => {
                     match Frame::decode_text(&text) {
                         Some(Frame::Control(Control::Open { stream, .. })) => streams.push(stream),
-                        Some(Frame::Control(outcome @ Control::Result { .. })) => result = Some(outcome),
+                        Some(Frame::Control(outcome @ Control::Result { .. })) => {
+                            result = Some(outcome);
+                            break;
+                        }
                         _ => {}
                     }
                     if !app_gone {
                         let _ = app_tx.send(Message::Text(text.as_str().into())).await;
-                    }
-                    if result.is_some() {
-                        break;
                     }
                 }
                 Some(Ok(Up::Binary(bytes))) => {
@@ -569,14 +574,19 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job) -> Control {
         }
     }
     let _ = up_tx.send(Up::Close(None)).await;
-    let _ = app_tx.send(Message::Close(None)).await;
-    result.unwrap_or_else(|| {
+    let result = result.unwrap_or_else(|| {
         if streams.is_empty() {
             finish("failed", "the sending service stopped before connecting to BIR".into())
         } else {
             finish("unknown", "the send ended without an outcome; BIR may have received this return".into())
         }
-    })
+    });
+    let text = conclude(&state.db, id, v2, &result).await?;
+    if !app_gone {
+        let _ = app_tx.send(Message::Text(text.into())).await;
+    }
+    let _ = app_tx.send(Message::Close(None)).await;
+    Ok(())
 }
 
 /// Key id of a receipt key. See [`jws::key_id`].

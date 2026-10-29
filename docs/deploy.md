@@ -15,6 +15,11 @@ document unreadable.**
 | `DOCUMENT_KEY` | `openssl rand -base64 32` |
 | `RECEIPT_SIGNING_KEY` | `openssl rand -base64 32` |
 | `RESEND_API_KEY`, `MAIL_FROM` | Resend, with buwiz.com verified as the sending domain |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | R2 API token, "Object Read & Write", limited to the `buwiz` and `assets` buckets |
+
+Claim documents live in R2 bucket `buwiz` as `claims/{claim}/{document}`. They
+are encrypted with `DOCUMENT_KEY` before upload, and deleted when the claim is
+decided or withdrawn.
 
 Settings that aren't secret are in `fly.toml` under `[env]`.
 

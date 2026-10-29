@@ -19,6 +19,7 @@ use crate::error::ApiError;
 use crate::notice::Notice;
 use crate::oauth::Bearer;
 use crate::state::AppState;
+use crate::storage::DocumentStore;
 use crate::tin::Tin;
 
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
@@ -95,6 +96,7 @@ fn clean_filename(raw: &str) -> String {
 /// Opens a claim with its files. Errors are messages for the person.
 pub async fn submit(
     db: &PgPool,
+    store: &DocumentStore,
     key: &[u8; 32],
     account_id: Uuid,
     tin: &Tin,
@@ -159,12 +161,45 @@ pub async fn submit(
         }
         other => other?,
     };
+    let mut uploaded = Vec::new();
+    let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
+    let committed = match stored {
+        Ok(()) => tx.commit().await.map_err(SubmitError::from),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = committed {
+        // The rows rolled back; drop the objects that made it to storage.
+        store.delete_all(&uploaded).await;
+        return Err(error);
+    }
+    tracing::info!(%claim_id, %account_id, "tin claim submitted");
+    Ok(claim_id)
+}
+
+async fn store_documents(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    claim_id: Uuid,
+    checked: Vec<(Upload, &'static str)>,
+    uploaded: &mut Vec<String>,
+) -> Result<(), SubmitError> {
     for (upload, content_type) in checked {
         let document_id = Uuid::new_v4();
         let (nonce, ciphertext) = crypto::seal(key, &document_context(claim_id, document_id), &upload.bytes)?;
+        let (in_row, object_key) = match store {
+            DocumentStore::Database => (Some(ciphertext), None),
+            DocumentStore::Objects(objects) => {
+                let object_key = format!("claims/{claim_id}/{document_id}");
+                objects.put(&object_key, ciphertext).await?;
+                uploaded.push(object_key.clone());
+                (None, Some(object_key))
+            }
+        };
         sqlx::query(
-            "INSERT INTO claim_documents (id, claim_id, kind, filename, content_type, size_bytes, sha256, nonce, ciphertext)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO claim_documents
+                 (id, claim_id, kind, filename, content_type, size_bytes, sha256, nonce, ciphertext, object_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(document_id)
         .bind(claim_id)
@@ -174,13 +209,12 @@ pub async fn submit(
         .bind(i32::try_from(upload.bytes.len()).unwrap_or(i32::MAX))
         .bind(crypto::sha256(&upload.bytes))
         .bind(nonce)
-        .bind(ciphertext)
-        .execute(&mut *tx)
+        .bind(in_row)
+        .bind(object_key)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await?;
-    tracing::info!(%claim_id, %account_id, "tin claim submitted");
-    Ok(claim_id)
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -290,7 +324,12 @@ pub struct OpenedDocument {
 }
 
 /// Decrypts one stored document, if its bytes still exist.
-pub async fn open_document(db: &PgPool, key: &[u8; 32], document_id: Uuid) -> anyhow::Result<Option<OpenedDocument>> {
+pub async fn open_document(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    document_id: Uuid,
+) -> anyhow::Result<Option<OpenedDocument>> {
     #[derive(sqlx::FromRow)]
     struct Stored {
         claim_id: Uuid,
@@ -298,15 +337,24 @@ pub async fn open_document(db: &PgPool, key: &[u8; 32], document_id: Uuid) -> an
         content_type: String,
         nonce: Option<Vec<u8>>,
         ciphertext: Option<Vec<u8>>,
+        object_key: Option<String>,
     }
-    let row: Option<Stored> =
-        sqlx::query_as("SELECT claim_id, filename, content_type, nonce, ciphertext FROM claim_documents WHERE id = $1")
-            .bind(document_id)
-            .fetch_optional(db)
-            .await?;
-    let Some(Stored { claim_id, filename, content_type, nonce: Some(nonce), ciphertext: Some(ciphertext) }) = row
-    else {
+    let row: Option<Stored> = sqlx::query_as(
+        "SELECT claim_id, filename, content_type, nonce, ciphertext, object_key FROM claim_documents WHERE id = $1",
+    )
+    .bind(document_id)
+    .fetch_optional(db)
+    .await?;
+    let Some(Stored { claim_id, filename, content_type, nonce: Some(nonce), ciphertext, object_key }) = row else {
         return Ok(None);
+    };
+    let ciphertext = match (ciphertext, object_key, store) {
+        (Some(ciphertext), _, _) => ciphertext,
+        (None, Some(object_key), DocumentStore::Objects(objects)) => match objects.get(&object_key).await? {
+            Some(ciphertext) => ciphertext,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     let bytes = crypto::open(key, &document_context(claim_id, document_id), &nonce, &ciphertext)?;
     Ok(Some(OpenedDocument { filename, content_type, bytes }))
@@ -329,6 +377,7 @@ impl From<sqlx::Error> for DecideError {
 /// Staff approve or reject a pending claim.
 pub async fn decide(
     db: &PgPool,
+    store: &DocumentStore,
     claim_id: Uuid,
     reviewer_id: Uuid,
     approve: bool,
@@ -372,14 +421,15 @@ pub async fn decide(
             other?;
         }
     }
-    purge_documents(&mut tx, claim_id).await?;
+    let objects = purge_documents(&mut tx, claim_id).await?;
     tx.commit().await?;
+    store.delete_all(&objects).await;
     tracing::info!(%claim_id, %reviewer_id, status, "tin claim decided");
     Ok(())
 }
 
 /// The claimant gives up a pending claim.
-pub async fn withdraw(db: &PgPool, claim_id: Uuid, account_id: Uuid) -> sqlx::Result<bool> {
+pub async fn withdraw(db: &PgPool, store: &DocumentStore, claim_id: Uuid, account_id: Uuid) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
     let updated = sqlx::query(
         "UPDATE tin_claims SET status = 'withdrawn', decided_at = now()
@@ -389,22 +439,24 @@ pub async fn withdraw(db: &PgPool, claim_id: Uuid, account_id: Uuid) -> sqlx::Re
     .bind(account_id)
     .execute(&mut *tx)
     .await?;
-    if updated.rows_affected() == 1 {
-        purge_documents(&mut tx, claim_id).await?;
-    }
+    let objects = if updated.rows_affected() == 1 { purge_documents(&mut tx, claim_id).await? } else { Vec::new() };
     tx.commit().await?;
+    store.delete_all(&objects).await;
     Ok(updated.rows_affected() == 1)
 }
 
-async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query(
+/// Marks a claim's documents deleted and returns the object keys to remove
+/// once the transaction commits.
+async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uuid) -> sqlx::Result<Vec<String>> {
+    let keys: Vec<Option<String>> = sqlx::query_scalar(
         "UPDATE claim_documents SET ciphertext = NULL, nonce = NULL, purged_at = now()
-         WHERE claim_id = $1 AND purged_at IS NULL",
+         WHERE claim_id = $1 AND purged_at IS NULL
+         RETURNING object_key",
     )
     .bind(claim_id)
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
-    Ok(())
+    Ok(keys.into_iter().flatten().collect())
 }
 
 /// `GET /api/tax-profiles`: the account's active TINs. The Buwiz apps treat

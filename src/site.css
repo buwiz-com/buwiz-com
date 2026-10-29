@@ -38,3 +38,15 @@ body {
   font: 16px/1.55 "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 a { color: var(--brand); }
+
+/* The Buwiz mark (brand_mark in pages.rs): the SVG is a mask, so the mark
+   takes the brand color of the light or dark theme. */
+.brand-mark {
+  display: inline-block;
+  flex: none;
+  height: var(--mark-h, 28px);
+  aspect-ratio: 316 / 378;
+  background-color: var(--brand);
+  -webkit-mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
+  mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
+}

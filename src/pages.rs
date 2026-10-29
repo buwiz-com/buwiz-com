@@ -20,11 +20,13 @@ use crate::oauth;
 use crate::state::AppState;
 use crate::web::{link, safe_next, session_account};
 
+mod home;
+
 pub fn router(state: AppState) -> Router {
     Router::builder()
         .app_context(state)
         .layout(root_layout)
-        .page(home_page)
+        .page(home::home_page)
         .page(login_page)
         .page(signup_page)
         .page(verify_page)
@@ -114,40 +116,6 @@ async fn notice_banner(notice: Option<Notice>) -> Result<impl View> {
         if let Some(notice) = notice {
             <p class=(if notice.is_error() { "notice error" } else { "notice" }) role="status">(notice.message())</p>
         }
-    })
-}
-
-#[page("/")]
-async fn home_page() -> Result<impl View> {
-    Ok(view! {
-        <main>
-            <section class="hero">
-                <h1>"File BIR returns without the queue."</h1>
-                <p class="lead">
-                    "Buwiz prepares, checks and sends your BIR returns from your own computer. "
-                    "Add your TIN once, and every filing after that takes minutes."
-                </p>
-                <div class="actions">
-                    <a class="button" href="/signup">"Create a free account"</a>
-                    <a class="button secondary" href="/login">"Sign in"</a>
-                </div>
-            </section>
-            <h2>"How it works"</h2>
-            <div class="steps">
-                <div class="card">
-                    <strong>"1. Create an account"</strong>
-                    <p class="muted">"Sign in with a code sent to your email. No password to remember."</p>
-                </div>
-                <div class="card">
-                    <strong>"2. Activate your TIN"</strong>
-                    <p class="muted">"Upload your BIR Form 2303 and a government ID. We check that the TIN is yours."</p>
-                </div>
-                <div class="card">
-                    <strong>"3. File from the Buwiz app"</strong>
-                    <p class="muted">"Fill in the form, see penalties before they happen, and send it to BIR."</p>
-                </div>
-            </div>
-        </main>
     })
 }
 

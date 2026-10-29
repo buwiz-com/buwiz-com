@@ -33,6 +33,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/site.css", get(stylesheet))
+        .route("/assets/home.css", get(home_stylesheet))
+        .route("/assets/screens/{name}", get(screenshot))
         // Desktop app sign-in (device flow) and tokens.
         .route("/auth/device/start", post(oauth::device_start))
         .route("/oauth/device/code", post(oauth::device_start))
@@ -75,10 +77,45 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
 }
 
 async fn stylesheet() -> Response {
-    let mut response = include_str!("site.css").into_response();
+    css(include_str!("site.css"))
+}
+
+async fn home_stylesheet() -> Response {
+    css(include_str!("home.css"))
+}
+
+fn css(body: &'static str) -> Response {
+    let mut response = body.into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300"));
+    response
+}
+
+/// Screenshots of the Buwiz app for the home page's tour, light and dark.
+pub(crate) const SCREENSHOTS: &[(&str, &[u8])] = &[
+    ("side_by_side_light.webp", include_bytes!("assets/shell_side_by_side_light.webp")),
+    ("side_by_side_dark.webp", include_bytes!("assets/shell_side_by_side_dark.webp")),
+    ("form_2550q_light.webp", include_bytes!("assets/shell_form_2550q_light.webp")),
+    ("form_2550q_dark.webp", include_bytes!("assets/shell_form_2550q_dark.webp")),
+    ("templates_light.webp", include_bytes!("assets/shell_templates_light.webp")),
+    ("templates_dark.webp", include_bytes!("assets/shell_templates_dark.webp")),
+    ("panel_profile_light.webp", include_bytes!("assets/shell_panel_profile_light.webp")),
+    ("panel_profile_dark.webp", include_bytes!("assets/shell_panel_profile_dark.webp")),
+    ("calendar_light.webp", include_bytes!("assets/shell_calendar_light.webp")),
+    ("calendar_dark.webp", include_bytes!("assets/shell_calendar_dark.webp")),
+    ("palette_light.webp", include_bytes!("assets/shell_palette_light.webp")),
+    ("palette_dark.webp", include_bytes!("assets/shell_palette_dark.webp")),
+];
+
+async fn screenshot(Path(name): Path<String>) -> Response {
+    let Some((_, bytes)) = SCREENSHOTS.iter().find(|(known, _)| *known == name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
     response
 }
 

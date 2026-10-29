@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod agents;
 pub mod bir;
+pub mod canonical;
 pub mod claims;
 pub mod config;
 pub mod crypto;
@@ -57,7 +58,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let address = format!("{}:{}", config.host, config.port);
     let state = AppState::new(config, db, relay, receipt_key, documents);
-    let app = web::router(state.clone(), pages::router(state));
+    let app = web::router(state.clone(), pages::router(state)).layer(axum::middleware::from_fn(canonical::bare_domain));
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");

@@ -51,6 +51,32 @@ fn no_app() -> Pipe {
     Pipe::new(out, inbound)
 }
 
+/// A request signed with the device key in `store`, sent as is: answers
+/// the HTTP status and the server's error code.
+async fn raw_signed(
+    harness: &Harness,
+    store: &common::SharedStore,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, String) {
+    let session: Value = serde_json::from_str(&store.get("session").unwrap().unwrap()).unwrap();
+    let key = DeviceKey::from_stored(&store.get("device_key").unwrap().unwrap()).unwrap();
+    let mut request = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{}{path}", harness.base))
+        .bearer_auth(session["access_token"].as_str().unwrap())
+        .header(HEADER_DEVICE, session["device_id"].as_str().unwrap())
+        .header("content-type", "application/json")
+        .body(body.to_vec());
+    for (name, value) in key.sign(method, path, body, device::now(), &device::nonce()) {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap_or_default();
+    (status, body["error"]["code"].as_str().unwrap_or_default().to_owned())
+}
+
 fn server_code(result: Result<Value, ClientError>) -> String {
     match result {
         Err(ClientError::Server { code, .. }) => code,
@@ -247,7 +273,8 @@ async fn an_xml_tin_other_than_the_tickets_is_refused() {
     let (_, _, view) = submit(submitter, &other, &other, "swap").await;
     let ended = submitter.relay(view["relay_path"].as_str().unwrap()).await.unwrap();
     assert!(
-        matches!(&ended, Ended::Result { status, error: Some(error), .. } if status == "failed" && error.contains("TIN")),
+        matches!(&ended, Ended::Result { status, error: Some(error), .. }
+            if status == "failed" && error == "the TIN in the return is not the ticket's TIN"),
         "{ended:?}"
     );
     assert!(harness.received.lock().await.is_empty());
@@ -276,26 +303,89 @@ async fn a_revoked_device_is_refused_everywhere() {
     // Juana removes the device on the account site.
     assert!(buwiz_cloud::devices::revoke(&harness.db, harness.account_id, device_id).await.unwrap());
 
-    // Its stored submission can no longer be relayed...
-    let relay = submitter.relay(view["relay_path"].as_str().unwrap()).await;
-    assert!(matches!(relay, Err(_)), "{relay:?}");
+    // Its stored submission can no longer be relayed: its sign-in is over.
+    let relay_path = view["relay_path"].as_str().unwrap();
+    assert_eq!(raw_signed(&harness, &store, "GET", relay_path, b"").await, (401, "invalid_token".to_owned()));
+    let relay = submitter.relay(relay_path).await;
+    assert!(matches!(&relay, Err(ClientError::Server { status: 401, .. })), "{relay:?}");
     assert_eq!(harness.submission_status(view["id"].as_str().unwrap()).await, "ready");
-    // ...its sign-in is over...
     let me = reqwest::Client::new().get(format!("{}/me", harness.base)).bearer_auth(&token).send().await.unwrap();
     assert_eq!(me.status(), 401);
-    // ...and it gets no ticket, even after refreshing.
+    // It gets no ticket: the token is refused, and so is the refresh.
+    let ticket_request = serde_json::to_vec(&ticket_body(TIN, &body, "revoked-2")).unwrap();
+    assert_eq!(
+        raw_signed(&harness, &store, "POST", "/api/tickets", &ticket_request).await,
+        (401, "invalid_token".to_owned())
+    );
     let ticket = submitter.signed("POST", "/api/tickets", &ticket_body(TIN, &body, "revoked-2")).await;
-    assert!(ticket.is_err(), "{ticket:?}");
+    assert!(matches!(ticket, Err(ClientError::SignedOut)), "{ticket:?}");
     assert!(harness.received.lock().await.is_empty());
 
-    // A device revoked while its sign-in lives on is refused by signature.
+    // A device revoked while its sign-in lives on is refused by its
+    // signature: device_revoked, for tickets and for the relay.
     let (second, second_store) = harness.signed_in().await;
+    let (_, _, second_view) = submit(second.submitter(), &body, &body, "revoked-4").await;
     let session: Value = serde_json::from_str(&second_store.get("session").unwrap().unwrap()).unwrap();
     sqlx::query("UPDATE devices SET revoked_at = now() WHERE id = $1::uuid")
         .bind(session["device_id"].as_str().unwrap())
         .execute(&harness.db)
         .await
         .unwrap();
+    let ticket_request = serde_json::to_vec(&ticket_body(TIN, &body, "revoked-3")).unwrap();
+    assert_eq!(
+        raw_signed(&harness, &second_store, "POST", "/api/tickets", &ticket_request).await,
+        (403, "device_revoked".to_owned())
+    );
+    let second_relay = second_view["relay_path"].as_str().unwrap();
+    assert_eq!(raw_signed(&harness, &second_store, "GET", second_relay, b"").await, (403, "device_revoked".to_owned()));
+    assert_eq!(harness.submission_status(second_view["id"].as_str().unwrap()).await, "ready");
     let refused = second.submitter().signed("POST", "/api/tickets", &ticket_body(TIN, &body, "revoked-3")).await;
     assert!(matches!(&refused, Err(ClientError::Other(message)) if message.contains("removed")), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_list_signed_by_another_key_is_refused_and_the_pipe_opens_nothing() {
+    let harness = Harness::start().await;
+    // A good client stores a sealed return...
+    let (submission, _) = harness.signed_in().await;
+    let body = xml(TIN);
+    let (_, _, view) = submit(submission.submitter(), &body, &body, "egress").await;
+
+    // ...but an app that pins another egress key trusts no list this
+    // server serves: it sends nothing and opens no pipe.
+    let mut config = harness.client_config();
+    config.egress_keys = vec![common::egress_public(&[0x66; 32])];
+    let (stranger, _) = harness.signed_in_with(config).await;
+    let refused = stranger.submitter().send(&format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"), &body).await;
+    assert_eq!(
+        refused.err(),
+        Some(bir_submit::SendError::NotSent(
+            "Can't send: the server's egress list is not signed by a pinned key.".into()
+        ))
+    );
+    let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();
+    assert_eq!(tickets, 1, "no ticket was spent on the refused send");
+    let relay = stranger.submitter().relay(view["relay_path"].as_str().unwrap()).await;
+    assert!(
+        matches!(&relay, Err(ClientError::Other(message)) if message.contains("not signed by a pinned key")),
+        "{relay:?}"
+    );
+    assert_eq!(harness.submission_status(view["id"].as_str().unwrap()).await, "ready", "the relay never opened");
+    assert!(harness.received.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_host_off_the_signed_list_is_refused() {
+    // The list names the dispatcher but not the SFTP server.
+    let harness = Harness::start_with(|dispatcher, _| vec![format!("127.0.0.1:{dispatcher}")]).await;
+    let (submission, _) = harness.signed_in().await;
+    let body = xml(TIN);
+    let (_, _, view) = submit(submission.submitter(), &body, &body, "off-list").await;
+    let ended = submission.submitter().relay(view["relay_path"].as_str().unwrap()).await.unwrap();
+    assert!(
+        matches!(&ended, Ended::Result { status, error: Some(error), .. }
+            if status == "failed" && error.contains("is not on the signed egress list")),
+        "{ended:?}"
+    );
+    assert!(harness.received.lock().await.is_empty());
 }

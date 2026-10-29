@@ -15,6 +15,7 @@ pub mod notice;
 pub mod oauth;
 pub mod pages;
 pub mod relay;
+pub mod staff;
 pub mod state;
 pub mod storage;
 pub mod submissions;

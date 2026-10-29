@@ -6,6 +6,7 @@ use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::bir;
+use crate::storage::{DocumentStore, ObjectStore};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -166,6 +167,25 @@ fn lab_server(raw: &str) -> anyhow::Result<bir::LabServer> {
         username: username.to_owned(),
         password: Zeroizing::new(password.to_owned()),
     })
+}
+
+/// Where claim documents go: object storage when `S3_ENDPOINT` is set
+/// (required on a public deployment), otherwise Postgres.
+pub fn document_store(public: bool) -> anyhow::Result<DocumentStore> {
+    let Some(endpoint) = std::env::var("S3_ENDPOINT").ok().filter(|value| !value.is_empty()) else {
+        if public {
+            bail!("S3_ENDPOINT and the other S3_* settings are required on a public deployment");
+        }
+        return Ok(DocumentStore::Database);
+    };
+    let store = ObjectStore::new(
+        &endpoint,
+        &var_or("S3_REGION", "auto"),
+        &required("S3_BUCKET")?,
+        &required("S3_ACCESS_KEY_ID")?,
+        &required("S3_SECRET_ACCESS_KEY")?,
+    )?;
+    Ok(DocumentStore::Objects(Box::new(store)))
 }
 
 /// Ed25519 key that signs receipts (`RECEIPT_SIGNING_KEY`, a base64 32-byte

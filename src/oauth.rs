@@ -155,7 +155,7 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
-            let tokens = issue_grant(&mut tx, account_id, client_id).await?;
+            let tokens = issue_grant(&mut tx, account_id, client_id, SCOPE_APP).await?;
             tx.commit().await?;
             return Ok(tokens);
         }
@@ -208,29 +208,41 @@ pub async fn pending_device(db: &PgPool, user_code: &str) -> sqlx::Result<Option
     .await
 }
 
+/// What a token may do. The Buwiz apps get `app`; AI agents get `mcp`,
+/// which reads but never files.
+pub const SCOPE_APP: &str = "app";
+pub const SCOPE_MCP: &str = "mcp";
+
 #[derive(Serialize)]
 pub struct TokenResponse {
     access_token: String,
     token_type: &'static str,
     expires_in: i64,
     refresh_token: String,
+    scope: String,
 }
 
-async fn issue_grant(
+pub(crate) async fn issue_grant(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
     client_id: &str,
+    scope: &str,
 ) -> sqlx::Result<TokenResponse> {
     let grant_id: Uuid =
-        sqlx::query_scalar("INSERT INTO oauth_grants (account_id, client_id) VALUES ($1, $2) RETURNING id")
+        sqlx::query_scalar("INSERT INTO oauth_grants (account_id, client_id, scope) VALUES ($1, $2, $3) RETURNING id")
             .bind(account_id)
             .bind(client_id)
+            .bind(scope)
             .fetch_one(&mut **tx)
             .await?;
-    issue_tokens(tx, grant_id).await
+    issue_tokens(tx, grant_id, scope).await
 }
 
-async fn issue_tokens(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, grant_id: Uuid) -> sqlx::Result<TokenResponse> {
+async fn issue_tokens(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    grant_id: Uuid,
+    scope: &str,
+) -> sqlx::Result<TokenResponse> {
     let now = OffsetDateTime::now_utc();
     let access_token = crypto::new_token("bwa_");
     let refresh_token = crypto::new_token("bwr_");
@@ -246,7 +258,13 @@ async fn issue_tokens(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, grant_id: 
         .bind(now + REFRESH_TTL)
         .execute(&mut **tx)
         .await?;
-    Ok(TokenResponse { access_token, token_type: "Bearer", expires_in: ACCESS_TTL.whole_seconds(), refresh_token })
+    Ok(TokenResponse {
+        access_token,
+        token_type: "Bearer",
+        expires_in: ACCESS_TTL.whole_seconds(),
+        refresh_token,
+        scope: scope.to_owned(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -255,10 +273,13 @@ pub struct TokenRequest {
     client_id: String,
     refresh_token: Option<String>,
     device_code: Option<String>,
+    code: Option<String>,
+    redirect_uri: Option<String>,
+    code_verifier: Option<String>,
 }
 
-/// `POST /oauth/token` (form-encoded): `refresh_token` and the RFC 8628
-/// `device_code` grant.
+/// `POST /oauth/token` (form-encoded): `refresh_token`, the RFC 8628
+/// `device_code` grant, and `authorization_code` with PKCE for agents.
 pub async fn token(
     State(state): State<AppState>,
     Form(request): Form<TokenRequest>,
@@ -276,24 +297,38 @@ pub async fn token(
             };
             redeem_device_code(&state.db, &request.client_id, &device_code).await.map(Json)
         }
-        _ => Err(OAuthError::new("unsupported_grant_type", "use refresh_token or device_code").into()),
+        "authorization_code" => {
+            let (Some(code), Some(redirect_uri), Some(verifier)) =
+                (request.code, request.redirect_uri, request.code_verifier)
+            else {
+                return Err(
+                    OAuthError::new("invalid_request", "code, redirect_uri and code_verifier are required").into()
+                );
+            };
+            crate::agents::redeem_code(&state.db, &request.client_id, &code, &redirect_uri, &verifier).await.map(Json)
+        }
+        _ => {
+            Err(OAuthError::new("unsupported_grant_type", "use authorization_code, refresh_token or device_code")
+                .into())
+        }
     }
 }
 
 async fn refresh(db: &PgPool, client_id: &str, refresh_token: &str) -> Result<TokenResponse, OAuthFailure> {
-    known_client(client_id)?;
     let mut tx = db.begin().await?;
     #[derive(sqlx::FromRow)]
     struct Stored {
         token_id: Uuid,
         grant_id: Uuid,
         grant_client: String,
+        scope: String,
         expires_at: OffsetDateTime,
         used_at: Option<OffsetDateTime>,
         revoked_at: Option<OffsetDateTime>,
     }
     let row: Option<Stored> = sqlx::query_as(
-        "SELECT r.id AS token_id, g.id AS grant_id, g.client_id AS grant_client, r.expires_at, r.used_at, g.revoked_at
+        "SELECT r.id AS token_id, g.id AS grant_id, g.client_id AS grant_client, g.scope, r.expires_at, r.used_at,
+                g.revoked_at
          FROM oauth_refresh_tokens r JOIN oauth_grants g ON g.id = r.grant_id
          WHERE r.token_hash = $1 FOR UPDATE OF r, g",
     )
@@ -301,7 +336,7 @@ async fn refresh(db: &PgPool, client_id: &str, refresh_token: &str) -> Result<To
     .fetch_optional(&mut *tx)
     .await?;
     let invalid = || OAuthError::new("invalid_grant", "sign in again").into();
-    let Some(Stored { token_id, grant_id, grant_client, expires_at, used_at, revoked_at }) = row else {
+    let Some(Stored { token_id, grant_id, grant_client, scope, expires_at, used_at, revoked_at }) = row else {
         return Err(invalid());
     };
     if grant_client != client_id || revoked_at.is_some() || expires_at <= OffsetDateTime::now_utc() {
@@ -319,7 +354,7 @@ async fn refresh(db: &PgPool, client_id: &str, refresh_token: &str) -> Result<To
         .bind(token_id)
         .execute(&mut *tx)
         .await?;
-    let tokens = issue_tokens(&mut tx, grant_id).await?;
+    let tokens = issue_tokens(&mut tx, grant_id, &scope).await?;
     tx.commit().await?;
     Ok(tokens)
 }
@@ -341,6 +376,18 @@ async fn revoke_grant(
 pub struct Bearer {
     pub account: Account,
     pub grant_id: Uuid,
+    pub scope: String,
+}
+
+impl Bearer {
+    /// Refuses agent (`mcp`) tokens: only the Buwiz apps may file.
+    pub fn require_app(&self) -> Result<(), ApiError> {
+        if self.scope == SCOPE_APP {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden("insufficient_scope", "AI agents cannot file returns; use the Buwiz app"))
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for Bearer {
@@ -353,8 +400,8 @@ impl FromRequestParts<AppState> for Bearer {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or(ApiError::InvalidToken)?;
-        let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT g.id, a.id, a.email
+        let row: Option<(Uuid, String, Uuid, String)> = sqlx::query_as(
+            "SELECT g.id, g.scope, a.id, a.email
              FROM oauth_access_tokens t
              JOIN oauth_grants g ON g.id = t.grant_id
              JOIN accounts a ON a.id = g.account_id
@@ -363,8 +410,8 @@ impl FromRequestParts<AppState> for Bearer {
         .bind(crypto::hash(token.trim()))
         .fetch_optional(&state.db)
         .await?;
-        let (grant_id, id, email) = row.ok_or(ApiError::InvalidToken)?;
-        Ok(Self { account: Account { id, email }, grant_id })
+        let (grant_id, scope, id, email) = row.ok_or(ApiError::InvalidToken)?;
+        Ok(Self { account: Account { id, email }, grant_id, scope })
     }
 }
 

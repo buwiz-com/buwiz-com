@@ -2,12 +2,14 @@
 //! relay for the Buwiz apps.
 
 pub mod accounts;
+pub mod agents;
 pub mod bir;
 pub mod claims;
 pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod mail;
+pub mod mcp;
 pub mod notice;
 pub mod oauth;
 pub mod pages;

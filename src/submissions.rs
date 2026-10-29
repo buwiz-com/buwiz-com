@@ -92,6 +92,7 @@ pub async fn create(
     bearer: Bearer,
     Json(request): Json<NewSubmission>,
 ) -> Result<Response, ApiError> {
+    bearer.require_app()?;
     let name = parse_filename(&request.filename).map_err(|message| ApiError::bad_request("bad_filename", message))?;
     let xml = request.xml.as_bytes();
     if xml.is_empty() || xml.len() > MAX_XML_BYTES {
@@ -182,7 +183,7 @@ pub struct SubmissionView {
 const VIEW_COLUMNS: &str =
     "id, status, filename, form_type, period, mode, attempts, error, remote_path, receipt_jws, created_at, sent_at";
 
-async fn find(db: &PgPool, account_id: Uuid, id: Uuid) -> sqlx::Result<Option<SubmissionView>> {
+pub async fn find(db: &PgPool, account_id: Uuid, id: Uuid) -> sqlx::Result<Option<SubmissionView>> {
     let view: Option<SubmissionView> =
         sqlx::query_as(&format!("SELECT {VIEW_COLUMNS} FROM submissions WHERE id = $1 AND account_id = $2"))
             .bind(id)
@@ -206,20 +207,23 @@ pub async fn show(
 
 /// `GET /api/submissions`: the 50 newest.
 pub async fn list(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "submissions": recent(&state.db, bearer.account.id).await? })))
+}
+
+pub async fn recent(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<SubmissionView>> {
     let views: Vec<SubmissionView> = sqlx::query_as(&format!(
         "SELECT {VIEW_COLUMNS} FROM submissions WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50"
     ))
-    .bind(bearer.account.id)
-    .fetch_all(&state.db)
+    .bind(account_id)
+    .fetch_all(db)
     .await?;
-    let views: Vec<SubmissionView> = views
+    Ok(views
         .into_iter()
         .map(|mut view| {
             view.relay_path = format!("/api/submissions/{}/relay", view.id);
             view
         })
-        .collect();
-    Ok(Json(json!({ "submissions": views })))
+        .collect())
 }
 
 /// `GET /api/submissions/{id}/relay`: upgrades to the relay pipe.
@@ -229,6 +233,7 @@ pub async fn relay(
     Path(id): Path<Uuid>,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
+    bearer.require_app()?;
     if find(&state.db, bearer.account.id, id).await?.is_none() {
         return Err(ApiError::not_found());
     }

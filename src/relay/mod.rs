@@ -9,6 +9,7 @@
 //! Either side sends `close` when it has no more bytes to write. The server
 //! ends with one `result`. See `docs/relay-protocol.md`.
 
+#[cfg(feature = "bir")]
 pub mod client;
 
 use std::collections::HashMap;
@@ -255,9 +256,9 @@ mod tests {
 
     #[test]
     fn control_messages_use_a_type_tag() {
-        let open = Control::Open { stream: 1, host: "birgovph.com".into(), port: 443 };
+        let open = Control::Open { stream: 1, host: "example.com".into(), port: 443 };
         let json = serde_json::to_string(&open).unwrap();
-        assert_eq!(json, r#"{"type":"open","stream":1,"host":"birgovph.com","port":443}"#);
+        assert_eq!(json, r#"{"type":"open","stream":1,"host":"example.com","port":443}"#);
         assert_eq!(Frame::decode_text(&json), Some(Frame::Control(open)));
         assert_eq!(Frame::decode_text(r#"{"type":"nope"}"#), None);
     }

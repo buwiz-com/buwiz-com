@@ -9,6 +9,7 @@ pub mod claims;
 pub mod config;
 pub mod crypto;
 pub mod devices;
+pub mod egress;
 pub mod envelope;
 pub mod error;
 pub mod jws;

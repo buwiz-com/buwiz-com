@@ -18,6 +18,7 @@ use crate::accounts::{self, Account, CodeError};
 use crate::agents;
 use crate::claims::{self, DecideError, DocumentKind, SubmitError, Upload};
 use crate::devices;
+use crate::egress;
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
@@ -65,6 +66,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
             post(submissions::create_v2).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
         )
         .route("/.well-known/buwiz-hpke.json", get(submissions::hpke_key))
+        .route("/.well-known/buwiz-egress.json", get(egress::list))
         // MCP and OAuth for AI agents.
         .route("/mcp", post(mcp::handle))
         .route("/.well-known/oauth-protected-resource", get(agents::protected_resource))

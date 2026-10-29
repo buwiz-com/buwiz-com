@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 
+use time::{OffsetDateTime, UtcOffset};
 use topcoat::Result;
 use topcoat::context::{Cx, app_context};
 use topcoat::router::error::redirect;
@@ -14,13 +15,15 @@ use uuid::Uuid;
 
 use crate::accounts::Account;
 use crate::agents::{self, AuthorizeProblem};
-use crate::claims::{self, ClaimRow, DocumentKind};
+use crate::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::notice::Notice;
 use crate::oauth;
 use crate::state::AppState;
 use crate::web::{link, safe_next, session_account};
 
 mod home;
+mod staff;
+mod tins;
 
 pub fn router(state: AppState) -> Router {
     Router::builder()
@@ -31,11 +34,14 @@ pub fn router(state: AppState) -> Router {
         .page(signup_page)
         .page(verify_page)
         .page(device_page)
-        .page(account_page)
-        .page(new_tin_page)
-        .page(admin_claims_page)
-        .page(claim_id::admin_claim_page)
         .page(authorize_page)
+        .page(tins::tins_page)
+        .page(tins::new_tin_page)
+        .page(tins::claim_id::fix_page)
+        .page(staff::claims_page)
+        .page(staff::claim_id::claim_page)
+        .page(staff::users_page)
+        .page(staff::account_id::user_page)
         .build()
 }
 
@@ -57,6 +63,16 @@ fn notice(cx: &Cx) -> Option<Notice> {
     query(cx, "notice").and_then(|code| Notice::from_code(&code))
 }
 
+/// The id at the end of the path (`/staff/claims/{id}`), or a 404.
+fn path_id(cx: &Cx, segment_from_end: usize) -> Result<Uuid> {
+    uri(cx)
+        .path()
+        .rsplit('/')
+        .nth(segment_from_end)
+        .and_then(|raw| raw.parse().ok())
+        .ok_or_else(|| topcoat::router::error::not_found().into())
+}
+
 async fn current(cx: &Cx) -> Result<Option<Account>> {
     session_account(state(cx), headers(cx)).await.map_err(fail)
 }
@@ -66,9 +82,19 @@ async fn signed_in(cx: &Cx) -> Result<Account> {
     match current(cx).await? {
         Some(account) => Ok(account),
         None => {
-            let here = uri(cx).path_and_query().map_or("/account", |path| path.as_str()).to_owned();
+            let here = uri(cx).path_and_query().map_or("/tins", |path| path.as_str()).to_owned();
             Err(redirect(link("/login", Some(Notice::SignInFirst), &[("next", &here)])).into())
         }
+    }
+}
+
+/// Staff only; signed-in people who are not get a 404.
+async fn admin(cx: &Cx) -> Result<Account> {
+    let account = signed_in(cx).await?;
+    if state(cx).config.is_admin(&account.email) {
+        Ok(account)
+    } else {
+        Err(topcoat::router::error::not_found().into())
     }
 }
 
@@ -76,6 +102,9 @@ async fn signed_in(cx: &Cx) -> Result<Account> {
 async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let account = current(cx).await?;
     let admin = account.as_ref().is_some_and(|account| state(cx).config.is_admin(&account.email));
+    let path = uri(cx).path().to_owned();
+    let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
+    let waiting = if staff_area { crate::staff::open_counts(&state(cx).db).await?.0 } else { 0 };
     Ok(view! {
         <!DOCTYPE html>
         <html lang="en">
@@ -84,55 +113,133 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>"Buwiz"</title>
                 <link rel="stylesheet" href="/assets/site.css">
+                brand_styles()
+                <link rel="stylesheet" href="/assets/account.css">
+                // Not deferred: it marks the page as scripted before the
+                // first paint, then sets itself up once the page is parsed.
+                <script src="/assets/account.js"></script>
             </head>
             <body>
-                <header class="site">
-                    <a class="brand" href="/">
-                        <picture>
-                            <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
-                            <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="24" height="24">
-                        </picture>
-                        "Buwiz"
-                    </a>
-                    <nav>
-                        if let Some(account) = &account {
-                            <a href="/account">"My TINs"</a>
-                            if admin {
-                                <a href="/admin/claims">"Review claims"</a>
-                            }
-                            <span class="muted">(account.email.clone())</span>
-                            <form method="post" action="/logout">
-                                <button class="link" type="submit">"Sign out"</button>
-                            </form>
-                        } else {
-                            <a href="/login">"Sign in"</a>
-                            <a class="button" href="/signup">"Create account"</a>
-                        }
-                    </nav>
-                </header>
+                if staff_area {
+                    staff_header(account: account.clone().expect("staff are signed in"), path: path.clone(), waiting: waiting)
+                } else {
+                    site_header(account: account.clone(), admin: admin, path: path.clone())
+                }
                 (slot)
             </body>
         </html>
     })
 }
 
+/// Two letters for an account's avatar, from its email.
+fn initials(email: &str) -> String {
+    email.chars().filter(char::is_ascii_alphanumeric).take(2).collect::<String>().to_uppercase()
+}
+
+/// The light header of the account site.
 #[component]
-async fn notice_banner(notice: Option<Notice>) -> Result<impl View> {
+async fn site_header(account: Option<Account>, admin: bool, path: String) -> Result<impl View> {
+    let on_tins = path.starts_with("/tins");
+    Ok(view! {
+        <header class="home top">
+            <div class="top-in">
+                <a class="top-brand" href="/">
+                    <picture>
+                        <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
+                        <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="28" height="28">
+                    </picture>
+                    <span class="top-name">"Buwiz"</span>
+                </a>
+                if let Some(account) = account {
+                    <nav class="top-nav" aria-label="Account">
+                        <a href="/tins" class=(if on_tins { "on" } else { "" })>"My TINs"</a>
+                    </nav>
+                    account_menu(email: account.email.clone(), admin: admin, staff_area: false)
+                } else {
+                    <nav class="top-nav top-guest" aria-label="Account">
+                        <a class="btn btn-ghost" href="/login">"Sign in"</a>
+                        <a class="btn btn-solid" href="/signup">"Create account"</a>
+                    </nav>
+                }
+            </div>
+        </header>
+    })
+}
+
+/// The dark header of the staff pages.
+#[component]
+async fn staff_header(account: Account, path: String, waiting: i64) -> Result<impl View> {
+    let on_users = path.starts_with("/staff/users");
+    Ok(view! {
+        <header class="home top staff-top">
+            <div class="top-in staff-in">
+                <a class="top-brand" href="/staff">
+                    <span class="staff-logo"><img src="/assets/brand/buwiz_logo_light.webp" alt="" width="24" height="24"></span>
+                    <span class="top-name">"Buwiz"</span>
+                    <span class="staff-tag">"STAFF"</span>
+                </a>
+                <nav class="top-nav" aria-label="Staff">
+                    <a href="/staff" class=(if on_users { "" } else { "on" })>
+                        icon(name: "fact_check")
+                        "Claims"
+                        if waiting > 0 {
+                            <span class="count" aria-label=(format!("{waiting} waiting"))>(waiting.to_string())</span>
+                        }
+                    </a>
+                    <a href="/staff/users" class=(if on_users { "on" } else { "" })>icon(name: "group") "Users"</a>
+                </nav>
+                account_menu(email: account.email.clone(), admin: true, staff_area: true)
+            </div>
+        </header>
+    })
+}
+
+/// The avatar button and its menu. A `<details>`, so it opens without
+/// JavaScript.
+#[component]
+async fn account_menu(email: String, admin: bool, staff_area: bool) -> Result<impl View> {
+    Ok(view! {
+        <details class="top-menu">
+            <summary aria-label=(format!("Account menu for {email}"))>
+                <span class="avatar">(initials(&email))</span>
+                icon(name: "expand_more")
+            </summary>
+            <div class="top-menu-panel">
+                <p class="top-menu-email">(email)</p>
+                if staff_area {
+                    <a href="/tins">icon(name: "badge") "My TINs"</a>
+                } else if admin {
+                    <a href="/staff">icon(name: "shield_person") "Staff"</a>
+                }
+                <form method="post" action="/logout">
+                    <button type="submit">icon(name: "logout") "Sign out"</button>
+                </form>
+            </div>
+        </details>
+    })
+}
+
+/// A notice above a page's content, with an icon for its tone.
+#[component]
+async fn page_notice(notice: Option<Notice>) -> Result<impl View> {
     Ok(view! {
         if let Some(notice) = notice {
-            <p class=(if notice.is_error() { "notice error" } else { "notice" }) role="status">(notice.message())</p>
+            <p class=(if notice.is_error() { "notice-bar error" } else { "notice-bar" }) role="status">
+                icon(name: if notice.is_error() { "error" } else { "check_circle" })
+                <span>(notice.message())</span>
+            </p>
         }
     })
 }
 
-/// The fonts and stylesheet of the home page's look, shared by the sign-in
-/// pages.
+/// The fonts and stylesheet of the home page's look, which every page
+/// shares.
 #[component]
 async fn brand_styles() -> Result<impl View> {
     Ok(view! {
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap">
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=block">
         <link rel="stylesheet" href="/assets/home.css">
     })
@@ -184,7 +291,6 @@ async fn email_form(
     let email = query(cx, "email").unwrap_or_default();
     let switch = link(switch_path, None, &[("next", &next)]);
     Ok(view! {
-        brand_styles()
         <main class="home auth">
             <section class="auth-card">
                 auth_brand()
@@ -255,7 +361,6 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
     let email = query(cx, "email").unwrap_or_default();
     let restart = link("/login", None, &[("next", &next), ("email", &email)]);
     Ok(view! {
-        brand_styles()
         <main class="home auth">
             <section class="auth-card">
                 auth_brand()
@@ -263,10 +368,12 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
                 <h1>"Check your email"</h1>
                 <p class="auth-lead">"We sent a 6-digit code to " <strong>(email.clone())</strong> "."</p>
                 auth_notice(notice: notice(cx))
-                <form class="auth-form" method="post" action="/auth/email/verify">
+                <form class="auth-form" method="post" action="/auth/email/verify" data-code-form="">
                     <input type="hidden" name="next" value=(next.clone())>
                     <input type="hidden" name="email" value=(email.clone())>
-                    <label class="auth-label" for="code">"Code"</label>
+                    <label class="auth-label" for="code">"Verification code"</label>
+                    // One field without JavaScript; account.js splits it
+                    // into six boxes and signs in on the last digit.
                     <input
                         id="code"
                         class="auth-code"
@@ -278,7 +385,9 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
                         placeholder="000000"
                         required=(true)
                         autofocus=(true)
+                        data-code=""
                     >
+                    <p class="auth-hint code-hint" hidden=(true)>icon(name: "bolt") "Paste the whole code or type it. You're signed in as soon as the last digit goes in."</p>
                     <button class="btn btn-solid auth-submit" type="submit">"Sign in" icon(name: "arrow_forward")</button>
                 </form>
                 <form class="auth-resend" method="post" action="/auth/email/start">
@@ -313,7 +422,6 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
     }
     let bad_code = !finished && request.is_none() && !raw_code.is_empty();
     Ok(view! {
-        brand_styles()
         <main class="home auth">
             <section class="auth-card">
                 auth_brand()
@@ -361,7 +469,6 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
 /// An AI agent asks to read the account (OAuth consent).
 #[page("/oauth/authorize")]
 async fn authorize_page(cx: &Cx) -> Result<impl View> {
-    signed_in(cx).await?;
     let params: HashMap<String, String> =
         uri(cx).query().map(|raw| form_urlencoded::parse(raw.as_bytes()).into_owned().collect()).unwrap_or_default();
     let config = &state(cx).config;
@@ -386,250 +493,171 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
     .iter()
     .filter_map(|name| params.get(*name).map(|value| ((*name).to_owned(), value.clone())))
     .collect();
+    let email = signed_in(cx).await?.email;
     Ok(view! {
-        <main>
+        <main class="home auth">
             if let Some(request) = request {
-                <h1>"Allow " (request.client_name.clone()) " to read your Buwiz account?"</h1>
-                <div class="card">
-                    <p>"It will be able to see:"</p>
-                    <ul>
-                        <li>"your active TINs (masked) and registered names"</li>
-                        <li>"your TIN claims and their review status"</li>
-                        <li>"the returns you sent through Buwiz and their receipts"</li>
-                    </ul>
-                    <p><strong>"It cannot file returns or change anything."</strong>" Returns are filed only from the Buwiz app on your computer, after you confirm."</p>
-                    <p class="muted">"After you answer, you go back to " (agents::redirect_host(&request.redirect_uri)) "."</p>
-                    <form method="post" action="/oauth/authorize/decision">
+                <section class="auth-card consent">
+                    <div class="consent-pair" aria-hidden="true">
+                        <span class="consent-app">(request.client_name.chars().next().map(|first| first.to_uppercase().to_string()).unwrap_or_default())</span>
+                        icon(name: "sync_alt")
+                        <span class="consent-buwiz">
+                            <picture>
+                                <source srcset="/assets/brand/buwiz_logo_dark.webp" media="(prefers-color-scheme: dark)">
+                                <img src="/assets/brand/buwiz_logo_light.webp" alt="" width="32" height="32">
+                            </picture>
+                        </span>
+                    </div>
+                    <h1>(request.client_name.clone()) " wants to read your Buwiz account"</h1>
+                    <p class="consent-who">"Signed in as " <strong>(email)</strong></p>
+                    <div class="consent-lists">
+                        <div class="consent-can">
+                            <p class="consent-head">icon(name: "visibility") "It can see"</p>
+                            <ul>
+                                <li>"Your active TINs, with the middle digits hidden"</li>
+                                <li>"Your TIN claims and their review status"</li>
+                                <li>"Returns you sent through Buwiz, and their receipts"</li>
+                            </ul>
+                        </div>
+                        <div class="consent-cannot">
+                            <p class="consent-head">icon(name: "block") "It can't"</p>
+                            <ul>
+                                <li>"File or send a return"</li>
+                                <li>"Change your account or your TINs"</li>
+                                <li>"See your uploaded documents"</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <p class="auth-hint">icon(name: "desktop_windows") "Returns are filed only from the Buwiz app on your computer, after you confirm them there."</p>
+                    <form class="auth-form" method="post" action="/oauth/authorize/decision">
                         for (name, value) in fields {
                             <input type="hidden" name=(name) value=(value)>
                         }
-                        <div class="actions">
-                            <button type="submit" name="decision" value="approve">"Allow"</button>
-                            <button class="secondary" type="submit" name="decision" value="deny">"Deny"</button>
+                        <div class="auth-actions">
+                            <button class="btn btn-ghost" type="submit" name="decision" value="deny">"Deny"</button>
+                            <button class="btn btn-solid" type="submit" name="decision" value="approve">"Allow"</button>
                         </div>
                     </form>
-                </div>
+                    <p class="consent-back">"After you answer, you go back to " <strong>(agents::redirect_host(&request.redirect_uri))</strong></p>
+                </section>
             } else {
-                <h1>"This sign-in request cannot be used"</h1>
-                <p class="notice error">(problem)</p>
-                <p class="muted">"Go back to the AI app and connect to Buwiz again."</p>
+                <section class="auth-card">
+                    auth_brand()
+                    <span class="auth-badge">icon(name: "link_off")</span>
+                    <h1>"This sign-in request cannot be used"</h1>
+                    <p class="auth-notice error" role="status">icon(name: "error") <span>(problem)</span></p>
+                    <p class="auth-lead">"Go back to the AI app and connect to Buwiz again."</p>
+                </section>
             }
+            <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
         </main>
     })
 }
 
-fn status_label(status: &str) -> &'static str {
-    match status {
-        "pending" => "Waiting for review",
-        "approved" => "Active",
-        "rejected" => "Not approved",
-        "withdrawn" => "Withdrawn",
-        _ => "Unknown",
-    }
+/// Times people read are Philippine time (UTC+8, no daylight saving).
+fn local(at: OffsetDateTime) -> OffsetDateTime {
+    at.to_offset(UtcOffset::from_hms(8, 0, 0).expect("valid offset"))
 }
 
-fn date(at: time::OffsetDateTime) -> String {
-    let date = at.date();
+/// `October 29, 2026`
+fn date(at: OffsetDateTime) -> String {
+    let date = local(at).date();
     format!("{} {}, {}", date.month(), date.day(), date.year())
 }
 
-#[page("/account")]
-async fn account_page(cx: &Cx) -> Result<impl View> {
-    let account = signed_in(cx).await?;
-    let claims = claims::for_account(&state(cx).db, account.id).await?;
-    Ok(view! {
-        <main>
-            <h1>"My TINs"</h1>
-            <p class="lead">"A TIN becomes active once we have checked your Form 2303. Active TINs unlock filing in the Buwiz app."</p>
-            notice_banner(notice: notice(cx))
-            <div class="actions">
-                <a class="button" href="/tins/new">"Add a TIN"</a>
-            </div>
-            if claims.is_empty() {
-                <p class="card muted">"No TINs yet. Add one to start filing."</p>
-            } else {
-                <div class="card">
-                    <table>
-                        <thead>
-                            <tr><th>"TIN"</th><th>"Registered name"</th><th>"Sent"</th><th>"Status"</th></tr>
-                        </thead>
-                        <tbody>
-                            for claim in claims {
-                                claim_row(claim: claim)
-                            }
-                        </tbody>
-                    </table>
-                </div>
-            }
-        </main>
-    })
+/// `Oct 29, 2026`
+fn short_date(at: OffsetDateTime) -> String {
+    let date = local(at).date();
+    format!("{:.3} {}, {}", date.month().to_string(), date.day(), date.year())
 }
 
-#[component]
-async fn claim_row(claim: ClaimRow) -> Result<impl View> {
-    let withdraw = format!("/tins/claims/{}/withdraw", claim.id);
-    Ok(view! {
-        <tr>
-            <td>(claim.tin().to_string())</td>
-            <td>(claim.registered_name.clone())</td>
-            <td>(date(claim.created_at))</td>
-            <td>
-                <span class=(format!("status {}", claim.status))>(status_label(&claim.status))</span>
-                if let Some(note) = claim.decision_note.clone() {
-                    <p class="hint">(note)</p>
-                }
-                if claim.status == "pending" {
-                    <form method="post" action=(withdraw)>
-                        <button class="link" type="submit">"Withdraw"</button>
-                    </form>
-                }
-            </td>
-        </tr>
-    })
+/// `Oct 29, 2026 · 4:12 PM`
+fn date_time(at: OffsetDateTime) -> String {
+    let local = local(at);
+    let (hour, minute) = (local.hour(), local.minute());
+    let half = if hour < 12 { "AM" } else { "PM" };
+    let hour = match hour % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    format!("{} · {hour}:{minute:02} {half}", short_date(at))
 }
 
-#[page("/tins/new")]
-async fn new_tin_page(cx: &Cx) -> Result<impl View> {
-    signed_in(cx).await?;
-    Ok(view! {
-        <main>
-            <h1>"Add a TIN"</h1>
-            <p class="lead">"Send us your BIR Form 2303 (Certificate of Registration) and a government ID. A person checks them, usually within one business day."</p>
-            notice_banner(notice: notice(cx))
-            <form class="card" method="post" action="/tins/claims" enctype="multipart/form-data">
-                <label for="tin">"TIN" <span class="hint">" (with branch code if not head office, e.g. 123-456-789-00000)"</span></label>
-                <input id="tin" type="text" name="tin" inputmode="numeric" placeholder="123-456-789-00000" required=(true)>
-                <label for="registered_name">"Registered name" <span class="hint">" (exactly as on Form 2303)"</span></label>
-                <input id="registered_name" type="text" name="registered_name" maxlength="200" required=(true)>
-                <label for="form_2303">"BIR Form 2303" <span class="hint">" (PDF or photo, up to 10 MB)"</span></label>
-                <input id="form_2303" type="file" name="form_2303" accept="application/pdf,image/*" required=(true)>
-                <label for="government_id">"Government ID" <span class="hint">" (passport, driver's license, UMID, PhilSys…)"</span></label>
-                <input id="government_id" type="file" name="government_id" accept="application/pdf,image/*" required=(true)>
-                <label for="supporting">"Other documents" <span class="hint">" (optional, up to 5: e.g. authorization letter, SPA, DTI/SEC papers)"</span></label>
-                <input id="supporting" type="file" name="supporting" accept="application/pdf,image/*" multiple=(true)>
-                <p class="hint">"Your files are encrypted when stored and deleted once your claim is decided."</p>
-                <div class="actions">
-                    <button type="submit">"Send for review"</button>
-                    <a class="button secondary" href="/account">"Cancel"</a>
-                </div>
-            </form>
-        </main>
-    })
-}
-
-/// Staff only; everyone else gets a 404.
-async fn admin(cx: &Cx) -> Result<Account> {
-    let account = signed_in(cx).await?;
-    if state(cx).config.is_admin(&account.email) {
-        Ok(account)
+/// How long ago: `5 minutes`, `2 hours`, `3 days`.
+fn span_since(at: OffsetDateTime) -> String {
+    let elapsed = OffsetDateTime::now_utc() - at;
+    let (count, unit) = if elapsed.whole_days() >= 1 {
+        (elapsed.whole_days(), "day")
+    } else if elapsed.whole_hours() >= 1 {
+        (elapsed.whole_hours(), "hour")
     } else {
-        Err(topcoat::router::error::not_found().into())
+        (elapsed.whole_minutes().max(1), "minute")
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
+/// `2 hours ago`, or `never`.
+fn ago(at: Option<OffsetDateTime>) -> String {
+    match at {
+        Some(at) if OffsetDateTime::now_utc() - at < time::Duration::minutes(1) => "just now".to_owned(),
+        Some(at) => format!("{} ago", span_since(at)),
+        None => "never".to_owned(),
     }
 }
 
-#[page("/admin/claims")]
-async fn admin_claims_page(cx: &Cx) -> Result<impl View> {
-    admin(cx).await?;
-    let claims = claims::pending(&state(cx).db).await?;
+/// A claim's status as people read it: (label, icon, CSS tone).
+fn status_look(status: &str) -> (&'static str, &'static str, &'static str) {
+    match status {
+        "pending" => ("Being checked", "schedule", "waiting"),
+        "needs_fix" => ("Needs a fix", "error", "fix"),
+        "approved" => ("Active", "check_circle", "active"),
+        "rejected" => ("Not approved", "cancel", "rejected"),
+        _ => ("Withdrawn", "undo", "withdrawn"),
+    }
+}
+
+/// A rounded label with an icon.
+#[component]
+async fn pill(label: String, icon_name: &'static str, tone: String) -> Result<impl View> {
     Ok(view! {
-        <main class="wide">
-            <h1>"TIN claims waiting for review"</h1>
-            notice_banner(notice: notice(cx))
-            if claims.is_empty() {
-                <p class="card muted">"Nothing to review."</p>
-            } else {
-                <div class="card">
-                    <table>
-                        <thead>
-                            <tr><th>"TIN"</th><th>"Registered name"</th><th>"Account"</th><th>"Sent"</th></tr>
-                        </thead>
-                        <tbody>
-                            for claim in claims {
-                                <tr>
-                                    <td><a href=(format!("/admin/claims/{}", claim.id))>(claim.tin().to_string())</a></td>
-                                    <td>(claim.registered_name.clone())</td>
-                                    <td>(claim.email.clone())</td>
-                                    <td>(date(claim.created_at))</td>
-                                </tr>
-                            }
-                        </tbody>
-                    </table>
-                </div>
-            }
-        </main>
+        <span class=(format!("tagpill {tone}"))>icon(name: icon_name) (label)</span>
     })
 }
 
-mod claim_id {
+/// Personal or business, as a pill.
+#[component]
+async fn kind_pill(kind: String) -> Result<impl View> {
+    let personal = kind == "personal";
+    Ok(view! {
+        pill(
+            label: ClaimKind::label(&kind).to_owned(),
+            icon_name: if personal { "person" } else { "storefront" },
+            tone: (if personal { "kind-personal" } else { "kind-business" }).to_owned()
+        )
+    })
+}
+
+/// The masked or full TIN in the monospace face.
+#[component]
+async fn tin_text(tin: String) -> Result<impl View> {
+    Ok(view! { <span class="mono tin-number">(tin)</span> })
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
 
-    #[page("/admin/claims/{claim_id}")]
-    pub async fn admin_claim_page(cx: &Cx) -> Result<impl View> {
-        admin(cx).await?;
-        let Ok(claim_id) = uri(cx).path().rsplit('/').next().unwrap_or_default().parse::<Uuid>() else {
-            return Err(topcoat::router::error::not_found().into());
-        };
-        let db = &state(cx).db;
-        let Some(claim) = claims::find(db, claim_id).await? else {
-            return Err(topcoat::router::error::not_found().into());
-        };
-        let documents = claims::documents(db, claim_id).await?;
-        let rivals = claims::rivals(db, &claim).await?;
-        let decide = format!("/admin/claims/{claim_id}/decision");
-        Ok(view! {
-            <main class="wide">
-                <p><a href="/admin/claims">"← All claims"</a></p>
-                <h1>(claim.tin().to_string())</h1>
-                notice_banner(notice: notice(cx))
-                <div class="card">
-                    <p><strong>"Registered name: "</strong>(claim.registered_name.clone())</p>
-                    <p><strong>"Account: "</strong>(claim.email.clone())</p>
-                    <p><strong>"Sent: "</strong>(date(claim.created_at))</p>
-                    <p><strong>"Status: "</strong>(status_label(&claim.status))</p>
-                </div>
-                if !rivals.is_empty() {
-                    <div class="notice error">
-                        <strong>"Other accounts claim this TIN:"</strong>
-                        <ul>
-                            for rival in rivals {
-                                <li>(rival.email.clone()) " — " (status_label(&rival.status)) " since " (date(rival.created_at))</li>
-                            }
-                        </ul>
-                    </div>
-                }
-                <h2>"Documents"</h2>
-                <div class="card">
-                    <table>
-                        <tbody>
-                            for document in documents {
-                                <tr>
-                                    <td>(DocumentKind::label(&document.kind))</td>
-                                    <td>
-                                        if document.purged_at.is_some() {
-                                            <span class="muted">(document.filename.clone()) " (deleted)"</span>
-                                        } else {
-                                            <a href=(format!("/admin/documents/{}", document.id)) target="_blank" rel="noopener">(document.filename.clone())</a>
-                                        }
-                                    </td>
-                                    <td>(format!("{} KB", (document.size_bytes + 1023) / 1024))</td>
-                                </tr>
-                            }
-                        </tbody>
-                    </table>
-                </div>
-                if claim.status == "pending" {
-                    <h2>"Decision"</h2>
-                    <form class="card" method="post" action=(decide)>
-                        <p class="muted">"Check that the TIN, registered name and ID match the Form 2303. Approving makes this account the TIN's only owner."</p>
-                        <label for="note">"Note to the claimant" <span class="hint">" (required when rejecting)"</span></label>
-                        <textarea id="note" name="note" maxlength="500"></textarea>
-                        <div class="actions">
-                            <button type="submit" name="decision" value="approve">"Approve"</button>
-                            <button class="danger" type="submit" name="decision" value="reject">"Reject"</button>
-                        </div>
-                    </form>
-                }
-            </main>
-        })
+    #[test]
+    fn dates_read_in_philippine_time() {
+        let at = OffsetDateTime::from_unix_timestamp(1_793_262_720).unwrap(); // 2026-10-29 08:32 UTC
+        assert_eq!(date(at), "October 29, 2026");
+        assert_eq!(short_date(at), "Oct 29, 2026");
+        assert_eq!(date_time(at), "Oct 29, 2026 · 4:32 PM");
+    }
+
+    #[test]
+    fn avatars_use_two_letters_of_the_email() {
+        assert_eq!(initials("ana@example.com"), "AN");
+        assert_eq!(initials("a.b@example.com"), "AB");
     }
 }

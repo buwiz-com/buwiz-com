@@ -211,7 +211,6 @@ const HERO_STATS: [(&str, &str); 4] = [
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let signed_in = current(cx).await?.is_some();
     Ok(view! {
-        brand_styles()
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600&family=Figtree:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap">
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home">
@@ -232,7 +231,7 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
 async fn account_actions(signed_in: bool) -> Result<impl View> {
     Ok(view! {
         if signed_in {
-            <a class="btn btn-solid" href="/account">icon(name: "badge") "Open My TINs"</a>
+            <a class="btn btn-solid" href="/tins">icon(name: "badge") "Open My TINs"</a>
             <a class="btn btn-ghost" href="/tins/new">"Add a TIN"</a>
         } else {
             <a class="btn btn-solid" href="/signup">icon(name: "person_add") "Create account"</a>

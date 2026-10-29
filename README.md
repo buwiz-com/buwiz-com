@@ -23,6 +23,13 @@ Spin-based `buwiz-server`, keeping only what the apps call.
   - SSH runs end to end through it, with BIR's host key pinned.
   - Each send ends in a signed receipt. See
     [docs/relay-protocol.md](docs/relay-protocol.md).
+- **MCP for AI agents**: `POST /mcp` with four read-only tools: active TINs,
+  TIN claims, sent returns, and one return with its receipt.
+  - Agents find the sign-in through the 401's `WWW-Authenticate` metadata
+    (RFC 9728 / RFC 8414), register themselves (RFC 7591), and sign in
+    with authorization code + PKCE after the person approves on a consent
+    page.
+  - Agent tokens carry the `mcp` scope and can never file a return.
 
 Built with [axum](https://github.com/tokio-rs/axum) for the API and
 [Topcoat](https://github.com/tokio-rs/topcoat) for the account site, on
@@ -69,6 +76,9 @@ account hostname and list the API hostname in `EXTRA_ORIGINS`.
 | `POST /api/submissions`, `GET /api/submissions[/{id}]` | Create and read submissions. |
 | `GET /api/submissions/{id}/relay` (WebSocket) | The relay pipe. See [docs/relay-protocol.md](docs/relay-protocol.md). |
 | `GET /.well-known/jwks.json` | Key that verifies receipts. |
+| `POST /mcp` | MCP (Streamable HTTP, JSON answers). App and agent tokens both work; tools only read. |
+| `GET /.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server` | OAuth discovery for agents. |
+| `POST /oauth/register`, `GET /oauth/authorize` | Agent registration and consent (PKCE S256). |
 
 Browser pages the apps open: `/login?next=…`, `/signup?next=…`,
 `/device?user_code=…`.
@@ -127,8 +137,7 @@ patch) do work under WASIX. Revisit when WASIX tokio catches up.
 
 ## Next
 
-1. MCP endpoint and OAuth for AI agents (PKCE, dynamic client registration).
-2. Port the full marketing home page.
-3. The relay client in buwiz-oss (`bir-submit`), following
+1. Port the full marketing home page.
+2. The relay client in buwiz-oss (`bir-submit`), following
    [docs/relay-protocol.md](docs/relay-protocol.md).
-4. Validate returns with buwiz-oss `bir-core` before sending.
+3. Validate returns with buwiz-oss `bir-core` before sending.

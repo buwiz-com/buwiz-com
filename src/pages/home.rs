@@ -1,7 +1,8 @@
 //! The public home page, ported from the old server's marketing site
-//! (`src/app/marketing` in buwiz-server). It needs no JavaScript: the app
-//! tour switches screens with radio buttons and the FAQ uses `<details>`.
-//! Styles live in `src/home.css`.
+//! (`src/app/marketing` in buwiz-server). The app tour switches screens with
+//! radio buttons and the FAQ uses `<details>`; only the AI Co-worker demos
+//! need JavaScript (`src/demo.js`). Styles live in `src/home.css`, and the
+//! demos' in `src/demo.css`.
 
 use super::*;
 
@@ -86,23 +87,71 @@ const ACCOUNT_STEPS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-/// (tool, title, what it reads)
-const AGENT_TOOLS: [(&str, &str, &str); 4] = [
-    ("list_tax_profiles", "Active TINs", "Your active TINs and what each allows in the Buwiz app."),
-    ("list_tin_claims", "TIN claims", "Every TIN you asked to activate, its review status and the reviewer's note."),
-    (
-        "list_submissions",
-        "Returns sent",
-        "The newest returns sent to BIR through Buwiz: form, period, status and when.",
-    ),
-    ("get_submission", "One return", "A single return you sent, with any error and its signed receipt."),
+/// One self-playing AI Co-worker demo; `film` names the one `/assets/demo.js`
+/// draws into its box.
+struct Demo {
+    film: &'static str,
+    tab: &'static str,
+    eyebrow: &'static str,
+    title: &'static str,
+    lead: &'static str,
+}
+
+/// The demos in filing order.
+const DEMOS: [Demo; 6] = [
+    Demo {
+        film: "connect",
+        tab: "Connect",
+        eyebrow: "CONNECT",
+        title: "Install Buwiz from the chat. Log in with Touch ID.",
+        lead: "Ask your co-worker to install the Buwiz plugin, then say “Log in with Buwiz”. A login card appears in the chat and your saved password fills it with Touch ID. You choose what the co-worker may do on your account.",
+    },
+    Demo {
+        film: "profiles",
+        tab: "Tax profiles",
+        eyebrow: "TAX PROFILES",
+        title: "One TIN, every branch, as live cards.",
+        lead: "A salary, two bakeshops and an apartment: a mixed-income earner keeps them all under one TIN. Ask in plain words and get your branches, the tax year, which branch files which form and what falls due next. Keep any of them as a Mini App.",
+    },
+    Demo {
+        film: "prepare",
+        tab: "Prepare",
+        eyebrow: "PREPARE",
+        title: "One spreadsheet for every branch. A finished form for each.",
+        lead: "Attach the payroll workbook your accountant sent for all your branches. The co-worker reads it, fills one 1601-C per branch, checks each against every official rule and opens them as BIR prints them, for you to review.",
+    },
+    Demo {
+        film: "submit",
+        tab: "Submit",
+        eyebrow: "SUBMIT",
+        title: "Say “submit”. Approve it. It is queued.",
+        lead: "The co-worker checks the form again, asks for permission to publish if you never gave it, and shows you exactly what will be filed. Nothing leaves until you approve.",
+    },
+    Demo {
+        film: "confirm",
+        tab: "Confirmation",
+        eyebrow: "CONFIRMATION",
+        title: "A routine watches your inbox for BIR's confirmation.",
+        lead: "Install Gmail and ask for a routine. Every minute it looks for BIR's confirmation email; when it arrives, the confirmation comes back as a PDF to print or keep.",
+    },
+    Demo {
+        film: "pay",
+        tab: "Pay",
+        eyebrow: "PAY",
+        title: "Paid online through LandBank, with your OK.",
+        lead: "A second routine waits for the confirmation, then opens the bank's payment site on the co-worker's computer and fills in BIR, the form, the period, the ATC and the amount. You log in with Touch ID and approve the amount.",
+    },
 ];
 
 /// (icon, title, body)
 const AGENT_PROMISES: [(&str, &str, &str); 3] = [
-    ("visibility", "Read-only, always", "Agent access can look things up but never change your account."),
-    ("key", "You approve each agent", "An agent signs in only after you allow it on a Buwiz consent page."),
-    ("approval", "Filing stays with you", "Returns are sent from the Buwiz app on your computer, never by an agent."),
+    ("approval", "Asks before it acts", "Filing and paying always wait for your approval, every time."),
+    (
+        "key",
+        "You choose what it may do",
+        "Approve the co-worker on your Buwiz account: which profiles, and which actions.",
+    ),
+    ("link_off", "End it anytime", "Remove the co-worker under Tax profiles, Connected agents, and its access stops."),
 ];
 
 /// (question, answer)
@@ -141,21 +190,22 @@ const TRUST: [(&str, &str); 5] = [
 #[page("/")]
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let signed_in = current(cx).await?.is_some();
-    let mcp_url = format!("{}/mcp", state(cx).config.account_origin);
     Ok(view! {
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap">
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=block">
         <link rel="stylesheet" href="/assets/home.css">
+        <link rel="stylesheet" href="/assets/demo.css">
         <main class="home">
             hero(signed_in: signed_in)
             tour()
             account_section(signed_in: signed_in)
-            agents_section(mcp_url: mcp_url)
+            agents_section()
             faq()
             footer()
         </main>
+        <script src="/assets/demo.js" defer=(true)></script>
     })
 }
 
@@ -352,33 +402,50 @@ async fn account_section(signed_in: bool) -> Result<impl View> {
     })
 }
 
+/// The AI Co-worker demos: a tab per demo (radios, like the tour), each with
+/// its story and an empty box that `/assets/demo.js` draws the app into and
+/// plays while it is on screen.
 #[component]
-async fn agents_section(mcp_url: String) -> Result<impl View> {
+async fn agents_section() -> Result<impl View> {
     Ok(view! {
         <section id="agents" class="section">
             <div class="section-head">
-                <span class="eyebrow">"AI AGENTS"</span>
-                <h2>"Ask your AI agent about your filings."</h2>
+                <span class="eyebrow">icon(name: "smart_toy") "AI Co-worker"</span>
+                <h2>"AI Native Tax Filing"</h2>
                 <p class="section-lead">
-                    "Connect an AI agent that speaks MCP to your Buwiz account. Approve it once and it can look up your active TINs, your TIN claims, the returns you sent and BIR's receipt for each. It only reads: filing stays in the Buwiz app, with you."
+                    "Give the paperwork to an AI Co-worker. It installs Buwiz from the chat, reads your tax profiles, turns your accountant's spreadsheet into a finished BIR form, files it when you approve, watches for BIR's confirmation and pays online. You stay in charge: every step that files or pays waits for your OK."
                 </p>
             </div>
-            <div class="agent-card panel">
-                <div class="agent-url">
-                    <span class="agent-url-label">"MCP server"</span>
-                    <code>(mcp_url)</code>
-                </div>
-                <ul class="agent-tools">
-                    for (tool, title, body) in AGENT_TOOLS {
-                        <li>
-                            <div class="agent-tool-head">
-                                <span class="agent-tool-title">(title)</span>
-                                <code>(tool)</code>
-                            </div>
-                            <p>(body)</p>
-                        </li>
+            <div class="demos">
+                for (i, demo) in DEMOS.iter().enumerate() {
+                    <input
+                        class="demo-radio"
+                        type="radio"
+                        name="demo"
+                        id=(format!("demo-{i}"))
+                        value=(demo.film)
+                        aria-label=(demo.tab)
+                        checked=(i == 0)
+                    >
+                }
+                <div class="demo-tabs">
+                    for (i, demo) in DEMOS.iter().enumerate() {
+                        <label class=(format!("demo-tab demo-tab-{i}")) for=(format!("demo-{i}"))>
+                            <span class="demo-tab-num">(format!("{:02}", i + 1))</span>
+                            (demo.tab)
+                        </label>
                     }
-                </ul>
+                </div>
+                for (i, demo) in DEMOS.iter().enumerate() {
+                    <div class=(format!("demo-panel demo-panel-{i}"))>
+                        <div class="demo-copy">
+                            <span class="eyebrow">(format!("{:02} · {}", i + 1, demo.eyebrow))</span>
+                            <h3>(demo.title)</h3>
+                            <p class="section-lead">(demo.lead)</p>
+                        </div>
+                        <div class="demo" data-film=(demo.film)></div>
+                    </div>
+                }
             </div>
             <div class="promises">
                 for (name, title, body) in AGENT_PROMISES {
@@ -438,8 +505,22 @@ async fn footer() -> Result<impl View> {
 
 #[cfg(test)]
 mod tests {
-    use super::FEATURES;
-    use crate::web::SCREENSHOTS;
+    use super::{DEMOS, FEATURES};
+    use crate::web::{ASSETS, SCREENSHOTS};
+
+    #[test]
+    fn every_demo_is_drawn_and_its_documents_served() {
+        let script = include_str!("../demo.js");
+        for demo in &DEMOS {
+            let film = format!("{}: {}Film,", demo.film, demo.film);
+            assert!(script.contains(&film), "demo.js has no {film}");
+        }
+        let used: Vec<&str> = script.split("\"/assets/").skip(1).filter_map(|rest| rest.split('"').next()).collect();
+        assert!(!used.is_empty());
+        for path in used {
+            assert!(ASSETS.iter().any(|(known, ..)| *known == path), "{path} is not served");
+        }
+    }
 
     #[test]
     fn every_tour_screen_is_served_in_both_themes() {

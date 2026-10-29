@@ -17,11 +17,13 @@ use uuid::Uuid;
 use crate::accounts::{self, Account, CodeError};
 use crate::agents;
 use crate::claims::{self, DecideError, DocumentKind, SubmitError, Upload};
+use crate::devices;
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
 use crate::state::AppState;
 use crate::submissions;
+use crate::tickets;
 use crate::tin::Tin;
 
 /// Room for the largest claim: two required files and five supporting
@@ -54,6 +56,15 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/api/submissions/{id}", get(submissions::show))
         .route("/api/submissions/{id}/relay", get(submissions::relay))
         .route("/.well-known/jwks.json", get(submissions::jwks))
+        // Submission v2: device keys, tickets, sealed returns.
+        .route("/api/devices", post(devices::register).get(devices::list))
+        .route("/api/devices/{id}/revoke", post(devices::revoke_api))
+        .route("/api/tickets", post(tickets::issue))
+        .route(
+            "/api/v2/submissions",
+            post(submissions::create_v2).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+        )
+        .route("/.well-known/buwiz-hpke.json", get(submissions::hpke_key))
         // MCP and OAuth for AI agents.
         .route("/mcp", post(mcp::handle))
         .route("/.well-known/oauth-protected-resource", get(agents::protected_resource))
@@ -68,6 +79,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/device/decision", post(device_decision))
         .route("/tins/claims", post(submit_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
         .route("/tins/claims/{claim_id}/withdraw", post(withdraw_claim))
+        .route("/devices/{device_id}/revoke", post(revoke_device))
         .route("/admin/claims/{claim_id}/decision", post(decide_claim))
         .route("/admin/documents/{document_id}", get(admin_document))
         .fallback(move |request: axum::extract::Request| {
@@ -431,6 +443,21 @@ async fn withdraw_claim(State(state): State<AppState>, headers: HeaderMap, Path(
     match claims::withdraw(&state.db, &state.documents, claim_id, account.id).await {
         Ok(true) => see_other(link("/account", Some(Notice::ClaimWithdrawn), &[])),
         Ok(false) => see_other(link("/account", Some(Notice::AlreadyDecided), &[])),
+        Err(error) => internal(error),
+    }
+}
+
+async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Path(device_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, "/account").await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    match devices::revoke(&state.db, account.id, device_id).await {
+        Ok(true) => see_other(link("/account", Some(Notice::DeviceRevoked), &[])),
+        Ok(false) => see_other(link("/account", None, &[])),
         Err(error) => internal(error),
     }
 }

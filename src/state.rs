@@ -6,33 +6,36 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
-use crate::bir;
 use crate::config::Config;
+use crate::link::SenderLink;
 use crate::mail::Mailer;
 use crate::storage::DocumentStore;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
+/// The Gatekeeper's state. It holds no BIR secret and no HPKE private key:
+/// sends go to the Sender through [`SenderLink`].
 pub struct Inner {
     pub config: Config,
     pub db: PgPool,
     pub mailer: Mailer,
-    pub relay: bir::Settings,
-    pub receipt_key: SigningKey,
     pub documents: DocumentStore,
+    /// Signs tickets.
+    pub ticket_key: SigningKey,
+    pub sender: SenderLink,
 }
 
 impl AppState {
     pub fn new(
         config: Config,
         db: PgPool,
-        relay: bir::Settings,
-        receipt_key: SigningKey,
         documents: DocumentStore,
+        ticket_key: SigningKey,
+        sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone());
-        Self(Arc::new(Inner { config, db, mailer, relay, receipt_key, documents }))
+        Self(Arc::new(Inner { config, db, mailer, documents, ticket_key, sender }))
     }
 }
 

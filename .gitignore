@@ -3,3 +3,5 @@
 *.log
 .env.*
 !.env.example
+e2e/target/
+e2e/Cargo.lock

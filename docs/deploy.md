@@ -54,6 +54,25 @@ reaches it over Fly's private network (`SENDER_URL=http://buwiz-sender.internal:
 The Gatekeeper refuses to start on a public origin without `SENDER_URL`
 and `TICKET_SIGNING_KEY`. See [relay-protocol.md](relay-protocol.md) §6.
 
+## The egress list (human step)
+
+Apps let the relay pipe connect only to the hosts on an egress list signed
+offline with a key this server never holds. Make the key and sign the list
+on a trusted machine, not on Fly:
+
+```sh
+cargo run --release --bin buwiz-egress-sign -- keygen egress.key
+# prints the public key: put it in buwiz-oss crates/bir-submit/src/egress.rs EGRESS_KEYS
+cargo run --release --bin buwiz-egress-sign -- sign egress.key 365 \
+  birgovph.com:443 birgovph.com:80 ws2.birgovph.com:443 ws2.birgovph.com:80 ebf2.bir.gov.ph:22
+# prints the JWS: fly secrets set -a buwiz-cloud EGRESS_LIST_JWS=<it>
+```
+
+Keep `egress.key` offline (password manager or hardware). The list expires
+(here after 365 days); sign a new one before then, or apps stop sending.
+To rotate the key, pin the new public key next to the old in a release
+first, then sign with the new key.
+
 ## Domains
 
 `buwiz.com`, `www.buwiz.com`, `account.buwiz.com` and `api.buwiz.com` have

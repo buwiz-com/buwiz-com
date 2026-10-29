@@ -13,7 +13,8 @@ document unreadable.**
 |---|---|
 | `DATABASE_URL` | Neon connection string (`sslmode=require`) |
 | `DOCUMENT_KEY` | `openssl rand -base64 32` |
-| `RECEIPT_SIGNING_KEY` | `openssl rand -base64 32` |
+| `TICKET_SIGNING_KEY` | `openssl rand -base64 32` |
+| `SENDER_URL`, `SENDER_SECRET` | The Sender's private address (below) and a shared secret, `openssl rand -base64 32` |
 | `RESEND_API_KEY`, `MAIL_FROM` | Resend, with buwiz.com verified as the sending domain |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | R2 API token, "Object Read & Write", limited to the `buwiz` and `assets` buckets |
 
@@ -34,6 +35,53 @@ curl https://buwiz-cloud.fly.dev/healthz
 If Fly's remote builder fails (503, `failed_precondition`), build on your
 machine instead: `fly deploy --local-only`. To change only settings, redeploy
 the last image: `fly deploy --image registry.fly.io/buwiz-cloud:<tag>`.
+
+## The Sender
+
+Submission runs in a second app, `buwiz-sender`, from the same image with
+`CMD ["buwiz-sender"]`, no public IP and no `[http_service]`; the Gatekeeper
+reaches it over Fly's private network (`SENDER_URL=http://buwiz-sender.internal:3009`,
+`SENDER_HOST=::`). Only the Sender gets the BIR secrets:
+
+| Secret (`buwiz-sender`) | |
+|---|---|
+| `SENDER_SECRET` | Same as the Gatekeeper's |
+| `TICKET_PUBLIC_KEYS` | Public half of `TICKET_SIGNING_KEY`, base64url |
+| `SENDER_HPKE_KEY` | `openssl rand -base64 32` (X25519 private key) |
+| `RECEIPT_SIGNING_KEY` | `openssl rand -base64 32` (moves here from the Gatekeeper; keep the old value so old receipts still verify) |
+| `BIR_RELAY_MODE`, `BIR_IAF_PASSPHRASE`, `BIR_DISPATCHER_PASSPHRASE`, `BIR_SSH_HOST_KEYS` | See [relay-protocol.md](relay-protocol.md) §7 |
+
+The Gatekeeper refuses to start on a public origin without `SENDER_URL`
+and `TICKET_SIGNING_KEY`. See [relay-protocol.md](relay-protocol.md) §6.
+
+## The relay trust list (human step)
+
+Apps trust three things only through a list signed offline with a key this
+server never holds: the hosts the relay pipe may open, the Sender's HPKE
+sealing key, and the Sender's receipt key. Make the key and sign the list on
+a trusted machine, not on Fly:
+
+```sh
+cargo run --release --bin buwiz-trust-sign -- keygen trust.key
+# prints the public key: put it in buwiz-oss crates/bir-submit/src/trust.rs TRUST_KEYS
+fly ssh console -a buwiz-sender -C "buwiz-sender public" > sender-keys.json
+cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.json \
+  birgovph.com:443 birgovph.com:80 ws2.birgovph.com:443 ws2.birgovph.com:80 ebf2.bir.gov.ph:22
+# prints the JWS: fly secrets set -a buwiz-cloud TRUST_LIST_JWS=<it>
+```
+
+Keep `trust.key` offline (password manager or hardware). The list expires
+(here after 365 days); sign a new one before then, or apps stop sending.
+
+Rotation, in this order, so no app ever meets a key its list lacks:
+
+1. **Sender keys** (`SENDER_HPKE_KEY`, `RECEIPT_SIGNING_KEY`): print the new
+   Sender's public keys, sign a list with both the old and the new
+   (`sender-keys.json` may be a JSON array of both), deploy that list,
+   *then* switch the Sender to the new keys. Drop the old keys from the list
+   at the next signing, after old receipts no longer need checking.
+2. **The trust key**: pin the new public key next to the old in an app
+   release first, then sign with the new key.
 
 ## Domains
 

@@ -50,6 +50,7 @@ notices! {
     DeviceInvalid = "device_invalid" => error "That code is wrong or has expired. Start the sign-in again in the app.",
     DeviceApproved = "device_approved" => info "Done. Go back to the app; it is signing you in.",
     DeviceDenied = "device_denied" => info "Sign-in declined. The app was not signed in.",
+    DeviceRevoked = "device_revoked" => info "Device removed. It can no longer send returns; sign in again on it to use it.",
     TinDigits = "tin_digits" => error "The TIN must have 9 digits.",
     TinZero = "tin_zero" => error "That TIN is not valid.",
     TinBranch = "tin_branch" => error "The branch code must have 3 or 5 digits (head office is 00000).",

@@ -15,7 +15,9 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::accounts::{self, Account, CodeError};
+use crate::agents;
 use crate::claims::{self, DecideError, DocumentKind, SubmitError, Upload};
+use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
 use crate::state::AppState;
@@ -47,6 +49,13 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/api/submissions/{id}", get(submissions::show))
         .route("/api/submissions/{id}/relay", get(submissions::relay))
         .route("/.well-known/jwks.json", get(submissions::jwks))
+        // MCP and OAuth for AI agents.
+        .route("/mcp", post(mcp::handle))
+        .route("/.well-known/oauth-protected-resource", get(agents::protected_resource))
+        .route("/.well-known/oauth-protected-resource/mcp", get(agents::protected_resource))
+        .route("/.well-known/oauth-authorization-server", get(agents::authorization_server))
+        .route("/oauth/register", post(agents::register))
+        .route("/oauth/authorize/decision", post(agents::decide))
         // Account site forms.
         .route("/auth/email/start", post(email_start))
         .route("/auth/email/verify", post(email_verify))
@@ -95,7 +104,7 @@ pub async fn session_account(state: &AppState, headers: &HeaderMap) -> anyhow::R
 
 /// Form posts must come from our own pages. Browsers send `Origin` on every
 /// POST; `Sec-Fetch-Site` covers the rare case they leave it out.
-fn same_origin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+pub(crate) fn same_origin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let ok = match headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) {
         Some(origin) => state.config.is_own_origin(origin),
         None => headers.get("sec-fetch-site").is_some_and(|value| value == "same-origin"),

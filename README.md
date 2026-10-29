@@ -8,8 +8,9 @@ Spin-based `buwiz-server`, keeping only what the apps call.
 - **TIN activation**: the person uploads BIR Form 2303, a government ID and
   any supporting documents. Staff review each claim by hand. An approved
   claim makes the TIN active, and a TIN has at most one owner. Files are
-  encrypted at rest (AES-256-GCM) and deleted when the claim is decided or
-  withdrawn. Their hashes stay.
+  encrypted (AES-256-GCM) before they are stored, in Cloudflare R2 in
+  production (any S3-compatible store; Postgres in development), and
+  deleted when the claim is decided or withdrawn. Their hashes stay.
 - **App sign-in**: the desktop and mini apps use the OAuth device flow
   (RFC 8628). Refresh tokens rotate, and reusing an old one ends the whole
   sign-in.

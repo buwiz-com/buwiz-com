@@ -140,31 +140,36 @@ impl Pipe {
     pub async fn connect(&self, host: &str, port: u16) -> Result<DuplexStream, PipeError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (opened, waiting) = oneshot::channel();
+        // The stream's inbound queue exists before `open` goes out: bytes the
+        // far end sends as soon as it connects (an SSH banner) may arrive
+        // before, or right after, `opened`, and must not be lost.
+        let (sender, mut from_app) = mpsc::unbounded_channel();
         {
             let mut streams = self.streams.lock().await;
             if streams.gone {
                 return Err(PipeError::Gone);
             }
             streams.pending.insert(id, opened);
+            streams.inbound.insert(id, sender);
         }
         let open = Control::Open { stream: id, host: host.to_owned(), port };
-        self.out.send(Frame::Control(open)).await.map_err(|_| PipeError::Gone)?;
-        match tokio::time::timeout(OPEN_TIMEOUT, waiting).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(reason))) => {
-                return Err(PipeError::Refused { host: host.to_owned(), port, reason });
-            }
-            Ok(Err(_)) => return Err(PipeError::Gone),
-            Err(_) => {
-                self.streams.lock().await.pending.remove(&id);
-                return Err(PipeError::Timeout { host: host.to_owned(), port });
-            }
+        if self.out.send(Frame::Control(open)).await.is_err() {
+            self.forget(id).await;
+            return Err(PipeError::Gone);
+        }
+        let failed = match tokio::time::timeout(OPEN_TIMEOUT, waiting).await {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(reason))) => Some(PipeError::Refused { host: host.to_owned(), port, reason }),
+            Ok(Err(_)) => Some(PipeError::Gone),
+            Err(_) => Some(PipeError::Timeout { host: host.to_owned(), port }),
+        };
+        if let Some(error) = failed {
+            self.forget(id).await;
+            return Err(error);
         }
 
         let (ours, theirs) = tokio::io::duplex(STREAM_BUFFER);
         let (mut from_us, mut to_us) = tokio::io::split(theirs);
-        let (sender, mut from_app) = mpsc::unbounded_channel();
-        self.streams.lock().await.inbound.insert(id, sender);
         // App → us.
         tokio::spawn(async move {
             while let Some(Some(bytes)) = from_app.recv().await {
@@ -192,6 +197,12 @@ impl Pipe {
             let _ = out.send(Frame::Control(Control::Close { stream: id })).await;
         });
         Ok(ours)
+    }
+
+    async fn forget(&self, id: u8) {
+        let mut streams = self.streams.lock().await;
+        streams.pending.remove(&id);
+        streams.inbound.remove(&id);
     }
 
     /// Sends the outcome. The caller then drops the pipe.

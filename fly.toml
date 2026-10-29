@@ -16,7 +16,7 @@ primary_region = "sin"
   # Device sign-in links point at ACCOUNT_ORIGIN. The mini app calls
   # api.buwiz.com; both names and fly.dev serve the same app.
   ACCOUNT_ORIGIN = "https://account.buwiz.com"
-  EXTRA_ORIGINS = "https://api.buwiz.com,https://buwiz-cloud.fly.dev"
+  EXTRA_ORIGINS = "https://buwiz.com,https://api.buwiz.com,https://buwiz-cloud.fly.dev"
   ADMIN_EMAILS = "support@buwiz.com"
   # Claim documents in Cloudflare R2 (keys are secrets).
   S3_ENDPOINT = "https://f1d5007ee46f17d2bd7a1d6cb4402906.r2.cloudflarestorage.com"

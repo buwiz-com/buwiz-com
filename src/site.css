@@ -42,8 +42,19 @@ header.site {
   border-bottom: 1px solid var(--line);
   background: var(--surface);
 }
-header.site .brand { font-weight: 700; font-size: 18px; color: var(--text); text-decoration: none; }
-header.site nav { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+header.site .brand {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text);
+  text-decoration: none;
+}
+header.site .brand img { display: block; width: 24px; height: 24px; object-fit: contain; object-position: bottom; }
+header.site nav { display: flex; align-items: center; justify-content: flex-end; gap: 14px; flex-wrap: wrap; }
+header.site nav > a:not(.button) { text-decoration: none; font-weight: 600; }
 header.site nav form { margin: 0; }
 main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }
 main.wide { max-width: 980px; }
@@ -100,6 +111,7 @@ th { color: var(--muted); font-weight: 600; font-size: 14px; }
 .steps { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .muted { color: var(--muted); }
 @media (max-width: 560px) {
+  header.site nav > .muted { display: none; }
   .hero h1 { font-size: 30px; }
   th:nth-child(3), td:nth-child(3) { display: none; }
 }

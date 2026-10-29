@@ -33,6 +33,11 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/site.css", get(stylesheet))
+        .route("/assets/home.css", get(home_stylesheet))
+        .route("/assets/screens/{name}", get(screenshot))
+        .route("/assets/demo.js", get(demo_script))
+        .route("/assets/demo.css", get(demo_stylesheet))
+        .route("/assets/{dir}/{name}", get(asset))
         // Desktop app sign-in (device flow) and tokens.
         .route("/auth/device/start", post(oauth::device_start))
         .route("/oauth/device/code", post(oauth::device_start))
@@ -75,10 +80,84 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
 }
 
 async fn stylesheet() -> Response {
-    let mut response = include_str!("site.css").into_response();
+    css(include_str!("site.css"))
+}
+
+async fn home_stylesheet() -> Response {
+    css(include_str!("home.css"))
+}
+
+async fn demo_script() -> Response {
+    text(include_str!("demo.js"), "text/javascript; charset=utf-8")
+}
+
+async fn demo_stylesheet() -> Response {
+    css(include_str!("demo.css"))
+}
+
+fn css(body: &'static str) -> Response {
+    text(body, "text/css; charset=utf-8")
+}
+
+fn text(body: &'static str, content_type: &'static str) -> Response {
+    let mut response = body.into_response();
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8"));
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300"));
+    response
+}
+
+/// Other files the pages load: the Buwiz logo, and for the home page's AI
+/// agent demos the two printed 1601-C documents their Computer screen shows
+/// and the font those use. (path under /assets, content type, bytes)
+pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
+    ("brand/buwiz_logo_light.webp", "image/webp", include_bytes!("assets/brand/buwiz_logo_light.webp")),
+    ("brand/buwiz_logo_dark.webp", "image/webp", include_bytes!("assets/brand/buwiz_logo_dark.webp")),
+    ("demo/1601c-october-2026.html", "text/html; charset=utf-8", include_bytes!("assets/demo/1601c-october-2026.html")),
+    (
+        "demo/1601c-october-2026-confirmation.html",
+        "text/html; charset=utf-8",
+        include_bytes!("assets/demo/1601c-october-2026-confirmation.html"),
+    ),
+    ("fonts/tinos-latin-400-normal.woff2", "font/woff2", include_bytes!("assets/fonts/tinos-latin-400-normal.woff2")),
+];
+
+async fn asset(Path((dir, name)): Path<(String, String)>) -> Response {
+    let path = format!("{dir}/{name}");
+    let Some((_, content_type, bytes)) = ASSETS.iter().find(|(known, _, _)| *known == path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+    response
+}
+
+/// Screenshots of the Buwiz app for the home page's tour, light and dark.
+pub(crate) const SCREENSHOTS: &[(&str, &[u8])] = &[
+    ("side_by_side_light.webp", include_bytes!("assets/shell_side_by_side_light.webp")),
+    ("side_by_side_dark.webp", include_bytes!("assets/shell_side_by_side_dark.webp")),
+    ("form_2550q_light.webp", include_bytes!("assets/shell_form_2550q_light.webp")),
+    ("form_2550q_dark.webp", include_bytes!("assets/shell_form_2550q_dark.webp")),
+    ("templates_light.webp", include_bytes!("assets/shell_templates_light.webp")),
+    ("templates_dark.webp", include_bytes!("assets/shell_templates_dark.webp")),
+    ("panel_profile_light.webp", include_bytes!("assets/shell_panel_profile_light.webp")),
+    ("panel_profile_dark.webp", include_bytes!("assets/shell_panel_profile_dark.webp")),
+    ("calendar_light.webp", include_bytes!("assets/shell_calendar_light.webp")),
+    ("calendar_dark.webp", include_bytes!("assets/shell_calendar_dark.webp")),
+    ("palette_light.webp", include_bytes!("assets/shell_palette_light.webp")),
+    ("palette_dark.webp", include_bytes!("assets/shell_palette_dark.webp")),
+];
+
+async fn screenshot(Path(name): Path<String>) -> Response {
+    let Some((_, bytes)) = SCREENSHOTS.iter().find(|(known, _)| *known == name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
     response
 }
 

@@ -1,6 +1,7 @@
 //! The account site, rendered with Topcoat. Pages only read; every change
 //! goes through a form post handled in [`crate::web`].
 
+use std::collections::HashMap;
 use std::fmt::Display;
 
 use topcoat::Result;
@@ -12,6 +13,7 @@ use topcoat::view::{View, component, view};
 use uuid::Uuid;
 
 use crate::accounts::Account;
+use crate::agents::{self, AuthorizeProblem};
 use crate::claims::{self, ClaimRow, DocumentKind};
 use crate::notice::Notice;
 use crate::oauth;
@@ -31,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .page(new_tin_page)
         .page(admin_claims_page)
         .page(claim_id::admin_claim_page)
+        .page(authorize_page)
         .build()
 }
 
@@ -263,6 +266,66 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
                         <button type="submit">"Continue"</button>
                     </div>
                 </form>
+            }
+        </main>
+    })
+}
+
+/// An AI agent asks to read the account (OAuth consent).
+#[page("/oauth/authorize")]
+async fn authorize_page(cx: &Cx) -> Result<impl View> {
+    signed_in(cx).await?;
+    let params: HashMap<String, String> =
+        uri(cx).query().map(|raw| form_urlencoded::parse(raw.as_bytes()).into_owned().collect()).unwrap_or_default();
+    let config = &state(cx).config;
+    let (request, problem) = match agents::check_authorize(&state(cx).db, config, &params).await {
+        Ok(request) => (Some(request), ""),
+        Err(problem @ AuthorizeProblem::Redirect { .. }) => {
+            let location = agents::problem_redirect(&problem, &config.account_origin).expect("redirect problem");
+            return Err(redirect(location).into());
+        }
+        Err(AuthorizeProblem::Untrusted(message)) => (None, message),
+    };
+    let fields: Vec<(String, String)> = [
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "code_challenge",
+        "code_challenge_method",
+        "state",
+        "scope",
+        "resource",
+    ]
+    .iter()
+    .filter_map(|name| params.get(*name).map(|value| ((*name).to_owned(), value.clone())))
+    .collect();
+    Ok(view! {
+        <main>
+            if let Some(request) = request {
+                <h1>"Allow " (request.client_name.clone()) " to read your Buwiz account?"</h1>
+                <div class="card">
+                    <p>"It will be able to see:"</p>
+                    <ul>
+                        <li>"your active TINs and registered names"</li>
+                        <li>"your TIN claims and their review status"</li>
+                        <li>"the returns you sent through Buwiz and their receipts"</li>
+                    </ul>
+                    <p><strong>"It cannot file returns or change anything."</strong>" Filing happens only in the Buwiz app."</p>
+                    <p class="muted">"After you answer, you go back to " (agents::redirect_host(&request.redirect_uri)) ". You can sign the agent out any time by signing out of Buwiz everywhere."</p>
+                    <form method="post" action="/oauth/authorize/decision">
+                        for (name, value) in fields {
+                            <input type="hidden" name=(name) value=(value)>
+                        }
+                        <div class="actions">
+                            <button type="submit" name="decision" value="approve">"Allow"</button>
+                            <button class="secondary" type="submit" name="decision" value="deny">"Deny"</button>
+                        </div>
+                    </form>
+                </div>
+            } else {
+                <h1>"This sign-in request cannot be used"</h1>
+                <p class="notice error">(problem)</p>
+                <p class="muted">"Go back to the AI app and connect to Buwiz again."</p>
             }
         </main>
     })

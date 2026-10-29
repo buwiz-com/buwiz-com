@@ -408,14 +408,19 @@ async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_i
 /// `GET /api/tax-profiles`: the account's active TINs. The Buwiz apps treat
 /// any profile with permissions as a license to use their BIR tools.
 pub async fn tax_profiles(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "profiles": active_profiles(&state.db, bearer.account.id).await? })))
+}
+
+/// The account's active TINs, as `/api/tax-profiles` and MCP show them.
+pub async fn active_profiles(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<Value>> {
     let rows: Vec<(Uuid, String, String, String, OffsetDateTime)> = sqlx::query_as(
         "SELECT id, tin_root, branch_code, registered_name, decided_at FROM tin_claims
          WHERE account_id = $1 AND status = 'approved' ORDER BY decided_at",
     )
-    .bind(bearer.account.id)
-    .fetch_all(&state.db)
+    .bind(account_id)
+    .fetch_all(db)
     .await?;
-    let profiles: Vec<Value> = rows
+    Ok(rows
         .into_iter()
         .map(|(id, root, branch, registered_name, activated_at)| {
             let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
@@ -428,8 +433,7 @@ pub async fn tax_profiles(State(state): State<AppState>, bearer: Bearer) -> Resu
                 "permissions": PROFILE_PERMISSIONS,
             })
         })
-        .collect();
-    Ok(Json(json!({ "profiles": profiles })))
+        .collect())
 }
 
 #[cfg(test)]

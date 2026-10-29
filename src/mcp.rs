@@ -154,7 +154,7 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
     };
     let content = match name {
         "list_tax_profiles" => {
-            json!({ "profiles": claims::active_profiles(&state.db, account_id).await.map_err(internal)? })
+            json!({ "profiles": claims::active_profiles(&state.db, account_id, false).await.map_err(internal)? })
         }
         "list_tin_claims" => {
             let claims = claims::for_account(&state.db, account_id).await.map_err(internal)?;
@@ -162,7 +162,7 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                 .into_iter()
                 .map(|claim| {
                     json!({
-                        "tin": claim.tin().to_string(),
+                        "tin_masked": claim.tin().masked(),
                         "registered_name": claim.registered_name,
                         "status": claim.status,
                         "note": claim.decision_note,

@@ -17,8 +17,11 @@ use crate::crypto;
 use crate::error::{ApiError, OAuthError, OAuthFailure};
 use crate::state::AppState;
 
-/// Public clients allowed to sign in. They hold no secret.
-pub const CLIENTS: &[(&str, &str)] = &[("buwiz-desktop", "Buwiz"), ("buwiz-books", "Buwiz Books")];
+/// Public clients allowed to sign in with the device flow, with the scope
+/// each gets. They hold no secret. Only the BIR app (`app`) may file and
+/// see full TINs.
+pub const CLIENTS: &[(&str, &str, &str)] =
+    &[("buwiz-desktop", "Buwiz", SCOPE_APP), ("buwiz-books", "Buwiz Books", SCOPE_BOOKS)];
 
 const DEVICE_TTL: Duration = Duration::minutes(15);
 const DEVICE_INTERVAL: i32 = 5;
@@ -28,7 +31,11 @@ const REFRESH_TTL: Duration = Duration::days(90);
 const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
 
 pub fn client_name(client_id: &str) -> Option<&'static str> {
-    CLIENTS.iter().find(|(id, _)| *id == client_id).map(|(_, name)| *name)
+    CLIENTS.iter().find(|(id, ..)| *id == client_id).map(|(_, name, _)| *name)
+}
+
+fn client_scope(client_id: &str) -> &'static str {
+    CLIENTS.iter().find(|(id, ..)| *id == client_id).map_or(SCOPE_MCP, |(.., scope)| *scope)
 }
 
 fn known_client(client_id: &str) -> Result<(), OAuthError> {
@@ -155,7 +162,7 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
-            let tokens = issue_grant(&mut tx, account_id, client_id, SCOPE_APP).await?;
+            let tokens = issue_grant(&mut tx, account_id, client_id, client_scope(client_id)).await?;
             tx.commit().await?;
             return Ok(tokens);
         }
@@ -212,6 +219,8 @@ pub async fn pending_device(db: &PgPool, user_code: &str) -> sqlx::Result<Option
 /// which reads but never files.
 pub const SCOPE_APP: &str = "app";
 pub const SCOPE_MCP: &str = "mcp";
+/// Buwiz Books: reads profiles by opaque id; never files or sees TINs.
+pub const SCOPE_BOOKS: &str = "books";
 
 #[derive(Serialize)]
 pub struct TokenResponse {
@@ -380,12 +389,12 @@ pub struct Bearer {
 }
 
 impl Bearer {
-    /// Refuses agent (`mcp`) tokens: only the Buwiz apps may file.
+    /// Refuses every token but the BIR app's: Books and AI agents never file.
     pub fn require_app(&self) -> Result<(), ApiError> {
         if self.scope == SCOPE_APP {
             Ok(())
         } else {
-            Err(ApiError::forbidden("insufficient_scope", "AI agents cannot file returns; use the Buwiz app"))
+            Err(ApiError::forbidden("insufficient_scope", "only the Buwiz BIR app can file returns"))
         }
     }
 }

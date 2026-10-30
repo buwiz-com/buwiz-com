@@ -67,9 +67,9 @@
 /* Headers */
 .top { position: relative; z-index: 10; background: var(--surface); border-bottom: 1px solid var(--line); }
 .top-in {
-  max-width: 1120px;
+  max-width: var(--shell);
   margin: 0 auto;
-  padding: 0 20px;
+  padding: 0 var(--shell-pad);
   min-height: 64px;
   display: flex;
   flex-wrap: wrap;
@@ -77,7 +77,6 @@
   gap: 12px 16px;
 }
 .top-brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); }
-.top-name { font-size: 18px; font-weight: 800; letter-spacing: -0.04em; }
 .top-nav { display: flex; flex-wrap: wrap; gap: 4px; flex: 1 1 auto; min-width: 0; }
 .top-nav a:not(.btn) {
   display: inline-flex;
@@ -184,10 +183,9 @@
 .avatar.huge { width: 64px; height: 64px; font-size: 20px; }
 
 .staff-top { background: #17191b; border-bottom-color: #17191b; color: #eceae4; }
-.staff-top .top-in { max-width: 1360px; }
 .staff-top .top-brand { color: #eceae4; }
-/* The brand green of the dark theme, so the mark reads on the dark bar. */
-.staff-top .brand-mark { background-color: #3fb58f; }
+/* The brand green of the dark theme, so the wordmark reads on the dark bar. */
+.staff-top .brand-wordmark { background-color: #3fb58f; }
 .staff-tag {
   display: inline-flex;
   align-items: center;
@@ -213,10 +211,13 @@
 /* Page frame */
 .page { min-height: calc(100dvh - 64px); padding: 28px 0 64px; }
 .page.staff { padding-top: 22px; background: var(--staff-bg); }
-.page-in { max-width: 1120px; margin: 0 auto; padding: 0 16px; display: flex; flex-direction: column; gap: 24px; }
-@media (min-width: 640px) { .page-in { padding: 0 20px; } .page { padding-top: 36px; } }
-.page-in.narrow { max-width: 1000px; }
-.page-in.staff-in { max-width: 1360px; gap: 20px; }
+.page-in { max-width: var(--shell); margin: 0 auto; padding: 0 var(--shell-pad); display: flex; flex-direction: column; gap: 24px; }
+@media (min-width: 640px) { .page { padding-top: 36px; } }
+/* Staff pages are wider, the add and fix forms narrower; the header
+   above follows (site.css, --shell). */
+.staff-top, .page.staff { --shell: 1360px; }
+.page-in.narrow, body:has(.page-in.narrow) .top { --shell: 1000px; }
+.page-in.staff-in { gap: 20px; }
 .page h1 { font-size: 28px; line-height: 1.15; font-weight: 800; letter-spacing: -0.03em; }
 @media (min-width: 640px) { .page h1 { font-size: 32px; } .page.staff h1 { font-size: 28px; } }
 .page .mono { font-family: var(--mono); }
@@ -904,4 +905,22 @@
 .device-text strong { font-size: 15px; color: var(--text); overflow-wrap: anywhere; }
 .device-row form { margin: 0; }
 .home .btn.device-remove { height: 36px; padding: 0 14px; font-size: 13px; }
+
+/* Confirm dialog (account.js): the site's own, never the browser's. */
+.confirm-dialog { position: fixed; inset: 0; margin: auto; width: min(440px, calc(100vw - 32px)); max-width: none; height: fit-content; max-height: calc(100dvh - 32px); padding: 0; border: 0; background: transparent; color: var(--text); overflow: visible; }
+.confirm-dialog::backdrop { background: rgb(8 10 12 / 0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.confirm-box { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 28px 56px -18px rgba(0, 0, 0, 0.45); }
+.confirm-title { margin: 0; font-family: var(--font-display); font-size: 20px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.25; }
+.confirm-detail { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; }
+.confirm-actions { display: flex; flex-wrap: wrap-reverse; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.confirm-actions .btn { flex: 1 1 140px; max-width: 200px; }
+.home .btn.confirm-danger { background: #c62828; color: #ffffff; }
+.home .btn.confirm-danger:hover { opacity: 0.92; }
+@media (max-width: 420px) { .confirm-actions .btn { max-width: none; } }
+@media (prefers-reduced-motion: no-preference) {
+  .confirm-dialog[open] { animation: confirm-in 0.16s ease-out; }
+  .confirm-dialog[open]::backdrop { animation: confirm-fade 0.16s ease-out; }
+}
+@keyframes confirm-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
+@keyframes confirm-fade { from { opacity: 0; } }
 

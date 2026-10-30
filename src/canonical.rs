@@ -2,6 +2,8 @@
 //! www.buwiz.com/x goes to https://buwiz.com/x, so every page has one
 //! address. The home page lives on the bare domain; the account host's root
 //! is the signed-in dashboard, and the API host's root says what it is.
+//! Only the bare domain is for search engines: everything on the account
+//! and API hosts is sent with `X-Robots-Tag: noindex`.
 
 use std::sync::Arc;
 
@@ -9,7 +11,7 @@ use axum::Json;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use http::header;
+use http::{HeaderValue, header};
 use serde_json::json;
 
 pub async fn bare_domain(request: Request, next: Next) -> Response {
@@ -40,6 +42,22 @@ pub async fn host_roots(State(account_origin): State<Arc<str>>, request: Request
         .into_response(),
         None => next.run(request).await,
     }
+}
+
+/// Asks search engines not to index anything on the account and API hosts.
+pub async fn no_index(request: Request, next: Next) -> Response {
+    let app_host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok()).is_some_and(is_app_host);
+    let mut response = next.run(request).await;
+    if app_host {
+        response.headers_mut().insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    }
+    response
+}
+
+/// The account and API hosts, as opposed to the public site.
+pub fn is_app_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host.starts_with("account.") || host.starts_with("api.")
 }
 
 #[derive(Debug, PartialEq)]
@@ -94,5 +112,13 @@ mod tests {
         assert_eq!(root_for("api.buwiz.com", "/oauth/device/code"), None);
         // A local server keeps the home page at its root.
         assert_eq!(root_for("localhost:3008", "/"), None);
+    }
+
+    #[test]
+    fn only_the_account_and_api_hosts_are_app_hosts() {
+        assert!(is_app_host("account.buwiz.com"));
+        assert!(is_app_host("API.buwiz.com"));
+        assert!(!is_app_host("buwiz.com"));
+        assert!(!is_app_host("localhost:3008"));
     }
 }

@@ -10,7 +10,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Form, Router};
-use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -20,7 +20,7 @@ use crate::agents;
 use crate::canonical::is_app_host;
 use crate::claims::{self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload};
 use crate::devices;
-use crate::downloads::{Arch, Kind, Platform};
+use crate::downloads::{self, Arch, File, Kind, Platform};
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
@@ -316,6 +316,7 @@ async fn download(
     State(state): State<AppState>,
     Path(platform): Path<String>,
     Query(query): Query<DownloadQuery>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
@@ -338,7 +339,7 @@ async fn download(
         Some(kind) => kind.map(Some),
     };
     match kind.and_then(|kind| release.pick(platform, kind, arch)) {
-        Some(file) => found(&file.url),
+        Some(file) => hand_out(&state, &method, &headers, &release.version, file).await,
         None if linux => {
             let (kind, arch) = (kind.flatten().unwrap_or(Kind::Deb), arch.unwrap_or(Arch::X64));
             found(&format!("/download?kind={}&arch={}#linux", kind.name(), arch.name()))
@@ -351,20 +352,36 @@ async fn download(
 /// not kept, to the released install script. While there is none, a
 /// browser goes to the Linux downloads, and anything else (curl) gets a
 /// 404, so a web page is never piped into `sh`.
-async fn install_linux_script(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn install_linux_script(State(state): State<AppState>, method: Method, headers: HeaderMap) -> Response {
     let header = |name| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default();
     if is_app_host(header(header::HOST)) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let release = state.downloads.latest().await;
-    match release.as_deref().and_then(|release| release.pick(Platform::Linux, Some(Kind::Sh), None)) {
-        Some(script) => found(&script.url),
+    let script =
+        release.as_deref().and_then(|release| Some((release, release.pick(Platform::Linux, Some(Kind::Sh), None)?)));
+    match script {
+        Some((release, script)) => hand_out(&state, &method, &headers, &release.version, script).await,
         None if header(header::ACCEPT).contains("text/html") => found("/download#linux"),
         None => {
             (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")], "No Linux install script is released yet.\n")
                 .into_response()
         }
     }
+}
+
+/// Sends the browser on to `file`, counting the download (see
+/// [`downloads::count`]) unless it is a HEAD or a crawler. A count that
+/// fails is logged, never in the way of the download.
+async fn hand_out(state: &AppState, method: &Method, headers: &HeaderMap, version: &str, file: &File) -> Response {
+    let agent = headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    if method != Method::HEAD
+        && downloads::is_download(agent)
+        && let Err(error) = downloads::count(&state.db, version, file).await
+    {
+        tracing::warn!(%error, file = file.name, "could not count a download");
+    }
+    found(&file.url)
 }
 
 /// A 302 the browser does not keep.

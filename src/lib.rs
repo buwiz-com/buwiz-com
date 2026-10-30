@@ -18,6 +18,7 @@ pub mod mail;
 pub mod mcp;
 pub mod notice;
 pub mod oauth;
+pub mod ocr;
 pub mod pages;
 pub mod relay;
 pub mod sender;
@@ -74,6 +75,9 @@ pub async fn run() -> anyhow::Result<()> {
     let address = format!("{}:{}", config.host, config.port);
     let account_origin: std::sync::Arc<str> = config.account_origin.as_str().into();
     let state = AppState::new(config, db, documents, ticket_key, sender);
+    if let Err(error) = ocr::resume(&state).await {
+        tracing::error!(error = ?error, "could not resume document readings");
+    }
     let app = web::router(state.clone(), pages::router(state))
         .layer(axum::middleware::from_fn_with_state(account_origin, canonical::host_roots))
         .layer(axum::middleware::from_fn(canonical::bare_domain));

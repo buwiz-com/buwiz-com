@@ -766,6 +766,12 @@
 .compare-value { font-weight: 600; overflow-wrap: anywhere; }
 .compare-value.unread { color: var(--faint); font-weight: 500; font-style: italic; }
 .compare-mark { color: var(--faint); }
+.compare-mark.good { color: var(--brand); }
+.compare-mark.warn { color: var(--wait-ink); }
+.compare-mark.bad { color: var(--danger); }
+.compare-sure { display: block; color: var(--faint); font-size: 11px; font-weight: 600; }
+.compare-status { display: flex; align-items: center; gap: 6px; color: var(--danger); font-size: 13px; font-weight: 600; }
+.compare-status .icon { font-size: 18px; }
 .checks { display: flex; flex-direction: column; gap: 8px; }
 .checks .flag { align-items: flex-start; gap: 10px; padding: 0; background: none; color: var(--text); font-size: 13.5px; font-weight: 500; line-height: 1.45; }
 .checks .flag .icon { font-size: 20px; }

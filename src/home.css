@@ -533,9 +533,10 @@
 }
 @media (min-width: 768px) { .home .hero-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 .home .hero-stats > div { padding: 18px 20px; background: var(--surface); }
-.home .hero-stats dt { font-family: var(--font-display); font-size: 26px; font-weight: 800; letter-spacing: -0.03em; color: var(--text); }
-@media (min-width: 768px) { .home .hero-stats dt { font-size: 32px; } }
-.home .hero-stats dd { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
+.home .hero-stats dt { display: flex; align-items: center; gap: 10px; font-family: var(--font-display); font-size: 22px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.15; color: var(--text); }
+.home .hero-stats dt .icon { flex: none; width: 36px; height: 36px; display: grid; place-items: center; border-radius: 10px; background: var(--soft); color: var(--brand); font-size: 20px; }
+@media (min-width: 768px) { .home .hero-stats dt { font-size: 24px; } }
+.home .hero-stats dd { margin: 10px 0 0; font-size: 14px; line-height: 1.5; color: var(--muted); }
 
 @keyframes hero-words {
   0%, 18% { transform: translateY(0); }
@@ -555,112 +556,6 @@
 @media (prefers-reduced-motion: reduce) {
   .home .hero-words, .home .float-chip, .home .device-phone, .home .hero-glow::after, .home .ph-toast { animation: none; }
 }
-
-/* One month with Buwiz: the journey card under the hero. */
-.home .month { max-width: var(--shell); margin: 0 auto; padding: 8px var(--shell-pad) 72px; }
-.home .month-label {
-  margin-bottom: 24px;
-  color: var(--faint);
-  font-size: 11px;
-  font-weight: 700;
-  text-align: center;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-}
-.home .month .journey-wrap { margin-top: 0; }
-
-.home .journey-wrap { position: relative; max-width: 1024px; margin: 48px auto 0; }
-@media (min-width: 768px) { .home .journey-wrap { margin-top: 64px; } }
-.home .journey-wrap::before {
-  content: "";
-  position: absolute;
-  inset: -32px -24px;
-  z-index: -1;
-  border-radius: 40px;
-  background: radial-gradient(ellipse at center, var(--soft), transparent 70%);
-  pointer-events: none;
-}
-.home .journey {
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: var(--surface);
-  padding: 12px;
-  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-}
-@media (min-width: 640px) { .home .journey { padding: 16px; } }
-.home .deadline {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin-bottom: 12px;
-  padding: 10px 14px;
-  border-radius: 12px;
-  border: 1px solid rgba(245, 158, 11, 0.3);
-  background: var(--warn-soft);
-  text-align: left;
-}
-.home .deadline-icon { font-size: 20px; color: var(--warn); }
-.home .deadline-text { flex: 1; min-width: 0; }
-.home .deadline-title { font-size: 13px; font-weight: 700; color: var(--text); }
-.home .deadline-sub { font-size: 11.5px; color: var(--muted); }
-.home .deadline-chip {
-  padding: 2px 10px;
-  border-radius: 999px;
-  background: rgba(245, 158, 11, 0.15);
-  color: var(--warn);
-  font-size: 11px;
-  font-weight: 600;
-}
-.home .journey-steps { display: grid; grid-template-columns: 1fr; gap: 12px; }
-@media (min-width: 768px) { .home .journey-steps { grid-template-columns: repeat(3, 1fr); } }
-.home .jstep {
-  display: flex;
-  flex-direction: column;
-  padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--bg);
-  text-align: left;
-  min-width: 0;
-}
-.home .jstep > p { margin-bottom: 8px; font-size: 12px; line-height: 1.4; color: var(--muted); }
-.home .jstep-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; font-weight: 700; color: var(--text); }
-.home .jnum {
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 999px;
-  background: var(--soft);
-  color: var(--brand);
-  font-size: 11px;
-  font-weight: 700;
-}
-.home .jstep-foot { margin-top: auto; }
-.home .jrow {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 0;
-  border-top: 1px solid var(--line);
-  font-size: 12px;
-}
-.home .jrow .mono { color: var(--muted); }
-.home .jcheck { padding: 10px 12px; border-radius: 8px; background: var(--soft); color: var(--brand); }
-.home .jcheck-title { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; }
-.home .jcheck-sub { margin-top: 2px; font-size: 11px; opacity: 0.8; }
-.home .jfile {
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  font-size: 11px;
-  color: var(--muted);
-}
-.home .jfile-title { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-weight: 600; color: var(--text); }
-.home .jfile-title .icon { font-size: 15px; color: var(--brand); }
 
 /* App tour: radios pick the screen; no JavaScript. */
 .home .tour { display: grid; gap: 16px; }

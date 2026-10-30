@@ -6,8 +6,6 @@
 
 use super::*;
 
-const ORUS: &str = "https://orus.bir.gov.ph/";
-
 #[page("/tins")]
 pub async fn tins_page(cx: &Cx) -> Result<impl View> {
     let account = signed_in(cx).await?;
@@ -309,7 +307,7 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                                 checked: false
                             )
                         </fieldset>
-                        <p class="hint-box for-personal">icon(name: "info") <span>"Get the free digital TIN ID from " <a href=(ORUS) target="_blank" rel="noopener">"ORUS"</a> " if you don't have the card. It counts as a government ID."</span></p>
+                        <p class="hint-box for-personal">icon(name: "info") <span>"The TIN ID card and the digital TIN ID from ORUS both work, and either counts as a government ID."</span></p>
                         <p class="hint-box for-business">icon(name: "info") <span>"If the Form 2303 is in a company's name instead of yours, we'll also ask for proof you can act for it."</span></p>
                         <div class="step-actions">
                             <a class="btn btn-ghost" href="/tins">"Cancel"</a>
@@ -376,51 +374,69 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
 
                     <section class="addtin-step" data-step="3">
                         progress(step: 3, label: "Documents", rest: "Almost done")
-                        <div class="for-personal">
+                        <div class="docs for-personal">
                             <div class="step-head">
                                 kind_pill(kind: "personal".to_owned())
                                 <h2 class="step-title">"Upload your TIN ID"</h2>
-                                <p class="page-lead">"One photo or file. The card or the digital TIN ID both work. A selfie or your National ID makes the check stronger."</p>
+                                <p class="page-lead">"One photo or file is all we need. A person checks it, usually within one business day."</p>
                             </div>
-                            <div class="slots-split">
-                                file_slot(field: "tin_id", title: "Your TIN ID", hint: "The card, or the digital TIN ID file from ORUS. PDF or photo, up to 10 MB.", icon_name: "badge", required: true)
-                                <aside class="panel tips">
-                                    <p class="tips-title">"A good photo"</p>
-                                    <p>icon(name: "crop_free") "All four corners in the frame"</p>
-                                    <p>icon(name: "light_mode") "No glare over the name or TIN"</p>
-                                    <p>icon(name: "picture_as_pdf") "The digital TIN ID file from ORUS works as is"</p>
-                                    <p class="tips-orus">"No TIN ID yet? " <a href=(ORUS) target="_blank" rel="noopener">"Get the free digital one from ORUS"</a></p>
-                                </aside>
-                            </div>
-                            <p class="slots-label">"Make the check stronger"</p>
-                            <div class="slots-pair">
-                                file_slot(field: "selfie", title: "Add a selfie", hint: "Face the camera in good light. We compare it with the photo on your TIN ID.", icon_name: "face", selfie: true)
-                                file_slot(field: "national_id", title: "Add your National ID", hint: "A photo of your PhilSys card or ePhilID, with its QR code readable.", icon_name: "id_card")
-                            </div>
-                        </div>
-                        <div class="for-business">
-                            <div class="step-head">
-                                kind_pill(kind: "business".to_owned())
-                                <h2 class="step-title">"Your business papers"</h2>
-                                <p class="page-lead">"A person checks everything, usually within one business day."</p>
-                            </div>
-                            <div class="slots">
-                                file_slot(field: "form_2303", title: "Form 2303", hint: "Your Certificate of Registration. PDF or photo, up to 10 MB.", icon_name: "description", required: true)
-                                file_slot(field: "government_id", title: "Your government ID", hint: "Passport, driver's license, UMID, PhilSys or another ID with your photo.", icon_name: "badge", required: true)
-                                <div class="authority">
-                                    file_slot(field: "authority", title: "Proof you can act for it", hint: "Needed when the Form 2303 is in a company's name rather than yours. Any one of these, naming you:", icon_name: "gavel")
-                                    <p class="chips" aria-label="Accepted proof">
-                                        <span>"Secretary's certificate"</span>
-                                        <span>"Board resolution"</span>
-                                        <span>"Special power of attorney"</span>
-                                    </p>
+                            doc_zone(field: "tin_id", title: "TIN ID", hint: "Card or the digital TIN ID from ORUS", icon_name: "badge", required: true)
+                            <div class="extras">
+                                <div class="extras-head">
+                                    <h3 class="extras-title" id="extras-personal">"Make the check faster " <span class="optional">"(optional)"</span></h3>
+                                    <p class="extras-lead">"A selfie or your National ID helps us confirm the TIN is yours."</p>
+                                </div>
+                                <div class="extra-chips" role="group" aria-labelledby="extras-personal">
+                                    extra_chip(field: "selfie", label: "Selfie", icon_name: "face")
+                                    extra_chip(field: "national_id", label: "National ID", icon_name: "id_card")
+                                </div>
+                                <div class="extra-panels">
+                                    <div class="extra" id="extra-selfie" data-extra="">
+                                        <div class="extra-in">
+                                            doc_zone(field: "selfie", title: "Selfie", hint: "Face the camera in good light", icon_name: "face", selfie: true, extra: true)
+                                        </div>
+                                    </div>
+                                    <div class="extra" id="extra-national_id" data-extra="">
+                                        <div class="extra-in">
+                                            doc_zone(field: "national_id", title: "National ID", hint: "PhilSys card or ePhilID, QR code readable", icon_name: "id_card", extra: true)
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
-                        <details class="panel more-papers">
-                            <summary>"Add other papers " <span class="optional">"(optional: SEC registration, DTI papers, up to 5)"</span></summary>
-                            file_slot(field: "supporting", title: "Other papers", hint: "PDF or photos, up to 10 MB each.", icon_name: "attach_file", multiple: true)
-                        </details>
+                        <div class="docs for-business">
+                            <div class="step-head">
+                                kind_pill(kind: "business".to_owned())
+                                <h2 class="step-title">"Your business papers"</h2>
+                                <p class="page-lead">"Your Form 2303 and a government ID. A person checks them, usually within one business day."</p>
+                            </div>
+                            <div class="zones">
+                                doc_zone(field: "form_2303", title: "Form 2303", hint: "Your BIR Certificate of Registration", icon_name: "description", required: true)
+                                doc_zone(field: "government_id", title: "Government ID", hint: "Passport, driver's license, UMID or another photo ID", icon_name: "badge", required: true)
+                            </div>
+                            <div class="extras">
+                                <div class="extras-head">
+                                    <h3 class="extras-title" id="extras-business">"Make the check faster " <span class="optional">"(optional)"</span></h3>
+                                    <p class="extras-lead">"Proof of authority is needed if the 2303 is in a company's name."</p>
+                                </div>
+                                <div class="extra-chips" role="group" aria-labelledby="extras-business">
+                                    extra_chip(field: "authority", label: "Proof of authority", icon_name: "gavel")
+                                    extra_chip(field: "supporting", label: "Other papers", icon_name: "attach_file")
+                                </div>
+                                <div class="extra-panels">
+                                    <div class="extra" id="extra-authority" data-extra="">
+                                        <div class="extra-in">
+                                            doc_zone(field: "authority", title: "Proof of authority", hint: "Secretary's certificate, board resolution or SPA naming you", icon_name: "gavel", extra: true)
+                                        </div>
+                                    </div>
+                                    <div class="extra" id="extra-supporting" data-extra="">
+                                        <div class="extra-in">
+                                            doc_zone(field: "supporting", title: "Other papers", hint: "SEC registration, DTI papers or anything else that helps", icon_name: "attach_file", multiple: true, extra: true)
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                         <div class="send-bar">
                             <span class="send-what">
                                 <span class="mono" data-echo="tin">"Your TIN"</span>
@@ -428,7 +444,10 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                             </span>
                             <span class="send-buttons">
                                 <button class="btn btn-ghost-dark" type="button" data-back="" hidden=(true)>"Back"</button>
-                                <button class="btn btn-send" type="submit">"Send for review" icon(name: "send")</button>
+                                <button class="btn btn-send" type="submit" data-send="">
+                                    <span data-send-label="">"Send for review"</span>
+                                    icon(name: "send")
+                                </button>
                             </span>
                         </div>
                         <p class="fine">icon(name: "bolt") "You can start preparing returns in the app right away. Sending to the BIR waits for the check."</p>
@@ -437,6 +456,102 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                 </form>
             </div>
         </main>
+    })
+}
+
+/// A document on step 3 of Add a TIN: a `<label>` drop zone around its
+/// file input. Without JavaScript it is a plain labelled file field. With
+/// it (`src/account.js`) the input is visually hidden, a file can be
+/// dropped on the zone, a chosen file shows as a tile with a preview and
+/// Replace and Remove, and `data-required` becomes `required` when the
+/// zone's kind of TIN is picked. `extra` zones open from a chip and can be
+/// closed while empty; the selfie's offers the camera on phones.
+#[component]
+async fn doc_zone(
+    field: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    icon_name: &'static str,
+    #[default] required: bool,
+    #[default] selfie: bool,
+    #[default] multiple: bool,
+    #[default] extra: bool,
+) -> Result<impl View> {
+    let accept = if selfie { "image/*" } else { "image/*,application/pdf" };
+    let formats = match (selfie, multiple) {
+        (true, _) => "JPG or PNG, up to 10 MB",
+        (false, true) => "JPG, PNG or PDF, up to 5 files of 10 MB each",
+        (false, false) => "JPG, PNG or PDF, up to 10 MB",
+    };
+    let hint_id = format!("{field}-hint");
+    let error_id = format!("{field}-error");
+    let described = format!("{hint_id} {error_id}");
+    Ok(view! {
+        <div class="doc" data-doc="" data-title=(title) data-multiple=(if multiple { "true" } else { "false" })>
+            <div class="zone" data-zone="">
+                <label class="zone-drop" for=(field)>
+                    <span class="zone-icon">icon(name: icon_name)</span>
+                    <span class="zone-text">
+                        <span class="zone-title">
+                            (title)
+                            if required {
+                                <span class="slot-tag">"Required"</span>
+                            }
+                        </span>
+                        <span class="zone-hint" id=(hint_id)>
+                            <span>(hint)</span>
+                            <span class="zone-formats">(formats)</span>
+                        </span>
+                    </span>
+                    if !selfie {
+                        <span class="zone-browse" aria-hidden="true">icon(name: "upload") <span>"Browse"</span></span>
+                    }
+                    <input
+                        id=(field)
+                        class="zone-input"
+                        type="file"
+                        name=(field)
+                        accept=(accept)
+                        multiple=(multiple)
+                        aria-describedby=(described)
+                        if selfie {
+                            capture="user"
+                        }
+                        if required {
+                            data-required="true"
+                        }
+                    >
+                </label>
+                if selfie {
+                    <div class="zone-ways">
+                        <button class="zone-way" type="button" data-capture="user">icon(name: "photo_camera") "Take a selfie"</button>
+                        <button class="zone-way" type="button" data-capture="">icon(name: "upload") "Upload a photo"</button>
+                    </div>
+                }
+                if extra {
+                    <button class="zone-close" type="button" data-close="" aria-label=(format!("Cancel {title}"))>icon(name: "close")</button>
+                }
+                <div class="zone-files" data-files=""></div>
+            </div>
+            <p class="doc-error" id=(error_id) aria-live="polite" data-error=""></p>
+        </div>
+    })
+}
+
+/// An optional paper on step 3, as a small tile that opens its drop zone
+/// (`#extra-{field}`). Shown only with JavaScript; without it the zones
+/// are always open.
+#[component]
+async fn extra_chip(field: &'static str, label: &'static str, icon_name: &'static str) -> Result<impl View> {
+    Ok(view! {
+        <button class="extra-chip" type="button" aria-expanded="false" aria-controls=(format!("extra-{field}")) data-chip=(field)>
+            <span class="extra-chip-tile">
+                icon(name: icon_name)
+                <span class="extra-chip-badge" aria-hidden="true"><span class="icon" data-badge="">"add"</span></span>
+            </span>
+            <span class="extra-chip-label">(label)</span>
+            <span class="visually-hidden" data-chip-state=""></span>
+        </button>
     })
 }
 

@@ -23,6 +23,7 @@ use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
 use crate::ocr;
+use crate::seo;
 use crate::state::AppState;
 use crate::submissions;
 use crate::tickets;
@@ -45,6 +46,11 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
         .route("/assets/{dir}/{name}", get(asset))
+        // Search engines, browsers and home screens.
+        .route("/favicon.ico", get(|| asset(Path(("brand".into(), "favicon.ico".into())))))
+        .route("/site.webmanifest", get(seo::manifest))
+        .route("/robots.txt", get(seo::robots))
+        .route("/sitemap.xml", get(seo::sitemap))
         // Desktop app sign-in (device flow) and tokens.
         .route("/auth/device/start", post(oauth::device_start))
         .route("/oauth/device/code", post(oauth::device_start))
@@ -150,16 +156,28 @@ fn text(body: &'static str, content_type: &'static str) -> Response {
     response
 }
 
-/// Other files the pages load: the Buwiz logo (WebP for pages, PNG for the
-/// sign-in code email), and for the home page's AI
+/// Other files the pages load: the Buwiz logo (WebP for pages), mark and
+/// wordmark (SVG masks), the wordmark as a PNG for the sign-in code email
+/// (and the older email logo, for codes already sent), the icons and the
+/// share card (also at /favicon.ico and in /site.webmanifest), and for the
+/// home page's AI
 /// agent demos the two printed 1601-C documents their Computer screen shows
 /// and the font those use. (path under /assets, content type, bytes)
 pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
     ("brand/buwiz_logo_light.webp", "image/webp", include_bytes!("assets/brand/buwiz_logo_light.webp")),
     ("brand/buwiz_logo_dark.webp", "image/webp", include_bytes!("assets/brand/buwiz_logo_dark.webp")),
     ("brand/buwiz_mark.svg", "image/svg+xml", include_bytes!("assets/brand/buwiz_mark.svg")),
+    ("brand/buwiz_wordmark.svg", "image/svg+xml", include_bytes!("assets/brand/buwiz_wordmark.svg")),
     ("brand/buwiz_favicon.svg", "image/svg+xml", include_bytes!("assets/brand/buwiz_favicon.svg")),
     ("brand/buwiz_logo_email.png", "image/png", include_bytes!("assets/brand/buwiz_logo_email.png")),
+    ("brand/buwiz_wordmark_email.png", "image/png", include_bytes!("assets/brand/buwiz_wordmark_email.png")),
+    ("brand/favicon.ico", "image/x-icon", include_bytes!("assets/brand/favicon.ico")),
+    ("brand/icon-32.png", "image/png", include_bytes!("assets/brand/icon-32.png")),
+    ("brand/icon-192.png", "image/png", include_bytes!("assets/brand/icon-192.png")),
+    ("brand/icon-512.png", "image/png", include_bytes!("assets/brand/icon-512.png")),
+    ("brand/icon-maskable-512.png", "image/png", include_bytes!("assets/brand/icon-maskable-512.png")),
+    ("brand/apple-touch-icon.png", "image/png", include_bytes!("assets/brand/apple-touch-icon.png")),
+    ("brand/og-image.png", "image/png", include_bytes!("assets/brand/og-image.png")),
     ("demo/1601c-october-2026.html", "text/html; charset=utf-8", include_bytes!("assets/demo/1601c-october-2026.html")),
     (
         "demo/1601c-october-2026-confirmation.html",

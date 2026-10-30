@@ -20,6 +20,7 @@ pub mod oauth;
 pub mod pages;
 pub mod relay;
 pub mod sender;
+pub mod staff;
 pub mod state;
 pub mod storage;
 pub mod submissions;

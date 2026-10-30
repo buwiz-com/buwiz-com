@@ -609,6 +609,30 @@ async fn icons_the_manifest_and_the_share_card_are_served(db: PgPool) {
     }
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn the_documents_step_keeps_every_file_field_and_orus_moves_to_sign_up(db: PgPool) {
+    let site = Site::new(db);
+    let (_, cookie) = site.person("ana@example.test").await;
+    let add = text(site.get("/tins/new", &cookie).await).await;
+    let step = &add[add.find("data-step=\"3\"").unwrap()..];
+    let personal = &step[step.find("docs for-personal").unwrap()..step.find("docs for-business").unwrap()];
+    let business = &step[step.find("docs for-business").unwrap()..];
+    for field in ["tin_id", "selfie", "national_id"] {
+        assert!(personal.contains(&format!("name=\"{field}\"")), "personal {field}");
+    }
+    for field in ["form_2303", "government_id", "authority", "supporting"] {
+        assert!(business.contains(&format!("name=\"{field}\"")), "business {field}");
+    }
+    // Each optional paper's chip opens its zone.
+    for field in ["selfie", "national_id", "authority", "supporting"] {
+        assert!(step.contains(&format!("aria-controls=\"extra-{field}\"")), "chip {field}");
+        assert!(step.contains(&format!("id=\"extra-{field}\"")), "zone {field}");
+    }
+    assert!(!add.contains("orus.bir.gov.ph"), "the ORUS link left /tins/new");
+    let signup = text(site.get("/signup", "").await).await;
+    assert!(signup.contains("href=\"https://orus.bir.gov.ph/\" target=\"_blank\" rel=\"noopener\""), "{signup}");
+}
+
 /// A stand-in for R2: objects kept in memory by path.
 #[derive(Clone, Default)]
 struct FakeObjects(Arc<Mutex<HashMap<String, Vec<u8>>>>);

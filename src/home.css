@@ -993,6 +993,9 @@
 
 .auth .auth-hint { display: flex; align-items: flex-start; gap: 8px; margin: 16px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .auth .auth-hint .icon { margin-top: 1px; font-size: 16px; color: var(--brand); }
+.auth .auth-hint + .auth-hint { margin-top: 8px; }
+.auth .auth-hint a { color: var(--brand); font-weight: 600; }
+.auth .auth-hint a:hover { text-decoration: underline; }
 .auth .auth-device-code {
   margin: 0 0 4px;
   padding: 18px;

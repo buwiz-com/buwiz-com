@@ -16,6 +16,13 @@ Spin-based `buwiz-server`, keeping only what the apps call.
     resends it. An approved claim makes the TIN active, and a TIN has at
     most one owner. People can prepare returns right away; sending them
     waits for approval.
+  - While a claim waits, the person can replace any file or remove an
+    optional one from its Files page; staff see that files changed after
+    sending. A claim that never became active can be deleted, files and
+    all, by its owner or by staff with a reason. An active TIN is removed
+    by its owner or revoked by staff: it stops being active, its sent
+    returns stay, and it can be claimed again. Each of these leaves a line
+    (masked TIN) in the account's history on the staff pages.
   - Files are encrypted (AES-256-GCM) before they are stored, in Cloudflare
     R2 in production (any S3-compatible store; Postgres in development),
     and deleted when the claim is decided or withdrawn, or the file is

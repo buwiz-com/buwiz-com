@@ -456,6 +456,9 @@
       this.tl = new Timeline();
       this.tl.speed.set(2);
       this.win = ref();
+      /// Called when a run ends on screen: moves the tour to the next film. Without it the
+      /// film plays again.
+      this.next = null;
       this.cur = new Cursor(this.tl, this.win, [0.62, 0.95]);
       this.screen = new AgentScreen();
       this.scroller = ref();
@@ -558,12 +561,15 @@
         .wait(300);
     }
 
-    /// The end of a run: hold the last frame, then play again if still on screen.
+    /// The end of a run: hold the last frame, then go on to the next film if still on
+    /// screen (or play again when this film stands alone).
     end(s, caption) {
       s.then(() => this.caption.set(caption))
         .wait(4500)
         .then(() => {
-          if (inView(this.win)) this.tl.play();
+          if (!inView(this.win)) return;
+          if (this.next) this.next();
+          else this.tl.play();
         });
     }
 
@@ -2419,11 +2425,31 @@
     box.append(...nodes);
     rigs.set(box.dataset.film, rig);
   }
-  for (const radio of document.querySelectorAll('input[name="demo"]')) {
+  const radios = [...document.querySelectorAll('input[name="demo"]')];
+  for (const radio of radios) {
     radio.addEventListener("change", () => {
       for (const [name, rig] of rigs) if (name !== radio.value) rig.tl.stop();
       const rig = rigs.get(radio.value);
       if (rig) requestAnimationFrame(() => rig.start());
     });
   }
+
+  // The films play as one tour: when one ends, the next tab opens, and after the last the
+  // tour starts again from the first. A visitor's own pick just continues the tour from there.
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  radios.forEach((radio, i) => {
+    const rig = rigs.get(radio.value);
+    if (!rig || radios.length < 2) return;
+    rig.next = () => {
+      const following = radios[(i + 1) % radios.length];
+      following.checked = true;
+      following.dispatchEvent(new Event("change"));
+      // Keep the open tab visible in a scrolling tab strip, without moving the page.
+      const tab = document.querySelector(`label[for="${following.id}"]`);
+      const strip = tab && tab.parentElement;
+      if (strip && strip.scrollWidth > strip.clientWidth) {
+        strip.scrollTo({ left: tab.offsetLeft - strip.offsetLeft - 16, behavior: reduced ? "auto" : "smooth" });
+      }
+    };
+  });
 })();

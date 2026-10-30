@@ -36,10 +36,12 @@ pub enum QueueFilter {
     SentBack,
     Approved,
     Rejected,
+    /// Approved once, then removed by the owner or revoked by staff.
+    Ended,
 }
 
 impl QueueFilter {
-    pub const ALL: [Self; 4] = [Self::Waiting, Self::SentBack, Self::Approved, Self::Rejected];
+    pub const ALL: [Self; 5] = [Self::Waiting, Self::SentBack, Self::Approved, Self::Rejected, Self::Ended];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Waiting)
@@ -51,6 +53,7 @@ impl QueueFilter {
             Self::SentBack => "sent_back",
             Self::Approved => "approved",
             Self::Rejected => "rejected",
+            Self::Ended => "ended",
         }
     }
 
@@ -60,15 +63,17 @@ impl QueueFilter {
             Self::SentBack => "Sent back",
             Self::Approved => "Approved",
             Self::Rejected => "Rejected",
+            Self::Ended => "Removed",
         }
     }
 
-    fn status(self) -> &'static str {
+    fn statuses(self) -> &'static [&'static str] {
         match self {
-            Self::Waiting => "pending",
-            Self::SentBack => "needs_fix",
-            Self::Approved => "approved",
-            Self::Rejected => "rejected",
+            Self::Waiting => &["pending"],
+            Self::SentBack => &["needs_fix"],
+            Self::Approved => &["approved"],
+            Self::Rejected => &["rejected"],
+            Self::Ended => &["removed", "revoked"],
         }
     }
 
@@ -79,6 +84,7 @@ impl QueueFilter {
             Self::Waiting => "coalesce(c.resent_at, c.created_at), c.id",
             Self::SentBack => "c.sent_back_at, c.id",
             Self::Approved | Self::Rejected => "c.decided_at DESC, c.id",
+            Self::Ended => "c.removed_at DESC, c.id",
         }
     }
 }
@@ -103,14 +109,14 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
              ARRAY(SELECT DISTINCT d.kind FROM claim_documents d
                    WHERE d.claim_id = c.id AND d.purged_at IS NULL) AS document_kinds
          FROM tin_claims c JOIN accounts a ON a.id = c.account_id
-         WHERE c.status = $1
+         WHERE c.status = ANY($1)
            AND ($2::text IS NULL OR a.email ILIKE $2 OR c.registered_name ILIKE $2 OR c.trade_name ILIKE $2
                 OR ($3::text IS NOT NULL AND c.tin_root || c.branch_code LIKE $3))
          ORDER BY {}
          LIMIT $4",
         filter.order()
     ))
-    .bind(filter.status())
+    .bind(filter.statuses())
     .bind(contains(search))
     .bind(tin_digits(search))
     .bind(LIST_LIMIT)
@@ -256,6 +262,31 @@ pub async fn claims_of(db: &PgPool, account_ids: &[Uuid]) -> sqlx::Result<Vec<Us
          WHERE account_id = ANY($1) AND status <> 'withdrawn' ORDER BY created_at",
     )
     .bind(account_ids)
+    .fetch_all(db)
+    .await
+}
+
+/// A line of `claim_audit`: a claim deleted, a TIN removed or revoked, a
+/// file replaced or removed.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AuditRow {
+    pub tin_masked: String,
+    pub action: String,
+    pub claim_status: String,
+    pub document_kind: Option<String>,
+    pub actor_id: Uuid,
+    pub actor_email: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// The audit lines about an account's claims, newest first.
+pub async fn audit(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<AuditRow>> {
+    sqlx::query_as(
+        "SELECT tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, created_at
+         FROM claim_audit WHERE account_id = $1 ORDER BY created_at DESC LIMIT 40",
+    )
+    .bind(account_id)
     .fetch_all(db)
     .await
 }

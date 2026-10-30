@@ -227,12 +227,15 @@ const PLATFORMS: [(&str, &[(&str, &str)]); 5] = [
 /// The Apple logo (Simple Icons, CC0).
 const APPLE: &str = "M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701";
 
-/// (figure, what it counts)
-const HERO_STATS: [(&str, &str); 4] = [
-    ("43", "BIR forms, every one"),
-    ("2,007", "official validation rules"),
-    ("30 days", "of deadlines in view"),
-    ("Offline", "after one sign-in"),
+/// What Buwiz stands for, under the hero: (icon, title, the proof).
+const HERO_STATS: [(&str, &str, &str); 3] = [
+    ("verified", "BIR parity", "All 43 BIR forms, checked with the same 2,007 rules as eBIRForms."),
+    (
+        "lock_person",
+        "Your data stays yours",
+        "Your books and returns are prepared on your computer and sealed before they leave it. Buwiz keeps the BIR receipt, not your books.",
+    ),
+    ("smart_toy", "AI native", "An AI co-worker drafts and checks your returns. You approve every filing."),
 ];
 
 pub(super) const TITLE: &str = "Buwiz: Philippine tax filing, made modern";
@@ -275,7 +278,6 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home landing">
             hero(signed_in: signed_in)
-            month()
             tour()
             account_section(signed_in: signed_in)
             agents_section()
@@ -371,10 +373,10 @@ async fn hero(signed_in: bool) -> Result<impl View> {
                 </div>
             </div>
             <dl class="hero-stats">
-                for (figure, label) in HERO_STATS {
+                for (name, title, proof) in HERO_STATS {
                     <div>
-                        <dt>(figure)</dt>
-                        <dd>(label)</dd>
+                        <dt>icon(name: name) (title)</dt>
+                        <dd>(proof)</dd>
                     </div>
                 }
             </dl>
@@ -444,65 +446,6 @@ const PHONE_TABS: [(&str, &str); 4] = [
     ("Filings", "M3 5h14v11H3z M3 9h14 M7 2.5v3 M13 2.5v3"),
     ("Calendar", "M3 4.5h14v12H3z M3 8.5h14 M7 2.5v3 M13 2.5v3"),
 ];
-
-/// One month with Buwiz, under the hero: the journey card.
-#[component]
-async fn month() -> Result<impl View> {
-    Ok(view! {
-        <section class="month">
-            <p class="month-label">"One month with Buwiz, from the deadline to BIR's receipt"</p>
-            <div class="journey-wrap">
-                journey()
-            </div>
-        </section>
-    })
-}
-
-/// One month of an employer's withholding return, from the deadline that
-/// starts it to BIR's receipt.
-#[component]
-async fn journey() -> Result<impl View> {
-    Ok(view! {
-        <div class="journey">
-            <div class="deadline">
-                <span class="icon deadline-icon" aria-hidden="true">"event_upcoming"</span>
-                <div class="deadline-text">
-                    <div class="deadline-title">"1601-C for October is due Nov 10"</div>
-                    <div class="deadline-sub">"JUAN DELA CRUZ · TIN 123-456-788 · 3 branches with staff"</div>
-                </div>
-                <span class="deadline-chip">"17 days left"</span>
-            </div>
-            <div class="journey-steps">
-                <div class="jstep">
-                    <div class="jstep-head"><span class="jnum">"1"</span><span>"Prepare"</span></div>
-                    <p>"Templates hold each branch's setup. Type only what changed: one return per branch."</p>
-                    <div class="jstep-foot">
-                        <div class="jrow"><span class="mono">"00001 Makati"</span><span class="num">"₱5,598.60"</span></div>
-                        <div class="jrow"><span class="mono">"00002 QC"</span><span class="num">"₱830.10"</span></div>
-                        <div class="jrow"><span class="mono">"00003 Pasig"</span><span class="num">"₱0.00"</span></div>
-                    </div>
-                </div>
-                <div class="jstep">
-                    <div class="jstep-head"><span class="jnum">"2"</span><span>"Check"</span></div>
-                    <p>"Every field runs through BIR's own eBIRForms rules before anything is filed."</p>
-                    <div class="jstep-foot jcheck">
-                        <div class="jcheck-title">icon(name: "verified") "0 errors"</div>
-                        <div class="jcheck-sub">"2,007 validations · 623 calculations"</div>
-                    </div>
-                </div>
-                <div class="jstep">
-                    <div class="jstep-head"><span class="jnum">"3"</span><span>"File"</span></div>
-                    <p>"Approve it once. Buwiz sends it to BIR from your own connection and keeps the signed receipt."</p>
-                    <div class="jstep-foot jfile">
-                        <div class="jfile-title">icon(name: "mark_email_read") "Received by BIR"</div>
-                        <div class="mono truncate">"123456788001-1601Cv2018-102026.xml"</div>
-                        <div class="faint">"3 November 2026 · 10:43 AM"</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    })
-}
 
 #[component]
 async fn screenshot(screen: &'static str, alt: &'static str) -> Result<impl View> {

@@ -142,6 +142,26 @@ impl Site {
             .await
             .unwrap()
     }
+
+    /// The claim's document readings once none is still running: (file,
+    /// status, error).
+    async fn readings(&self, claim_id: Uuid) -> Vec<(String, String, Option<String>)> {
+        for _ in 0..100 {
+            let readings: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT d.filename, r.status, r.error FROM document_readings r
+                 JOIN claim_documents d ON d.id = r.document_id WHERE d.claim_id = $1 ORDER BY d.created_at",
+            )
+            .bind(claim_id)
+            .fetch_all(&self.db)
+            .await
+            .unwrap();
+            if readings.iter().all(|(_, status, _)| status != "reading") {
+                return readings;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("document readings did not finish");
+    }
 }
 
 enum Part {
@@ -304,10 +324,21 @@ async fn a_claim_sent_back_is_fixed_and_resent(db: PgPool) {
     assert_eq!(files, [("blurry.png".to_owned(), false), ("sharp.png".to_owned(), true)]);
     assert_eq!(location(&site.upload(&resend, &cookie, &fixed).await), "/tins?notice=not_sent_back");
 
+    // Only the new TIN ID is read; the replaced file's reading went with it.
+    // These test files are not real photos, and OCR may not be built in.
+    let readings = site.readings(claim).await;
+    assert_eq!(readings.len(), 1, "{readings:?}");
+    let (file, status, error) = &readings[0];
+    assert_eq!((file.as_str(), status.as_str()), ("sharp.png", "failed"));
+    let expected = if cfg!(feature = "ocr") { "the photo could not be opened" } else { "OCR not built in" };
+    assert_eq!(error.as_deref(), Some(expected));
+
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Typed vs. on the document") && review.contains("Resent"), "{review}");
+    assert!(review.contains("Read by OCR on our server") && review.contains(&format!("read: {expected}")), "{review}");
     assert_eq!(location(&site.post(&decide, &staff, "decision=approve").await), "/staff?notice=claim_decided");
     assert_eq!(site.claim_status(claim).await, "approved");
+    assert_eq!(site.readings(claim).await, []);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -981,6 +1012,9 @@ async fn claimants_replace_and_remove_files_while_open(db: PgPool) {
     assert_eq!(location(&response), back("file_replaced"));
     let new_tin_id = document("tin_id").await;
     assert_ne!(new_tin_id, tin_id);
+    // The new TIN ID is read; the old one's reading went with its row.
+    let readings = site.readings(claim).await;
+    assert_eq!(readings.iter().map(|(file, ..)| file.as_str()).collect::<Vec<_>>(), ["new-id.png"]);
     let stored = objects.of_claim(claim);
     assert!(!stored.contains(&old_object) && stored.contains(&format!("/buwiz-test/claims/{claim}/{new_tin_id}")));
     assert_eq!(location(&site.post(&remove_selfie, &cookie, "").await), back("file_removed"));

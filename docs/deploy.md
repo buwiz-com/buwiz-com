@@ -41,6 +41,28 @@ If Fly's remote builder fails (503, `failed_precondition`), build on your
 machine instead: `fly deploy --local-only`. To change only settings, redeploy
 the last image: `fly deploy --image registry.fly.io/buwiz-cloud:<tag>`.
 
+## OCR of claim documents
+
+The image is built with `--features ocr`: the TIN ID or 2303 of each claim
+is read in the Gatekeeper's process, one document at a time, at most two
+minutes each. The models are in the image at
+`/usr/local/share/buwiz/ocr-models` (`OCR_MODEL_DIR`). Running the binary
+outside the image (systemd on EC2), copy that directory next to it and set
+`OCR_MODEL_DIR` in the unit, or run `scripts/ocr-models.sh /some/dir`.
+The binary is built on Ubuntu 24.04 and needs its libstdc++ (GCC 14), so
+the host runs Ubuntu 24.04 or newer. A
+missing model shows staff "Couldn't read: the OCR models are missing on the
+server" and logs which file; nothing else breaks.
+
+Once it has read a few documents, OCR holds about 350 MB (models, ONNX
+Runtime's buffers), on top of the server's own memory; it levels off there
+rather than growing. A document takes 1 to 2 seconds on an M-series Mac and
+should take 3 to 6 on a t4g.micro, which uses one of its two cores for it.
+Move to a t4g.small (2 GB) when the server's own memory passes about
+350 MB, when the host starts to swap, or when claims queue faster than one
+every few seconds. Fly's machine has 512 MB: give it 1 GB while it still
+runs this image.
+
 ## The Sender
 
 Submission runs in a second app, `buwiz-sender`, from the same image with

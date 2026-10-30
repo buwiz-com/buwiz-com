@@ -975,7 +975,8 @@ async fn record_file_change(
 /// The claimant swaps one file of an open claim for a new one of the same
 /// kind, checked like the files of a new claim. The old file is deleted at
 /// once, row and object. A claim sent back still goes through
-/// [`resend`]; the change counts as a fix there.
+/// [`resend`]; the change counts as a fix there. Returns the new file's id,
+/// for OCR to read it ([`crate::ocr::queue_document`]).
 pub async fn replace_document(
     db: &PgPool,
     store: &DocumentStore,
@@ -984,7 +985,7 @@ pub async fn replace_document(
     claim_id: Uuid,
     document_id: Uuid,
     upload: Upload,
-) -> Result<(), SubmitError> {
+) -> Result<Uuid, SubmitError> {
     let mut tx = db.begin().await?;
     let file = lock_open_file(&mut tx, actor, claim_id, document_id).await?;
     if upload.kind.as_str() != file.kind {
@@ -1010,15 +1011,7 @@ pub async fn replace_document(
     };
     store.delete_all(&file.object_key.into_iter().collect::<Vec<_>>()).await;
     tracing::info!(%claim_id, %document_id, %new_id, "claim document replaced");
-    document_replaced(claim_id, new_id);
-    Ok(())
-}
-
-/// Runs once a replaced file is stored and committed, with the new file's
-/// id. The place for work on new files (reading them with OCR) to start,
-/// as it does for the files of a new or resent claim.
-pub fn document_replaced(claim_id: Uuid, document_id: Uuid) {
-    tracing::debug!(%claim_id, %document_id, "new claim document ready");
+    Ok(new_id)
 }
 
 /// The claimant drops an optional file (selfie, National ID, proof of

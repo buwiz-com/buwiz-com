@@ -22,6 +22,7 @@ use crate::devices;
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
+use crate::ocr;
 use crate::seo;
 use crate::state::AppState;
 use crate::submissions;
@@ -462,7 +463,10 @@ async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipa
         uploads: form.uploads,
     };
     match claims::submit(&state.db, &state.documents, &state.config.document_key, account.id, claim).await {
-        Ok(_) => see_other(link("/tins", Some(Notice::ClaimSubmitted), &[])),
+        Ok(claim_id) => {
+            ocr::queue_claim(&state, claim_id).await;
+            see_other(link("/tins", Some(Notice::ClaimSubmitted), &[]))
+        }
         Err(SubmitError::Invalid(notice)) => back(notice),
         Err(SubmitError::Internal(error)) => internal(error),
     }
@@ -489,7 +493,10 @@ async fn resend_claim(
     };
     let fix = Resend { registered_name: form.registered_name, trade_name: form.trade_name, uploads: form.uploads };
     match claims::resend(&state.db, &state.documents, &state.config.document_key, account.id, claim_id, fix).await {
-        Ok(()) => see_other(link("/tins", Some(Notice::ClaimResent), &[])),
+        Ok(()) => {
+            ocr::queue_claim(&state, claim_id).await;
+            see_other(link("/tins", Some(Notice::ClaimResent), &[]))
+        }
         Err(SubmitError::Invalid(notice @ (Notice::ClaimMissing | Notice::NotSentBack))) => {
             see_other(link("/tins", Some(notice), &[]))
         }
@@ -622,7 +629,11 @@ async fn replace_document(
     };
     let key = &state.config.document_key;
     match claims::replace_document(&state.db, &state.documents, key, &account, claim_id, document_id, upload).await {
-        Ok(()) => after_file_change(claim_id, Notice::FileReplaced),
+        Ok(new_id) => {
+            // The old file's reading went with its row; read the new one.
+            ocr::queue_document(&state, new_id).await;
+            after_file_change(claim_id, Notice::FileReplaced)
+        }
         Err(SubmitError::Invalid(notice)) => after_file_change(claim_id, notice),
         Err(SubmitError::Internal(error)) => internal(error),
     }

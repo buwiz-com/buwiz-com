@@ -144,6 +144,48 @@ pub async fn end_session(db: &PgPool, token: &str) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Ends every sign-in of an account: browser sessions, app and agent
+/// grants (which ends their access and refresh tokens), and sign-ins
+/// approved but not yet picked up by the app or agent.
+pub async fn sign_out_everywhere(db: &PgPool, account_id: Uuid) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("UPDATE web_sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_everywhere'
+         WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE device_authorizations SET consumed_at = now() WHERE account_id = $1 AND consumed_at IS NULL")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE oauth_codes SET used_at = now() WHERE account_id = $1 AND used_at IS NULL")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    tracing::info!(%account_id, "signed out everywhere");
+    Ok(())
+}
+
+/// Ends one app's or agent's sign-in on the account.
+pub async fn sign_out_app(db: &PgPool, account_id: Uuid, grant_id: Uuid) -> sqlx::Result<bool> {
+    let updated = sqlx::query(
+        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_by_staff'
+         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(grant_id)
+    .bind(account_id)
+    .execute(db)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
 /// The value of cookie `name` in a `Cookie` header map.
 pub fn cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
     headers

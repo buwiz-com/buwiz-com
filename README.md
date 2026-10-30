@@ -5,17 +5,28 @@ Spin-based `buwiz-server`, keeping only what the apps call.
 
 - **Accounts**: sign in with a 6-digit code sent by email. No passwords, no
   organizations, no workspaces. One account can hold several TINs.
-- **TIN activation**: the person uploads BIR Form 2303, a government ID and
-  any supporting documents. Staff review each claim by hand. An approved
-  claim makes the TIN active, and a TIN has at most one owner. Files are
-  encrypted (AES-256-GCM) before they are stored, in Cloudflare R2 in
-  production (any S3-compatible store; Postgres in development), and
-  deleted when the claim is decided or withdrawn. Their hashes stay.
+- **TIN activation**: the person says whose TIN it is and uploads its papers.
+  - Personal: a TIN ID (card or ORUS digital TIN ID); a selfie and a photo
+    of the National ID are optional and strengthen the check.
+  - Business: BIR Form 2303 and a government ID, plus proof of authority
+    (secretary's certificate, board resolution or SPA) when the 2303 is in
+    a company's name.
+  - Staff review each claim by hand at `/staff`: approve, reject, or send
+    it back with reasons; the person fixes it from My TINs (`/tins`) and
+    resends it. An approved claim makes the TIN active, and a TIN has at
+    most one owner. People can prepare returns right away; sending them
+    waits for approval.
+  - Files are encrypted (AES-256-GCM) before they are stored, in Cloudflare
+    R2 in production (any S3-compatible store; Postgres in development),
+    and deleted when the claim is decided or withdrawn, or the file is
+    replaced. Their hashes stay.
 - **App sign-in**: the desktop and mini apps use the OAuth device flow
   (RFC 8628). Refresh tokens rotate, and reusing an old one ends the whole
   sign-in.
 - **Licence gate**: `GET /api/tax-profiles` lists the account's active TINs.
   The apps unlock their BIR tools when any profile has permissions.
+  `?include=pending` also lists TINs still being checked or sent back, with
+  a `status` and no `filing.submit` permission.
 - **Submission relay**: files a return with BIR for an active TIN.
   - Two processes: the public **Gatekeeper** (`buwiz-cloud`) and the
     **Sender** (`buwiz-sender`), which alone keeps BIR's passphrases, the
@@ -57,7 +68,8 @@ cargo run                                  # http://localhost:3008
 Migrations run at start. Without `SENDER_URL`, the Sender runs inside this
 process (development only; see [docs/relay-protocol.md](docs/relay-protocol.md)
 §6 for running `buwiz-sender` on its own). Without `RESEND_API_KEY`, sign-in codes appear in
-the server log; with it, they are emailed. Put your email in `ADMIN_EMAILS` to see **Review claims**.
+the server log; with it, they are emailed. Put your email in `ADMIN_EMAILS` to see
+the staff pages at `/staff` (claims queue and users); everyone else gets a 404 there.
 
 Smoke test of the whole flow (device sign-in, claim, review, licence gate,
 refresh rotation):
@@ -80,7 +92,7 @@ account hostname and list the API hostname in `EXTRA_ORIGINS`.
 | `POST /auth/device/poll` `{"client_id","device_code"}` | `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, then tokens. |
 | `POST /oauth/token` (form) | `grant_type=refresh_token` or `urn:ietf:params:oauth:grant-type:device_code`. Access tokens last 15 minutes, refresh tokens 90 days. |
 | `GET /me` | `{"user_id","email"}`. 401 means signed out. |
-| `GET /api/tax-profiles` | `{"profiles":[{"id","tin","tin_masked","registered_name","activated_at","permissions"}]}`. Link by `id`, not the TIN. |
+| `GET /api/tax-profiles` | `{"profiles":[{"id","tin","tin_masked","registered_name","activated_at","permissions"}]}`. Link by `id`, not the TIN. `?include=pending` adds open claims and a `status` (`approved`, `pending`, `needs_fix`) to every profile; open ones have `activated_at: null` and can prepare but not submit. |
 | `POST /api/auth/logout` | Ends this app's sign-in. |
 | `POST /api/submissions`, `GET /api/submissions[/{id}]` | Create and read submissions. |
 | `GET /api/submissions/{id}/relay` (WebSocket) | The relay pipe. See [docs/relay-protocol.md](docs/relay-protocol.md). |
@@ -119,7 +131,9 @@ cargo run --bin buwiz-relay -- --server http://localhost:3008 --token <access to
 ```
 
 Tests: `cargo test` runs the relay end to end in one process (fake
-dispatcher, SSH server with a pinned key, the app's allow-list).
+dispatcher, SSH server with a pinned key, the app's allow-list), and the
+account site against Postgres (`tests/account_site.rs`: each test gets its
+own database, so `DATABASE_URL` must be set, e.g. from `.env`).
 `scripts/v6.sh` runs `e2e/` (its own workspace): submission v2 with the
 real buwiz-oss client, from a queued 1701Q to a verified receipt, and the
 attacks it must refuse. It needs Docker and read access to buwiz-oss. With

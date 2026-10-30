@@ -1020,7 +1020,6 @@
 }
 @media (max-width: 480px) { .auth .auth-card { padding: 24px 20px; } }
 .auth .auth-brand { display: inline-flex; align-items: flex-end; gap: 10px; margin-bottom: 28px; color: var(--text); }
-.auth .auth-brand img { width: 28px; height: 28px; object-fit: contain; object-position: bottom; }
 .auth .auth-brand span { padding-bottom: 1px; font-size: 18px; font-weight: 800; letter-spacing: -0.04em; line-height: 1; }
 .auth .auth-badge {
   display: flex;

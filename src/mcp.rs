@@ -165,7 +165,7 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                         "tin_masked": claim.tin().masked(),
                         "registered_name": claim.registered_name,
                         "status": claim.status,
-                        "note": claim.decision_note,
+                        "note": if claim.status == "needs_fix" { claim.fix_note } else { claim.decision_note },
                         "sent_at": claim.created_at.unix_timestamp(),
                     })
                 })

@@ -150,7 +150,7 @@ async fn platform_card(
                     <ul class="dl-others" aria-label=(format!("Other downloads for {name}"))>
                         for other in others {
                             <li>
-                                <a href=(other.url.clone())>(file_label(&other))</a>
+                                <a href=(other.route())>(file_label(&other))</a>
                                 <span class="faint">(format!("{} · {}", other.name, size(other.size)))</span>
                                 <code>(other.sha256.clone())</code>
                             </li>
@@ -281,7 +281,7 @@ async fn linux_card(picker: LinuxPicker, version: String) -> Result<impl View> {
                     data-size=(size(other.size))
                     data-sha256=(other.sha256.clone())
                 >
-                    <a href=(other.url.clone())>(file_label(&other))</a>
+                    <a href=(other.route())>(file_label(&other))</a>
                     <span class="faint">(format!("{} · {}", other.name, size(other.size)))</span>
                     <code>(other.sha256.clone())</code>
                 </li>

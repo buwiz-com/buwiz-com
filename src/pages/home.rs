@@ -464,7 +464,7 @@ async fn hero(signed_in: bool, release: Option<Arc<Release>>, yours: Option<Devi
                             <ul class="get-files" id="get-files" aria-label="Other downloads" hidden=(true)>
                                 for file in release.files.clone() {
                                     <li>
-                                        <a href=(file.url.clone())>
+                                        <a href=(file.route())>
                                             (format!("{} · {} · {}", platform_name(file.platform), file.kind.label(), file.arch.label(file.platform)))
                                         </a>
                                         <span class="faint">(format!("{} · {} · {}", file.name, release.version, size(file.size)))</span>

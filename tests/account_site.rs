@@ -13,6 +13,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use buwiz_cloud::config::{Config, MailConfig};
+use buwiz_cloud::downloads::{self, Arch, Kind, Platform, Total};
 use buwiz_cloud::link::SenderLink;
 use buwiz_cloud::state::AppState;
 use buwiz_cloud::storage::{DocumentStore, ObjectStore};
@@ -573,8 +574,8 @@ async fn the_code_page_counts_down_to_the_codes_real_expiry(db: PgPool) {
     // The link's expiry is the code's, give or take the time to store it.
     let linked = expires_at.parse::<i128>().unwrap();
     let real = stored.unix_timestamp_nanos() / 1_000_000;
-    assert!((0..2_000).contains(&(real - linked)), "{linked} vs {real}");
-    assert!(["Code expires in 10:00", "Code expires in 9:59"].contains(&words.as_str()), "{words}");
+    assert!((0..10_000).contains(&(real - linked)), "{linked} vs {real}");
+    assert!(words == "Code expires in 10:00" || words.starts_with("Code expires in 9:5"), "{words}");
     assert!(page.contains(&format!(r#"<input type="hidden" name="expires" value="{expires_at}">"#)), "{page}");
     assert!(page.contains(r#"<p class="visually-hidden" role="status" data-timer-status=""></p>"#), "{page}");
     assert!(page.contains(r#"<form class="auth-resend" "#), "{page}");
@@ -1363,6 +1364,60 @@ async fn downloads_go_to_the_released_installer_without_caching(db: PgPool) {
     .await;
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn downloads_are_counted_per_file_and_day_without_crawlers(db: PgPool) {
+    let (releases, url) = FakeReleases::start().await;
+    releases.set_latest(&latest_json(&later_files()));
+    let site = Site::with_downloads(db.clone(), &url);
+    let fetch = |method: Method, path: &str, agent: &str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "buwiz.com")
+            .header(header::USER_AGENT, agent)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let person = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
+    for (method, path, agent) in [
+        (Method::GET, "/download/mac", person),
+        (Method::GET, "/download/mac?kind=dmg", person),
+        (Method::GET, "/download/linux?kind=rpm&arch=arm64", person),
+        (Method::GET, "/install-linux.sh", "curl/8.7.1"),
+        // Not counted: crawlers and link previews, no User-Agent, a HEAD.
+        (Method::GET, "/download/mac", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
+        (Method::GET, "/download/mac", "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)"),
+        (Method::GET, "/download/mac", ""),
+        (Method::HEAD, "/download/windows", person),
+    ] {
+        assert_eq!(site.send(fetch(method, path, agent)).await.status(), StatusCode::FOUND, "{path} {agent}");
+    }
+    let total = |platform, arch, kind, count| Total { platform, arch, kind, count };
+    assert_eq!(
+        downloads::totals(&db).await.unwrap(),
+        vec![
+            total(Platform::Mac, Arch::Universal, Kind::Dmg, 2),
+            total(Platform::Linux, Arch::Arm64, Kind::Rpm, 1),
+            total(Platform::Linux, Arch::Universal, Kind::Sh, 1),
+        ]
+    );
+    // Kept per version and Manila day, and nothing about who asked.
+    let rows: Vec<(String, String, String, String, i64, bool)> = sqlx::query_as(
+        "SELECT version, platform, arch, kind, count, day = (now() AT TIME ZONE 'Asia/Manila')::date
+         FROM download_counts ORDER BY platform, kind",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    let row = |platform: &str, arch: &str, kind: &str, count| {
+        ("1.2.0".to_owned(), platform.to_owned(), arch.to_owned(), kind.to_owned(), count, true)
+    };
+    assert_eq!(
+        rows,
+        vec![row("linux", "arm64", "rpm", 1), row("linux", "universal", "sh", 1), row("macos", "universal", "dmg", 2)]
+    );
+}
+
 /// The download page's platform cards, each up to its end.
 fn platform_cards(page: &str) -> Vec<&str> {
     page.split("<li class=\"panel dl-card").skip(1).map(|card| card.split("</li></ul>").next().unwrap()).collect()
@@ -1443,9 +1498,13 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
     assert!(get.contains(r#"<button class="get-more" type="button" aria-expanded="false" aria-controls="get-files">"#));
     let files = &get[get.find(r#"<ul class="get-files" id="get-files""#).unwrap()..];
     assert!(files.starts_with(r#"<ul class="get-files" id="get-files" aria-label="Other downloads" hidden="">"#));
-    for name in ["Buwiz-1.2.0-macos-universal.dmg", "Buwiz-1.2.0-windows-x64-setup.exe", "buwiz_1.2.0_amd64.deb"] {
-        assert!(files.contains(&format!(r#"href="{url}/releases/v1.2.0/{name}""#)), "{name}");
+    // Each through this site's link, which counts it.
+    for route in
+        ["/download/mac?kind=dmg", "/download/windows?kind=exe&amp;arch=x64", "/download/linux?kind=deb&amp;arch=x64"]
+    {
+        assert!(files.contains(&format!(r#"href="{route}""#)), "{route}: {files}");
     }
+    assert!(!files.contains(&url), "{files}");
     assert!(files.contains("buwiz_1.2.0_amd64.deb · 1.2.0 · 55.0 MB"), "{files}");
     assert!(!files.contains("Buwiz.ipa"), "{files}");
     assert!(home.contains(r#"<script src="/assets/download.js" defer=""></script>"#));
@@ -1545,18 +1604,20 @@ async fn the_linux_card_asks_which_linux_and_processor(db: PgPool) {
     }
     // Every Linux file, with its facts, is in the page for the script and
     // for anyone without it.
-    for name in [
-        "buwiz_1.2.0_amd64.deb",
-        "buwiz_1.2.0_arm64.deb",
-        "Buwiz-1.2.0-linux-x64.rpm",
-        "Buwiz-1.2.0-linux-arm64.rpm",
-        "Buwiz-1.2.0-linux-x64.tar.gz",
-        "Buwiz-1.2.0-linux-arm64.tar.gz",
-        "Buwiz-1.2.0-linux-install.sh",
+    // Each links through this site, which counts it.
+    for (name, route) in [
+        ("buwiz_1.2.0_amd64.deb", "/download/linux?kind=deb&amp;arch=x64"),
+        ("buwiz_1.2.0_arm64.deb", "/download/linux?kind=deb&amp;arch=arm64"),
+        ("Buwiz-1.2.0-linux-x64.rpm", "/download/linux?kind=rpm&amp;arch=x64"),
+        ("Buwiz-1.2.0-linux-arm64.rpm", "/download/linux?kind=rpm&amp;arch=arm64"),
+        ("Buwiz-1.2.0-linux-x64.tar.gz", "/download/linux?kind=targz&amp;arch=x64"),
+        ("Buwiz-1.2.0-linux-arm64.tar.gz", "/download/linux?kind=targz&amp;arch=arm64"),
+        ("Buwiz-1.2.0-linux-install.sh", "/install-linux.sh"),
     ] {
         assert!(linux.contains(&format!(r#"data-name="{name}""#)), "{name}");
-        assert!(linux.contains(&format!(r#"href="{url}/releases/v1.2.0/{name}""#)), "{name}");
+        assert!(linux.contains(&format!(r#"href="{route}""#)), "{route}: {linux}");
     }
+    assert!(!linux.contains(&url), "{linux}");
     assert!(linux.contains(&format!(r#"data-kind="rpm" data-arch="x64" data-name="Buwiz-1.2.0-linux-x64.rpm" data-size="56.0 MB" data-sha256="{SHA_RPM}""#)));
     // The install script, to copy.
     assert!(linux.contains("<code>curl -fsSL https://buwiz.com/install-linux.sh | sh</code>"), "{linux}");

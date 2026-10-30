@@ -21,6 +21,7 @@ pub mod oauth;
 pub mod pages;
 pub mod relay;
 pub mod sender;
+pub mod staff;
 pub mod state;
 pub mod storage;
 pub mod submissions;
@@ -71,8 +72,11 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     let address = format!("{}:{}", config.host, config.port);
+    let account_origin: std::sync::Arc<str> = config.account_origin.as_str().into();
     let state = AppState::new(config, db, documents, ticket_key, sender);
-    let app = web::router(state.clone(), pages::router(state)).layer(axum::middleware::from_fn(canonical::bare_domain));
+    let app = web::router(state.clone(), pages::router(state))
+        .layer(axum::middleware::from_fn_with_state(account_origin, canonical::host_roots))
+        .layer(axum::middleware::from_fn(canonical::bare_domain));
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");

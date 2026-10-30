@@ -7,6 +7,18 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # tests/account_site.rs makes a database per test here.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: buwiz_cloud
+          POSTGRES_PASSWORD: buwiz_cloud
+          POSTGRES_DB: buwiz_cloud
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://buwiz_cloud:buwiz_cloud@localhost:5432/buwiz_cloud
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

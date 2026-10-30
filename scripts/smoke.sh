@@ -31,15 +31,15 @@ echo "7b. poll again (used): $(poll)"
 echo "8. /me: $(curl -s -H "Authorization: Bearer $AT" $B/me)"
 echo "9. tax-profiles before claim: $(curl -s -H "Authorization: Bearer $AT" -H 'Accept: application/json' $B/api/tax-profiles)"
 printf '%%PDF-1.7\n2303 scan\n' > f2303.pdf; printf '\x89PNG\r\n\x1a\nidcard' > id.png; printf 'MZ\x90evil' > evil.exe
-echo "10a. claim with bad file -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F tin=123-456-789 -F 'registered_name=Juan Dela Cruz' -F form_2303=@f2303.pdf -F government_id=@evil.exe $B/tins/claims)"
-echo "10b. claim bad TIN -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F tin=12345 -F 'registered_name=Juan' -F form_2303=@f2303.pdf -F government_id=@id.png $B/tins/claims)"
-echo "10c. claim ok -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F tin=123-456-789 -F 'registered_name=Juan Dela Cruz' -F form_2303=@f2303.pdf -F government_id=@id.png -F supporting=@f2303.pdf $B/tins/claims)"
-echo "10d. duplicate claim -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F tin=123456789 -F 'registered_name=Juan Dela Cruz' -F form_2303=@f2303.pdf -F government_id=@id.png $B/tins/claims)"
-echo "11. account page lists: $(curl -s -b $J1 $B/account | grep -oE '123-456-789-00000|Waiting for review' | sort -u | tr '\n' ' ')"
-echo "12. non-admin /admin/claims -> $(curl -s -o /dev/null -w '%{http_code}' -b $J1 $B/admin/claims)"
-echo "13. sign in admin"; signin $J2 admin@example.test /admin/claims
-CID=$(curl -s -b $J2 $B/admin/claims | grep -oE '/admin/claims/[0-9a-f-]{36}' | head -1); echo "  claim: $CID"
-DOC=$(curl -s -b $J2 $B$CID | grep -oE '/admin/documents/[0-9a-f-]{36}' | head -1)
+echo "10a. claim with bad file -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F kind=business -F tin=123-456-789 -F 'registered_name=Juan Dela Cruz' -F form_2303=@f2303.pdf -F government_id=@evil.exe $B/tins/claims)"
+echo "10b. claim bad TIN -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F kind=business -F tin=12345 -F 'registered_name=Juan' -F form_2303=@f2303.pdf -F government_id=@id.png $B/tins/claims)"
+echo "10c. claim ok -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F kind=business -F tin=123-456-789 -F 'registered_name=Juan Dela Cruz' -F form_2303=@f2303.pdf -F government_id=@id.png -F supporting=@f2303.pdf $B/tins/claims)"
+echo "10d. duplicate claim -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F kind=business -F tin=123456789 -F 'registered_name=Juan Dela Cruz' -F form_2303=@f2303.pdf -F government_id=@id.png $B/tins/claims)"
+echo "11. account page lists: $(curl -s -b $J1 $B/tins | grep -oE '123-456-789-00000|Being checked' | sort -u | tr '\n' ' ')"
+echo "12. non-staff /staff -> $(curl -s -o /dev/null -w "%{http_code}" -b $J1 $B/staff)"
+echo "13. sign in admin"; signin $J2 admin@example.test /staff
+CID=$(curl -s -b $J2 $B/staff | grep -oE '/staff/claims/[0-9a-f-]{36}' | head -1); echo "  claim: $CID"
+DOC=$(curl -s -b $J2 $B$CID | grep -oE '/staff/documents/[0-9a-f-]{36}' | head -1)
 echo "14. admin opens document: $(curl -s -D - -o doc.bin -b $J2 $B$DOC | grep -iE '^(HTTP|content-type)' | tr -d '\r' | tr '\n' ' ') bytes=$(head -c 8 doc.bin)"
 echo "14b. user cannot open document -> $(curl -s -o /dev/null -w '%{http_code}' -b $J1 $B$DOC)"
 echo "15. reject without note -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J2 -H "$O" -d decision=reject $B$CID/decision)"

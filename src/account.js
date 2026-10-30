@@ -19,10 +19,61 @@ document.documentElement.classList.add("js");
       if (input.type === "file" && input.closest(".slot")) showFiles(input);
     });
 
-    // Forms that end something ask first.
+    // Forms that end something ask first, in a dialog that matches the site
+    // (never the browser's own confirm box). `data-confirm` is the question,
+    // `data-confirm-detail` the line under it, `data-confirm-label` the
+    // button, and `data-confirm-tone="danger"` paints that button red.
+    let confirmBox = null;
+    const askFirst = (form, submitter) => {
+      if (!confirmBox) {
+        confirmBox = document.createElement("dialog");
+        confirmBox.className = "home confirm-dialog";
+        confirmBox.setAttribute("aria-labelledby", "confirm-title");
+        confirmBox.setAttribute("aria-describedby", "confirm-detail");
+        confirmBox.innerHTML =
+          '<form method="dialog" class="confirm-box">' +
+          '<h2 class="confirm-title" id="confirm-title"></h2>' +
+          '<p class="confirm-detail" id="confirm-detail"></p>' +
+          '<div class="confirm-actions">' +
+          '<button class="btn btn-ghost" value="cancel">Cancel</button>' +
+          '<button class="btn btn-solid confirm-ok" value="ok"></button>' +
+          "</div></form>";
+        document.body.append(confirmBox);
+        // A click on the backdrop cancels.
+        confirmBox.addEventListener("click", (event) => {
+          if (event.target === confirmBox) confirmBox.close("cancel");
+        });
+      }
+      const data = form.dataset;
+      confirmBox.querySelector(".confirm-title").textContent = data.confirm;
+      const detail = confirmBox.querySelector(".confirm-detail");
+      detail.textContent = data.confirmDetail || "";
+      detail.hidden = !data.confirmDetail;
+      const ok = confirmBox.querySelector(".confirm-ok");
+      ok.textContent = data.confirmLabel || "Confirm";
+      ok.classList.toggle("confirm-danger", data.confirmTone === "danger");
+      confirmBox.returnValue = "cancel";
+      confirmBox.onclose = () => {
+        if (confirmBox.returnValue !== "ok") return;
+        form.dataset.confirmed = "yes";
+        if (form.requestSubmit) form.requestSubmit(submitter || undefined);
+        else form.submit();
+      };
+      confirmBox.showModal();
+      // The safe choice has focus, so Enter never destroys anything by accident.
+      confirmBox.querySelector('[value="cancel"]').focus();
+    };
     document.addEventListener("submit", (event) => {
-      const message = event.target.dataset && event.target.dataset.confirm;
-      if (message && !window.confirm(message)) event.preventDefault();
+      const form = event.target;
+      if (!form.dataset || !form.dataset.confirm) return;
+      if (form.dataset.confirmed === "yes") {
+        delete form.dataset.confirmed;
+        return;
+      }
+      // Browsers without <dialog> (none current) just send the form.
+      if (typeof HTMLDialogElement !== "function") return;
+      event.preventDefault();
+      askFirst(form, event.submitter);
     });
 
     // The account menu closes on a click elsewhere or Escape.

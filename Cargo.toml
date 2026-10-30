@@ -14,6 +14,7 @@ path = "src/main.rs"
 [[bin]]
 name = "buwiz-relay"
 path = "src/bin/buwiz-relay.rs"
+required-features = ["bir"]
 
 [[bin]]
 name = "buwiz-trust-sign"
@@ -23,33 +24,68 @@ path = "src/bin/buwiz-trust-sign.rs"
 name = "buwiz-sender"
 path = "src/bin/buwiz-sender.rs"
 
+# Tests and examples that need the BIR relay code. Their paths are given so
+# that a checkout without those files still parses.
+[[test]]
+name = "relay"
+path = "tests/relay.rs"
+required-features = ["bir"]
+
+[[test]]
+name = "iaf_golden"
+path = "tests/iaf_golden.rs"
+required-features = ["bir"]
+
+[[example]]
+name = "iaf-decrypt"
+path = "examples/iaf-decrypt.rs"
+required-features = ["bir"]
+
+[features]
+default = []
+# The BIR relay: `src/bir/` (dispatcher, IAF encryption, SFTP upload) and
+# the v1 reference client. Without it the Sender answers every send with
+# `failed`, "relay not built in". Production builds use `--features bir`.
+bir = [
+    "dep:aes",
+    "dep:cbc",
+    "dep:flate2",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:pbkdf2",
+    "dep:russh",
+    "dep:russh-sftp",
+    "dep:sha1",
+]
+
 [dependencies]
-aes = "0.8"
+aes = { version = "0.8", optional = true }
 aes-gcm = "0.10"
 anyhow = "1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 bytes = "1"
-cbc = { version = "0.1", features = ["alloc"] }
+cbc = { version = "0.1", features = ["alloc"], optional = true }
 ed25519-dalek = "2"
-flate2 = { version = "1", default-features = false, features = ["zlib"] }
+flate2 = { version = "1", default-features = false, features = ["zlib"], optional = true }
 form_urlencoded = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 http = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-russh = { version = "0.63", default-features = false, features = ["flate2", "ring"] }
-russh-sftp = "3"
+russh = { version = "0.63", default-features = false, features = ["flate2", "ring"], optional = true }
+russh-sftp = { version = "3", optional = true }
 rusty-s3 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-sha1 = "0.10"
+sha1 = { version = "0.10", optional = true }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "time", "migrate", "macros"] }
 thiserror = "2"

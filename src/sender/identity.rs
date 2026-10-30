@@ -143,6 +143,8 @@ mod tests {
         assert!(check(b"not xml", &ticket("00012345300000", "1701Qv2018", "2026Q1")).is_err());
     }
 
+    /// The fixtures (`tests/fixtures/iaf/`) belong to the BIR relay files.
+    #[cfg(feature = "bir")]
     #[test]
     fn the_fixture_returns_match() {
         let fixture = include_bytes!("../../tests/fixtures/iaf/1601C-062025.plain.xml");

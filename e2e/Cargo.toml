@@ -1,7 +1,8 @@
 # End-to-end tests of submission v2 with the real buwiz-oss client
 # (`bir-submit`, `bir-core`, `bir-app-core`). A workspace of its own, so the
 # server's CI, which cannot read the private buwiz-oss repo, never builds
-# it. Run it with `scripts/v6.sh`.
+# it. Run it with `scripts/v6.sh`. It uses the server's BIR relay, so it
+# builds the server with the `bir` feature and needs those files.
 [package]
 name = "buwiz-e2e"
 version = "0.0.0"
@@ -19,7 +20,7 @@ base64 = "0.22"
 bir-app-core = { git = "https://github.com/buwiz-corp/buwiz-oss", branch = "goal/complete" }
 bir-core = { git = "https://github.com/buwiz-corp/buwiz-oss", branch = "goal/complete" }
 bir-submit = { git = "https://github.com/buwiz-corp/buwiz-oss", branch = "goal/complete" }
-buwiz-cloud = { path = ".." }
+buwiz-cloud = { path = "..", features = ["bir"] }
 ed25519-dalek = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 russh = { version = "0.63", default-features = false, features = ["flate2", "ring"] }

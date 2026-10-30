@@ -534,6 +534,103 @@ async fn staff_can_sign_an_account_out_everywhere(db: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn sign_in_and_sign_up_name_their_button_and_go_without_a_password(db: PgPool) {
+    let site = Site::new(db);
+    let button = |label: &str| {
+        format!(r#"type="submit">{label}<span class="icon" aria-hidden="true">arrow_forward</span></button>"#)
+    };
+    let hint = r#"<p class="auth-hint"><span class="icon" aria-hidden="true">lock</span>Passwordless login</p>"#;
+    let lead = "Enter your email and we will send you a 6-digit code.";
+    let login = text(site.get("/login", "").await).await;
+    assert!(login.contains(&button("Sign in")) && login.contains(hint) && login.contains(lead), "{login}");
+    let signup = text(site.get("/signup", "").await).await;
+    assert!(signup.contains(&button("Create account")) && signup.contains(hint) && signup.contains(lead), "{signup}");
+    for page in [login, signup] {
+        assert!(!page.contains("Email me a code") && !page.contains("10 minutes"), "{page}");
+    }
+}
+
+/// The text of the code page's countdown and its `data-expires-at`.
+fn code_timer(page: &str) -> (String, String) {
+    let timer = &page[page.find("code-timer").unwrap()..];
+    let timer = &timer[..timer.find("</p>").unwrap()];
+    let expires_at = timer.split("data-expires-at=\"").nth(1).unwrap().split('"').next().unwrap();
+    let words = timer.split("data-timer-text=\"\">").nth(1).unwrap().split('<').next().unwrap();
+    assert!(!timer.contains("role="), "the ticking text is not announced: {timer}");
+    (words.to_owned(), expires_at.to_owned())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_code_page_counts_down_to_the_codes_real_expiry(db: PgPool) {
+    let site = Site::new(db);
+    let sent = site.post("/auth/email/start", "", "email=Ana%40Example.test").await;
+    assert_eq!(sent.status(), StatusCode::SEE_OTHER);
+    let verify = location(&sent);
+    let stored: OffsetDateTime =
+        sqlx::query_scalar("SELECT expires_at FROM email_codes").fetch_one(&site.db).await.unwrap();
+    let page = text(site.get(&verify, "").await).await;
+    let (words, expires_at) = code_timer(&page);
+    // The link's expiry is the code's, give or take the time to store it.
+    let linked = expires_at.parse::<i128>().unwrap();
+    let real = stored.unix_timestamp_nanos() / 1_000_000;
+    assert!((0..2_000).contains(&(real - linked)), "{linked} vs {real}");
+    assert!(["Code expires in 10:00", "Code expires in 9:59"].contains(&words.as_str()), "{words}");
+    assert!(page.contains(&format!(r#"<input type="hidden" name="expires" value="{expires_at}">"#)), "{page}");
+    assert!(page.contains(r#"<p class="visually-hidden" role="status" data-timer-status=""></p>"#), "{page}");
+    assert!(page.contains(r#"<form class="auth-resend" "#), "{page}");
+    // The icon shares the heading's line, and the notice says only to look.
+    assert!(page.contains(
+        r#"<div class="auth-heading"><span class="auth-badge"><span class="icon" aria-hidden="true">mark_email_unread</span></span><h1>Check your email</h1></div>"#
+    ));
+    assert!(page.contains(
+        r#"role="status"><span class="icon" aria-hidden="true">check_circle</span><span>Please check your email</span>"#
+    ));
+    assert!(!page.contains("Paste the 6-digit code"));
+
+    // A wrong code comes back to the same countdown, not a fresh one.
+    let wrong = site
+        .post("/auth/email/verify", "", &format!("email=ana%40example.test&code=000000&expires={expires_at}"))
+        .await;
+    let page = text(site.get(&location(&wrong), "").await).await;
+    assert_eq!(code_timer(&page).1, expires_at);
+
+    // Reloaded 18 seconds before the end, it shows 0:18.
+    let soon = (OffsetDateTime::now_utc() + time::Duration::milliseconds(18_500)).unix_timestamp_nanos() / 1_000_000;
+    let page = text(site.get(&format!("/login/verify?email=ana%40example.test&expires={soon}"), "").await).await;
+    assert!(["Code expires in 0:18", "Code expires in 0:17"].contains(&code_timer(&page).0.as_str()));
+
+    // The page tells nothing from the database: a code for someone's email
+    // without the link's expiry, a run-out one, or nonsense all say expired
+    // and point at a new code. An expiry past ten minutes is cut to ten.
+    let past = (OffsetDateTime::now_utc() - time::Duration::minutes(1)).unix_timestamp_nanos() / 1_000_000;
+    for query in
+        ["email=ana%40example.test", &format!("email=ana%40example.test&expires={past}"), "email=x&expires=soon"]
+    {
+        let page = text(site.get(&format!("/login/verify?{query}"), "").await).await;
+        assert_eq!(code_timer(&page).0, "Code expired", "{query}");
+        assert!(page.contains("code-timer expired") && page.contains(r#"<form class="auth-resend due" "#), "{page}");
+    }
+    let page = text(site.get("/login/verify?email=ana%40example.test&expires=99999999999999", "").await).await;
+    assert!(["Code expires in 10:00", "Code expires in 9:59"].contains(&code_timer(&page).0.as_str()));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_header_is_as_wide_on_every_page(db: PgPool) {
+    let site = Site::new(db);
+    let home = text(site.get("/assets/home.css", "").await).await;
+    assert!(home.contains(".home.landing, .top { --shell: 1400px; --shell-pad: var(--gutter); }"));
+    for sheet in ["/assets/site.css", "/assets/home.css", "/assets/account.css"] {
+        let css = text(site.get(sheet, "").await).await;
+        for rule in css.lines().filter(|line| line.contains("--shell") && line.contains('{')) {
+            let selector = rule.split('{').next().unwrap();
+            assert!(!selector.contains("top") || selector == ".home.landing, .top ", "{sheet}: {rule}");
+        }
+    }
+    let site_css = text(site.get("/assets/site.css", "").await).await;
+    assert!(site_css.contains("html { scrollbar-gutter: stable; }"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn sign_in_and_add_tin_pages_render(db: PgPool) {
     let site = Site::new(db);
     let (_, cookie) = site.person("ana@example.test").await;

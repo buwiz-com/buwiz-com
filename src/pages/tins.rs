@@ -346,12 +346,12 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                                 <div class="extra-panels">
                                     <div class="extra" id="extra-selfie" data-extra="">
                                         <div class="extra-in">
-                                            doc_zone(field: "selfie", title: "Selfie", hint: "Face the camera in good light. We compare it with your TIN ID.", icon_name: "face", selfie: true, extra: true)
+                                            doc_zone(field: "selfie", title: "Selfie", hint: "Face the camera in good light", icon_name: "face", selfie: true, extra: true)
                                         </div>
                                     </div>
                                     <div class="extra" id="extra-national_id" data-extra="">
                                         <div class="extra-in">
-                                            doc_zone(field: "national_id", title: "National ID", hint: "Your PhilSys card or ePhilID, with its QR code readable", icon_name: "id_card", extra: true)
+                                            doc_zone(field: "national_id", title: "National ID", hint: "PhilSys card or ePhilID, QR code readable", icon_name: "id_card", extra: true)
                                         </div>
                                     </div>
                                 </div>
@@ -364,8 +364,8 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                                 <p class="page-lead">"Your Form 2303 and a government ID. A person checks them, usually within one business day."</p>
                             </div>
                             <div class="zones">
-                                doc_zone(field: "form_2303", title: "Form 2303", hint: "Your Certificate of Registration from the BIR", icon_name: "description", required: true)
-                                doc_zone(field: "government_id", title: "Government ID", hint: "Passport, driver's license, UMID, PhilSys or another ID with your photo", icon_name: "badge", required: true)
+                                doc_zone(field: "form_2303", title: "Form 2303", hint: "Your BIR Certificate of Registration", icon_name: "description", required: true)
+                                doc_zone(field: "government_id", title: "Government ID", hint: "Passport, driver's license, UMID or another photo ID", icon_name: "badge", required: true)
                             </div>
                             <div class="extras">
                                 <div class="extras-head">

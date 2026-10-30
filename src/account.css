@@ -677,7 +677,7 @@
   place-items: center;
   flex: none;
 }
-.tile-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.home .tile-thumb img { width: 100%; height: 100%; object-fit: cover; }
 .tile-thumb.pdf { align-content: center; gap: 1px; background: var(--err-bg); border-color: color-mix(in srgb, var(--danger) 20%, var(--line)); color: var(--danger); }
 .tile-thumb.pdf .icon { font-size: 24px; }
 .tile-glyph { font-size: 10px; font-weight: 800; letter-spacing: 0.06em; line-height: 1; }
@@ -763,7 +763,8 @@
 }
 .extra-chip-tile > .icon { font-size: 24px; }
 .extra-chip[aria-expanded="true"] .extra-chip-tile { background: var(--brand); color: var(--brand-ink); }
-.extra-chip-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.home .extra-chip-img { position: absolute; inset: 0; width: 48px; height: 48px; max-width: none; object-fit: cover; border-radius: inherit; }
+.extra-chip-tile:has(.extra-chip-img) > .icon { visibility: hidden; }
 .extra-chip-badge {
   position: absolute;
   top: -6px;
@@ -795,6 +796,7 @@
 @media (prefers-reduced-motion: reduce) {
   .js .extra, .js .extra .extra-in, .zone, .extra-chip { transition: none; }
 }
+.home .btn-send:disabled .icon { display: none; }
 .home .btn-send:disabled { background: color-mix(in srgb, var(--night-accent) 30%, var(--night)); color: var(--night-muted); cursor: not-allowed; }
 .send-bar {
   display: flex;

@@ -28,6 +28,9 @@ const ORIGIN: &str = "http://localhost:3008";
 const STAFF: &str = "staff@example.test";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nphoto";
 const PDF: &[u8] = b"%PDF-1.7\nscan";
+/// Nothing listens on the discard port: the downloads bucket is unreachable,
+/// so nothing is released.
+const NO_DOWNLOADS: &str = "http://127.0.0.1:9";
 
 struct Site {
     db: PgPool,
@@ -40,6 +43,15 @@ impl Site {
     }
 
     fn with_store(db: PgPool, store: DocumentStore) -> Self {
+        Self::build(db, store, NO_DOWNLOADS)
+    }
+
+    /// A site whose installers are at `downloads_url`.
+    fn with_downloads(db: PgPool, downloads_url: &str) -> Self {
+        Self::build(db, DocumentStore::Database, downloads_url)
+    }
+
+    fn build(db: PgPool, store: DocumentStore, downloads_url: &str) -> Self {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
@@ -51,6 +63,7 @@ impl Site {
             admin_emails: vec![STAFF.into()],
             mail: MailConfig::Log,
             trust_list: None,
+            downloads_url: downloads_url.into(),
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         // The account site never reaches the Sender in these tests.
@@ -1071,5 +1084,259 @@ async fn claimants_replace_and_remove_files_while_open(db: PgPool) {
         .unwrap();
         let response = site.post(&format!("/tins/claims/{other}/documents/{file}/remove"), &cookie, "").await;
         assert_eq!(location(&response), "/tins?notice=files_locked", "{status}");
+    }
+}
+
+/// A stand-in for the `buwiz-releases` bucket: `/latest.json` is whatever
+/// the test sets, or a 404 while unset.
+#[derive(Clone, Default)]
+struct FakeReleases(Arc<Mutex<Option<Vec<u8>>>>);
+
+impl FakeReleases {
+    /// Serves the bucket on a free port; returns it and its URL.
+    async fn start() -> (Self, String) {
+        let releases = Self::default();
+        let shared = releases.0.clone();
+        let app = axum::Router::new().route(
+            "/latest.json",
+            axum::routing::get(move || {
+                let latest = shared.lock().unwrap().clone();
+                async move {
+                    match latest {
+                        Some(bytes) => bytes.into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (releases, url)
+    }
+
+    fn set_latest(&self, latest: &[u8]) {
+        *self.0.lock().unwrap() = Some(latest.to_vec());
+    }
+}
+
+const SHA_MAC: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const SHA_DEB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+/// One file of a manifest.
+fn release_file(platform: &str, arch: &str, kind: &str, file: &str, size: u64, sha: &str) -> Value {
+    serde_json::json!({"platform": platform, "arch": arch, "kind": kind, "file": file, "size": size, "sha256": sha})
+}
+
+/// Version 1.2.0 as the release CI (buwiz-oss) writes it, named as it names
+/// them, before Android signing is set up: no Android file, and an iOS
+/// entry this server does not know, plus `extra` files.
+fn latest_json(extra: &[Value]) -> Vec<u8> {
+    let other = "0".repeat(64);
+    let mut files = vec![
+        release_file("macos", "universal", "dmg", "Buwiz-1.2.0-macos-universal.dmg", 84_213_000, SHA_MAC),
+        release_file("windows", "x64", "exe", "Buwiz-1.2.0-windows-x64-setup.exe", 60_000_000, &other),
+        release_file("linux", "x64", "deb", "buwiz_1.2.0_amd64.deb", 55_000_000, SHA_DEB),
+        release_file("ios", "arm64", "ipa", "Buwiz.ipa", 1, &other),
+    ];
+    files.extend_from_slice(extra);
+    serde_json::json!({"version": "1.2.0", "published_at": "2026-11-02T01:00:00Z", "files": files})
+        .to_string()
+        .into_bytes()
+}
+
+/// Files the CI may add later: an AppImage, the signed Android APK, an MSI.
+fn later_files() -> Vec<Value> {
+    let other = "0".repeat(64);
+    vec![
+        release_file("linux", "x64", "appimage", "Buwiz-1.2.0-linux-x64.AppImage", 90_000_000, &other),
+        release_file("android", "arm64", "apk", "Buwiz-1.2.0-android-arm64.apk", 40_000_000, &other),
+        release_file("windows", "x64", "msi", "Buwiz-1.2.0-windows-x64.msi", 62_000_000, &other),
+    ]
+}
+
+async fn download_from(site: &Site, path: &str) -> Response {
+    site.on_host("buwiz.com", path).await
+}
+
+fn cache_control(response: &Response) -> &str {
+    response.headers().get(header::CACHE_CONTROL).map_or("", |value| value.to_str().unwrap())
+}
+
+/// Asks for each path and checks it redirects, uncached, to `target`.
+async fn assert_redirects(site: &Site, cases: &[(&str, String)]) {
+    for (path, target) in cases {
+        let response = download_from(site, path).await;
+        assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+        assert_eq!(&location(&response), target, "{path}");
+        assert_eq!(cache_control(&response), "no-store", "{path}");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn downloads_go_to_the_released_installer_without_caching(db: PgPool) {
+    let (releases, url) = FakeReleases::start().await;
+    releases.set_latest(&latest_json(&[]));
+    let site = Site::with_downloads(db.clone(), &url);
+    let file = |name: &str| format!("{url}/releases/v1.2.0/{name}");
+    assert_redirects(
+        &site,
+        &[
+            ("/download/mac", file("Buwiz-1.2.0-macos-universal.dmg")),
+            ("/download/windows", file("Buwiz-1.2.0-windows-x64-setup.exe")),
+            // Today's Linux file is the deb.
+            ("/download/linux", file("buwiz_1.2.0_amd64.deb")),
+            ("/download/linux?kind=deb", file("buwiz_1.2.0_amd64.deb")),
+            // No such file: the download page, which lists what there is.
+            ("/download/android", "/download".into()),
+            ("/download/linux?kind=appimage", "/download".into()),
+            ("/download/linux?kind=msi", "/download".into()),
+            ("/download/mac?kind=nonsense", "/download".into()),
+        ],
+    )
+    .await;
+    for path in ["/download/ios", "/download/macos", "/download/mac/extra"] {
+        assert_eq!(download_from(&site, path).await.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for host in ["account.buwiz.com", "api.buwiz.com"] {
+        assert_eq!(site.on_host(host, "/download/mac").await.status(), StatusCode::NOT_FOUND, "{host}");
+        assert_eq!(site.on_host(host, "/download").await.status(), StatusCode::NOT_FOUND, "{host}");
+    }
+
+    // Once the CI adds an AppImage, an MSI and the APK, they become the
+    // defaults; the others stay a `?kind=` away.
+    releases.set_latest(&latest_json(&later_files()));
+    let site = Site::with_downloads(db, &url);
+    assert_redirects(
+        &site,
+        &[
+            ("/download/linux", file("Buwiz-1.2.0-linux-x64.AppImage")),
+            ("/download/linux?kind=deb", file("buwiz_1.2.0_amd64.deb")),
+            ("/download/windows", file("Buwiz-1.2.0-windows-x64.msi")),
+            ("/download/windows?kind=exe", file("Buwiz-1.2.0-windows-x64-setup.exe")),
+            ("/download/android", file("Buwiz-1.2.0-android-arm64.apk")),
+        ],
+    )
+    .await;
+}
+
+/// The download page's platform cards, each up to its end.
+fn platform_cards(page: &str) -> Vec<&str> {
+    page.split("<li class=\"panel dl-card").skip(1).map(|card| card.split("</li></ul>").next().unwrap()).collect()
+}
+
+fn card<'a>(cards: &[&'a str], name: &str) -> &'a str {
+    cards.iter().find(|card| card.contains(&format!("<h2>{name}</h2>"))).unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_download_page_lists_the_release_and_highlights_the_visitors_platform(db: PgPool) {
+    let (releases, url) = FakeReleases::start().await;
+    releases.set_latest(&latest_json(&[]));
+    let site = Site::with_downloads(db.clone(), &url);
+    let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
+    let request = Request::get("/download").header(header::HOST, "buwiz.com").header(header::USER_AGENT, mac);
+    let page = text(site.send(request.body(Body::empty()).unwrap()).await).await;
+    assert!(page.contains("<title>Download Buwiz for Windows, macOS, Linux and Android</title>"), "{page}");
+    assert!(page.contains(r#"<link rel="canonical" href="https://buwiz.com/download">"#));
+    assert!(!page.contains("noindex"));
+    assert!(page.contains("Version 1.2.0, released November 2, 2026."));
+    for platform in ["mac", "windows", "linux"] {
+        assert!(page.contains(&format!(r#"href="/download/{platform}""#)), "{platform}");
+    }
+    // The Mac card is the visitor's, with its installer's size and checksum.
+    let cards = platform_cards(&page);
+    assert_eq!(cards.len(), 5);
+    let mac_card = card(&cards, "macOS");
+    assert!(mac_card.starts_with(" yours\""), "{mac_card}");
+    assert!(mac_card.contains("84.2 MB") && mac_card.contains(SHA_MAC), "{mac_card}");
+    assert_eq!(cards.iter().filter(|card| card.starts_with(" yours\"")).count(), 1);
+    let linux = card(&cards, "Linux");
+    assert!(linux.contains("Debian, Ubuntu (.deb)") && linux.contains(SHA_DEB) && linux.contains("55.0 MB"), "{linux}");
+    // Android has no file yet; iOS will come from the App Store.
+    let android = card(&cards, "Android");
+    assert!(
+        android.contains(r#"<span class="soon-tag">Coming soon</span>"#) && !android.contains("href="),
+        "{android}"
+    );
+    let ios = card(&cards, "iOS");
+    assert!(ios.contains("App Store, coming soon") && !ios.contains("href="), "{ios}");
+    assert!(!page.contains("Buwiz.ipa") && !page.contains("/download/android"));
+
+    // The home page's platform row links here, Android and iOS still to come.
+    let home = text(site.on_host("buwiz.com", "/").await).await;
+    let row = &home[home.find(r#"<div class="platforms"#).unwrap()..];
+    let row = &row[..row.find("</div>").unwrap()];
+    assert!(row.contains(r#"<a class="btn btn-solid" href="/download">"#), "{row}");
+    for platform in ["mac", "windows", "linux"] {
+        assert!(row.contains(&format!(r#"href="/download/{platform}""#)), "{platform}");
+    }
+    assert!(row.contains(r#"title="Android, coming soon""#) && row.contains(r#"title="iOS, coming soon""#), "{row}");
+    assert!(!row.contains("soon-tag") && !row.contains("/download/android"), "{row}");
+
+    let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
+    assert!(sitemap.contains("<loc>https://buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"), "{sitemap}");
+
+    // With more files, each card lists the ones it does not default to.
+    releases.set_latest(&latest_json(&later_files()));
+    let page = text(download_from(&Site::with_downloads(db, &url), "/download").await).await;
+    let cards = platform_cards(&page);
+    let linux = card(&cards, "Linux");
+    assert!(linux.contains(r#"href="/download/linux""#) && linux.contains("AppImage · x64"), "{linux}");
+    let others = &linux[linux.find("dl-others").unwrap()..];
+    assert!(others.contains(&format!(r#"href="{url}/releases/v1.2.0/buwiz_1.2.0_amd64.deb""#)), "{others}");
+    assert!(others.contains(SHA_DEB) && !others.contains("AppImage"), "{others}");
+    assert!(card(&cards, "Android").contains(r#"href="/download/android""#));
+}
+
+/// What every page says while nothing is released.
+async fn assert_coming_soon(site: &Site, why: &str) {
+    let response = download_from(site, "/download/windows").await;
+    assert_eq!(response.status(), StatusCode::FOUND, "{why}");
+    assert_eq!(location(&response), "/download", "{why}");
+    assert_eq!(cache_control(&response), "no-store", "{why}");
+
+    let page = download_from(site, "/download").await;
+    assert_eq!(page.status(), StatusCode::OK, "{why}");
+    let page = text(page).await;
+    assert!(page.contains("Buwiz is coming soon to Windows, macOS, Linux and Android"), "{why}");
+    assert_eq!(page.matches(r#"<span class="soon-tag">Coming soon</span>"#).count(), 4, "{why}");
+    assert!(page.contains("App Store, coming soon"), "{why}");
+    assert!(!page.contains("href=\"/download/") && !page.contains("releases/v"), "{why}");
+    assert!(page.contains(r#"<meta name="robots" content="noindex">"#), "{why}");
+
+    let home = text(site.on_host("buwiz.com", "/").await).await;
+    assert!(
+        home.contains(r#"<div class="platforms rise d3"><span class="soon-tag">Coming soon</span><ul aria-label="Where Buwiz will run"><li class="platform" title="Windows, coming soon"><svg"#),
+        "{why}"
+    );
+    assert!(!home.contains("/download"), "{why}");
+
+    let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
+    assert!(!sitemap.contains("/download"), "{why}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn nothing_is_released_until_latest_json_exists(db: PgPool) {
+    let (_releases, url) = FakeReleases::start().await;
+    assert_coming_soon(&Site::with_downloads(db, &url), "no latest.json").await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_broken_or_unreachable_manifest_means_coming_soon(db: PgPool) {
+    assert_coming_soon(&Site::new(db.clone()), "unreachable").await;
+    let sha = "0".repeat(64);
+    let path_trick = serde_json::json!({
+        "version": "1.2.0",
+        "files": [{"platform": "windows", "arch": "x64", "kind": "msi", "file": "../../evil.msi", "size": 1, "sha256": sha}],
+    })
+    .to_string();
+    let bad_version = String::from_utf8(latest_json(&[])).unwrap().replace("\"1.2.0\"", "\"1.2.0/../..\"");
+    for (latest, why) in
+        [("{\"version\":", "broken JSON"), (path_trick.as_str(), "path trick"), (bad_version.as_str(), "bad version")]
+    {
+        let (releases, url) = FakeReleases::start().await;
+        releases.set_latest(latest.as_bytes());
+        assert_coming_soon(&Site::with_downloads(db.clone(), &url), why).await;
     }
 }

@@ -2,11 +2,10 @@
 //! (`src/app/marketing` in buwiz-server). The app tour switches screens with
 //! radio buttons and the FAQ uses `<details>`; only the AI Co-worker demos
 //! need JavaScript (`src/demo.js`). Styles live in `src/home.css`, and the
-//! demos' in `src/demo.css`. The hero's Download button is chosen from
-//! `User-Agent`; `src/download.js` only refines it (an ARM64 Linux, an iPad
-//! that asked for the desktop site) and opens "Other downloads".
+//! demos' in `src/demo.css`. The hero's one Download button is chosen from
+//! `User-Agent` on the server; no script changes it. A Linux visitor also
+//! gets the install script's command to copy, once it is released.
 
-use super::download::size;
 use super::*;
 use crate::downloads::{Arch, Device, Kind, Platform, Release, guess_device};
 use http::header;
@@ -294,12 +293,11 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let release = state(cx).downloads.latest().await;
     let user_agent = headers(cx).get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
     let yours = guess_device(user_agent);
-    let released = release.is_some();
     Ok(view! {
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap">
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home landing">
-            hero(signed_in: signed_in, release: release, yours: yours)
+            hero(release: release, yours: yours)
             tour()
             account_section(signed_in: signed_in)
             agents_section()
@@ -307,9 +305,6 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
             footer()
         </main>
         <script src="/assets/demo.js" defer=(true)></script>
-        if released {
-            <script src="/assets/download.js" defer=(true)></script>
-        }
     })
 }
 
@@ -327,69 +322,64 @@ async fn account_actions(signed_in: bool) -> Result<impl View> {
     })
 }
 
-/// The hero's Download button: what it says and where it goes.
-struct Offer {
-    /// The device it is for, as `data-get` for `/assets/download.js`.
-    device: &'static str,
-    href: String,
-    title: &'static str,
-    /// What the file is, under the title.
-    detail: &'static str,
-    /// The same file for ARM64, when released, for the script to switch
-    /// to on an ARM64 Linux computer.
-    arm64_href: Option<String>,
+/// The hero's one Download button for `device`: its label and its counted
+/// link. Anything without a file of its own in the release (an iPhone, a
+/// Chromebook, a device we cannot tell) gets the download page.
+fn download_button(release: &Release, device: Option<Device>) -> (&'static str, String) {
+    let platform = match device {
+        Some(Device::Platform(platform)) => platform,
+        _ => return ("Download", "/download".to_owned()),
+    };
+    // `/download/linux` is the x64 deb; the others are whatever `pick` gives.
+    let released = match platform {
+        Platform::Linux => release.pick(Platform::Linux, Some(Kind::Deb), Some(Arch::X64)).is_some(),
+        _ => release.pick(platform, None, None).is_some(),
+    };
+    let label = match platform {
+        Platform::Mac => "Download for Mac",
+        Platform::Windows => "Download for Windows",
+        Platform::Linux => "Download for Linux",
+        Platform::Android => "Download for Android",
+    };
+    if released { (label, format!("/download/{}", platform.slug())) } else { ("Download", "/download".to_owned()) }
 }
 
-/// The installer for the visitor's device, when there is one for it.
-fn offer(release: &Release, device: Option<Device>) -> Option<Offer> {
-    let has = |platform, kind, arch| release.pick(platform, Some(kind), Some(arch)).is_some();
-    let deb = |arch: Arch| format!("/download/linux?kind=deb&arch={}", arch.name());
-    let offer = |device, href, title, detail| Offer { device, href, title, detail, arm64_href: None };
-    match device? {
-        Device::Platform(Platform::Windows) if has(Platform::Windows, Kind::Exe, Arch::X64) => Some(offer(
-            "windows",
-            "/download/windows?kind=exe&arch=x64".to_owned(),
-            "Download for Windows",
-            "Installer · 64-bit",
-        )),
-        Device::Platform(Platform::Mac) => release.pick(Platform::Mac, None, None).map(|file| {
-            let chips = match file.arch {
-                Arch::Universal => "Apple and Intel chips",
-                Arch::Arm64 => "Apple chips",
-                Arch::X64 => "Intel chips",
-            };
-            offer("mac", "/download/mac".to_owned(), "Download for Mac", chips)
-        }),
-        Device::Platform(Platform::Linux) if has(Platform::Linux, Kind::Deb, Arch::X64) => Some(Offer {
-            arm64_href: has(Platform::Linux, Kind::Deb, Arch::Arm64).then(|| deb(Arch::Arm64)),
-            ..offer("linux", deb(Arch::X64), "Download for Linux", "Ubuntu, Debian (.deb)")
-        }),
-        Device::Chromebook if has(Platform::Linux, Kind::Deb, Arch::X64) => {
-            Some(offer("chromebook", deb(Arch::X64), "Download for Chromebook", "Linux app (.deb) · 64-bit"))
-        }
-        Device::Platform(Platform::Android) => release
-            .pick(Platform::Android, None, None)
-            .map(|_| offer("android", "/download/android".to_owned(), "Download for Android", "APK")),
-        _ => None,
-    }
-}
-
-/// What [`PLATFORMS`] calls `platform`.
-fn platform_name(platform: Platform) -> &'static str {
-    PLATFORMS.iter().find(|(_, listed, _)| *listed == Some(platform)).map_or("", |(name, _, _)| name)
-}
-
-/// The hero's downloads: "Coming soon" until a version is released, then
-/// one big button for the visitor's device (guessed from `User-Agent`),
-/// "Other downloads" with every released file, and the row of platform
-/// logos, each linking to its installer. An iPhone or iPad gets the link to
-/// open on a computer instead; so does an iPad that asked for the desktop
-/// site and so says Macintosh, which only `/assets/download.js` can tell.
+/// The hero: "Coming soon" until a version is released, then one Download
+/// button for the visitor's device (guessed from `User-Agent`) and a quiet
+/// link to the other platforms. The row of platform logos only says where
+/// Buwiz runs; nothing in it is a link.
 #[component]
-async fn hero(signed_in: bool, release: Option<Arc<Release>>, yours: Option<Device>) -> Result<impl View> {
-    let offer = release.as_deref().and_then(|release| offer(release, yours));
-    let ios = yours == Some(Device::Ios);
-    let mac = offer.as_ref().is_some_and(|offer| offer.device == "mac");
+async fn hero(release: Option<Arc<Release>>, yours: Option<Device>) -> Result<impl View> {
+    let button = release.as_deref().map(|release| download_button(release, yours));
+    let released = release.is_some();
+    // The install script's line, for a Linux visitor, once it is released.
+    let script = yours == Some(Device::Platform(Platform::Linux))
+        && button.as_ref().is_some_and(|(_, href)| href == "/download/linux")
+        && release.as_deref().is_some_and(has_install_script);
+    let logos: Vec<(&str, Logo, bool)> = PLATFORMS
+        .iter()
+        .map(|(name, platform, paths)| {
+            let available = release
+                .as_deref()
+                .zip(*platform)
+                .is_some_and(|(release, platform)| release.pick(platform, None, None).is_some());
+            (*name, *paths, available)
+        })
+        .collect();
+    let names = |available: bool| {
+        let names: Vec<&str> = logos.iter().filter(|(.., ok)| *ok == available).map(|(name, ..)| *name).collect();
+        match names.split_last() {
+            Some((last, [])) => (*last).to_owned(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => String::new(),
+        }
+    };
+    let (ready, later) = (names(true), names(false));
+    let summary = match (ready.is_empty(), later.is_empty()) {
+        (true, _) => format!("Coming soon to {later}"),
+        (false, true) => format!("Available for {ready}"),
+        (false, false) => format!("Available for {ready}; {later} coming soon"),
+    };
     Ok(view! {
         <section id="hero" class="hero-wrap">
             <div class="hero-glow" aria-hidden="true"></div>
@@ -411,95 +401,33 @@ async fn hero(signed_in: bool, release: Option<Arc<Release>>, yours: Option<Devi
                     <p class="hero-lead rise d2">
                         "Buwiz fills in your BIR returns, checks every one against the official eBIRForms rules, reminds you before each deadline, then files it with BIR from your own connection. One TIN, every branch under it, all 43 forms."
                     </p>
-                    <div class="hero-actions rise d3">account_actions(signed_in: signed_in)</div>
-                    if let Some(release) = release.clone() {
+                    if let Some((label, href)) = button {
                         <div class="get rise d3">
-                            if let Some(offer) = offer {
-                                <div class="get-main" data-get=(offer.device)>
-                                    <a
-                                        class="btn btn-solid btn-get"
-                                        href=(offer.href)
-                                        aria-label=(format!("{} · {}", offer.title, offer.detail))
-                                        data-arm64-href=(offer.arm64_href)
-                                    >
-                                        icon(name: "download")
-                                        <span class="get-text"><b>(offer.title)</b><small>(offer.detail)</small></span>
-                                    </a>
-                                    if offer.device == "linux" {
-                                        <a class="get-alt" href="/download#linux">"Not Ubuntu? Pick your Linux →"</a>
-                                    }
-                                    if offer.device == "chromebook" {
-                                        <p class="get-note">
-                                            icon(name: "info")
-                                            <span>"Turn on Linux in your Chromebook's Settings first (search Settings for “Linux”), then open the file."</span>
-                                        </p>
-                                    }
-                                </div>
-                            } else if !ios {
-                                <div class="get-main">
-                                    <a class="btn btn-solid btn-get" href="/download">
-                                        icon(name: "download")
-                                        <span class="get-text"><b>"Download"</b></span>
-                                    </a>
-                                </div>
+                            <a class="btn btn-solid btn-get" href=(href.clone())>icon(name: "download") (label)</a>
+                            if href != "/download" {
+                                <a class="get-other" href="/download">"Other platforms"</a>
                             }
-                            if ios || mac {
-                                <div class="get-main get-ios" data-get="ios" hidden=(!ios)>
-                                    <p class="get-ios-title">icon(name: "computer") "Buwiz runs on your computer"</p>
-                                    <p class="get-note">"Open this link on your Windows, Mac or Linux computer to download it."</p>
-                                    <div class="copy-row" data-copy-group="">
-                                        <a href="/download">"buwiz.com/download"</a>
-                                        <button class="btn btn-ghost" type="button" data-copy="https://buwiz.com/download" hidden=(true)>
-                                            icon(name: "content_copy")
-                                            "Copy"
-                                        </button>
-                                        <span class="copy-status" role="status"></span>
-                                    </div>
-                                </div>
+                            if script {
+                                install_line()
                             }
-                            <button class="get-more" type="button" aria-expanded="false" aria-controls="get-files">
-                                "Other downloads"
-                                icon(name: "expand_more")
-                            </button>
-                            <ul class="get-files" id="get-files" aria-label="Other downloads" hidden=(true)>
-                                for file in release.files.clone() {
-                                    <li>
-                                        <a href=(file.route())>
-                                            (format!("{} · {} · {}", platform_name(file.platform), file.kind.label(), file.arch.label(file.platform)))
-                                        </a>
-                                        <span class="faint">(format!("{} · {} · {}", file.name, release.version, size(file.size)))</span>
-                                    </li>
-                                }
-                            </ul>
                         </div>
                     }
                     <div class="platforms rise d3">
-                        if let Some(release) = release {
-                            <ul aria-label="Download Buwiz">
-                                for (name, platform, paths) in PLATFORMS {
-                                    if let Some(platform) = platform.filter(|platform| release.pick(*platform, None, None).is_some()) {
-                                        <li class="platform">
-                                            <a href=(format!("/download/{}", platform.slug())) title=(format!("Download for {name}"))>
-                                                platform_logo(label: format!("Download for {name}"), paths: paths)
-                                            </a>
-                                        </li>
-                                    } else {
-                                        <li class="platform" title=(format!("{name}, coming soon"))>
-                                            platform_logo(label: format!("{name}, coming soon"), paths: paths)
-                                        </li>
-                                    }
-                                }
-                            </ul>
-                        } else {
+                        if !released {
                             <span class="soon-tag">"Coming soon"</span>
-                            <ul aria-label="Where Buwiz will run">
-                                for (name, _, paths) in PLATFORMS {
-                                    <li class="platform" title=(format!("{name}, coming soon"))>
+                        }
+                        <p class="visually-hidden">(summary)</p>
+                        <ul aria-hidden="true">
+                            for (name, paths, available) in logos {
+                                if available {
+                                    <li class="platform" title=(name)>platform_logo(label: name.to_owned(), paths: paths)</li>
+                                } else {
+                                    <li class=(if released { "platform soon" } else { "platform" }) title=(format!("{name}, coming soon"))>
                                         platform_logo(label: format!("{name}, coming soon"), paths: paths)
                                     </li>
                                 }
-                            </ul>
-                        }
+                            }
+                        </ul>
                     </div>
                 </div>
                 <div class="hero-visual rise d2">
@@ -542,6 +470,26 @@ async fn hero(signed_in: bool, release: Option<Arc<Release>>, yours: Option<Devi
                 }
             </dl>
         </section>
+    })
+}
+
+/// Whether the release has the Linux install script, so that
+/// `curl … /install-linux.sh | sh` gets it rather than a 404.
+pub(super) fn has_install_script(release: &Release) -> bool {
+    release.pick(Platform::Linux, Some(Kind::Sh), None).is_some()
+}
+
+/// The Linux install command on one line, selectable, with a Copy button
+/// that `/assets/account.js` shows where the clipboard can be written.
+#[component]
+pub(super) async fn install_line() -> Result<impl View> {
+    let command = format!("curl -fsSL {}/install-linux.sh | sh", crate::seo::SITE);
+    Ok(view! {
+        <div class="install-line" data-copy-group="">
+            <code>(command.clone())</code>
+            <button type="button" data-copy=(command) hidden=(true)>"Copy"</button>
+            <span class="copy-status" role="status"></span>
+        </div>
     })
 }
 

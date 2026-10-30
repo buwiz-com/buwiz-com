@@ -1427,11 +1427,21 @@ fn card<'a>(cards: &[&'a str], name: &str) -> &'a str {
     cards.iter().find(|card| card.contains(&format!("<h2>{name}</h2>"))).unwrap()
 }
 
-/// The home page hero's downloads, up to the platform logos.
+/// The home page hero's download, up to the platform logos.
 fn hero_downloads(home: &str) -> &str {
-    let get = &home[home.find(r#"<div class="get rise d3">"#).unwrap()..];
-    &get[..get.find(r#"<div class="platforms"#).unwrap()]
+    let hero = &home[home.find(r#"<section id="hero""#).unwrap()..];
+    &hero[..hero.find(r#"<div class="platforms"#).unwrap()]
 }
+
+/// The home page hero's row of platform logos.
+fn platform_row(home: &str) -> &str {
+    let row = &home[home.find(r#"<div class="platforms"#).unwrap()..];
+    &row[..row.find("</div>").unwrap()]
+}
+
+/// The Linux install command's row: selectable text, and a Copy button the
+/// script shows where it can copy.
+const INSTALL_LINE: &str = r#"<div class="install-line" data-copy-group=""><code>curl -fsSL https://buwiz.com/install-linux.sh | sh</code><button type="button" data-copy="curl -fsSL https://buwiz.com/install-linux.sh | sh" hidden="">Copy</button><span class="copy-status" role="status"></span></div>"#;
 
 const MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
 const WINDOWS: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36";
@@ -1450,27 +1460,33 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
     assert!(page.contains(r#"<link rel="canonical" href="https://buwiz.com/download">"#));
     assert!(!page.contains("noindex"));
     assert!(page.contains("Version 1.2.0, released November 2, 2026."));
-    for platform in ["mac", "windows"] {
-        assert!(page.contains(&format!(r#"href="/download/{platform}""#)), "{platform}");
-    }
-    // The Mac card is the visitor's, with its installer's size and checksum.
+    // One card per platform, the Mac one marked as the visitor's, each with
+    // one button through the counted route, its version and size, and its
+    // SHA-256 in small print.
     let cards = platform_cards(&page);
     assert_eq!(cards.len(), 5);
-    let mac_card = card(&cards, "macOS");
-    assert!(mac_card.starts_with(r#" yours" id="mac">"#), "{mac_card}");
-    assert!(mac_card.contains("84.2 MB") && mac_card.contains(SHA_MAC), "{mac_card}");
     assert_eq!(cards.iter().filter(|card| card.starts_with(" yours\"")).count(), 1);
-    assert!(card(&cards, "Windows").contains("Installer (.exe) · x64"));
-    // One Linux file: no choices to make, just the button that names it.
-    let linux = card(&cards, "Linux");
-    assert!(linux.starts_with(r#"" id="linux">"#), "{linux}");
-    assert!(linux.contains(r#"<form class="dl-pick" method="get" action="/download/linux""#), "{linux}");
-    assert!(!linux.contains("<fieldset") && !linux.contains(r#"type="radio""#), "{linux}");
-    assert!(linux.contains(r#"<input type="hidden" name="kind" value="deb">"#), "{linux}");
-    assert!(linux.contains(r#"<input type="hidden" name="arch" value="x64">"#), "{linux}");
-    assert!(linux.contains("Download buwiz_1.2.0_amd64.deb</span></button>"), "{linux}");
-    assert!(linux.contains(SHA_DEB) && linux.contains("55.0 MB"), "{linux}");
-    assert!(!linux.contains("install-linux.sh"), "{linux}");
+    let mac = card(&cards, "macOS");
+    assert!(mac.starts_with(r#" yours" id="mac">"#), "{mac}");
+    assert!(mac.contains(r#"<span class="dl-yours">Your device</span>"#), "{mac}");
+    for (name, href, label, facts, sha) in [
+        ("macOS", "/download/mac", "Download for Mac", "Version 1.2.0 · .dmg · 84.2 MB", SHA_MAC),
+        (
+            "Windows",
+            "/download/windows",
+            "Download for Windows",
+            "Version 1.2.0 · .exe · x64 · 60.0 MB",
+            &"0".repeat(64),
+        ),
+        ("Linux", "/download/linux", "Download for Linux", "Version 1.2.0 · .deb · x64 · 55.0 MB", SHA_DEB),
+    ] {
+        let card = card(&cards, name);
+        assert_eq!(card.matches("<a ").count(), 1, "one link: {card}");
+        assert!(card.contains(&format!(r#"<a class="btn btn-solid" href="{href}">"#)), "{card}");
+        assert!(card.contains(&format!("</span>{label}</a>")), "{card}");
+        assert!(card.contains(&format!(r#"<p class="dl-facts">{facts}</p>"#)), "{card}");
+        assert!(card.contains(&format!("<code>{sha}</code>")), "{card}");
+    }
     // Android has no file yet; iOS will come from the App Store.
     let android = card(&cards, "Android");
     assert!(
@@ -1478,197 +1494,154 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
         "{android}"
     );
     let ios = card(&cards, "iOS");
-    assert!(ios.contains("App Store, coming soon") && !ios.contains("href="), "{ios}");
+    assert!(ios.contains("Coming to the App Store") && !ios.contains("href=") && !ios.contains("btn"), "{ios}");
     assert!(!page.contains("Buwiz.ipa") && !page.contains("/download/android"));
-    assert!(page.contains(r#"<script src="/assets/download.js" defer=""></script>"#));
-
-    // The home page's platform row links here, Android and iOS still to come.
-    let home = text(site.on_host("buwiz.com", "/").await).await;
-    let row = &home[home.find(r#"<div class="platforms"#).unwrap()..];
-    let row = &row[..row.find("</div>").unwrap()];
-    for platform in ["mac", "windows", "linux"] {
-        assert!(row.contains(&format!(r#"href="/download/{platform}""#)), "{platform}");
-    }
-    assert!(row.contains(r#"title="Android, coming soon""#) && row.contains(r#"title="iOS, coming soon""#), "{row}");
-    assert!(!row.contains("soon-tag") && !row.contains("/download/android"), "{row}");
-    // An unknown visitor gets the download page, and every file under
-    // "Other downloads", closed until asked for.
-    let get = hero_downloads(&home);
-    assert!(get.contains(r#"<a class="btn btn-solid btn-get" href="/download">"#), "{get}");
-    assert!(get.contains(r#"<button class="get-more" type="button" aria-expanded="false" aria-controls="get-files">"#));
-    let files = &get[get.find(r#"<ul class="get-files" id="get-files""#).unwrap()..];
-    assert!(files.starts_with(r#"<ul class="get-files" id="get-files" aria-label="Other downloads" hidden="">"#));
-    // Each through this site's link, which counts it.
-    for route in
-        ["/download/mac?kind=dmg", "/download/windows?kind=exe&amp;arch=x64", "/download/linux?kind=deb&amp;arch=x64"]
+    assert!(!page.contains(&url), "never straight to the bucket");
+    for gone in
+        ["<form", "<fieldset", r#"type="radio""#, "dl-terminal", "data-copy", "<script src=\"/assets/download.js"]
     {
-        assert!(files.contains(&format!(r#"href="{route}""#)), "{route}: {files}");
+        assert!(!page.contains(gone), "{gone}");
     }
-    assert!(!files.contains(&url), "{files}");
-    assert!(files.contains("buwiz_1.2.0_amd64.deb · 1.2.0 · 55.0 MB"), "{files}");
-    assert!(!files.contains("Buwiz.ipa"), "{files}");
-    assert!(home.contains(r#"<script src="/assets/download.js" defer=""></script>"#));
 
     let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
     assert!(sitemap.contains("<loc>https://buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"), "{sitemap}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn the_home_page_offers_the_visitors_installer(db: PgPool) {
+async fn the_home_page_has_one_download_button_for_the_visitors_device(db: PgPool) {
     let (releases, url) = FakeReleases::start().await;
     releases.set_latest(&latest_json(&[]));
     let site = Site::with_downloads(db.clone(), &url);
-    let hero = async |site: &Site, agent: &str| {
-        let home = text(browse(site, "/", agent).await).await;
-        hero_downloads(&home).to_owned()
+    let button = |href: &str, label: &str| {
+        format!(
+            r#"<a class="btn btn-solid btn-get" href="{href}"><span class="icon" aria-hidden="true">download</span>{label}</a>"#
+        )
     };
-    let button =
-        |href: &str, label: &str| format!(r#"<a class="btn btn-solid btn-get" href="{href}" aria-label="{label}""#);
-
-    let windows = hero(&site, WINDOWS).await;
-    let exe = button("/download/windows?kind=exe&amp;arch=x64", "Download for Windows · Installer · 64-bit");
-    assert!(windows.contains(&exe), "{windows}");
-
-    // A Mac gets the dmg; the iPhone and iPad words are there, hidden, for
-    // an iPad that asked for the desktop site.
-    let mac = hero(&site, MAC).await;
-    assert!(mac.contains(&button("/download/mac", "Download for Mac · Apple and Intel chips")), "{mac}");
-    assert!(mac.contains(r#"<div class="get-main get-ios" data-get="ios" hidden="">"#), "{mac}");
-
-    let linux = hero(&site, LINUX).await;
-    let deb = button("/download/linux?kind=deb&amp;arch=x64", "Download for Linux · Ubuntu, Debian (.deb)");
-    assert!(linux.contains(&format!("{deb}>")), "no ARM64 deb to switch to: {linux}");
-    assert!(linux.contains(r#"<a class="get-alt" href="/download#linux">Not Ubuntu? Pick your Linux →</a>"#));
-    assert!(!linux.contains("Ubuntu?</") && !linux.contains("Fedora"), "never a guessed distro: {linux}");
-
-    let chromebook = hero(&site, CHROMEBOOK).await;
-    let deb = button("/download/linux?kind=deb&amp;arch=x64", "Download for Chromebook · Linux app (.deb) · 64-bit");
-    assert!(chromebook.contains(&deb) && chromebook.contains("Turn on Linux in your Chromebook"), "{chromebook}");
-
-    // No app for iPhones: the link to open on a computer, to copy.
-    let iphone = hero(&site, IPHONE).await;
-    assert!(!iphone.contains("btn-get"), "{iphone}");
-    assert!(iphone.contains(r#"<div class="get-main get-ios" data-get="ios">"#), "{iphone}");
-    assert!(iphone.contains("Buwiz runs on your computer"), "{iphone}");
-    assert!(iphone.contains(r#"<a href="/download">buwiz.com/download</a>"#), "{iphone}");
-    assert!(iphone.contains(r#"data-copy="https://buwiz.com/download" hidden="""#), "{iphone}");
-    assert!(iphone.contains(r#"<span class="copy-status" role="status"></span>"#), "{iphone}");
-
-    // No APK yet: Android gets the download page.
-    let android = hero(&site, ANDROID).await;
-    assert!(android.contains(r#"<a class="btn btn-solid btn-get" href="/download">"#), "{android}");
-
-    for (agent, hero) in [(WINDOWS, &windows), (MAC, &mac), (LINUX, &linux), (IPHONE, &iphone)] {
-        assert!(hero.contains(r#"aria-controls="get-files""#), "{agent}");
-        assert!(!hero.contains("alert(") && !hero.contains("confirm("), "{agent}");
+    let other = r#"<a class="get-other" href="/download">Other platforms</a>"#;
+    let check = async |site: &Site, agent: &str, href: &str, label: &str| {
+        let home = text(browse(site, "/", agent).await).await;
+        let hero = hero_downloads(&home);
+        assert!(hero.contains(&button(href, label)), "{agent}: {hero}");
+        assert_eq!(hero.matches("<a ").count(), if href == "/download" { 1 } else { 2 }, "{agent}: {hero}");
+        assert_eq!(hero.contains(other), href != "/download", "{agent}: {hero}");
+        // The header has the account; the hero has none of it.
+        // No install script in this release, so no command to copy either.
+        for gone in
+            ["/signup", "/login", "/tins", "Other downloads", "Not Ubuntu", "Chromebook", "data-copy", "<button"]
+        {
+            assert!(!hero.contains(gone), "{agent}: {gone}: {hero}");
+        }
+        // The logos only show where Buwiz runs: no links, nothing to click.
+        let row = platform_row(&home);
+        assert!(!row.contains("<a ") && !row.contains("href="), "{agent}: {row}");
+        assert!(row.contains(r#"<li class="platform" title="Windows">"#), "{row}");
+        assert!(row.contains(r#"<li class="platform soon" title="Android, coming soon">"#), "{row}");
+        assert!(
+            row.contains(
+                r#"<p class="visually-hidden">Available for Windows, macOS and Linux; Android and iOS coming soon</p>"#
+            ),
+            "{row}"
+        );
+        assert!(!home.contains("download.js") && !home.contains("alert(") && !home.contains("confirm("), "{agent}");
+    };
+    check(&site, MAC, "/download/mac", "Download for Mac").await;
+    check(&site, WINDOWS, "/download/windows", "Download for Windows").await;
+    check(&site, LINUX, "/download/linux", "Download for Linux").await;
+    // No file of their own: the download page.
+    for agent in [IPHONE, CHROMEBOOK, ANDROID, "curl/8.7.1"] {
+        check(&site, agent, "/download", "Download").await;
     }
 
-    // With the APK and an ARM64 deb out, Android gets its button and Linux
-    // the ARM64 deb for the script to switch to.
+    // With an APK out, Android gets its button.
     releases.set_latest(&latest_json(&later_files()));
-    let site = Site::with_downloads(db, &url);
-    let android = hero(&site, ANDROID).await;
-    assert!(android.contains(&button("/download/android", "Download for Android · APK")), "{android}");
-    let linux = hero(&site, LINUX).await;
-    assert!(linux.contains(r#"data-arm64-href="/download/linux?kind=deb&amp;arch=arm64""#), "{linux}");
-    assert!(linux.contains("Buwiz-1.2.0-linux-install.sh"), "every file is listed: {linux}");
+    let site = Site::with_downloads(db.clone(), &url);
+    let home = text(browse(&site, "/", ANDROID).await).await;
+    assert!(hero_downloads(&home).contains(&button("/download/android", "Download for Android")), "{home}");
+    assert!(platform_row(&home).contains("Available for Windows, macOS, Linux and Android; iOS coming soon"));
+    assert!(!home.contains("install-line"), "Linux only");
+    // With the install script out, a Linux visitor gets its command to copy
+    // under the button; nobody else does.
+    let home = text(browse(&site, "/", LINUX).await).await;
+    let hero = hero_downloads(&home);
+    assert!(hero.contains(&button("/download/linux", "Download for Linux")), "{hero}");
+    assert!(hero.contains(INSTALL_LINE), "{hero}");
+    for agent in [MAC, WINDOWS, CHROMEBOOK] {
+        assert!(!text(browse(&site, "/", agent).await).await.contains("install-line"), "{agent}");
+    }
+
+    // Signed in, the hero still has just the download; the header has My TINs.
+    let (_, cookie) = site.person("owner@example.com").await;
+    let request = Request::get("/")
+        .header(header::HOST, "buwiz.com")
+        .header(header::USER_AGENT, MAC)
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let home = text(site.send(request).await).await;
+    let hero = hero_downloads(&home);
+    assert!(!hero.contains("/tins") && hero.matches("<a ").count() == 2, "{hero}");
+    let header = &home[..home.find("<main").unwrap()];
+    assert!(header.contains(r#"<a href="/tins" class="">My TINs</a>"#), "{header}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn the_linux_card_asks_which_linux_and_processor(db: PgPool) {
+async fn the_download_page_lists_other_files_as_plain_links(db: PgPool) {
     let (releases, url) = FakeReleases::start().await;
     releases.set_latest(&latest_json(&later_files()));
     let site = Site::with_downloads(db.clone(), &url);
-    let linux_card = async |path: &str| {
-        let page = text(browse(&site, path, LINUX).await).await;
-        card(&platform_cards(&page), "Linux").to_owned()
-    };
+    let page = text(browse(&site, "/download", LINUX).await).await;
+    let cards = platform_cards(&page);
 
-    let linux = linux_card("/download").await;
-    for choice in [
-        "<legend>Which Linux do you use?</legend>",
-        r#"<input type="radio" name="kind" value="deb" checked="">"#,
-        "Ubuntu, Debian, Linux Mint",
-        r#"<input type="radio" name="kind" value="rpm">"#,
-        "Fedora, Red Hat, openSUSE",
-        r#"<input type="radio" name="kind" value="targz">"#,
-        "Any other Linux",
-        "<legend>Processor</legend>",
-        r#"<input type="radio" name="arch" value="x64" checked="">"#,
-        "64-bit Intel or AMD <code>uname -m → x86_64</code>",
-        r#"<input type="radio" name="arch" value="arm64">"#,
-        "ARM64 <code>uname -m → aarch64</code>",
-        "Download buwiz_1.2.0_amd64.deb</span></button>",
+    // Linux: the x64 deb is the button; every other file a small link
+    // through this site, which counts it. No choices, no terminal.
+    let linux = card(&cards, "Linux");
+    assert!(linux.starts_with(r#" yours" id="linux">"#), "{linux}");
+    assert!(linux.contains(r#"<a class="btn btn-solid" href="/download/linux">"#), "{linux}");
+    assert_eq!(linux.matches("btn-solid").count(), 1, "{linux}");
+    for (label, route) in [
+        (".deb · ARM64", "/download/linux?kind=deb&amp;arch=arm64"),
+        (".rpm · x64", "/download/linux?kind=rpm&amp;arch=x64"),
+        (".rpm · ARM64", "/download/linux?kind=rpm&amp;arch=arm64"),
+        (".tar.gz · x64", "/download/linux?kind=targz&amp;arch=x64"),
+        (".tar.gz · ARM64", "/download/linux?kind=targz&amp;arch=arm64"),
+        ("Install script", "/install-linux.sh"),
     ] {
-        assert!(linux.contains(choice), "{choice}: {linux}");
+        assert!(linux.contains(&format!(r#"<a href="{route}">{label}</a>"#)), "{label}: {linux}");
     }
-    // Every Linux file, with its facts, is in the page for the script and
-    // for anyone without it.
-    // Each links through this site, which counts it.
-    for (name, route) in [
-        ("buwiz_1.2.0_amd64.deb", "/download/linux?kind=deb&amp;arch=x64"),
-        ("buwiz_1.2.0_arm64.deb", "/download/linux?kind=deb&amp;arch=arm64"),
-        ("Buwiz-1.2.0-linux-x64.rpm", "/download/linux?kind=rpm&amp;arch=x64"),
-        ("Buwiz-1.2.0-linux-arm64.rpm", "/download/linux?kind=rpm&amp;arch=arm64"),
-        ("Buwiz-1.2.0-linux-x64.tar.gz", "/download/linux?kind=targz&amp;arch=x64"),
-        ("Buwiz-1.2.0-linux-arm64.tar.gz", "/download/linux?kind=targz&amp;arch=arm64"),
-        ("Buwiz-1.2.0-linux-install.sh", "/install-linux.sh"),
-    ] {
-        assert!(linux.contains(&format!(r#"data-name="{name}""#)), "{name}");
-        assert!(linux.contains(&format!(r#"href="{route}""#)), "{route}: {linux}");
+    assert!(!linux.contains("/download/linux?kind=deb&amp;arch=x64"), "the button's file is not listed again");
+    for gone in ["<form", "<fieldset", r#"type="radio""#, "dl-terminal"] {
+        assert!(!linux.contains(gone), "{gone}: {linux}");
     }
-    assert!(!linux.contains(&url), "{linux}");
-    assert!(linux.contains(&format!(r#"data-kind="rpm" data-arch="x64" data-name="Buwiz-1.2.0-linux-x64.rpm" data-size="56.0 MB" data-sha256="{SHA_RPM}""#)));
-    // The install script, to copy.
-    assert!(linux.contains("<code>curl -fsSL https://buwiz.com/install-linux.sh | sh</code>"), "{linux}");
-    assert!(linux.contains(r#"data-copy="curl -fsSL https://buwiz.com/install-linux.sh | sh" hidden="""#), "{linux}");
-    assert!(linux.contains(r#"<a href="/install-linux.sh">View the script</a>"#), "{linux}");
-    assert!(linux.contains(r#"<span class="copy-status" role="status"></span>"#), "{linux}");
+    // The install script's command, on one line, to copy.
+    assert!(linux.contains(INSTALL_LINE), "{linux}");
+    assert_eq!(page.matches("install-line").count(), 1, "Linux only: {page}");
 
-    // Sent back from `/download/linux` with a choice: it is made here.
-    let linux = linux_card("/download?kind=rpm&arch=arm64").await;
-    assert!(linux.contains(r#"<input type="radio" name="kind" value="rpm" checked="">"#), "{linux}");
-    assert!(linux.contains(r#"<input type="radio" name="arch" value="arm64" checked="">"#), "{linux}");
-    assert!(linux.contains("Download Buwiz-1.2.0-linux-arm64.rpm</span></button>"), "{linux}");
-
-    // The Windows card's button is the installer; the MSI says who it is for.
-    let page = text(browse(&site, "/download", WINDOWS).await).await;
-    let windows = card(&platform_cards(&page), "Windows");
+    // Windows: the installer is the button, the MSI a small link.
+    let windows = card(&cards, "Windows");
     assert!(windows.contains(r#"<a class="btn btn-solid" href="/download/windows">"#), "{windows}");
-    assert!(windows.contains("Installer (.exe) · x64"), "{windows}");
-    assert!(windows.contains("MSI package (.msi) · x64 · for IT / managed installs"), "{windows}");
+    assert!(
+        windows.contains(r#"<a href="/download/windows?kind=msi&amp;arch=x64">.msi (for IT) · x64</a>"#),
+        "{windows}"
+    );
+    let android = card(&cards, "Android");
+    assert!(android.contains(r#"<a class="btn btn-solid" href="/download/android">"#), "{android}");
+    assert!(!page.contains(&url), "never straight to the bucket");
 
-    // Only x64 files: which Linux, but no processor to choose; a choice
-    // with no file says so rather than linking.
+    // A Linux release without an x64 deb: the button is its best file.
     let other = "0".repeat(64);
-    releases.set_latest(&latest_json(&[release_file(
-        "linux",
-        "x64",
-        "rpm",
-        "Buwiz-1.2.0-linux-x64.rpm",
-        56_000_000,
-        &other,
-    )]));
-    let site = Site::with_downloads(db.clone(), &url);
-    let page = text(browse(&site, "/download?kind=rpm&arch=arm64", LINUX).await).await;
-    let linux = card(&platform_cards(&page), "Linux");
-    assert_eq!(linux.matches("<fieldset").count(), 1, "{linux}");
-    assert!(linux.contains("Which Linux do you use?") && !linux.contains("Processor"), "{linux}");
-    assert!(linux.contains(r#"<input type="hidden" name="arch" value="x64">"#), "{linux}");
-    assert!(linux.contains("Download Buwiz-1.2.0-linux-x64.rpm"), "{linux}");
-    let only_arm = serde_json::json!({
+    let only_rpm = serde_json::json!({
         "version": "1.2.0",
-        "files": [
-            release_file("linux", "arm64", "deb", "buwiz_1.2.0_arm64.deb", 1, &other),
-            release_file("linux", "x64", "rpm", "Buwiz-1.2.0-linux-x64.rpm", 1, &other),
-        ],
+        "files": [release_file("linux", "x64", "rpm", "Buwiz-1.2.0-linux-x64.rpm", 1, &other)],
     });
-    releases.set_latest(only_arm.to_string().as_bytes());
-    let site = Site::with_downloads(db, &url);
-    let page = text(browse(&site, "/download?kind=rpm&arch=arm64", LINUX).await).await;
+    releases.set_latest(only_rpm.to_string().as_bytes());
+    let site = Site::with_downloads(db.clone(), &url);
+    let page = text(browse(&site, "/download", LINUX).await).await;
     let linux = card(&platform_cards(&page), "Linux");
-    assert!(linux.contains(r#"<button class="btn btn-solid" type="submit" disabled="">"#), "{linux}");
-    assert!(linux.contains("Not available for this choice yet"), "{linux}");
+    assert!(linux.contains(r#"<a class="btn btn-solid" href="/download/linux?kind=rpm&amp;arch=x64">"#), "{linux}");
+    assert!(!linux.contains("install-line"), "no script released: {linux}");
+    // And the home page sends a Linux visitor to the download page.
+    let home = text(browse(&site, "/", LINUX).await).await;
+    assert!(hero_downloads(&home).contains(r#"<a class="btn btn-solid btn-get" href="/download">"#), "{home}");
 }
 
 /// What every page says while nothing is released.
@@ -1685,16 +1658,16 @@ async fn assert_coming_soon(site: &Site, why: &str) {
     let page = text(page).await;
     assert!(page.contains("Buwiz is coming soon to Windows, macOS, Linux and Android"), "{why}");
     assert_eq!(page.matches(r#"<span class="soon-tag">Coming soon</span>"#).count(), 4, "{why}");
-    assert!(page.contains("App Store, coming soon"), "{why}");
+    assert!(page.contains("Coming to the App Store"), "{why}");
     assert!(!page.contains("href=\"/download/") && !page.contains("releases/v"), "{why}");
     assert!(page.contains(r#"<meta name="robots" content="noindex">"#), "{why}");
 
     let home = text(site.on_host("buwiz.com", "/").await).await;
     assert!(
-        home.contains(r#"<div class="platforms rise d3"><span class="soon-tag">Coming soon</span><ul aria-label="Where Buwiz will run"><li class="platform" title="Windows, coming soon"><svg"#),
+        home.contains(r#"<div class="platforms rise d3"><span class="soon-tag">Coming soon</span><p class="visually-hidden">Coming soon to Windows, macOS, Linux, Android and iOS</p><ul aria-hidden="true"><li class="platform" title="Windows, coming soon"><svg"#),
         "{why}"
     );
-    assert!(!home.contains("/download"), "{why}");
+    assert!(!home.contains("/download") && !home.contains("btn-get"), "{why}");
 
     let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
     assert!(!sitemap.contains("/download"), "{why}");

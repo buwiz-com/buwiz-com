@@ -10,6 +10,7 @@ document.documentElement.classList.add("js");
 
   function ready() {
     for (const input of document.querySelectorAll("input[data-code]")) codeBoxes(input);
+    for (const timer of document.querySelectorAll("[data-expires-at]")) codeTimer(timer);
     for (const form of document.querySelectorAll("form[data-addtin]")) addTin(form);
     for (const viewer of document.querySelectorAll(".viewer")) documentViewer(viewer);
 
@@ -183,8 +184,33 @@ document.documentElement.classList.add("js");
     cells[0].focus();
     const submit = form.querySelector(".auth-submit");
     if (submit) submit.hidden = true;
-    const hint = form.querySelector(".code-hint");
-    if (hint) hint.hidden = false;
+  }
+
+  // The same words as code_timer_text in src/pages.rs.
+  function timerText(seconds) {
+    return seconds > 0 ? `Code expires in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}` : "Code expired";
+  }
+
+  // The code page's countdown, to the expiry the server rendered. Running
+  // out is said once in the status line, and the resend link stands out.
+  function codeTimer(timer) {
+    const expiresAt = Number(timer.dataset.expiresAt);
+    if (!expiresAt) return;
+    const text = timer.querySelector("[data-timer-text]");
+    const status = document.querySelector("[data-timer-status]");
+    const resend = document.querySelector(".auth-resend");
+    let clock = 0;
+    const tick = () => {
+      const seconds = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+      text.textContent = timerText(seconds);
+      if (seconds > 0) return;
+      clearInterval(clock);
+      timer.classList.add("expired");
+      if (resend) resend.classList.add("due");
+      if (status) status.textContent = "Code expired. Send a new one.";
+    };
+    clock = setInterval(tick, 1000);
+    tick();
   }
 
   // Add a TIN: one step at a time, the TIN typed with dashes added, only the

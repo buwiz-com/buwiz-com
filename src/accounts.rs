@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::crypto;
 use crate::notice::Notice;
 
-const CODE_TTL: Duration = Duration::minutes(10);
+pub const CODE_TTL: Duration = Duration::minutes(10);
 const CODES_PER_HOUR: i64 = 5;
 const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);

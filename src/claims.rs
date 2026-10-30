@@ -10,6 +10,13 @@
 //! new files and is `pending` again. One TIN has at most one approved
 //! owner. Document bytes are dropped when a claim ends; the hash and
 //! metadata stay.
+//!
+//! Ending: a claim that never became active can be deleted, rows, files
+//! and all (by the claimant, or by staff with a reason). An approved claim
+//! keeps its row for the returns sent with it: `removed` when the owner
+//! gives the TIN up, `revoked` when staff end the ownership. Either way the
+//! TIN can be claimed again. Each of these, and each file the claimant
+//! replaces or removes on an open claim, leaves a line in `claim_audit`.
 
 use std::collections::HashMap;
 
@@ -20,6 +27,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::accounts::Account;
 use crate::crypto;
 use crate::error::ApiError;
 use crate::notice::Notice;
@@ -311,7 +319,7 @@ pub async fn submit(
     let mut uploaded = Vec::new();
     let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
     let committed = match stored {
-        Ok(()) => tx.commit().await.map_err(SubmitError::from),
+        Ok(_) => tx.commit().await.map_err(SubmitError::from),
         Err(error) => Err(error),
     };
     if let Err(error) = committed {
@@ -343,15 +351,17 @@ pub async fn resend(
     fix: Resend,
 ) -> Result<(), SubmitError> {
     let mut tx = db.begin().await?;
-    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT status, kind, registered_name, trade_name FROM tin_claims
-         WHERE id = $1 AND account_id = $2 FOR UPDATE",
+    // Files replaced on the claim's files page since it was sent back count
+    // as a change.
+    let row: Option<(String, String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT status, kind, registered_name, trade_name, coalesce(files_changed_at > sent_back_at, false)
+         FROM tin_claims WHERE id = $1 AND account_id = $2 FOR UPDATE",
     )
     .bind(claim_id)
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((status, kind, old_name, old_trade)) = row else {
+    let Some((status, kind, old_name, old_trade, files_changed)) = row else {
         return Err(SubmitError::Invalid(Notice::ClaimMissing));
     };
     if status != "needs_fix" {
@@ -360,7 +370,7 @@ pub async fn resend(
     let kind = ClaimKind::parse(&kind).expect("stored kinds are valid");
     let (registered_name, trade_name) =
         check_names(&fix.registered_name, &fix.trade_name).map_err(SubmitError::Invalid)?;
-    if fix.uploads.is_empty() && registered_name == old_name && trade_name == old_trade {
+    if fix.uploads.is_empty() && !files_changed && registered_name == old_name && trade_name == old_trade {
         return Err(SubmitError::Invalid(Notice::FixNeedsChange));
     }
     let checked = check_uploads(kind, fix.uploads).map_err(SubmitError::Invalid)?;
@@ -394,7 +404,7 @@ pub async fn resend(
     let mut uploaded = Vec::new();
     let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
     let committed = match stored {
-        Ok(()) => tx.commit().await.map_err(SubmitError::from),
+        Ok(_) => tx.commit().await.map_err(SubmitError::from),
         Err(error) => Err(error),
     };
     if let Err(error) = committed {
@@ -413,9 +423,11 @@ async fn store_documents(
     claim_id: Uuid,
     checked: Vec<(Upload, &'static str)>,
     uploaded: &mut Vec<String>,
-) -> Result<(), SubmitError> {
+) -> Result<Vec<Uuid>, SubmitError> {
+    let mut ids = Vec::with_capacity(checked.len());
     for (upload, content_type) in checked {
         let document_id = Uuid::new_v4();
+        ids.push(document_id);
         let (nonce, ciphertext) = crypto::seal(key, &document_context(claim_id, document_id), &upload.bytes)?;
         let (in_row, object_key) = match store {
             DocumentStore::Database => (Some(ciphertext), None),
@@ -444,7 +456,7 @@ async fn store_documents(
         .execute(&mut **tx)
         .await?;
     }
-    Ok(())
+    Ok(ids)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -483,6 +495,9 @@ pub struct ClaimRow {
     pub sent_back_at: Option<OffsetDateTime>,
     pub resent_at: Option<OffsetDateTime>,
     pub decided_at: Option<OffsetDateTime>,
+    pub removed_at: Option<OffsetDateTime>,
+    pub removal_note: Option<String>,
+    pub files_changed_at: Option<OffsetDateTime>,
 }
 
 impl ClaimRow {
@@ -499,11 +514,17 @@ impl ClaimRow {
     pub fn waiting_since(&self) -> OffsetDateTime {
         self.resent_at.unwrap_or(self.created_at)
     }
+
+    /// When the claimant changed files on a claim already waiting for
+    /// review, after it went into the queue.
+    pub fn files_changed_while_waiting(&self) -> Option<OffsetDateTime> {
+        self.files_changed_at.filter(|at| self.status == "pending" && *at > self.waiting_since())
+    }
 }
 
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
-     c.decided_at";
+     c.decided_at, c.removed_at, c.removal_note, c.files_changed_at";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -763,6 +784,265 @@ async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_i
     .fetch_all(&mut **tx)
     .await?;
     Ok(keys.into_iter().flatten().collect())
+}
+
+/// Who ends a claim: its owner, or staff, who must say why.
+pub enum By<'a> {
+    Owner,
+    Staff { reason: &'a str },
+}
+
+/// Statuses of a claim that never became an active TIN, so nothing refers
+/// to it and it can be deleted outright.
+pub const DELETABLE: &[&str] = &["pending", "needs_fix", "rejected", "withdrawn"];
+
+/// A claim locked for a change, with what its audit line needs.
+struct Locked {
+    id: Uuid,
+    account_id: Uuid,
+    kind: String,
+    status: String,
+    tin_masked: String,
+}
+
+async fn lock_claim(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uuid) -> sqlx::Result<Option<Locked>> {
+    let row: Option<(Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT account_id, kind, status, tin_root, branch_code FROM tin_claims WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|(account_id, kind, status, root, branch)| Locked {
+        id: claim_id,
+        account_id,
+        kind,
+        status,
+        tin_masked: Tin::parse(&root, &branch).expect("stored TINs are valid").masked(),
+    }))
+}
+
+/// The owner acts on their own claim; staff on someone else's, with a
+/// reason. Returns the trimmed reason.
+fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>) -> Result<Option<String>, Notice> {
+    match by {
+        By::Owner if claim.account_id != actor.id => Err(Notice::ClaimMissing),
+        By::Owner => Ok(None),
+        By::Staff { .. } if claim.account_id == actor.id => Err(Notice::OwnClaim),
+        By::Staff { reason } => {
+            let reason = reason.trim();
+            if reason.is_empty() { Err(Notice::ReasonMissing) } else { Ok(Some(reason.to_owned())) }
+        }
+    }
+}
+
+async fn audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    claim: &Locked,
+    actor: &Account,
+    action: &str,
+    document_kind: Option<&str>,
+    reason: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO claim_audit
+             (claim_id, account_id, tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(claim.id)
+    .bind(claim.account_id)
+    .bind(&claim.tin_masked)
+    .bind(action)
+    .bind(&claim.status)
+    .bind(document_kind)
+    .bind(actor.id)
+    .bind(&actor.email)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Deletes a claim that never became an active TIN: its row, its document
+/// rows and their stored objects. Only the audit line is left.
+pub async fn delete(
+    db: &PgPool,
+    store: &DocumentStore,
+    claim_id: Uuid,
+    actor: &Account,
+    by: By<'_>,
+) -> Result<Notice, DecideError> {
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !DELETABLE.contains(&claim.status.as_str()) {
+        return Err(DecideError::Refused(Notice::ClaimNotDeletable));
+    }
+    let objects: Vec<String> = sqlx::query_scalar(
+        "SELECT object_key FROM claim_documents WHERE claim_id = $1 AND purged_at IS NULL AND object_key IS NOT NULL",
+    )
+    .bind(claim_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    // The document rows go with it (ON DELETE CASCADE).
+    sqlx::query("DELETE FROM tin_claims WHERE id = $1").bind(claim_id).execute(&mut *tx).await?;
+    audit(&mut tx, &claim, actor, "deleted", None, reason.as_deref()).await?;
+    tx.commit().await?;
+    store.delete_all(&objects).await;
+    tracing::info!(%claim_id, actor = %actor.id, "tin claim deleted");
+    Ok(Notice::ClaimDeleted)
+}
+
+/// Ends the ownership of an active TIN: `removed` by its owner, `revoked`
+/// by staff. The row stays for the returns sent with it. Tax profiles,
+/// tickets and the relay only take `approved` claims, and the one-owner
+/// index only counts those, so the TIN is inactive at once and free to be
+/// claimed again.
+pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<'_>) -> Result<Notice, DecideError> {
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if claim.status != "approved" {
+        return Err(DecideError::Refused(Notice::TinNotActive));
+    }
+    let (status, notice) = match by {
+        By::Owner => ("removed", Notice::TinRemoved),
+        By::Staff { .. } => ("revoked", Notice::OwnershipRevoked),
+    };
+    sqlx::query(
+        "UPDATE tin_claims SET status = $2, removed_at = now(), removed_by = $3, removal_note = $4 WHERE id = $1",
+    )
+    .bind(claim_id)
+    .bind(status)
+    .bind(actor.id)
+    .bind(&reason)
+    .execute(&mut *tx)
+    .await?;
+    audit(&mut tx, &claim, actor, status, None, reason.as_deref()).await?;
+    tx.commit().await?;
+    tracing::info!(%claim_id, actor = %actor.id, status, "tin ownership ended");
+    Ok(notice)
+}
+
+/// One stored file of the claimant's own open claim, locked for a change.
+struct OpenFile {
+    claim: Locked,
+    kind: String,
+    object_key: Option<String>,
+}
+
+async fn lock_open_file(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: &Account,
+    claim_id: Uuid,
+    document_id: Uuid,
+) -> Result<OpenFile, SubmitError> {
+    let claim = lock_claim(tx, claim_id)
+        .await?
+        .filter(|claim| claim.account_id == actor.id)
+        .ok_or(SubmitError::Invalid(Notice::ClaimMissing))?;
+    if !matches!(claim.status.as_str(), "pending" | "needs_fix") {
+        return Err(SubmitError::Invalid(Notice::FilesLocked));
+    }
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT kind, object_key FROM claim_documents WHERE id = $1 AND claim_id = $2 AND purged_at IS NULL",
+    )
+    .bind(document_id)
+    .bind(claim_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (kind, object_key) = row.ok_or(SubmitError::Invalid(Notice::DocumentMissing))?;
+    Ok(OpenFile { claim, kind, object_key })
+}
+
+/// Notes the change for staff and in the audit.
+async fn record_file_change(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    file: &OpenFile,
+    actor: &Account,
+    action: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE tin_claims SET files_changed_at = now() WHERE id = $1")
+        .bind(file.claim.id)
+        .execute(&mut **tx)
+        .await?;
+    audit(tx, &file.claim, actor, action, Some(&file.kind), None).await
+}
+
+/// The claimant swaps one file of an open claim for a new one of the same
+/// kind, checked like the files of a new claim. The old file is deleted at
+/// once, row and object. A claim sent back still goes through
+/// [`resend`]; the change counts as a fix there.
+pub async fn replace_document(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    actor: &Account,
+    claim_id: Uuid,
+    document_id: Uuid,
+    upload: Upload,
+) -> Result<(), SubmitError> {
+    let mut tx = db.begin().await?;
+    let file = lock_open_file(&mut tx, actor, claim_id, document_id).await?;
+    if upload.kind.as_str() != file.kind {
+        return Err(SubmitError::Invalid(Notice::WrongDocuments));
+    }
+    let kind = ClaimKind::parse(&file.claim.kind).expect("stored kinds are valid");
+    let checked = check_uploads(kind, vec![upload]).map_err(SubmitError::Invalid)?;
+    sqlx::query("DELETE FROM claim_documents WHERE id = $1").bind(document_id).execute(&mut *tx).await?;
+    let mut uploaded = Vec::new();
+    let committed = async {
+        let ids = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await?;
+        record_file_change(&mut tx, &file, actor, "file_replaced").await?;
+        tx.commit().await?;
+        Ok::<_, SubmitError>(ids[0])
+    }
+    .await;
+    let new_id = match committed {
+        Ok(new_id) => new_id,
+        Err(error) => {
+            store.delete_all(&uploaded).await;
+            return Err(error);
+        }
+    };
+    store.delete_all(&file.object_key.into_iter().collect::<Vec<_>>()).await;
+    tracing::info!(%claim_id, %document_id, %new_id, "claim document replaced");
+    document_replaced(claim_id, new_id);
+    Ok(())
+}
+
+/// Runs once a replaced file is stored and committed, with the new file's
+/// id. The place for work on new files (reading them with OCR) to start,
+/// as it does for the files of a new or resent claim.
+pub fn document_replaced(claim_id: Uuid, document_id: Uuid) {
+    tracing::debug!(%claim_id, %document_id, "new claim document ready");
+}
+
+/// The claimant drops an optional file (selfie, National ID, proof of
+/// authority, other papers) from an open claim. Required ones can only be
+/// replaced.
+pub async fn remove_document(
+    db: &PgPool,
+    store: &DocumentStore,
+    actor: &Account,
+    claim_id: Uuid,
+    document_id: Uuid,
+) -> Result<(), SubmitError> {
+    let mut tx = db.begin().await?;
+    let file = lock_open_file(&mut tx, actor, claim_id, document_id).await?;
+    let kind = ClaimKind::parse(&file.claim.kind).expect("stored kinds are valid");
+    if kind.required().iter().any(|required| required.as_str() == file.kind) {
+        return Err(SubmitError::Invalid(Notice::FileRequired));
+    }
+    sqlx::query("DELETE FROM claim_documents WHERE id = $1").bind(document_id).execute(&mut *tx).await?;
+    record_file_change(&mut tx, &file, actor, "file_removed").await?;
+    tx.commit().await?;
+    store.delete_all(&file.object_key.into_iter().collect::<Vec<_>>()).await;
+    tracing::info!(%claim_id, %document_id, "claim document removed");
+    Ok(())
 }
 
 /// `GET /api/tax-profiles`: the account's active TINs. The Buwiz apps treat

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::accounts::{self, Account, CodeError};
 use crate::agents;
-use crate::claims::{self, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload};
+use crate::claims::{self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload};
 use crate::devices;
 use crate::mcp;
 use crate::notice::Notice;
@@ -87,9 +87,18 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/tins/claims", post(submit_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
         .route("/tins/claims/{claim_id}/withdraw", post(withdraw_claim))
         .route("/tins/claims/{claim_id}/resend", post(resend_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
+        .route("/tins/claims/{claim_id}/delete", post(delete_claim))
+        .route("/tins/claims/{claim_id}/remove", post(remove_tin))
+        .route(
+            "/tins/claims/{claim_id}/documents/{document_id}/replace",
+            post(replace_document).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)),
+        )
+        .route("/tins/claims/{claim_id}/documents/{document_id}/remove", post(remove_document))
         // Staff. Everyone else gets a 404 (see `require_admin`).
         .route("/staff/claims", get(|| async { Redirect::permanent("/staff") }))
         .route("/staff/claims/{claim_id}/decision", post(decide_claim))
+        .route("/staff/claims/{claim_id}/delete", post(staff_delete_claim))
+        .route("/staff/claims/{claim_id}/revoke", post(revoke_claim))
         .route("/staff/documents/{document_id}", get(staff_document))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
@@ -540,6 +549,97 @@ async fn withdraw_claim(State(state): State<AppState>, headers: HeaderMap, Path(
     }
 }
 
+/// The claimant deletes a claim that never became active.
+async fn delete_claim(State(state): State<AppState>, headers: HeaderMap, Path(claim_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, "/tins").await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    match claims::delete(&state.db, &state.documents, claim_id, &account, By::Owner).await {
+        Ok(notice) | Err(DecideError::Refused(notice)) => see_other(link("/tins", Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
+    }
+}
+
+/// The owner gives up an active TIN.
+async fn remove_tin(State(state): State<AppState>, headers: HeaderMap, Path(claim_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, "/tins").await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    match claims::end_ownership(&state.db, claim_id, &account, By::Owner).await {
+        Ok(notice) | Err(DecideError::Refused(notice)) => see_other(link("/tins", Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
+    }
+}
+
+/// Where a file change goes back to: the claim's files page, or My TINs
+/// when the claim is gone or no longer open.
+fn after_file_change(claim_id: Uuid, notice: Notice) -> Response {
+    match notice {
+        Notice::ClaimMissing | Notice::FilesLocked => see_other(link("/tins", Some(notice), &[])),
+        notice => see_other(link(&format!("/tins/claims/{claim_id}/files"), Some(notice), &[])),
+    }
+}
+
+/// One new file in the field named after the old file's kind.
+async fn replace_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((claim_id, document_id)): Path<(Uuid, Uuid)>,
+    multipart: Multipart,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, &format!("/tins/claims/{claim_id}/files")).await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    let mut uploads = match read_claim_form(multipart).await {
+        Ok(form) => form.uploads,
+        Err(notice) => return after_file_change(claim_id, notice),
+    };
+    let Some(upload) = uploads.pop().filter(|_| uploads.is_empty()) else {
+        return after_file_change(claim_id, Notice::ChooseFile);
+    };
+    let key = &state.config.document_key;
+    match claims::replace_document(&state.db, &state.documents, key, &account, claim_id, document_id, upload).await {
+        Ok(new_id) => {
+            // The old file's reading went with its row; read the new one.
+            ocr::queue_document(&state, new_id).await;
+            after_file_change(claim_id, Notice::FileReplaced)
+        }
+        Err(SubmitError::Invalid(notice)) => after_file_change(claim_id, notice),
+        Err(SubmitError::Internal(error)) => internal(error),
+    }
+}
+
+async fn remove_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((claim_id, document_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, &format!("/tins/claims/{claim_id}/files")).await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    match claims::remove_document(&state.db, &state.documents, &account, claim_id, document_id).await {
+        Ok(()) => after_file_change(claim_id, Notice::FileRemoved),
+        Err(SubmitError::Invalid(notice)) => after_file_change(claim_id, notice),
+        Err(SubmitError::Internal(error)) => internal(error),
+    }
+}
+
 async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Path(device_id): Path<Uuid>) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
@@ -600,6 +700,56 @@ async fn decide_claim(
     match claims::decide(&state.db, &state.documents, claim_id, reviewer.id, &decision, &note).await {
         Ok(notice) => see_other(link("/staff", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct StaffReason {
+    #[serde(default)]
+    reason: String,
+}
+
+/// Staff delete a claim that never became active.
+async fn staff_delete_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/claims/{claim_id}");
+    let staff = match require_admin(&state, &headers, &back_to).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let by = By::Staff { reason: &form.reason };
+    match claims::delete(&state.db, &state.documents, claim_id, &staff, by).await {
+        Ok(notice) => see_other(link("/staff", Some(notice), &[])),
+        Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
+    }
+}
+
+/// Staff end an approved claim's ownership.
+async fn revoke_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/claims/{claim_id}");
+    let staff = match require_admin(&state, &headers, &back_to).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    match claims::end_ownership(&state.db, claim_id, &staff, By::Staff { reason: &form.reason }).await {
+        Ok(notice) | Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }
 }

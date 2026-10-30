@@ -139,7 +139,9 @@ Browser pages the apps open: `/login?next=…`, `/signup?next=…`,
 | `buwiz-relay`, `iaf-decrypt`, the relay tests | Not built | Built |
 
 `--features ocr` reads claim documents on the server (`src/ocr/`): it adds
-ONNX Runtime, linked statically, and about 25 MB to the binary. The models
+ONNX Runtime, linked statically, and about 30 MB to the binary. That
+ONNX Runtime needs GCC 14's libstdc++, so the `Dockerfile` builds on
+Ubuntu 24.04. The models
 (13 MB, Apache-2.0) are files, not in git: `scripts/ocr-models.sh` fetches
 them, pinned and checked, into `ocr-models/`, and `OCR_MODEL_DIR` points
 elsewhere. Without the feature every reading ends "OCR not built in".

@@ -18,8 +18,9 @@ pub const DICTIONARY: &str = "ppocrv5_latin_dict.txt";
 
 pub struct PaddleOcr {
     models: PathBuf,
-    /// Loaded on first use and kept: about 60 MB, against a second each
-    /// time to load them again.
+    /// Loaded on first use and kept. Loading them for each document costs
+    /// one to five seconds more, and the memory is not reliably given back
+    /// between documents anyway.
     pipeline: Mutex<Option<OAROCR>>,
 }
 

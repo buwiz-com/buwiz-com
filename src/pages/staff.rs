@@ -679,7 +679,7 @@ pub mod account_id {
                         </span>
                         <span class="user-actions">
                             <span class=(format!("id-badge {id_tone}"))>icon(name: id_icon) (id_label)</span>
-                            <form method="post" action=(format!("/staff/users/{account_id}/sign-out")) data-confirm="Sign this account out of every browser, app and AI agent?">
+                            <form method="post" action=(format!("/staff/users/{account_id}/sign-out")) data-confirm="Sign out everywhere?" data-confirm-detail="This account is signed out of every browser, the desktop app and every AI agent. They can sign in again." data-confirm-label="Sign out everywhere" data-confirm-tone="danger">
                                 <button class="btn btn-ghost btn-small" type="submit">icon(name: "logout") "Sign out everywhere"</button>
                             </form>
                         </span>
@@ -813,7 +813,7 @@ async fn connected_app(account_id: Uuid, app: AppRow) -> Result<impl View> {
                 <b>(name.clone())</b>
                 <span>(detail)</span>
             </span>
-            <form method="post" action=(action) data-confirm=(format!("Sign {name} out of this account?"))>
+            <form method="post" action=(action) data-confirm=(format!("Sign {name} out?")) data-confirm-detail="It loses access to this account until the person connects it again." data-confirm-label=(if app.is_agent() { "Remove" } else { "Sign out" }) data-confirm-tone="danger">
                 <button class="btn btn-ghost btn-small" type="submit">(if app.is_agent() { "Remove" } else { "Sign out" })</button>
             </form>
         </div>

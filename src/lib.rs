@@ -21,6 +21,7 @@ pub mod oauth;
 pub mod pages;
 pub mod relay;
 pub mod sender;
+pub mod seo;
 pub mod staff;
 pub mod state;
 pub mod storage;
@@ -72,16 +73,22 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     let address = format!("{}:{}", config.host, config.port);
-    let account_origin: std::sync::Arc<str> = config.account_origin.as_str().into();
-    let state = AppState::new(config, db, documents, ticket_key, sender);
-    let app = web::router(state.clone(), pages::router(state))
-        .layer(axum::middleware::from_fn_with_state(account_origin, canonical::host_roots))
-        .layer(axum::middleware::from_fn(canonical::bare_domain));
+    let app = app(AppState::new(config, db, documents, ticket_key, sender));
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");
     axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
     Ok(())
+}
+
+/// The whole site: the routes and pages, behind the host rules of
+/// [`canonical`].
+pub fn app(state: AppState) -> axum::Router {
+    let account_origin: std::sync::Arc<str> = state.config.account_origin.as_str().into();
+    web::router(state.clone(), pages::router(state))
+        .layer(axum::middleware::from_fn_with_state(account_origin, canonical::host_roots))
+        .layer(axum::middleware::from_fn(canonical::no_index))
+        .layer(axum::middleware::from_fn(canonical::bare_domain))
 }
 
 /// Development only: runs the Sender in this process on a loopback port.

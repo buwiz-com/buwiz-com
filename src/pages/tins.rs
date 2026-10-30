@@ -167,7 +167,7 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
                             <a class="btn btn-solid btn-small" href=(fix)>icon(name: "upload_file") "Fix and send again"</a>
                         }
                         <a class="btn btn-ghost btn-small" href=(files)>icon(name: "folder_open") "Files"</a>
-                        <form method="post" action=(withdraw) data-confirm="Withdraw this claim? Its documents are deleted.">
+                        <form method="post" action=(withdraw) data-confirm="Withdraw this claim?" data-confirm-detail="Its uploaded documents are deleted. You can add this TIN again later." data-confirm-label="Withdraw" data-confirm-tone="danger">
                             <button class="btn btn-quiet btn-small" type="submit">"Withdraw"</button>
                         </form>
                         confirm_form(

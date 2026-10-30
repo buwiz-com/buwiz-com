@@ -22,6 +22,7 @@ use crate::oauth;
 use crate::state::AppState;
 use crate::web::{link, safe_next, session_account};
 
+mod download;
 mod home;
 mod staff;
 mod tins;
@@ -31,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .app_context(state)
         .layout(root_layout)
         .page(home::home_page)
+        .page(download::download_page)
         .page(login_page)
         .page(signup_page)
         .page(verify_page)
@@ -107,7 +109,11 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let path = uri(cx).path().to_owned();
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let waiting = if staff_area { crate::staff::open_counts(&state(cx).db).await?.0 } else { 0 };
-    let head = head_for(&path);
+    let mut head = head_for(&path);
+    // Search engines find the download page once there is something on it.
+    if path == "/download" && state(cx).downloads.latest().await.is_none() {
+        head.index = false;
+    }
     Ok(view! {
         <!DOCTYPE html>
         <html lang="en">
@@ -117,7 +123,7 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 <title>(head.title)</title>
                 <meta name="description" content=(head.description)>
                 if head.index {
-                    home::home_head()
+                    home::public_head(url: format!("{}{path}", crate::seo::SITE), title: head.title, description: head.description)
                 } else {
                     <meta name="robots" content="noindex">
                 }
@@ -150,8 +156,8 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
 struct Head {
     title: &'static str,
     description: &'static str,
-    /// Only the public home page is for search engines; every other page
-    /// asks not to be indexed.
+    /// Only the public pages (home and download) are for search engines;
+    /// every other page asks not to be indexed.
     index: bool,
 }
 
@@ -163,6 +169,7 @@ const ACCOUNT_DESCRIPTION: &str = "Your Buwiz account: sign in, add your TINs an
 fn head_for(path: &str) -> Head {
     let title = match path {
         "/" => return Head { title: home::TITLE, description: home::DESCRIPTION, index: true },
+        "/download" => return Head { title: download::TITLE, description: download::DESCRIPTION, index: true },
         "/login" => "Sign in · Buwiz",
         "/signup" => "Create account · Buwiz",
         "/login/verify" => "Check your email · Buwiz",

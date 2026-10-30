@@ -29,6 +29,9 @@ pub struct Config {
     pub mail: MailConfig,
     /// The offline-signed relay trust list apps fetch (`TRUST_LIST_JWS`).
     pub trust_list: Option<String>,
+    /// Where the app's installers are, e.g. `https://downloads.buwiz.com`
+    /// (see [`crate::downloads`]).
+    pub downloads_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +77,7 @@ impl Config {
                 .ok()
                 .map(|raw| raw.trim().to_owned())
                 .filter(|raw| !raw.is_empty()),
+            downloads_url: origin(&var_or("DOWNLOADS_URL", "https://downloads.buwiz.com")).context("DOWNLOADS_URL")?,
         })
     }
 

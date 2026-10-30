@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Form, Router};
@@ -17,8 +17,10 @@ use uuid::Uuid;
 
 use crate::accounts::{self, Account, CodeError};
 use crate::agents;
+use crate::canonical::is_app_host;
 use crate::claims::{self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload};
 use crate::devices;
+use crate::downloads::{Kind, Platform};
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
@@ -51,6 +53,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/site.webmanifest", get(seo::manifest))
         .route("/robots.txt", get(seo::robots))
         .route("/sitemap.xml", get(seo::sitemap))
+        // The app's installers; `/download` itself is a page.
+        .route("/download/{platform}", get(download))
         // Desktop app sign-in (device flow) and tokens.
         .route("/auth/device/start", post(oauth::device_start))
         .route("/oauth/device/code", post(oauth::device_start))
@@ -288,6 +292,35 @@ fn moved(uri: &Uri, path: &str) -> Response {
         None => path.to_owned(),
     };
     Redirect::permanent(&location).into_response()
+}
+
+#[derive(Deserialize)]
+struct DownloadQuery {
+    kind: Option<String>,
+}
+
+/// The released installer for a platform (`?kind=deb` and so on to choose
+/// one), with a 302 the browser does not keep, so a newly released version
+/// is what the next click gets. Nothing released, or nothing for that
+/// platform: the download page, which says what is coming.
+async fn download(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    Query(query): Query<DownloadQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let Some(platform) = Platform::from_slug(&platform).filter(|_| !is_app_host(host)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let kind = match query.kind.as_deref() {
+        None => Some(None),
+        Some(name) => Kind::from_name(name).map(Some),
+    };
+    let release = state.downloads.latest().await;
+    let file = release.as_deref().zip(kind).and_then(|(release, kind)| release.pick(platform, kind));
+    let target = file.map_or("/download", |file| file.url.as_str());
+    (StatusCode::FOUND, [(header::LOCATION, target), (header::CACHE_CONTROL, "no-store")]).into_response()
 }
 
 /// `/account` was the old name of My TINs.

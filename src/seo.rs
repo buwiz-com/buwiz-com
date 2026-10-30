@@ -2,11 +2,14 @@
 //! the sitemap, which depend on the host (see [`crate::canonical`]), and the
 //! web app manifest.
 
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde_json::json;
 
 use crate::canonical::is_app_host;
+use crate::downloads::Release;
+use crate::state::AppState;
 
 /// The public site, whichever host a request came in on.
 pub const SITE: &str = "https://buwiz.com";
@@ -27,11 +30,11 @@ pub async fn robots(headers: HeaderMap) -> Response {
     text(robots_txt(host(&headers)), "text/plain; charset=utf-8")
 }
 
-pub async fn sitemap(headers: HeaderMap) -> Response {
+pub async fn sitemap(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if is_app_host(host(&headers)) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    text(sitemap_xml(), "application/xml; charset=utf-8")
+    text(sitemap_xml(state.downloads.latest().await.as_deref()), "application/xml; charset=utf-8")
 }
 
 pub async fn manifest() -> Response {
@@ -71,9 +74,16 @@ fn robots_txt(host: &str) -> String {
     body
 }
 
-fn sitemap_xml() -> String {
+/// The [`PAGES`], and the download page once a version is released.
+fn sitemap_xml(release: Option<&Release>) -> String {
+    let download = release.map(|release| {
+        let lastmod = release.published_at.map_or_else(|| PAGES[0].1.to_owned(), |at| at.date().to_string());
+        ("/download", lastmod)
+    });
     let urls: String = PAGES
         .iter()
+        .map(|(path, lastmod)| (*path, (*lastmod).to_owned()))
+        .chain(download)
         .map(|(path, lastmod)| {
             format!("  <url>\n    <loc>{SITE}{path}</loc>\n    <lastmod>{lastmod}</lastmod>\n  </url>\n")
         })
@@ -119,7 +129,19 @@ mod tests {
 
     #[test]
     fn the_sitemap_lists_the_home_page() {
-        let sitemap = sitemap_xml();
+        let sitemap = sitemap_xml(None);
         assert!(sitemap.contains("<loc>https://buwiz.com/</loc>\n    <lastmod>2026-10-30</lastmod>"), "{sitemap}");
+        assert!(!sitemap.contains("/download"), "{sitemap}");
+    }
+
+    #[test]
+    fn the_sitemap_lists_the_download_page_once_released() {
+        let manifest = br#"{"version":"1.2.0","published_at":"2026-11-02T01:00:00Z","files":[{"platform":"android","arch":"universal","kind":"apk","file":"Buwiz.apk","size":1,"sha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}]}"#;
+        let release = Release::parse(manifest, "https://downloads.buwiz.com").unwrap();
+        let sitemap = sitemap_xml(Some(&release));
+        assert!(
+            sitemap.contains("<loc>https://buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"),
+            "{sitemap}"
+        );
     }
 }

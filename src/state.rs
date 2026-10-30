@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
 use crate::config::Config;
+use crate::downloads::Downloads;
 use crate::link::SenderLink;
 use crate::mail::Mailer;
 use crate::ocr::Reader;
@@ -27,6 +28,8 @@ pub struct Inner {
     pub sender: SenderLink,
     /// Reads claim documents on this server, one at a time.
     pub ocr: Reader,
+    /// The released version of the app, if any.
+    pub downloads: Downloads,
 }
 
 impl AppState {
@@ -38,7 +41,8 @@ impl AppState {
         sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
-        Self(Arc::new(Inner { config, db, mailer, documents, ticket_key, sender, ocr: Reader::from_env() }))
+        let downloads = Downloads::new(&config.downloads_url);
+        Self(Arc::new(Inner { config, db, mailer, documents, ticket_key, sender, ocr: Reader::from_env(), downloads }))
     }
 }
 

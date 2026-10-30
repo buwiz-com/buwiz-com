@@ -440,7 +440,7 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
                         autofocus=(true)
                         data-code=""
                     >
-                    <p class="auth-hint code-hint" hidden=(true)>icon(name: "bolt") "Paste the whole code or type it. You're signed in as soon as the last digit goes in."</p>
+                    <p class="auth-hint code-hint" hidden=(true)>icon(name: "content_paste") "Paste the 6-digit code"</p>
                     <button class="btn btn-solid auth-submit" type="submit">"Sign in" icon(name: "arrow_forward")</button>
                 </form>
                 <form class="auth-resend" method="post" action="/auth/email/start">

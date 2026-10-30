@@ -1014,3 +1014,33 @@
 .auth .auth-switch a, .auth .auth-foot a { color: var(--brand); font-weight: 600; }
 .auth .auth-switch a:hover, .auth .auth-link:hover, .auth .auth-foot a:hover { text-decoration: underline; }
 .auth .auth-foot { color: var(--faint); font-size: 12px; text-align: center; }
+
+/* Once a version is released, the hero's platform row has a Download
+ * button and each logo links to its installer. */
+.home .platforms .btn { height: 32px; padding: 0 14px; font-size: 13px; }
+.home .platform a { display: flex; color: inherit; }
+
+/* Download page (src/pages/download.rs): a card per platform; the
+ * visitor's own is outlined in the brand colour. */
+.home .downloads { border-top: 0; }
+.home .downloads h1 { margin-bottom: 12px; font-size: 36px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.1; }
+@media (min-width: 768px) { .home .downloads h1 { font-size: 48px; } }
+.home .dl-grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin: 0; padding: 0; list-style: none; }
+@media (min-width: 768px) { .home .dl-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 1280px) { .home .dl-grid { grid-template-columns: repeat(3, 1fr); } }
+.home .dl-card { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; min-width: 0; padding: 24px; }
+.home .dl-card.yours { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand); }
+.home .dl-card-head { display: flex; align-items: center; gap: 12px; width: 100%; }
+.home .dl-card-head svg { flex: none; width: 28px; height: 28px; color: var(--text); }
+.home .dl-card-head h2 { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+.home .dl-card-head .badge { margin-left: auto; }
+.home .dl-facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; width: 100%; margin: 0; font-size: 13px; }
+.home .dl-facts div { display: contents; }
+.home .dl-facts dt { color: var(--muted); }
+.home .dl-facts dd { min-width: 0; margin: 0; color: var(--text); }
+.home .dl-card code { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.home .dl-others { display: grid; gap: 12px; width: 100%; margin: 0; padding: 16px 0 0; border-top: 1px solid var(--line); list-style: none; font-size: 13px; }
+.home .dl-others li { display: grid; gap: 2px; min-width: 0; }
+.home .dl-others a { color: var(--brand); font-weight: 600; }
+.home .dl-check { display: flex; align-items: flex-start; gap: 8px; margin-top: 32px; color: var(--muted); font-size: 14px; line-height: 1.65; }
+.home .dl-check code { color: var(--text); }

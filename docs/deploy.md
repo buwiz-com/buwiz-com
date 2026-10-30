@@ -113,6 +113,35 @@ Rotation, in this order, so no app ever meets a key its list lacks:
 2. **The trust key**: pin the new public key next to the old in an app
    release first, then sign with the new key.
 
+## Downloads
+
+The app's installers are in R2 bucket `buwiz-releases`, public at
+`https://downloads.buwiz.com` (`DOWNLOADS_URL`, the default). The buwiz-oss
+release CI uploads each version as:
+
+- `releases/v{VERSION}/{file}`: the installers, never changed once uploaded.
+- `releases/v{VERSION}/manifest.json`: the version, `published_at` and, for
+  each file, its platform (`macos`, `windows`, `linux`, `android`), arch
+  (`arm64`, `x64`, `universal`), kind (`dmg`, `msi`, `exe`, `appimage`,
+  `deb`, `rpm`, `apk`), file name, size and SHA-256.
+
+Nothing is released until `latest.json` exists at the bucket's root. To
+release a version, copy its `manifest.json` there (with
+`Cache-Control: max-age=60`); to take it back, delete `latest.json`. The
+server reads `latest.json` at most once a minute, so a change shows within
+about a minute. While it is missing, `/download` and the home page say
+"Coming soon". Once it exists, the home page's platform row links to
+`/download`, which lists every file with its size and SHA-256 and joins the
+sitemap, and `/download/{mac,windows,linux,android}` (`?kind=deb` and so on
+for a particular file) redirects, uncached, to the installer: by default the
+Mac's universal DMG, the Windows x64 MSI or else EXE, the Linux AppImage or
+else DEB, and the Android APK. A platform with no file says "Coming soon".
+
+If the bucket can't be reached or `latest.json` is broken, the server keeps
+the last good one, or says "Coming soon" if it never had one. File names
+must be plain names (letters, digits, `.`, `_`, `-`, `+`); files with other
+names, and platforms or kinds the server doesn't know, are left out.
+
 ## Domains
 
 `buwiz.com`, `www.buwiz.com`, `account.buwiz.com` and `api.buwiz.com` have

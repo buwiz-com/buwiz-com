@@ -1,7 +1,8 @@
 FROM rust:1.99-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked
+# Production: the BIR relay files (src/bir/ and the rest) must be present.
+RUN cargo build --release --locked --features bir
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*

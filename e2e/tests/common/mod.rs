@@ -196,7 +196,7 @@ pub async fn sftp_server_with(stall: Arc<std::sync::atomic::AtomicBool>) -> (u16
     (port, fingerprint, received)
 }
 
-/// A fake `tinDispatcherSFTP.php` that names `upload_host:upload_port`.
+/// A fake BIR dispatcher that names `upload_host:upload_port`.
 pub async fn dispatcher_server(upload_host: &str, upload_port: u16) -> u16 {
     let wrap = |plain: &str| dispatcher::wrap_field(plain, DISPATCH_PASS);
     let body = format!(

@@ -14,26 +14,7 @@ use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
 use crate::relay::Pipe;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Encrypts and checks everything, then stops. Nothing reaches BIR.
-    DryRun,
-    /// Uploads to a test SFTP server from settings, skipping the dispatcher.
-    Lab,
-    /// Files with BIR.
-    Live,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DryRun => "dry_run",
-            Self::Lab => "lab",
-            Self::Live => "live",
-        }
-    }
-}
+pub use crate::sender::{Mode, SendError, Sent};
 
 /// A dispatcher endpoint, tried in order.
 #[derive(Clone, Debug)]
@@ -97,23 +78,6 @@ pub struct Job<'a> {
     pub form_type: &'a str,
     pub filename: &'a str,
     pub xml: &'a [u8],
-}
-
-#[derive(Debug)]
-pub struct Sent {
-    pub remote_path: String,
-    /// SHA-256 of the encrypted file as uploaded, hex.
-    pub payload_sha256: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SendError {
-    /// Nothing reached BIR; sending again is safe.
-    #[error("{0}")]
-    NotSent(String),
-    /// BIR may have the file. Sending again could file twice.
-    #[error("{0}")]
-    MaybeSent(String),
 }
 
 pub async fn send(pipe: &Pipe, job: &Job<'_>, settings: &Settings) -> Result<Sent, SendError> {
@@ -193,6 +157,4 @@ async fn ask_dispatcher(pipe: &Pipe, job: &Job<'_>, settings: &Settings) -> Resu
     Err(SendError::NotSent(format!("BIR's dispatcher did not answer: {}", failures.join("; "))))
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
+pub use crate::crypto::hex;

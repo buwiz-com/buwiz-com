@@ -855,6 +855,12 @@
   scrollbar-width: none;
 }
 .home .demo-tabs::-webkit-scrollbar { display: none; }
+/* The AI Co-worker head, its tab row and each film's copy sit centred over
+ * the demo window. `safe` keeps the first tab reachable when the row
+ * scrolls on a phone. */
+.home .section-head.centered { margin-inline: auto; text-align: center; }
+.home .demo-tabs { justify-content: safe center; }
+.home .demo-copy { margin-inline: auto; text-align: center; }
 .home .demo-tab {
   display: inline-flex;
   flex-shrink: 0;

@@ -886,3 +886,21 @@
 .device-row form { margin: 0; }
 .home .btn.device-remove { height: 36px; padding: 0 14px; font-size: 13px; }
 
+/* Confirm dialog (account.js): the site's own, never the browser's. */
+.confirm-dialog { position: fixed; inset: 0; margin: auto; width: min(440px, calc(100vw - 32px)); max-width: none; height: fit-content; max-height: calc(100dvh - 32px); padding: 0; border: 0; background: transparent; color: var(--text); overflow: visible; }
+.confirm-dialog::backdrop { background: rgb(8 10 12 / 0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.confirm-box { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 28px 56px -18px rgba(0, 0, 0, 0.45); }
+.confirm-title { margin: 0; font-family: var(--font-display); font-size: 20px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.25; }
+.confirm-detail { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; }
+.confirm-actions { display: flex; flex-wrap: wrap-reverse; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.confirm-actions .btn { flex: 1 1 140px; max-width: 200px; }
+.home .btn.confirm-danger { background: #c62828; color: #ffffff; }
+.home .btn.confirm-danger:hover { opacity: 0.92; }
+@media (max-width: 420px) { .confirm-actions .btn { max-width: none; } }
+@media (prefers-reduced-motion: no-preference) {
+  .confirm-dialog[open] { animation: confirm-in 0.16s ease-out; }
+  .confirm-dialog[open]::backdrop { animation: confirm-fade 0.16s ease-out; }
+}
+@keyframes confirm-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
+@keyframes confirm-fade { from { opacity: 0; } }
+

@@ -330,7 +330,11 @@ async fn auth_notice(notice: Option<Notice>) -> Result<impl View> {
     })
 }
 
-/// Sign in and sign up: both email a code. `switch_*` links to the other.
+/// The BIR's ORUS site, where anyone with a TIN gets the free digital TIN ID.
+const ORUS: &str = "https://orus.bir.gov.ph/";
+
+/// Sign in and sign up: both email a code. `switch_*` links to the other;
+/// `orus` adds where to get a TIN ID (sign-up).
 #[component]
 async fn email_form(
     cx: &Cx,
@@ -339,6 +343,7 @@ async fn email_form(
     switch_prompt: &'static str,
     switch_label: &'static str,
     switch_path: &'static str,
+    #[default] orus: bool,
 ) -> Result<impl View> {
     let next = safe_next(query(cx, "next").as_deref());
     let email = query(cx, "email").unwrap_or_default();
@@ -369,6 +374,9 @@ async fn email_form(
                     <button class="btn btn-solid auth-submit" type="submit">"Email me a code" icon(name: "arrow_forward")</button>
                 </form>
                 <p class="auth-hint">icon(name: "lock") "No password to remember. Each code works once, for 10 minutes."</p>
+                if orus {
+                    <p class="auth-hint">icon(name: "badge") <span>"No TIN ID yet? " <a href=(ORUS) target="_blank" rel="noopener">"Get the free digital TIN ID from ORUS"</a></span></p>
+                }
                 <p class="auth-switch">(switch_prompt) " " <a href=(switch)>(switch_label)</a></p>
             </section>
             <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
@@ -403,7 +411,8 @@ async fn signup_page(cx: &Cx) -> Result<impl View> {
             intro: "Enter your email. We will send a code to confirm it; that is all you need.",
             switch_prompt: "Already have an account?",
             switch_label: "Sign in",
-            switch_path: "/login"
+            switch_path: "/login",
+            orus: true
         )
     })
 }

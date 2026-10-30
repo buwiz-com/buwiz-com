@@ -5,7 +5,9 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "bir")]
 use crate::bir;
+use crate::sender::{Mode, RelaySettings};
 use crate::storage::{DocumentStore, ObjectStore};
 
 #[derive(Clone, Debug)]
@@ -123,39 +125,55 @@ fn document_key(raw: &str) -> anyhow::Result<[u8; 32]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("DOCUMENT_KEY must be 32 bytes"))
 }
 
-/// Relay settings: `BIR_RELAY_MODE` is `dry_run` (default), `lab` or `live`.
-pub fn relay_settings() -> anyhow::Result<bir::Settings> {
-    let mode = match var_or("BIR_RELAY_MODE", "dry_run").as_str() {
-        "dry_run" => bir::Mode::DryRun,
-        "lab" => bir::Mode::Lab,
-        "live" => bir::Mode::Live,
+/// `BIR_RELAY_MODE`: `dry_run` (default), `lab` or `live`.
+pub fn relay_mode() -> anyhow::Result<Mode> {
+    Ok(match var_or("BIR_RELAY_MODE", "dry_run").as_str() {
+        "dry_run" => Mode::DryRun,
+        "lab" => Mode::Lab,
+        "live" => Mode::Live,
         other => bail!("BIR_RELAY_MODE must be dry_run, lab or live, not `{other}`"),
-    };
+    })
+}
+
+/// Built without the `bir` feature: only `BIR_RELAY_MODE` is read, and
+/// every send fails with [`crate::sender::NOT_BUILT_IN`].
+#[cfg(not(feature = "bir"))]
+pub fn relay_settings() -> anyhow::Result<RelaySettings> {
+    let mode = relay_mode()?;
+    tracing::warn!(mode = mode.as_str(), "built without the `bir` feature: every send fails, nothing reaches BIR");
+    Ok(RelaySettings { mode })
+}
+
+/// Relay settings: [`relay_mode`] and the other `BIR_*` settings.
+/// `BIR_SFTP_HOSTS` has no default and is required in `live`.
+#[cfg(feature = "bir")]
+pub fn relay_settings() -> anyhow::Result<RelaySettings> {
+    let mode = relay_mode()?;
     let secret = |name: &str| -> anyhow::Result<Zeroizing<String>> {
         match std::env::var(name).ok().filter(|value| !value.is_empty()) {
             Some(value) => Ok(Zeroizing::new(value)),
             // A dry run encrypts with a placeholder: nothing is sent.
-            None if mode == bir::Mode::DryRun => Ok(Zeroizing::new("dry-run".to_owned())),
+            None if mode == Mode::DryRun => Ok(Zeroizing::new("dry-run".to_owned())),
             None => bail!("{name} is required when BIR_RELAY_MODE={}", mode.as_str()),
         }
     };
     let pinned_keys = list("BIR_SSH_HOST_KEYS");
-    if mode != bir::Mode::DryRun && pinned_keys.is_empty() {
+    if mode != Mode::DryRun && pinned_keys.is_empty() {
         bail!("BIR_SSH_HOST_KEYS must list the upload server's SHA256:… host-key fingerprints");
     }
     let lab = match mode {
-        bir::Mode::Lab => Some(lab_server(&required("BIR_LAB_SFTP")?)?),
+        Mode::Lab => Some(lab_server(&required("BIR_LAB_SFTP")?)?),
         _ => None,
     };
-    let sftp_hosts = match list("BIR_SFTP_HOSTS") {
-        hosts if hosts.is_empty() => vec!["ebf2.bir.gov.ph".to_owned()],
-        hosts => hosts,
-    };
+    let sftp_hosts = list("BIR_SFTP_HOSTS");
+    if mode == Mode::Live && sftp_hosts.is_empty() {
+        bail!("BIR_SFTP_HOSTS must list the upload hosts BIR's dispatcher may name (see the BIR relay's docs)");
+    }
     Ok(bir::Settings {
         mode,
         iaf_passphrase: secret("BIR_IAF_PASSPHRASE")?,
         dispatcher_passphrase: match mode {
-            bir::Mode::Live => secret("BIR_DISPATCHER_PASSPHRASE")?,
+            Mode::Live => secret("BIR_DISPATCHER_PASSPHRASE")?,
             _ => Zeroizing::new(String::new()),
         },
         dispatchers: bir::bir_dispatchers(),
@@ -168,6 +186,7 @@ pub fn relay_settings() -> anyhow::Result<bir::Settings> {
 }
 
 /// `user:password@host:port`.
+#[cfg(feature = "bir")]
 fn lab_server(raw: &str) -> anyhow::Result<bir::LabServer> {
     let (login, address) = raw.rsplit_once('@').context("BIR_LAB_SFTP is user:password@host:port")?;
     let (username, password) = login.split_once(':').context("BIR_LAB_SFTP is user:password@host:port")?;
@@ -252,6 +271,7 @@ pub fn sender_url(public: bool) -> anyhow::Result<Option<(String, Zeroizing<Stri
 mod tests {
     use super::*;
 
+    #[cfg(feature = "bir")]
     #[test]
     fn lab_servers_parse_with_a_colon_in_the_password() {
         let lab = lab_server("lab:pa:ss@127.0.0.1:2222").unwrap();

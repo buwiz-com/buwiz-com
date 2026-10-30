@@ -3,6 +3,7 @@
 
 pub mod accounts;
 pub mod agents;
+#[cfg(feature = "bir")]
 pub mod bir;
 pub mod canonical;
 pub mod claims;
@@ -91,7 +92,9 @@ pub fn app(state: AppState) -> axum::Router {
 }
 
 /// Development only: runs the Sender in this process on a loopback port.
-/// Public deployments run `buwiz-sender` on its own (`SENDER_URL`).
+/// Public deployments run `buwiz-sender` on its own (`SENDER_URL`). Built
+/// without the `bir` feature, this Sender fails every send with
+/// [`sender::NOT_BUILT_IN`].
 async fn embedded_sender(ticket_key: &ed25519_dalek::SigningKey, issuer: &str) -> anyhow::Result<SenderLink> {
     let config = sender::SenderConfig::embedded(ticket_key.verifying_key(), issuer)?;
     let secret = config.secret.clone();

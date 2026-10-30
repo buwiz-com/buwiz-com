@@ -92,13 +92,8 @@ fn proof(parts: &Parts) -> Result<Proof<'_>, ApiError> {
 async fn check(db: &PgPool, parts: &Parts, body: &[u8], key: &VerifyingKey) -> Result<(), ApiError> {
     let proof = proof(parts)?;
     let path = parts.uri.path_and_query().map_or_else(|| parts.uri.path(), |pq| pq.as_str());
-    let input = signing_input(
-        parts.method.as_str(),
-        path,
-        &crate::bir::hex(&crypto::sha256(body)),
-        proof.timestamp,
-        proof.nonce,
-    );
+    let input =
+        signing_input(parts.method.as_str(), path, &crypto::hex(&crypto::sha256(body)), proof.timestamp, proof.nonce);
     key.verify(input.as_bytes(), &proof.signature)
         .map_err(|_| unauthorized("bad_signature", "the device signature does not verify"))?;
     let fresh = sqlx::query("INSERT INTO request_nonces (public_key, nonce) VALUES ($1, $2) ON CONFLICT DO NOTHING")

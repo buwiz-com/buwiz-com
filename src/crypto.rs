@@ -23,6 +23,11 @@ pub fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
+/// Lowercase hex.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Encrypts `plaintext` with AES-256-GCM. `context` (the claim and document
 /// ids) is bound as associated data, so a ciphertext cannot be moved to
 /// another row. Returns `(nonce, ciphertext)`.

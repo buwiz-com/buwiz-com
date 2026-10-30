@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -47,6 +48,15 @@ impl Platform {
     }
 
     /// The manifest's name for it.
+    fn manifest_name(self) -> &'static str {
+        match self {
+            Platform::Mac => "macos",
+            Platform::Windows => "windows",
+            Platform::Linux => "linux",
+            Platform::Android => "android",
+        }
+    }
+
     fn from_manifest(name: &str) -> Option<Self> {
         match name {
             "macos" => Some(Platform::Mac),
@@ -199,6 +209,18 @@ struct Entry {
     sha256: String,
 }
 
+impl File {
+    /// This file's link on this site: it counts the download, then sends
+    /// the browser on to [`File::url`].
+    pub fn route(&self) -> String {
+        match self.arch {
+            _ if self.kind == Kind::Sh => "/install-linux.sh".to_owned(),
+            Arch::Universal => format!("/download/{}?kind={}", self.platform.slug(), self.kind.name()),
+            arch => format!("/download/{}?kind={}&arch={}", self.platform.slug(), self.kind.name(), arch.name()),
+        }
+    }
+}
+
 impl Release {
     /// Reads a manifest whose files are under `{base}/releases/v{version}/`.
     /// Files on platforms, processors or kinds this server does not know
@@ -337,6 +359,65 @@ pub fn guess_platform(user_agent: &str) -> Option<Platform> {
         Some(Device::Platform(platform)) => Some(platform),
         _ => None,
     }
+}
+
+/// Whether a request for a file is someone downloading it, not a crawler
+/// or a link preview following the link. curl and wget count: they are how
+/// `install-linux.sh` is fetched.
+pub fn is_download(user_agent: &str) -> bool {
+    let agent = user_agent.to_ascii_lowercase();
+    !agent.is_empty()
+        && !["bot", "crawl", "spider", "slurp", "preview", "facebookexternalhit", "headless", "lighthouse"]
+            .iter()
+            .any(|word| agent.contains(word))
+}
+
+/// Counts one download of `file`, of release `version`, on today's date in
+/// Manila.
+pub async fn count(db: &PgPool, version: &str, file: &File) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO download_counts (day, version, platform, arch, kind, count)
+         VALUES ((now() AT TIME ZONE 'Asia/Manila')::date, $1, $2, $3, $4, 1)
+         ON CONFLICT (day, version, platform, arch, kind) DO UPDATE SET count = download_counts.count + 1",
+    )
+    .bind(version)
+    .bind(file.platform.manifest_name())
+    .bind(file.arch.name())
+    .bind(file.kind.name())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Downloads of one kind of file, every version and day together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Total {
+    pub platform: Platform,
+    pub arch: Arch,
+    pub kind: Kind,
+    pub count: i64,
+}
+
+/// Every file's downloads so far, most downloaded first: for showing on the
+/// site. Names this server no longer knows are left out.
+pub async fn totals(db: &PgPool) -> sqlx::Result<Vec<Total>> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT platform, arch, kind, sum(count)::bigint FROM download_counts
+         GROUP BY platform, arch, kind ORDER BY 4 DESC, 1, 2, 3",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(platform, arch, kind, count)| {
+            Some(Total {
+                platform: Platform::from_manifest(&platform)?,
+                arch: Arch::from_name(&arch)?,
+                kind: Kind::from_name(&kind)?,
+                count,
+            })
+        })
+        .collect())
 }
 
 /// `latest.json`, fetched when asked for and kept for [`REFRESH`].

@@ -19,10 +19,9 @@
      in pages.rs). */
   --font-display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
   --font-body: "Figtree", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  /* The content column: the header and the page share it, so the logo and
-     the header's last button line up with the page's edges. The home page
-     (home.css) and the staff and narrow account pages (account.css) set
-     their own. */
+  /* The content column of the pages. The header has the home page's on
+     every page (home.css), and the staff and narrow account pages
+     (account.css) set their own. */
   --shell: 1120px;
   --shell-pad: 16px;
   color-scheme: light dark;
@@ -43,6 +42,9 @@
   }
 }
 * { box-sizing: border-box; }
+/* Room for the scrollbar on short pages too, so nothing shifts between a
+   page that scrolls and one that does not. */
+html { scrollbar-gutter: stable; }
 body {
   margin: 0;
   background: var(--bg);

@@ -366,6 +366,10 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Ok(email) => email,
         Err(notice) => return see_other(link("/login", Some(notice), &[("next", &next)])),
     };
+    // For the code page's countdown, in ms. Taken before the code is stored,
+    // so it never outlasts the code.
+    let expires =
+        ((time::OffsetDateTime::now_utc() + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
     let code = match accounts::issue_code(&state.db, &email).await {
         Ok(code) => code,
         Err(CodeError::TooMany) => {
@@ -376,7 +380,11 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
     if let Err(error) = state.mailer.send_sign_in_code(&email, &code).await {
         return internal(error);
     }
-    see_other(link("/login/verify", Some(Notice::CodeSent), &[("email", &email), ("next", &next)]))
+    see_other(link(
+        "/login/verify",
+        Some(Notice::CodeSent),
+        &[("email", &email), ("next", &next), ("expires", &expires)],
+    ))
 }
 
 #[derive(Deserialize)]
@@ -384,6 +392,8 @@ struct EmailVerify {
     email: String,
     code: String,
     next: Option<String>,
+    /// The code page's countdown, passed back to it on a wrong code.
+    expires: Option<String>,
 }
 
 async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailVerify>) -> Response {
@@ -397,7 +407,12 @@ async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(fo
     let account = match accounts::redeem_code(&state.db, &email, &form.code).await {
         Ok(account) => account,
         Err(CodeError::Invalid | CodeError::TooMany) => {
-            return see_other(link("/login/verify", Some(Notice::CodeInvalid), &[("email", &email), ("next", &next)]));
+            let expires = form.expires.unwrap_or_default();
+            return see_other(link(
+                "/login/verify",
+                Some(Notice::CodeInvalid),
+                &[("email", &email), ("next", &next), ("expires", &expires)],
+            ));
         }
         Err(CodeError::Internal(error)) => return internal(error),
     };

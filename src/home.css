@@ -24,8 +24,9 @@
 }
 @media (min-width: 640px) { .home { --gutter: 24px; } }
 @media (min-width: 768px) { .home { --gutter: 40px; } }
-/* The home page's column, for its sections and the header above them. */
-.home.landing, body:has(main.landing) .top { --shell: 1400px; --shell-pad: var(--gutter); }
+/* The home page's column, for its sections, and the header's on every
+   page, so the logo and its buttons stay put from page to page. */
+.home.landing, .top { --shell: 1400px; --shell-pad: var(--gutter); }
 
 .home a { text-decoration: none; }
 .home p { margin: 0; }

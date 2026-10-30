@@ -19,8 +19,15 @@
      in pages.rs). */
   --font-display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
   --font-body: "Figtree", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* The content column: the header and the page share it, so the logo and
+     the header's last button line up with the page's edges. The home page
+     (home.css) and the staff and narrow account pages (account.css) set
+     their own. */
+  --shell: 1120px;
+  --shell-pad: 16px;
   color-scheme: light dark;
 }
+@media (min-width: 640px) { :root { --shell-pad: 20px; } }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #121416;
@@ -44,9 +51,10 @@ body {
 }
 a { color: var(--brand); }
 
-/* The Buwiz mark (brand_mark in pages.rs): the SVG is a mask, so the mark
-   takes the brand color of the light or dark theme. */
-.brand-mark {
+/* The Buwiz mark and wordmark (brand_mark and brand_wordmark in pages.rs):
+   each SVG is a mask, so they take the brand color of the light or dark
+   theme. */
+.brand-mark, .brand-wordmark {
   display: inline-block;
   flex: none;
   height: var(--mark-h, 28px);
@@ -54,4 +62,9 @@ a { color: var(--brand); }
   background-color: var(--brand);
   -webkit-mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
   mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
+}
+.brand-wordmark {
+  aspect-ratio: 674 / 215;
+  -webkit-mask-image: url("/assets/brand/buwiz_wordmark.svg");
+  mask-image: url("/assets/brand/buwiz_wordmark.svg");
 }

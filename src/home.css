@@ -24,6 +24,8 @@
 }
 @media (min-width: 640px) { .home { --gutter: 24px; } }
 @media (min-width: 768px) { .home { --gutter: 40px; } }
+/* The home page's column, for its sections and the header above them. */
+.home.landing, body:has(main.landing) .top { --shell: 1400px; --shell-pad: var(--gutter); }
 
 .home a { text-decoration: none; }
 .home p { margin: 0; }
@@ -77,9 +79,9 @@
 
 /* Sections */
 .home .section {
-  max-width: 1400px;
+  max-width: var(--shell);
   margin: 0 auto;
-  padding: 80px var(--gutter);
+  padding: 80px var(--shell-pad);
   border-top: 1px solid var(--line);
 }
 .home .section-head { max-width: 65ch; margin-bottom: 48px; }
@@ -87,7 +89,7 @@
 .home .faq h2 {
   font-size: 30px;
   font-weight: 800;
-  letter-spacing: -0.04em;
+  letter-spacing: -0.03em;
   line-height: 1.15;
   margin-bottom: 12px;
 }
@@ -124,9 +126,9 @@
 .home .hero-wrap {
   position: relative;
   isolation: isolate;
-  max-width: 1400px;
+  max-width: var(--shell);
   margin: 0 auto;
-  padding: 48px var(--gutter) 56px;
+  padding: 48px var(--shell-pad) 56px;
 }
 @media (min-width: 768px) { .home .hero-wrap { padding-top: 72px; } }
 .home .hero-glow {
@@ -176,7 +178,7 @@
   margin-bottom: 22px;
   font-size: 40px;
   font-weight: 800;
-  letter-spacing: -0.05em;
+  letter-spacing: -0.035em;
   line-height: 1.02;
 }
 @media (min-width: 640px) { .home .hero-copy h1 { font-size: 56px; } }
@@ -205,32 +207,23 @@
 .home .hero-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; }
 @media (min-width: 1024px) { .home .hero-actions { justify-content: flex-start; } }
 
-.home .platforms { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: 28px 0 0; padding: 0; list-style: none; }
+/* Where the app will run: logos only, one line down to 360px, with one
+ * "Coming soon" tag for the row. */
+.home .platforms { display: flex; flex-wrap: nowrap; align-items: center; justify-content: center; gap: 14px; margin: 28px 0 0; }
 @media (min-width: 1024px) { .home .platforms { justify-content: flex-start; } }
-.home .platform {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 600;
-}
-.home .platform .icon { font-size: 16px; color: var(--brand); }
-.home .platform.soon { border-style: dashed; background: transparent; color: var(--muted); }
-.home .platform.soon .icon { color: var(--faint); }
+.home .platforms ul { display: flex; align-items: center; gap: 14px; margin: 0; padding: 0; list-style: none; }
+.home .platform { display: flex; color: var(--muted); transition: color 0.15s; }
+.home .platform:hover { color: var(--brand); }
+.home .platform svg { display: block; width: 22px; height: 22px; }
 .home .soon-tag {
-  padding: 1px 6px;
+  flex: none;
+  padding: 3px 9px;
+  border: 1px dashed var(--line-strong);
   border-radius: 999px;
-  background: var(--warn-soft);
-  color: var(--warn);
-  font-size: 9.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 /* The devices. */
@@ -540,7 +533,7 @@
 }
 @media (min-width: 768px) { .home .hero-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 .home .hero-stats > div { padding: 18px 20px; background: var(--surface); }
-.home .hero-stats dt { font-family: var(--font-display); font-size: 26px; font-weight: 800; letter-spacing: -0.04em; color: var(--text); }
+.home .hero-stats dt { font-family: var(--font-display); font-size: 26px; font-weight: 800; letter-spacing: -0.03em; color: var(--text); }
 @media (min-width: 768px) { .home .hero-stats dt { font-size: 32px; } }
 .home .hero-stats dd { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
 
@@ -564,7 +557,7 @@
 }
 
 /* One month with Buwiz: the journey card under the hero. */
-.home .month { max-width: 1400px; margin: 0 auto; padding: 8px var(--gutter) 72px; }
+.home .month { max-width: var(--shell); margin: 0 auto; padding: 8px var(--shell-pad) 72px; }
 .home .month-label {
   margin-bottom: 24px;
   color: var(--faint);
@@ -972,9 +965,9 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  max-width: 1400px;
+  max-width: var(--shell);
   margin: 0 auto;
-  padding: 40px var(--gutter);
+  padding: 40px var(--shell-pad);
 }
 @media (min-width: 768px) { .home-footer-inner { flex-direction: row; align-items: center; } }
 .home-footer-name { margin-bottom: 4px; font-size: 14px; font-weight: 700; color: var(--text); }
@@ -1019,8 +1012,7 @@
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 24px 48px -16px rgba(0, 0, 0, 0.18);
 }
 @media (max-width: 480px) { .auth .auth-card { padding: 24px 20px; } }
-.auth .auth-brand { display: inline-flex; align-items: flex-end; gap: 10px; margin-bottom: 28px; color: var(--text); }
-.auth .auth-brand span { padding-bottom: 1px; font-size: 18px; font-weight: 800; letter-spacing: -0.04em; line-height: 1; }
+.auth .auth-brand { display: inline-flex; margin-bottom: 28px; }
 .auth .auth-badge {
   display: flex;
   align-items: center;

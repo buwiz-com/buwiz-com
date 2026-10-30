@@ -10,8 +10,8 @@ const SIGN_IN_CODE_HTML: &str = include_str!("email/sign_in_code.html");
 
 pub struct Mailer {
     config: MailConfig,
-    /// Absolute URL of the PNG logo in the email header (mail apps do not
-    /// show WebP or SVG reliably).
+    /// Absolute URL of the PNG wordmark in the email header (mail apps do
+    /// not show WebP or SVG reliably).
     logo_url: String,
     http: reqwest::Client,
 }
@@ -20,7 +20,7 @@ impl Mailer {
     pub fn new(config: MailConfig, site_origin: &str) -> Self {
         Self {
             config,
-            logo_url: format!("{site_origin}/assets/brand/buwiz_logo_email.png"),
+            logo_url: format!("{site_origin}/assets/brand/buwiz_wordmark_email.png"),
             http: reqwest::Client::new(),
         }
     }
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn the_code_is_the_only_number_and_leads_the_subject() {
-        let message = CodeMessage::new("042917", "https://account.buwiz.com/assets/brand/buwiz_logo_email.png");
+        let message = CodeMessage::new("042917", "https://account.buwiz.com/assets/brand/buwiz_wordmark_email.png");
         assert!(message.subject.starts_with("042917 "));
         assert!(message.text.contains("verification code is 042917"));
         for part in [message.subject.as_str(), message.text.as_str(), visible(&message.html).as_str()] {
@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn the_template_is_fully_filled_in() {
-        let message = CodeMessage::new("042917", "https://account.buwiz.com/assets/brand/buwiz_logo_email.png");
+        let message = CodeMessage::new("042917", "https://account.buwiz.com/assets/brand/buwiz_wordmark_email.png");
         assert!(!message.html.contains("{{"));
-        assert!(message.html.contains(r#"src="https://account.buwiz.com/assets/brand/buwiz_logo_email.png""#));
+        assert!(message.html.contains(r#"src="https://account.buwiz.com/assets/brand/buwiz_wordmark_email.png""#));
     }
 }

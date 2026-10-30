@@ -230,7 +230,11 @@ const APPLE: &str = "M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1
 /// What Buwiz stands for, under the hero: (icon, title, the proof).
 const HERO_STATS: [(&str, &str, &str); 3] = [
     ("verified", "BIR parity", "All 43 BIR forms, checked with the same 2,007 rules as eBIRForms."),
-    ("lock_person", "Your data stays yours", "Your books and returns are prepared on your computer and sealed before they leave it. Buwiz keeps the BIR receipt, not your books."),
+    (
+        "lock_person",
+        "Your data stays yours",
+        "Your books and returns are prepared on your computer and sealed before they leave it. Buwiz keeps the BIR receipt, not your books.",
+    ),
     ("smart_toy", "AI native", "An AI co-worker drafts and checks your returns. You approve every filing."),
 ];
 

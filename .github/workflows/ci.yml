@@ -26,6 +26,8 @@ jobs:
           toolchain: "1.99"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # Without the `bir` feature: the public build, which has no BIR relay
+      # files. Production builds use `--features bir` (see the Dockerfile).
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

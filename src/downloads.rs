@@ -66,13 +66,19 @@ pub enum Arch {
 }
 
 impl Arch {
-    fn from_manifest(name: &str) -> Option<Self> {
-        match name {
-            "arm64" => Some(Arch::Arm64),
-            "x64" => Some(Arch::X64),
-            "universal" => Some(Arch::Universal),
-            _ => None,
+    const ALL: [Arch; 3] = [Arch::Arm64, Arch::X64, Arch::Universal];
+
+    /// The manifest's name for it; also `?arch=` of `/download/{platform}`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::Arm64 => "arm64",
+            Arch::X64 => "x64",
+            Arch::Universal => "universal",
         }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|arch| arch.name() == name)
     }
 
     /// What people call it on `platform`.
@@ -97,11 +103,16 @@ pub enum Kind {
     AppImage,
     Deb,
     Rpm,
+    /// A `.tar.gz` to unpack, for any other Linux.
+    TarGz,
+    /// The Linux install script, `curl … | sh`; always `universal`.
+    Sh,
     Apk,
 }
 
 impl Kind {
-    const ALL: [Kind; 7] = [Kind::Dmg, Kind::Msi, Kind::Exe, Kind::AppImage, Kind::Deb, Kind::Rpm, Kind::Apk];
+    const ALL: [Kind; 9] =
+        [Kind::Dmg, Kind::Msi, Kind::Exe, Kind::AppImage, Kind::Deb, Kind::Rpm, Kind::TarGz, Kind::Sh, Kind::Apk];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -111,6 +122,8 @@ impl Kind {
             Kind::AppImage => "appimage",
             Kind::Deb => "deb",
             Kind::Rpm => "rpm",
+            Kind::TarGz => "targz",
+            Kind::Sh => "sh",
             Kind::Apk => "apk",
         }
     }
@@ -122,21 +135,23 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Kind::Dmg => "Disk image (.dmg)",
-            Kind::Msi => "Installer (.msi)",
-            Kind::Exe => "Setup (.exe)",
+            Kind::Msi => "MSI package (.msi)",
+            Kind::Exe => "Installer (.exe)",
             Kind::AppImage => "AppImage",
-            Kind::Deb => "Debian, Ubuntu (.deb)",
-            Kind::Rpm => "Fedora, openSUSE (.rpm)",
+            Kind::Deb => "Ubuntu, Debian (.deb)",
+            Kind::Rpm => "Fedora, Red Hat, openSUSE (.rpm)",
+            Kind::TarGz => "Any Linux (.tar.gz)",
+            Kind::Sh => "Install script (.sh)",
             Kind::Apk => "APK",
         }
     }
 
     /// The one platform this kind installs on.
-    fn platform(self) -> Platform {
+    pub fn platform(self) -> Platform {
         match self {
             Kind::Dmg => Platform::Mac,
             Kind::Msi | Kind::Exe => Platform::Windows,
-            Kind::AppImage | Kind::Deb | Kind::Rpm => Platform::Linux,
+            Kind::AppImage | Kind::Deb | Kind::Rpm | Kind::TarGz | Kind::Sh => Platform::Linux,
             Kind::Apk => Platform::Android,
         }
     }
@@ -201,8 +216,11 @@ impl Release {
             .filter_map(|value| serde_json::from_value::<Entry>(value).ok())
             .filter_map(|entry| {
                 let platform = Platform::from_manifest(&entry.platform)?;
-                let arch = Arch::from_manifest(&entry.arch)?;
+                let arch = Arch::from_name(&entry.arch)?;
                 let kind = Kind::from_name(&entry.kind).filter(|kind| kind.platform() == platform)?;
+                if kind == Kind::Sh && arch != Arch::Universal {
+                    return None;
+                }
                 if !is_file_name(&entry.file) || !is_sha256(&entry.sha256) {
                     tracing::warn!(file = entry.file, "latest.json: left out a file with a bad name or SHA-256");
                     return None;
@@ -230,24 +248,31 @@ impl Release {
         self.files.iter().filter(move |file| file.platform == platform)
     }
 
-    /// The file `/download/{platform}` sends people to: of `kind` when
-    /// asked, otherwise the one that suits most computers.
-    pub fn pick(&self, platform: Platform, kind: Option<Kind>) -> Option<&File> {
-        self.files_for(platform).filter(|file| kind.is_none_or(|kind| file.kind == kind)).min_by_key(|file| rank(file))
+    /// The file `/download/{platform}` sends people to: of `kind` and for
+    /// processor `arch` (a universal build runs on any) when asked,
+    /// otherwise the one that suits most computers. The install script is
+    /// only ever given when asked for.
+    pub fn pick(&self, platform: Platform, kind: Option<Kind>, arch: Option<Arch>) -> Option<&File> {
+        self.files_for(platform)
+            .filter(|file| kind.map_or(file.kind != Kind::Sh, |kind| file.kind == kind))
+            .filter(|file| arch.is_none_or(|arch| file.arch == arch || file.arch == Arch::Universal))
+            .min_by_key(|file| rank(file))
     }
 }
 
 /// Lower is better: a Mac gets the universal build, Windows the x64
-/// installer (MSI before EXE), Linux the AppImage, Android the APK.
+/// installer (EXE before MSI, which is for IT departments), Linux the x64
+/// deb, Android the APK.
 fn rank(file: &File) -> (usize, usize) {
     let arch = |order: &[Arch]| order.iter().position(|arch| *arch == file.arch).unwrap_or(order.len());
     let kind = |order: &[Kind]| order.iter().position(|kind| *kind == file.kind).unwrap_or(order.len());
     match file.platform {
         Platform::Mac => (arch(&[Arch::Universal, Arch::Arm64, Arch::X64]), 0),
-        Platform::Windows => (arch(&[Arch::X64, Arch::Universal, Arch::Arm64]), kind(&[Kind::Msi, Kind::Exe])),
-        Platform::Linux => {
-            (kind(&[Kind::AppImage, Kind::Deb, Kind::Rpm]), arch(&[Arch::X64, Arch::Universal, Arch::Arm64]))
-        }
+        Platform::Windows => (arch(&[Arch::X64, Arch::Universal, Arch::Arm64]), kind(&[Kind::Exe, Kind::Msi])),
+        Platform::Linux => (
+            kind(&[Kind::Deb, Kind::Rpm, Kind::TarGz, Kind::AppImage]),
+            arch(&[Arch::X64, Arch::Universal, Arch::Arm64]),
+        ),
         Platform::Android => (arch(&[Arch::Universal, Arch::Arm64, Arch::X64]), 0),
     }
 }
@@ -273,22 +298,44 @@ fn is_sha256(raw: &str) -> bool {
     raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// A guess at the visitor's platform from `User-Agent`, to highlight its
-/// download. iPhones and iPads (which say "like Mac OS X") and Chromebooks
-/// get `None`.
-pub fn guess_platform(user_agent: &str) -> Option<Platform> {
+/// What the visitor is on, as far as `User-Agent` tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    /// One the app has installers for.
+    Platform(Platform),
+    /// An iPhone, iPad or iPod (which say "like Mac OS X"). An iPad asking
+    /// for desktop sites says Macintosh; only the page's script can tell.
+    Ios,
+    /// A Chromebook, which runs the Linux deb once Linux is turned on.
+    Chromebook,
+}
+
+/// A guess at the visitor's device from `User-Agent`; `None` when it says
+/// nothing we know.
+pub fn guess_device(user_agent: &str) -> Option<Device> {
     if user_agent.contains("Android") {
-        Some(Platform::Android)
-    } else if ["iPhone", "iPad", "iPod", "CrOS"].iter().any(|name| user_agent.contains(name)) {
-        None
+        Some(Device::Platform(Platform::Android))
+    } else if ["iPhone", "iPad", "iPod"].iter().any(|name| user_agent.contains(name)) {
+        Some(Device::Ios)
+    } else if user_agent.contains("CrOS") {
+        Some(Device::Chromebook)
     } else if user_agent.contains("Windows") {
-        Some(Platform::Windows)
+        Some(Device::Platform(Platform::Windows))
     } else if user_agent.contains("Macintosh") || user_agent.contains("Mac OS X") {
-        Some(Platform::Mac)
+        Some(Device::Platform(Platform::Mac))
     } else if user_agent.contains("Linux") || user_agent.contains("X11") {
-        Some(Platform::Linux)
+        Some(Device::Platform(Platform::Linux))
     } else {
         None
+    }
+}
+
+/// A guess at the visitor's platform from `User-Agent`, to highlight its
+/// download. iPhones, iPads and Chromebooks get `None`.
+pub fn guess_platform(user_agent: &str) -> Option<Platform> {
+    match guess_device(user_agent) {
+        Some(Device::Platform(platform)) => Some(platform),
+        _ => None,
     }
 }
 
@@ -451,12 +498,12 @@ mod tests {
             entry("linux", "x64", "rpm", "linux.rpm"),
             entry("android", "arm64", "apk", "android-arm.apk"),
         ]);
-        let pick = |platform, kind| release.pick(platform, kind).map(|file| file.name.as_str());
+        let pick = |platform, kind| release.pick(platform, kind, None).map(|file| file.name.as_str());
         assert_eq!(pick(Platform::Mac, None), Some("mac-universal.dmg"));
-        assert_eq!(pick(Platform::Windows, None), Some("win-x64.msi"));
-        assert_eq!(pick(Platform::Windows, Some(Kind::Exe)), Some("win-x64.exe"));
-        assert_eq!(pick(Platform::Linux, None), Some("linux-x64.AppImage"));
-        assert_eq!(pick(Platform::Linux, Some(Kind::Deb)), Some("linux.deb"));
+        assert_eq!(pick(Platform::Windows, None), Some("win-x64.exe"));
+        assert_eq!(pick(Platform::Windows, Some(Kind::Msi)), Some("win-x64.msi"));
+        assert_eq!(pick(Platform::Linux, None), Some("linux.deb"));
+        assert_eq!(pick(Platform::Linux, Some(Kind::AppImage)), Some("linux-x64.AppImage"));
         assert_eq!(pick(Platform::Linux, Some(Kind::Rpm)), Some("linux.rpm"));
         assert_eq!(pick(Platform::Linux, Some(Kind::Apk)), None);
         assert_eq!(pick(Platform::Android, None), Some("android-arm.apk"));
@@ -467,7 +514,7 @@ mod tests {
             entry("windows", "x64", "exe", "Buwiz-1.2.0-windows-x64-setup.exe"),
             entry("linux", "x64", "deb", "buwiz_1.2.0_amd64.deb"),
         ]);
-        let pick = |platform| today.pick(platform, None).map(|file| file.name.as_str());
+        let pick = |platform| today.pick(platform, None, None).map(|file| file.name.as_str());
         assert_eq!(pick(Platform::Mac), Some("Buwiz-1.2.0-macos-universal.dmg"));
         assert_eq!(pick(Platform::Windows), Some("Buwiz-1.2.0-windows-x64-setup.exe"));
         assert_eq!(pick(Platform::Linux), Some("buwiz_1.2.0_amd64.deb"));
@@ -477,9 +524,39 @@ mod tests {
             entry("macos", "arm64", "dmg", "mac-arm.dmg"),
             entry("windows", "arm64", "exe", "win-arm.exe"),
         ]);
-        assert_eq!(arm_only.pick(Platform::Mac, None).unwrap().name, "mac-arm.dmg");
-        assert_eq!(arm_only.pick(Platform::Windows, None).unwrap().name, "win-arm.exe");
-        assert!(arm_only.pick(Platform::Linux, None).is_none());
+        assert_eq!(arm_only.pick(Platform::Mac, None, None).unwrap().name, "mac-arm.dmg");
+        assert_eq!(arm_only.pick(Platform::Windows, None, None).unwrap().name, "win-arm.exe");
+        assert!(arm_only.pick(Platform::Linux, None, None).is_none());
+    }
+
+    #[test]
+    fn linux_files_are_picked_by_kind_and_processor() {
+        let release = release(vec![
+            entry("macos", "universal", "dmg", "mac.dmg"),
+            entry("linux", "x64", "deb", "amd64.deb"),
+            entry("linux", "arm64", "deb", "arm64.deb"),
+            entry("linux", "x64", "rpm", "x64.rpm"),
+            entry("linux", "arm64", "targz", "arm64.tar.gz"),
+            entry("linux", "universal", "sh", "install.sh"),
+            // The script runs on any processor; any other is left out.
+            entry("linux", "x64", "sh", "x64-install.sh"),
+        ]);
+        let pick = |kind, arch| release.pick(Platform::Linux, kind, arch).map(|file| file.name.as_str());
+        assert_eq!(pick(Some(Kind::Deb), Some(Arch::X64)), Some("amd64.deb"));
+        assert_eq!(pick(Some(Kind::Deb), Some(Arch::Arm64)), Some("arm64.deb"));
+        assert_eq!(pick(Some(Kind::Rpm), Some(Arch::X64)), Some("x64.rpm"));
+        assert_eq!(pick(Some(Kind::Rpm), Some(Arch::Arm64)), None);
+        assert_eq!(pick(Some(Kind::TarGz), Some(Arch::Arm64)), Some("arm64.tar.gz"));
+        assert_eq!(pick(Some(Kind::TarGz), Some(Arch::X64)), None);
+        assert_eq!(pick(Some(Kind::Sh), Some(Arch::Arm64)), Some("install.sh"));
+        assert_eq!(pick(Some(Kind::Sh), None), Some("install.sh"));
+        // Never the script unless asked for it.
+        assert_eq!(pick(None, Some(Arch::Arm64)), Some("arm64.deb"));
+        let script_only = self::release(vec![entry("linux", "universal", "sh", "install.sh")]);
+        assert!(script_only.pick(Platform::Linux, None, None).is_none());
+        // A universal Mac build suits either processor.
+        assert_eq!(release.pick(Platform::Mac, None, Some(Arch::Arm64)).unwrap().name, "mac.dmg");
+        assert_eq!(release.files.iter().filter(|file| file.kind == Kind::Sh).count(), 1);
     }
 
     #[test]
@@ -508,6 +585,21 @@ mod tests {
         for (agent, platform) in cases {
             assert_eq!(guess_platform(agent), platform, "{agent}");
         }
+        for (agent, device) in [
+            ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148", Device::Ios),
+            ("Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148", Device::Ios),
+            (
+                "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 Chrome/130.0 Safari/537.36",
+                Device::Chromebook,
+            ),
+            (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+                Device::Platform(Platform::Linux),
+            ),
+        ] {
+            assert_eq!(guess_device(agent), Some(device), "{agent}");
+        }
+        assert_eq!(guess_device("curl/8.7.1"), None);
     }
 
     /// Serves `body` (or a 404 when `None`) as `/latest.json` on a free port.

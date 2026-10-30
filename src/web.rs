@@ -20,7 +20,7 @@ use crate::agents;
 use crate::canonical::is_app_host;
 use crate::claims::{self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload};
 use crate::devices;
-use crate::downloads::{Kind, Platform};
+use crate::downloads::{Arch, Kind, Platform};
 use crate::mcp;
 use crate::notice::Notice;
 use crate::oauth;
@@ -47,6 +47,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/screens/{name}", get(screenshot))
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
+        .route("/assets/download.js", get(download_script))
         .route("/assets/{dir}/{name}", get(asset))
         // Search engines, browsers and home screens.
         .route("/favicon.ico", get(|| asset(Path(("brand".into(), "favicon.ico".into())))))
@@ -55,6 +56,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/sitemap.xml", get(seo::sitemap))
         // The app's installers; `/download` itself is a page.
         .route("/download/{platform}", get(download))
+        .route("/install-linux.sh", get(install_linux_script))
         // Desktop app sign-in (device flow) and tokens.
         .route("/auth/device/start", post(oauth::device_start))
         .route("/oauth/device/code", post(oauth::device_start))
@@ -142,6 +144,10 @@ async fn account_script() -> Response {
 
 async fn demo_script() -> Response {
     text(include_str!("demo.js"), "text/javascript; charset=utf-8")
+}
+
+async fn download_script() -> Response {
+    text(include_str!("download.js"), "text/javascript; charset=utf-8")
 }
 
 async fn demo_stylesheet() -> Response {
@@ -297,12 +303,15 @@ fn moved(uri: &Uri, path: &str) -> Response {
 #[derive(Deserialize)]
 struct DownloadQuery {
     kind: Option<String>,
+    arch: Option<String>,
 }
 
-/// The released installer for a platform (`?kind=deb` and so on to choose
-/// one), with a 302 the browser does not keep, so a newly released version
-/// is what the next click gets. Nothing released, or nothing for that
-/// platform: the download page, which says what is coming.
+/// The released installer for a platform (`?kind=deb&arch=arm64` and so on
+/// to choose one), with a 302 the browser does not keep, so a newly
+/// released version is what the next click gets. An unknown processor is
+/// x64; on Linux a missing one is too, and a missing or unknown kind is the
+/// deb. Nothing released: the download page, which says what is coming.
+/// No such file: the platform on that page, with the choice made there.
 async fn download(
     State(state): State<AppState>,
     Path(platform): Path<String>,
@@ -313,14 +322,54 @@ async fn download(
     let Some(platform) = Platform::from_slug(&platform).filter(|_| !is_app_host(host)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let kind = match query.kind.as_deref() {
-        None => Some(None),
-        Some(name) => Kind::from_name(name).map(Some),
+    let Some(release) = state.downloads.latest().await else {
+        return found("/download");
     };
+    let linux = platform == Platform::Linux;
+    let arch = match query.arch.as_deref() {
+        Some(name) => Some(Arch::from_name(name).filter(|arch| *arch != Arch::Universal).unwrap_or(Arch::X64)),
+        None => linux.then_some(Arch::X64),
+    };
+    let asked = query.kind.as_deref().map(|name| Kind::from_name(name).filter(|kind| kind.platform() == platform));
+    // `None` when asked for a kind this platform has not got.
+    let kind = match asked {
+        _ if linux => Some(Some(asked.flatten().unwrap_or(Kind::Deb))),
+        None => Some(None),
+        Some(kind) => kind.map(Some),
+    };
+    match kind.and_then(|kind| release.pick(platform, kind, arch)) {
+        Some(file) => found(&file.url),
+        None if linux => {
+            let (kind, arch) = (kind.flatten().unwrap_or(Kind::Deb), arch.unwrap_or(Arch::X64));
+            found(&format!("/download?kind={}&arch={}#linux", kind.name(), arch.name()))
+        }
+        None => found(&format!("/download#{}", platform.slug())),
+    }
+}
+
+/// What `curl -fsSL https://buwiz.com/install-linux.sh | sh` runs: a 302,
+/// not kept, to the released install script. While there is none, a
+/// browser goes to the Linux downloads, and anything else (curl) gets a
+/// 404, so a web page is never piped into `sh`.
+async fn install_linux_script(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let header = |name| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    if is_app_host(header(header::HOST)) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let release = state.downloads.latest().await;
-    let file = release.as_deref().zip(kind).and_then(|(release, kind)| release.pick(platform, kind));
-    let target = file.map_or("/download", |file| file.url.as_str());
-    (StatusCode::FOUND, [(header::LOCATION, target), (header::CACHE_CONTROL, "no-store")]).into_response()
+    match release.as_deref().and_then(|release| release.pick(Platform::Linux, Some(Kind::Sh), None)) {
+        Some(script) => found(&script.url),
+        None if header(header::ACCEPT).contains("text/html") => found("/download#linux"),
+        None => {
+            (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")], "No Linux install script is released yet.\n")
+                .into_response()
+        }
+    }
+}
+
+/// A 302 the browser does not keep.
+fn found(location: &str) -> Response {
+    (StatusCode::FOUND, [(header::LOCATION, location), (header::CACHE_CONTROL, "no-store")]).into_response()
 }
 
 /// `/account` was the old name of My TINs.

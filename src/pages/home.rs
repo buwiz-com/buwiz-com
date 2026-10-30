@@ -211,7 +211,7 @@ const HERO_STATS: [(&str, &str); 4] = [
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let signed_in = current(cx).await?.is_some();
     Ok(view! {
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600&family=Figtree:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap">
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home">
             hero(signed_in: signed_in)

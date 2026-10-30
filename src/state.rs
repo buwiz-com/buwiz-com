@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::link::SenderLink;
 use crate::mail::Mailer;
+use crate::ocr::Reader;
 use crate::storage::DocumentStore;
 
 #[derive(Clone)]
@@ -24,6 +25,8 @@ pub struct Inner {
     /// Signs tickets.
     pub ticket_key: SigningKey,
     pub sender: SenderLink,
+    /// Reads claim documents on this server, one at a time.
+    pub ocr: Reader,
 }
 
 impl AppState {
@@ -35,7 +38,7 @@ impl AppState {
         sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
-        Self(Arc::new(Inner { config, db, mailer, documents, ticket_key, sender }))
+        Self(Arc::new(Inner { config, db, mailer, documents, ticket_key, sender, ocr: Reader::from_env() }))
     }
 }
 

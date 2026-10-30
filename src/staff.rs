@@ -92,6 +92,11 @@ pub struct QueueRow {
     pub rivals: i64,
     /// Kinds of the files still stored.
     pub document_kinds: Vec<String>,
+    /// The kind of the newest TIN ID or 2303 read on our server, and how
+    /// its TIN and name compare with what was typed.
+    pub reading_kind: Option<String>,
+    pub tin_match: Option<String>,
+    pub name_match: Option<String>,
 }
 
 pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Result<Vec<QueueRow>> {
@@ -101,8 +106,15 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
               WHERE o.tin_root = c.tin_root AND o.branch_code = c.branch_code AND o.account_id <> c.account_id
                 AND o.status IN ('pending', 'needs_fix', 'approved')) AS rivals,
              ARRAY(SELECT DISTINCT d.kind FROM claim_documents d
-                   WHERE d.claim_id = c.id AND d.purged_at IS NULL) AS document_kinds
+                   WHERE d.claim_id = c.id AND d.purged_at IS NULL) AS document_kinds,
+             reading.reading_kind, reading.tin_match, reading.name_match
          FROM tin_claims c JOIN accounts a ON a.id = c.account_id
+         LEFT JOIN LATERAL (
+             SELECT d.kind AS reading_kind, r.tin_match, r.name_match
+             FROM claim_documents d JOIN document_readings r ON r.document_id = d.id
+             WHERE d.claim_id = c.id AND d.purged_at IS NULL AND r.status = 'read'
+             ORDER BY d.created_at DESC LIMIT 1
+         ) reading ON true
          WHERE c.status = $1
            AND ($2::text IS NULL OR a.email ILIKE $2 OR c.registered_name ILIKE $2 OR c.trade_name ILIKE $2
                 OR ($3::text IS NOT NULL AND c.tin_root || c.branch_code LIKE $3))

@@ -4,3 +4,5 @@
 .git
 .github
 scripts
+!scripts/ocr-models.sh
+ocr-models

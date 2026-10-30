@@ -107,14 +107,26 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let path = uri(cx).path().to_owned();
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let waiting = if staff_area { crate::staff::open_counts(&state(cx).db).await?.0 } else { 0 };
+    let head = head_for(&path);
     Ok(view! {
         <!DOCTYPE html>
         <html lang="en">
             <head>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>"Buwiz"</title>
+                <title>(head.title)</title>
+                <meta name="description" content=(head.description)>
+                if head.index {
+                    home::home_head()
+                } else {
+                    <meta name="robots" content="noindex">
+                }
                 <link rel="icon" type="image/svg+xml" href="/assets/brand/buwiz_favicon.svg">
+                <link rel="icon" href="/favicon.ico" sizes="48x48">
+                <link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png">
+                <link rel="manifest" href="/site.webmanifest">
+                <meta name="theme-color" content="#f7f6f2" media="(prefers-color-scheme: light)">
+                <meta name="theme-color" content="#121416" media="(prefers-color-scheme: dark)">
                 <link rel="stylesheet" href="/assets/site.css">
                 brand_styles()
                 <link rel="stylesheet" href="/assets/account.css">
@@ -134,6 +146,38 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     })
 }
 
+/// What a page puts in `<head>` about itself.
+struct Head {
+    title: &'static str,
+    description: &'static str,
+    /// Only the public home page is for search engines; every other page
+    /// asks not to be indexed.
+    index: bool,
+}
+
+/// The description of every page but the home page.
+const ACCOUNT_DESCRIPTION: &str = "Your Buwiz account: sign in, add your TINs and connect the Buwiz apps.";
+
+/// The head of the page at `path`. The layout renders `<head>` before the
+/// page, so pages are told apart here by their path.
+fn head_for(path: &str) -> Head {
+    let title = match path {
+        "/" => return Head { title: home::TITLE, description: home::DESCRIPTION, index: true },
+        "/login" => "Sign in · Buwiz",
+        "/signup" => "Create account · Buwiz",
+        "/login/verify" => "Check your email · Buwiz",
+        "/device" => "Sign in to the app · Buwiz",
+        "/oauth/authorize" => "Connect an AI app · Buwiz",
+        "/tins" => "My TINs · Buwiz",
+        "/tins/new" => "Add a TIN · Buwiz",
+        _ if path.starts_with("/tins/") => "Fix and send again · Buwiz",
+        "/staff" => "Staff · Buwiz",
+        _ if path.starts_with("/staff/") => "Staff · Buwiz",
+        _ => "Buwiz",
+    };
+    Head { title, description: ACCOUNT_DESCRIPTION, index: false }
+}
+
 /// Two letters for an account's avatar, from its email.
 fn initials(email: &str) -> String {
     email.chars().filter(char::is_ascii_alphanumeric).take(2).collect::<String>().to_uppercase()
@@ -146,9 +190,8 @@ async fn site_header(account: Option<Account>, admin: bool, path: String) -> Res
     Ok(view! {
         <header class="home top">
             <div class="top-in">
-                <a class="top-brand" href="/">
-                    brand_mark(height: 28)
-                    <span class="top-name">"Buwiz"</span>
+                <a class="top-brand" href="/" aria-label="Buwiz home">
+                    brand_wordmark(height: 28)
                 </a>
                 if let Some(account) = account {
                     <nav class="top-nav" aria-label="Account">
@@ -173,10 +216,9 @@ async fn staff_header(account: Account, path: String, waiting: i64) -> Result<im
     Ok(view! {
         <header class="home top staff-top">
             <div class="top-in staff-in">
-                <a class="top-brand" href="/staff">
-                    brand_mark(height: 28)
-                    <span class="top-name">"Buwiz"</span>
-                    <span class="staff-tag">"STAFF"</span>
+                <a class="top-brand" href="/staff" aria-label="Buwiz staff">
+                    brand_wordmark(height: 26)
+                    <span class="staff-tag" aria-hidden="true">"STAFF"</span>
                 </a>
                 <nav class="top-nav" aria-label="Staff">
                     <a href="/staff" class=(if on_users { "" } else { "on" })>
@@ -239,7 +281,7 @@ async fn brand_styles() -> Result<impl View> {
     Ok(view! {
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap">
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=block">
         <link rel="stylesheet" href="/assets/home.css">
     })
@@ -257,13 +299,21 @@ async fn brand_mark(height: u32) -> Result<impl View> {
     Ok(view! { <span class="brand-mark" aria-hidden="true" style=(format!("--mark-h: {height}px"))></span> })
 }
 
-/// The Buwiz logo and name at the top of a sign-in card.
+/// The Buwiz wordmark (the mark as its "b", then "uwiz"), painted like
+/// [`brand_mark`]. It names itself, for links with no other text.
+#[component]
+async fn brand_wordmark(height: u32) -> Result<impl View> {
+    Ok(view! {
+        <span class="brand-wordmark" role="img" aria-label="Buwiz" style=(format!("--mark-h: {height}px"))></span>
+    })
+}
+
+/// The Buwiz wordmark at the top of a sign-in card.
 #[component]
 async fn auth_brand() -> Result<impl View> {
     Ok(view! {
         <a class="auth-brand" href="/" aria-label="Buwiz home">
-            brand_mark(height: 30)
-            <span>"BUWIZ"</span>
+            brand_wordmark(height: 32)
         </a>
     })
 }
@@ -281,7 +331,11 @@ async fn auth_notice(notice: Option<Notice>) -> Result<impl View> {
     })
 }
 
-/// Sign in and sign up: both email a code. `switch_*` links to the other.
+/// The BIR's ORUS site, where anyone with a TIN gets the free digital TIN ID.
+const ORUS: &str = "https://orus.bir.gov.ph/";
+
+/// Sign in and sign up: both email a code. `switch_*` links to the other;
+/// `orus` adds where to get a TIN ID (sign-up).
 #[component]
 async fn email_form(
     cx: &Cx,
@@ -290,6 +344,7 @@ async fn email_form(
     switch_prompt: &'static str,
     switch_label: &'static str,
     switch_path: &'static str,
+    #[default] orus: bool,
 ) -> Result<impl View> {
     let next = safe_next(query(cx, "next").as_deref());
     let email = query(cx, "email").unwrap_or_default();
@@ -320,6 +375,9 @@ async fn email_form(
                     <button class="btn btn-solid auth-submit" type="submit">"Email me a code" icon(name: "arrow_forward")</button>
                 </form>
                 <p class="auth-hint">icon(name: "lock") "No password to remember. Each code works once, for 10 minutes."</p>
+                if orus {
+                    <p class="auth-hint">icon(name: "badge") <span>"No TIN ID yet? " <a href=(ORUS) target="_blank" rel="noopener">"Get the free digital TIN ID from ORUS"</a></span></p>
+                }
                 <p class="auth-switch">(switch_prompt) " " <a href=(switch)>(switch_label)</a></p>
             </section>
             <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
@@ -354,7 +412,8 @@ async fn signup_page(cx: &Cx) -> Result<impl View> {
             intro: "Enter your email. We will send a code to confirm it; that is all you need.",
             switch_prompt: "Already have an account?",
             switch_label: "Sign in",
-            switch_path: "/login"
+            switch_path: "/login",
+            orus: true
         )
     })
 }
@@ -391,7 +450,7 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
                         autofocus=(true)
                         data-code=""
                     >
-                    <p class="auth-hint code-hint" hidden=(true)>icon(name: "bolt") "Paste the whole code or type it. You're signed in as soon as the last digit goes in."</p>
+                    <p class="auth-hint code-hint" hidden=(true)>icon(name: "content_paste") "Paste the 6-digit code"</p>
                     <button class="btn btn-solid auth-submit" type="submit">"Sign in" icon(name: "arrow_forward")</button>
                 </form>
                 <form class="auth-resend" method="post" action="/auth/email/start">
@@ -692,6 +751,24 @@ mod tests {
         assert_eq!(date(at), "October 29, 2026");
         assert_eq!(short_date(at), "Oct 29, 2026");
         assert_eq!(date_time(at), "Oct 29, 2026 · 4:32 PM");
+    }
+
+    #[test]
+    fn only_the_home_page_is_indexed() {
+        assert!(head_for("/").index);
+        assert_eq!(head_for("/").title, "Buwiz: Philippine tax filing, made modern");
+        for (path, title) in [
+            ("/login", "Sign in · Buwiz"),
+            ("/tins", "My TINs · Buwiz"),
+            ("/tins/claims/0b6e/fix", "Fix and send again · Buwiz"),
+            ("/staff", "Staff · Buwiz"),
+            ("/staff/users", "Staff · Buwiz"),
+            ("/nowhere", "Buwiz"),
+        ] {
+            let head = head_for(path);
+            assert_eq!(head.title, title, "{path}");
+            assert!(!head.index, "{path}");
+        }
     }
 
     #[test]

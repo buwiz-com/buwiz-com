@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .page(tins::tins_page)
         .page(tins::new_tin_page)
         .page(tins::claim_id::fix_page)
+        .page(tins::claim_id::files_page)
         .page(staff::claims_page)
         .page(staff::claim_id::claim_page)
         .page(staff::users_page)
@@ -612,6 +613,8 @@ fn status_look(status: &str) -> (&'static str, &'static str, &'static str) {
         "needs_fix" => ("Needs a fix", "error", "fix"),
         "approved" => ("Active", "check_circle", "active"),
         "rejected" => ("Not approved", "cancel", "rejected"),
+        "removed" => ("Removed", "remove_circle", "withdrawn"),
+        "revoked" => ("Revoked", "block", "rejected"),
         _ => ("Withdrawn", "undo", "withdrawn"),
     }
 }
@@ -621,6 +624,42 @@ fn status_look(status: &str) -> (&'static str, &'static str, &'static str) {
 async fn pill(label: String, icon_name: &'static str, tone: String) -> Result<impl View> {
     Ok(view! {
         <span class=(format!("tagpill {tone}"))>icon(name: icon_name) (label)</span>
+    })
+}
+
+/// A form that ends or erases something. `data-confirm…` makes
+/// `account.js` ask first in the site's own dialog: `question`, then
+/// `detail` saying what happens, and `confirm` on the red button. Staff
+/// actions also carry a required reason.
+#[component]
+async fn confirm_form(
+    label: &'static str,
+    action: String,
+    question: String,
+    detail: String,
+    confirm: &'static str,
+    #[default] reason: bool,
+) -> Result<impl View> {
+    Ok(view! {
+        <form
+            class=(if reason { "end-form" } else { "" })
+            method="post"
+            action=(action)
+            data-confirm=(question)
+            data-confirm-detail=(detail)
+            data-confirm-label=(confirm)
+            data-confirm-tone="danger"
+        >
+            if reason {
+                <label class="decision-label">
+                    "Reason"
+                    <textarea name="reason" rows="2" maxlength="500" required=(true) placeholder="Kept in the account's history."></textarea>
+                </label>
+                <button class="btn btn-danger" type="submit">(label)</button>
+            } else {
+                <button class="btn btn-quiet btn-small" type="submit">(label)</button>
+            }
+        </form>
     })
 }
 

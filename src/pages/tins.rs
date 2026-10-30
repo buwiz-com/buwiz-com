@@ -1,5 +1,5 @@
-//! The person's own pages: My TINs, adding a TIN, and fixing a claim staff
-//! sent back. The add-a-TIN form is one form in three steps: with
+//! The person's own pages: My TINs, adding a TIN, a claim's files, and
+//! fixing a claim staff sent back. The add-a-TIN form is one form in three steps: with
 //! JavaScript (`src/account.js`) it shows one step at a time; without, the
 //! steps stack and the form still posts. Which papers show for a personal
 //! or a business TIN follows the chosen radio button in CSS (`:has()`).
@@ -13,13 +13,14 @@ pub async fn tins_page(cx: &Cx) -> Result<impl View> {
     let account = signed_in(cx).await?;
     let mut claims = claims::for_account(&state(cx).db, account.id).await?;
     let devices = devices::for_account(&state(cx).db, account.id).await?;
-    // Newest first. A rejected claim stays until the TIN is added again.
+    // Newest first. A rejected or revoked claim stays until the TIN is added
+    // again; a removed TIN is gone from here.
     let mut seen = Vec::new();
     claims.retain(|claim| {
         let tin = (claim.tin_root.clone(), claim.branch_code.clone());
         let keep = match claim.status.as_str() {
-            "withdrawn" => false,
-            "rejected" => !seen.contains(&tin),
+            "withdrawn" | "removed" => false,
+            "rejected" | "revoked" => !seen.contains(&tin),
             _ => true,
         };
         seen.push(tin);
@@ -106,6 +107,10 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
         claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(_, message)| message).collect();
     let withdraw = format!("/tins/claims/{}/withdraw", claim.id);
     let fix = format!("/tins/claims/{}/fix", claim.id);
+    let files = format!("/tins/claims/{}/files", claim.id);
+    let delete = format!("/tins/claims/{}/delete", claim.id);
+    let remove = format!("/tins/claims/{}/remove", claim.id);
+    let tin = claim.tin().to_string();
     Ok(view! {
         <article class="tin-card">
             <div class="tin-card-top">
@@ -122,7 +127,7 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
             <ol class="track" aria-label="Review progress">
                 <li class="done">"Sent"</li>
                 <li class=(checked.1)>(checked.0)</li>
-                <li class=(if status == "approved" { "done" } else { "" })>"Active"</li>
+                <li class=(match status.as_str() { "approved" => "done", "revoked" => "warn", _ => "" })>"Active"</li>
             </ol>
             match status.as_str() {
                 "approved" => <p class="tin-note active">"Active since " (claim.decided_at.map(date).unwrap_or_default()) ". File from the Buwiz app on your computer."</p>,
@@ -140,21 +145,63 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
                         }
                     </div>
                 },
+                "revoked" => {
+                    <div class="tin-note fix">
+                        <p><strong>"No longer active."</strong> " Our staff ended this ownership on " (claim.removed_at.map(date).unwrap_or_default()) "."</p>
+                        if let Some(note) = claim.removal_note.clone() {
+                            <p>(note)</p>
+                        }
+                        <p>"You can add the TIN again with new papers."</p>
+                    </div>
+                },
                 _ => {
                     <div class="tin-note fix">
                         <p><strong>"Not approved."</strong> " " (claim.decision_note.clone().unwrap_or_default())</p>
                     </div>
                 },
             }
-            if claim.is_open() {
-                <div class="tin-actions">
-                    if status == "needs_fix" {
-                        <a class="btn btn-solid btn-small" href=(fix)>icon(name: "upload_file") "Fix and send again"</a>
-                    }
-                    <form method="post" action=(withdraw) data-confirm="Withdraw this claim? Its documents are deleted.">
-                        <button class="btn btn-quiet btn-small" type="submit">"Withdraw"</button>
-                    </form>
-                </div>
+            match status.as_str() {
+                "pending" | "needs_fix" => {
+                    <div class="tin-actions">
+                        if status == "needs_fix" {
+                            <a class="btn btn-solid btn-small" href=(fix)>icon(name: "upload_file") "Fix and send again"</a>
+                        }
+                        <a class="btn btn-ghost btn-small" href=(files)>icon(name: "folder_open") "Files"</a>
+                        <form method="post" action=(withdraw) data-confirm="Withdraw this claim? Its documents are deleted.">
+                            <button class="btn btn-quiet btn-small" type="submit">"Withdraw"</button>
+                        </form>
+                        confirm_form(
+                            label: "Delete",
+                            action: delete,
+                            question: "Delete this claim?".to_owned(),
+                            detail: "The claim and every file you sent with it are erased for good.".to_owned(),
+                            confirm: "Delete"
+                        )
+                    </div>
+                },
+                "rejected" => {
+                    <div class="tin-actions">
+                        confirm_form(
+                            label: "Delete",
+                            action: delete,
+                            question: "Delete this claim?".to_owned(),
+                            detail: "The claim and any file still kept with it are erased for good.".to_owned(),
+                            confirm: "Delete"
+                        )
+                    </div>
+                },
+                "approved" => {
+                    <div class="tin-actions">
+                        confirm_form(
+                            label: "Remove this TIN",
+                            action: remove,
+                            question: format!("Remove {tin}?"),
+                            detail: "It stops being active and the app can't send returns for it. Sent returns stay in your history; add it again any time.".to_owned(),
+                            confirm: "Remove"
+                        )
+                    </div>
+                },
+                _ => "",
             }
         </article>
     })
@@ -422,8 +469,111 @@ async fn kind_option(
     })
 }
 
+/// One stored file on the claim's files page: replace it, or remove it
+/// when the claim can do without it.
+#[component]
+async fn file_row(claim_id: Uuid, document: DocumentRow, required: bool) -> Result<impl View> {
+    let base = format!("/tins/claims/{claim_id}/documents/{}", document.id);
+    let accept = if document.kind == "selfie" { "image/*" } else { "application/pdf,image/*" };
+    let size = format!("{} KB", (document.size_bytes + 1023) / 1024);
+    Ok(view! {
+        <li class="file-row">
+            <span class="file-icon">icon(name: DocumentKind::icon(&document.kind))</span>
+            <span class="file-text">
+                <b>
+                    (DocumentKind::label(&document.kind))
+                    if required {
+                        <span class="slot-tag">"Required"</span>
+                    }
+                </b>
+                <span class="file-name">(document.filename.clone())</span>
+                <span>(size) " · added " (date_time(document.created_at))</span>
+            </span>
+            <div class="file-actions">
+                <form
+                    class="file-replace"
+                    method="post"
+                    action=(format!("{base}/replace"))
+                    enctype="multipart/form-data"
+                    data-confirm="Replace this file?"
+                    data-confirm-detail="The new file takes its place, and this one is deleted for good."
+                    data-confirm-label="Replace"
+                    data-confirm-tone="danger"
+                >
+                    <input type="file" name=(document.kind.clone()) accept=(accept) required=(true) aria-label=(format!("New {}", DocumentKind::label(&document.kind))) >
+                    <button class="btn btn-ghost btn-small" type="submit">icon(name: "upload_file") "Replace"</button>
+                </form>
+                if !required {
+                    confirm_form(
+                        label: "Remove",
+                        action: format!("{base}/remove"),
+                        question: "Remove this file?".to_owned(),
+                        detail: "It is deleted for good. The claim keeps its other files.".to_owned(),
+                        confirm: "Remove"
+                    )
+                }
+            </div>
+        </li>
+    })
+}
+
 pub mod claim_id {
     use super::*;
+
+    /// The files of a claim still open, one at a time: replace any of
+    /// them, remove the optional ones.
+    #[page("/tins/claims/{claim_id}/files")]
+    pub async fn files_page(cx: &Cx) -> Result<impl View> {
+        let account = signed_in(cx).await?;
+        let claim_id = path_id(cx, 1)?;
+        let db = &state(cx).db;
+        let claim = match claims::find(db, claim_id).await? {
+            Some(claim) if claim.account_id == account.id => claim,
+            _ => return Err(topcoat::router::error::not_found().into()),
+        };
+        if !claim.is_open() {
+            return Err(redirect(link("/tins", Some(Notice::FilesLocked), &[])).into());
+        }
+        let kind = ClaimKind::parse(&claim.kind).unwrap_or(ClaimKind::Business);
+        let rows: Vec<(DocumentRow, bool)> = claims::documents(db, claim_id)
+            .await?
+            .into_iter()
+            .filter(|document| document.purged_at.is_none())
+            .map(|document| {
+                let required = kind.required().iter().any(|required| required.as_str() == document.kind);
+                (document, required)
+            })
+            .collect();
+        let fix = format!("/tins/claims/{claim_id}/fix");
+        Ok(view! {
+            <main class="home page">
+                <div class="page-in narrow">
+                    <a class="back" href="/tins">icon(name: "arrow_back") "My TINs"</a>
+                    page_notice(notice: notice(cx))
+                    <div class="step-head">
+                        kind_pill(kind: claim.kind.clone())
+                        <h1>"Your files"</h1>
+                        <p class="page-lead">tin_text(tin: claim.tin().to_string()) " · " (claim.registered_name.clone())</p>
+                    </div>
+                    if claim.status == "needs_fix" {
+                        <p class="hint-box">icon(name: "info") <span>"When your files are right, " <a href=(fix)>"send the claim again"</a> " so the reviewer checks it."</span></p>
+                    } else {
+                        <p class="hint-box">icon(name: "info") <span>"The reviewer sees your changes, and that you made them after sending the claim."</span></p>
+                    }
+                    if rows.is_empty() {
+                        <p class="panel empty">"No files on this claim."</p>
+                    } else {
+                        <ul class="panel file-rows">
+                            for (document, required) in rows {
+                                file_row(claim_id: claim_id, document: document, required: required)
+                            }
+                        </ul>
+                    }
+                    <p class="fine">icon(name: "lock") "Files are encrypted. A replaced or removed file is deleted at once."</p>
+                </div>
+            </main>
+        })
+    }
 
     /// A claim staff sent back: what they asked for, the files on it, and
     /// a form to replace files or correct the name and send it again.

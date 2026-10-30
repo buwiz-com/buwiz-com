@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::claims::FIX_REASONS;
-use crate::staff::{self as queries, AppRow, IdStatus, QueueFilter, QueueRow, UserFilter};
+use crate::staff::{self as queries, AppRow, AuditRow, IdStatus, QueueFilter, QueueRow, UserFilter};
 
 /// A small note on a queue row or in the checks list: (tone, icon, text).
 /// Tones: `good`, `warn`, `bad`, `info`.
@@ -29,6 +29,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     }
     if claim.status == "pending" && claim.resent_at.is_some() {
         flags.push(("warn", "replay", "Resent after a fix".to_owned()));
+    }
+    if let Some(at) = claim.files_changed_while_waiting() {
+        flags.push(("warn", "swap_horiz", format!("Files changed after sending · {}", date_time(at))));
     }
     if claim.kind == "personal" {
         if has("selfie") {
@@ -130,6 +133,7 @@ async fn queue_row(row: QueueRow) -> Result<impl View> {
             (format!("Waiting {}", span_since(since)), OffsetDateTime::now_utc() - since > time::Duration::days(1))
         }
         "needs_fix" => (format!("Sent back {}", ago(claim.sent_back_at)), false),
+        "removed" | "revoked" => (format!("Ended {}", claim.removed_at.map(short_date).unwrap_or_default()), false),
         _ => (format!("Decided {}", claim.decided_at.map(short_date).unwrap_or_default()), false),
     };
     Ok(view! {
@@ -202,7 +206,7 @@ pub mod claim_id {
         let claimant_tins = claims::for_account(db, claim.account_id)
             .await?
             .iter()
-            .filter(|other| !matches!(other.status.as_str(), "withdrawn" | "rejected"))
+            .filter(|other| matches!(other.status.as_str(), "pending" | "needs_fix" | "approved"))
             .count();
         let kind = ClaimKind::parse(&claim.kind).unwrap_or(ClaimKind::Business);
         let stored = |document: DocumentKind| {
@@ -244,6 +248,9 @@ pub mod claim_id {
                     ("info", "gavel", "No proof of authority: needed only if the 2303 names a company".to_owned())
                 }),
             }
+            if let Some(at) = claim.files_changed_while_waiting() {
+                checks.push(("warn", "swap_horiz", format!("Files changed after sending · {}", date_time(at))));
+            }
             checks.push(("warn", "visibility", "Looks real, and matches what was typed? Your call".to_owned()));
         }
 
@@ -262,6 +269,10 @@ pub mod claim_id {
             claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(label, _)| label).collect();
         let own_claim = claim.account_id == reviewer.id;
         let decide = format!("/staff/claims/{claim_id}/decision");
+        let delete = format!("/staff/claims/{claim_id}/delete");
+        let revoke = format!("/staff/claims/{claim_id}/revoke");
+        let deletable = claims::DELETABLE.contains(&claim.status.as_str());
+        let ended = matches!(claim.status.as_str(), "removed" | "revoked");
         let tabs: Vec<(usize, DocumentRow)> = documents.into_iter().enumerate().collect();
         Ok(view! {
             <main class="home page staff">
@@ -378,12 +389,49 @@ pub mod claim_id {
                                         <button class="btn btn-danger" type="submit" name="decision" value="reject">"Reject"</button>
                                     </div>
                                 </form>
+                            } else if ended {
+                                <section class="panel side-card">
+                                    <h2>"Ended"</h2>
+                                    <p class="side-text">"Approved " (claim.decided_at.map(date_time).unwrap_or_default())</p>
+                                    <p class="side-text">
+                                        (if claim.status == "removed" { "Removed by the owner " } else { "Revoked by staff " })
+                                        (claim.removed_at.map(date_time).unwrap_or_default())
+                                    </p>
+                                    if let Some(note) = claim.removal_note.clone() {
+                                        <p class="side-text quote">(note)</p>
+                                    }
+                                </section>
                             } else {
                                 <section class="panel side-card">
                                     <h2>"Decided"</h2>
                                     <p class="side-text">(status_label) " · " (claim.decided_at.map(date_time).unwrap_or_default())</p>
                                     if let Some(note) = claim.decision_note.clone() {
                                         <p class="side-text quote">(note)</p>
+                                    }
+                                </section>
+                            }
+                            if !own_claim && (deletable || claim.status == "approved") {
+                                <section class="panel side-card end-claim">
+                                    if claim.status == "approved" {
+                                        <p class="side-text">"Ends this account's ownership. The TIN stops being active at once, its sent returns stay, and it can be claimed again."</p>
+                                        confirm_form(
+                                            label: "Revoke ownership",
+                                            action: revoke,
+                                            question: format!("Revoke {}'s ownership of {}?", claim.email, claim.tin()),
+                                            detail: "The TIN stops being active at once; the owner sees your reason on My TINs.".to_owned(),
+                                            confirm: "Revoke",
+                                            reason: true
+                                        )
+                                    } else {
+                                        <p class="side-text">"Erases the claim and its files for good. Only a line in the account's history stays."</p>
+                                        confirm_form(
+                                            label: "Delete claim",
+                                            action: delete,
+                                            question: format!("Delete this claim by {}?", claim.email),
+                                            detail: "The claim and every file on it are erased for good.".to_owned(),
+                                            confirm: "Delete",
+                                            reason: true
+                                        )
                                     }
                                 </section>
                             }
@@ -584,6 +632,7 @@ pub mod account_id {
         let documents = claims::account_documents(db, account_id).await?;
         let apps = queries::apps(db, account_id).await?;
         let sessions = queries::sessions(db, account_id).await?;
+        let audit = queries::audit(db, account_id).await?;
         let id_status = IdStatus::of(config.is_admin(&user.email), claims.iter().map(|claim| claim.status.as_str()));
         let (id_label, id_icon, id_tone) = id_status.look();
         let mut names: Vec<String> = Vec::new();
@@ -608,7 +657,7 @@ pub mod account_id {
             .collect();
         let live_sessions = sessions.iter().filter(|(_, live)| *live).count();
         let signed_in: Vec<AppRow> = apps.iter().filter(|app| app.signed_in).cloned().collect();
-        let history = history(&user, &claims, &apps, &sessions);
+        let history = history(&user, &claims, &apps, &sessions, &audit);
         let subtitle = {
             let mut parts = vec![format!("Joined {}", date(user.created_at))];
             parts.push(format!("active {}", ago(user.last_active)));
@@ -772,12 +821,14 @@ async fn connected_app(account_id: Uuid, app: AppRow) -> Result<impl View> {
 }
 
 /// The account's story from the timestamps already kept: when it was
-/// made, its sign-ins, its claims and what happened to them. Newest first.
+/// made, its sign-ins, its claims and what happened to them, and the audit
+/// lines (deleted claims included). Newest first.
 fn history(
     user: &queries::UserRow,
     claims: &[ClaimRow],
     apps: &[AppRow],
     sessions: &[(OffsetDateTime, bool)],
+    audit: &[AuditRow],
 ) -> Vec<(OffsetDateTime, &'static str, String)> {
     let mut events = vec![(user.created_at, "person_add", "Created the account".to_owned())];
     for (at, _) in sessions {
@@ -810,14 +861,53 @@ fn history(
         }
         if let Some(at) = claim.decided_at {
             let (icon_name, what) = match claim.status.as_str() {
-                "approved" => ("verified", format!("{tin} approved")),
+                "approved" | "removed" | "revoked" => ("verified", format!("{tin} approved")),
                 "rejected" => ("cancel", format!("{tin} not approved")),
                 _ => ("undo", format!("Withdrew {tin}")),
             };
             events.push((at, icon_name, what));
         }
     }
+    for line in audit {
+        events.push((line.created_at, audit_icon(&line.action), audit_text(line, user.id)));
+    }
     events.sort_by_key(|event| std::cmp::Reverse(event.0));
     events.truncate(40);
     events
+}
+
+fn audit_icon(action: &str) -> &'static str {
+    match action {
+        "deleted" => "delete",
+        "removed" => "remove_circle",
+        "revoked" => "block",
+        "file_replaced" => "swap_horiz",
+        _ => "draft",
+    }
+}
+
+/// An audit line as the history reads it. Staff actions name the staff
+/// member and carry their reason.
+fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
+    let tin = &line.tin_masked;
+    let file = line.document_kind.as_deref().map(DocumentKind::label).unwrap_or_default();
+    let what = match line.action.as_str() {
+        "deleted" => {
+            let status = match line.claim_status.as_str() {
+                "pending" => "waiting",
+                "needs_fix" => "sent back",
+                other => other,
+            };
+            format!("deleted a {status} claim on {tin}")
+        }
+        "removed" => format!("removed {tin}"),
+        "revoked" => format!("revoked the ownership of {tin}"),
+        "file_replaced" => format!("replaced the {file} on {tin}"),
+        _ => format!("removed the {file} from {tin}"),
+    };
+    let who = if line.actor_id == account_id { "The person".to_owned() } else { format!("Staff {}", line.actor_email) };
+    match &line.reason {
+        Some(reason) => format!("{who} {what}: {reason}"),
+        None => format!("{who} {what}"),
+    }
 }

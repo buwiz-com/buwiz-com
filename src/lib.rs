@@ -18,6 +18,7 @@ pub mod mail;
 pub mod mcp;
 pub mod notice;
 pub mod oauth;
+pub mod ocr;
 pub mod pages;
 pub mod relay;
 pub mod sender;
@@ -73,7 +74,11 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     let address = format!("{}:{}", config.host, config.port);
-    let app = app(AppState::new(config, db, documents, ticket_key, sender));
+    let state = AppState::new(config, db, documents, ticket_key, sender);
+    if let Err(error) = ocr::resume(&state).await {
+        tracing::error!(error = ?error, "could not resume document readings");
+    }
+    let app = app(state);
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");

@@ -5,3 +5,4 @@
 !.env.example
 e2e/target/
 e2e/Cargo.lock
+/ocr-models

@@ -27,6 +27,14 @@ Spin-based `buwiz-server`, keeping only what the apps call.
     R2 in production (any S3-compatible store; Postgres in development),
     and deleted when the claim is decided or withdrawn, or the file is
     replaced. Their hashes stay.
+  - The TIN ID or 2303 is read on this server when the claim is sent or
+    resent (PaddleOCR PP-OCRv5 mobile on ONNX Runtime; a digital PDF's text
+    layer first). Staff see the TIN, name, birth date or RDO code beside
+    what was typed, with a mark per row, and the queue flags "TIN matches
+    the ID" or "Name differs". Only those fields are kept, and they go with
+    the file. Nothing is sent to anyone else, and staff still decide.
+    Behind the `ocr` cargo feature; see
+    [Builds with and without BIR](#builds-with-and-without-bir).
 - **App sign-in**: the desktop and mini apps use the OAuth device flow
   (RFC 8628). Refresh tokens rotate, and reusing an old one ends the whole
   sign-in.
@@ -130,8 +138,17 @@ Browser pages the apps open: `/login?next=…`, `/signup?next=…`,
 | Sender (`buwiz-sender` and the in-process development Sender) | Checks tickets and opens envelopes, then answers every send `failed`, "relay not built in". Nothing reaches BIR, so it is safe to retry. | Sends through the relay |
 | `buwiz-relay`, `iaf-decrypt`, the relay tests | Not built | Built |
 
-The `Dockerfile` builds with `--features bir`. CI builds, lints and tests
-without it.
+`--features ocr` reads claim documents on the server (`src/ocr/`): it adds
+ONNX Runtime, linked statically, and about 30 MB to the binary. That
+ONNX Runtime needs GCC 14's libstdc++, so the `Dockerfile` builds on
+Ubuntu 24.04. The models
+(13 MB, Apache-2.0) are files, not in git: `scripts/ocr-models.sh` fetches
+them, pinned and checked, into `ocr-models/`, and `OCR_MODEL_DIR` points
+elsewhere. Without the feature every reading ends "OCR not built in".
+
+The `Dockerfile` builds with `--features bir,ocr` and puts the models in
+`/usr/local/share/buwiz/ocr-models`. CI builds, lints and tests without
+them.
 
 ## Relay modes
 
@@ -170,6 +187,8 @@ the server with `bir`). With `--features bir` and `BIR_IAF_PASSPHRASE` set,
 output.
 `cargo test --features bir -- --include-ignored` also runs HTTPS through the pipe against
 example.com.
+`scripts/ocr-models.sh && cargo test --features ocr` adds `tests/ocr.rs`:
+OCR of a synthetic TIN ID drawn in the test, alone and through a claim.
 
 ## Configuration
 

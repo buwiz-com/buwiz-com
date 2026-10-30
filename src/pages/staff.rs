@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::claims::FIX_REASONS;
+use crate::ocr::extract::{self, Kind, Verdict};
+use crate::ocr::{self, Reading};
 use crate::staff::{self as queries, AppRow, AuditRow, IdStatus, QueueFilter, QueueRow, UserFilter};
 
 /// A small note on a queue row or in the checks list: (tone, icon, text).
@@ -32,6 +34,19 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     }
     if let Some(at) = claim.files_changed_while_waiting() {
         flags.push(("warn", "swap_horiz", format!("Files changed after sending · {}", date_time(at))));
+    }
+    let document = if row.reading_kind.as_deref() == Some("form_2303") { "the 2303" } else { "the ID" };
+    match ocr::verdict(row.tin_match.as_deref()) {
+        Some(Verdict::Match) => flags.push(("good", "fact_check", format!("TIN matches {document}"))),
+        Some(Verdict::Partial) => flags.push(("warn", "rule", format!("Branch code differs on {document}"))),
+        Some(Verdict::Mismatch) => flags.push(("bad", "report", format!("TIN differs from {document}"))),
+        None => {}
+    }
+    match ocr::verdict(row.name_match.as_deref()) {
+        Some(Verdict::Match) => flags.push(("good", "fact_check", "Name matches".to_owned())),
+        Some(Verdict::Partial) => flags.push(("warn", "rule", "Name partly matches".to_owned())),
+        Some(Verdict::Mismatch) => flags.push(("warn", "report", "Name differs".to_owned())),
+        None => {}
     }
     if claim.kind == "personal" {
         if has("selfie") {
@@ -156,32 +171,157 @@ async fn queue_row(row: QueueRow) -> Result<impl View> {
     })
 }
 
-/// "Typed vs. on the document": what the person typed beside what the
-/// document says. The document column waits for AI reading (a later
-/// change); each row's third value is where an extracted value goes, and
-/// it is `None` until then.
+/// One row of "Typed vs. on the document".
+struct CompareRow {
+    label: &'static str,
+    /// `None` for what the form does not ask (birth date, RDO code).
+    typed: Option<String>,
+    read: Option<String>,
+    /// How sure the engine was of `read`, 0 to 1.
+    confidence: Option<f32>,
+    verdict: Option<Verdict>,
+}
+
+/// Where the reading of the claim's TIN ID or 2303 stands, and its rows.
+struct Comparison {
+    /// Shown in the document column instead of values: "Reading…" and the
+    /// like. `None` once read.
+    waiting: Option<&'static str>,
+    failed: Option<String>,
+    from_pdf: bool,
+    rows: Vec<CompareRow>,
+}
+
+/// What the person typed beside what OCR read from the claim's TIN ID or
+/// 2303, with a mark per row. The marks help look; staff still decide.
+fn comparison(claim: &ClaimRow, kind: ClaimKind, reading: Option<&Reading>) -> Comparison {
+    let status = reading.map(|reading| reading.status.as_str());
+    let waiting = match status {
+        None => Some("Not read yet"),
+        Some("reading") => Some("Reading…"),
+        Some("failed") => Some("Couldn't read"),
+        Some(_) => None,
+    };
+    let failed = reading
+        .filter(|reading| reading.status == "failed")
+        .map(|reading| reading.error.clone().unwrap_or_else(|| "unknown reason".to_owned()));
+    let read = reading.filter(|reading| reading.status == "read");
+    let fields = read.and_then(|reading| reading.fields.as_ref()).map(|fields| &fields.0);
+    let sure = read.and_then(|reading| reading.confidence.as_ref()).map(|confidence| confidence.0.clone());
+    let sure = sure.unwrap_or_default();
+    let get = |field: fn(&extract::Fields) -> &Option<String>| fields.and_then(|fields| field(fields).clone());
+    let expected = if kind == ClaimKind::Personal { Kind::TinId } else { Kind::Form2303 };
+    let tin = claim.tin();
+    let mut rows = Vec::new();
+    if let Some(fields) = fields {
+        rows.push(CompareRow {
+            label: "Document",
+            typed: Some(expected.label().to_owned()),
+            read: Some(fields.kind.label().to_owned()),
+            confidence: None,
+            verdict: Some(if fields.kind == expected { Verdict::Match } else { Verdict::Mismatch }),
+        });
+    }
+    let read_tin = get(|fields| &fields.tin);
+    rows.push(CompareRow {
+        label: "TIN",
+        typed: Some(tin.to_string()),
+        verdict: read_tin.as_deref().map(|read| extract::compare_tin(&tin, read)),
+        read: read_tin,
+        confidence: sure.tin,
+    });
+    let read_name = get(|fields| &fields.name);
+    rows.push(CompareRow {
+        label: "Name",
+        typed: Some(claim.registered_name.clone()),
+        verdict: read_name.as_deref().map(|read| extract::compare_names(&claim.registered_name, read)),
+        read: read_name,
+        confidence: sure.name,
+    });
+    match kind {
+        ClaimKind::Personal => rows.push(CompareRow {
+            label: "Birth date",
+            typed: None,
+            read: get(|fields| &fields.birth_date),
+            confidence: sure.birth_date,
+            verdict: None,
+        }),
+        ClaimKind::Business => {
+            let read_trade = get(|fields| &fields.trade_name);
+            if claim.trade_name.is_some() || read_trade.is_some() {
+                let verdict = match (&claim.trade_name, &read_trade) {
+                    (Some(typed), Some(read)) => Some(extract::compare_names(typed, read)),
+                    (Some(_), None) | (None, Some(_)) => Some(Verdict::Mismatch),
+                    (None, None) => None,
+                };
+                rows.push(CompareRow {
+                    label: "Trade name",
+                    typed: claim.trade_name.clone(),
+                    read: read_trade,
+                    confidence: sure.trade_name,
+                    verdict: if fields.is_some() { verdict } else { None },
+                });
+            }
+            rows.push(CompareRow {
+                label: "RDO code",
+                typed: None,
+                read: get(|fields| &fields.rdo),
+                confidence: sure.rdo,
+                verdict: None,
+            });
+        }
+    }
+    Comparison { waiting, failed, from_pdf: read.is_some_and(Reading::from_text_layer), rows }
+}
+
+/// "Typed vs. on the document", filled from the reading.
 #[component]
-async fn typed_vs_document(rows: Vec<(&'static str, String, Option<String>)>) -> Result<impl View> {
+async fn typed_vs_document(comparison: Comparison) -> Result<impl View> {
+    let Comparison { waiting, failed, from_pdf, rows } = comparison;
+    let (tag_icon, tag) = if from_pdf {
+        ("picture_as_pdf", "Read from the PDF on our server")
+    } else {
+        ("document_scanner", "Read by OCR on our server")
+    };
     Ok(view! {
         <section class="panel side-card">
             <div class="side-head">
                 <h2>"Typed vs. on the document"</h2>
-                <span class="side-tag">icon(name: "auto_awesome") "AI reading comes later"</span>
+                <span class="side-tag">icon(name: tag_icon) (tag)</span>
             </div>
+            if let Some(reason) = failed {
+                <p class="compare-status">icon(name: "error") "Couldn't read: " (reason)</p>
+            }
             <div class="compare">
                 <span></span>
                 <span class="compare-head">"TYPED"</span>
                 <span class="compare-head">"DOCUMENT"</span>
                 <span></span>
-                for (label, typed, read) in rows {
-                    <span class="compare-label">(label)</span>
-                    <span class="compare-value">(typed)</span>
-                    if let Some(read) = read {
-                        <span class="compare-value">(read)</span>
+                for row in rows {
+                    <span class="compare-label">(row.label)</span>
+                    if let Some(typed) = row.typed {
+                        <span class="compare-value">(typed)</span>
                     } else {
-                        <span class="compare-value unread">"Not read yet"</span>
+                        <span class="compare-value unread">"Not asked"</span>
                     }
-                    <span class="compare-mark">icon(name: "more_horiz")</span>
+                    if let Some(waiting) = waiting {
+                        <span class="compare-value unread">(waiting)</span>
+                    } else if let Some(read) = row.read {
+                        <span class="compare-value">
+                            (read)
+                            if let Some(sure) = row.confidence {
+                                <span class="compare-sure">(format!("{:.0}% sure", sure * 100.0))</span>
+                            }
+                        </span>
+                    } else {
+                        <span class="compare-value unread">"Not found"</span>
+                    }
+                    match row.verdict {
+                        Some(Verdict::Match) => <span class="compare-mark good" title="Matches">icon(name: "check_circle")</span>,
+                        Some(Verdict::Partial) => <span class="compare-mark warn" title="Partly matches">icon(name: "warning")</span>,
+                        Some(Verdict::Mismatch) => <span class="compare-mark bad" title="Differs">icon(name: "warning")</span>,
+                        None => <span class="compare-mark">icon(name: "more_horiz")</span>,
+                    }
                 }
             </div>
         </section>
@@ -254,10 +394,8 @@ pub mod claim_id {
             checks.push(("warn", "visibility", "Looks real, and matches what was typed? Your call".to_owned()));
         }
 
-        let mut compare = vec![("TIN", claim.tin().to_string(), None), ("Name", claim.registered_name.clone(), None)];
-        if let Some(trade) = &claim.trade_name {
-            compare.push(("Trade name", trade.clone(), None));
-        }
+        let reading = ocr::for_claim(db, claim_id).await?;
+        let compare = comparison(&claim, kind, reading.as_ref());
         let (status_label, status_icon, status_tone) = status_look(&claim.status);
         let age = match claim.status.as_str() {
             "pending" => Some(format!("Waiting {}", span_since(claim.waiting_since()))),
@@ -330,7 +468,7 @@ pub mod claim_id {
                                 </span>
                                 <a href=(format!("/staff/users/{}", claim.account_id))>"View user"</a>
                             </section>
-                            typed_vs_document(rows: compare)
+                            typed_vs_document(comparison: compare)
                             if !checks.is_empty() {
                                 <section class="panel side-card">
                                     <h2>"Checks"</h2>

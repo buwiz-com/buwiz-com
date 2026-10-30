@@ -1274,6 +1274,25 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
     assert!(row.contains(r#"title="Android, coming soon""#) && row.contains(r#"title="iOS, coming soon""#), "{row}");
     assert!(!row.contains("soon-tag") && !row.contains("/download/android"), "{row}");
 
+    // A Mac visitor's button goes straight to the Mac installer; an iPhone,
+    // or a platform with no file yet, gets the download page.
+    let android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Mobile Safari/537.36";
+    let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148";
+    for (agent, button) in [
+        (mac, r#"<a class="btn btn-solid" href="/download/mac">"#),
+        (android, r#"<a class="btn btn-solid" href="/download">"#),
+        (iphone, r#"<a class="btn btn-solid" href="/download">"#),
+    ] {
+        let request = Request::get("/").header(header::HOST, "buwiz.com").header(header::USER_AGENT, agent);
+        let home = text(site.send(request.body(Body::empty()).unwrap()).await).await;
+        let row = &home[home.find(r#"<div class="platforms"#).unwrap()..];
+        let row = &row[..row.find("</div>").unwrap()];
+        assert!(row.contains(button), "{agent}: {row}");
+    }
+    let request = Request::get("/").header(header::HOST, "buwiz.com").header(header::USER_AGENT, mac);
+    let home = text(site.send(request.body(Body::empty()).unwrap()).await).await;
+    assert!(home.contains("Download for macOS</a>"), "{home}");
+
     let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
     assert!(sitemap.contains("<loc>https://buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"), "{sitemap}");
 

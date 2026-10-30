@@ -5,7 +5,8 @@
 //! demos' in `src/demo.css`.
 
 use super::*;
-use crate::downloads::{Platform, Release};
+use crate::downloads::{Platform, Release, guess_platform};
+use http::header;
 use std::sync::Arc;
 
 /// One screen of the app tour. `screen` names a pair of screenshots served
@@ -288,11 +289,13 @@ pub(super) async fn public_head(url: String, title: &'static str, description: &
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let signed_in = current(cx).await?.is_some();
     let release = state(cx).downloads.latest().await;
+    let user_agent = headers(cx).get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let yours = guess_platform(user_agent);
     Ok(view! {
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap">
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home landing">
-            hero(signed_in: signed_in, release: release)
+            hero(signed_in: signed_in, release: release, yours: yours)
             tour()
             account_section(signed_in: signed_in)
             agents_section()
@@ -318,9 +321,17 @@ async fn account_actions(signed_in: bool) -> Result<impl View> {
 }
 
 /// The hero's platform row: "Coming soon" until a version is released, then
-/// a Download button, with each logo linking to its installer.
+/// a Download button, with each logo linking to its installer. The button
+/// goes straight to the installer for the visitor's platform (`yours`,
+/// guessed from `User-Agent`) when there is one, else to the download page.
 #[component]
-async fn hero(signed_in: bool, release: Option<Arc<Release>>) -> Result<impl View> {
+async fn hero(signed_in: bool, release: Option<Arc<Release>>, yours: Option<Platform>) -> Result<impl View> {
+    let yours =
+        release.as_deref().zip(yours).filter(|(release, platform)| release.pick(*platform, None).is_some()).and_then(
+            |(_, platform)| {
+                PLATFORMS.iter().find(|(_, listed, _)| *listed == Some(platform)).map(|(name, _, _)| (platform, *name))
+            },
+        );
     Ok(view! {
         <section id="hero" class="hero-wrap">
             <div class="hero-glow" aria-hidden="true"></div>
@@ -345,7 +356,14 @@ async fn hero(signed_in: bool, release: Option<Arc<Release>>) -> Result<impl Vie
                     <div class="hero-actions rise d3">account_actions(signed_in: signed_in)</div>
                     <div class="platforms rise d3">
                         if let Some(release) = release {
-                            <a class="btn btn-solid" href="/download">icon(name: "download") "Download"</a>
+                            if let Some((platform, name)) = yours {
+                                <a class="btn btn-solid" href=(format!("/download/{}", platform.slug()))>
+                                    icon(name: "download")
+                                    (format!("Download for {name}"))
+                                </a>
+                            } else {
+                                <a class="btn btn-solid" href="/download">icon(name: "download") "Download"</a>
+                            }
                             <ul aria-label="Download Buwiz">
                                 for (name, platform, paths) in PLATFORMS {
                                     if let Some(platform) = platform.filter(|platform| release.pick(*platform, None).is_some()) {

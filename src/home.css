@@ -1016,9 +1016,8 @@
 .auth .auth-switch a:hover, .auth .auth-link:hover, .auth .auth-foot a:hover { text-decoration: underline; }
 .auth .auth-foot { color: var(--faint); font-size: 12px; text-align: center; }
 
-/* Once a version is released, the hero's platform row has a Download
- * button and each logo links to its installer. */
-.home .platforms .btn { height: 32px; padding: 0 14px; font-size: 13px; }
+/* Once a version is released, each logo in the hero's platform row links
+ * to its installer. */
 .home .platform a { display: flex; color: inherit; }
 
 /* Download page (src/pages/download.rs): a card per platform; the
@@ -1045,3 +1044,66 @@
 .home .dl-others a { color: var(--brand); font-weight: 600; }
 .home .dl-check { display: flex; align-items: flex-start; gap: 8px; margin-top: 32px; color: var(--muted); font-size: 14px; line-height: 1.65; }
 .home .dl-check code { color: var(--text); }
+
+/* Hidden choices stay hidden even where a class sets `display`. */
+.home .get [hidden], .home .dl-card [hidden] { display: none; }
+
+/* The hero's downloads (src/pages/home.rs): one big button for the
+ * visitor's device, "Other downloads" under it. Without JavaScript the
+ * list is simply shown. */
+.home .get { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 28px 0 0; }
+@media (min-width: 1024px) { .home .get { align-items: flex-start; } }
+.home .get-main { display: flex; flex-direction: column; align-items: inherit; gap: 8px; max-width: 100%; }
+.home .btn-get { height: auto; min-height: 56px; padding: 10px 22px; white-space: normal; text-align: left; }
+.home .btn-get .icon { font-size: 22px; }
+.home .get-text { display: grid; gap: 1px; }
+.home .get-text b { font-size: 16px; }
+.home .get-text small { font-size: 12px; font-weight: 600; opacity: 0.85; }
+.home .get-alt { color: var(--brand); font-size: 13px; font-weight: 600; }
+.home .get-alt:hover { text-decoration: underline; }
+.home .get-note { display: flex; align-items: flex-start; gap: 6px; max-width: 420px; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.home .get-note .icon { font-size: 18px; }
+.home .get-ios-title { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 16px; font-weight: 700; color: var(--text); }
+.home .copy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; max-width: 100%; }
+.home .copy-row a { color: var(--brand); font-weight: 700; }
+.home .copy-row code { padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.home .copy-row .btn { height: 34px; padding: 0 12px; font-size: 13px; }
+.home .copy-status { color: var(--muted); font-size: 13px; }
+.home .copy-status:empty { display: none; }
+.home .get-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.home .get-more:hover { color: var(--brand); }
+.home .get-more .icon { font-size: 18px; transition: transform 0.15s; }
+.home .get-more[aria-expanded="true"] .icon { transform: rotate(180deg); }
+.home .get-files { display: grid; gap: 8px; width: 100%; max-width: 520px; margin: 0; padding: 12px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); list-style: none; font-size: 13px; text-align: left; }
+.home .get-files li { display: grid; gap: 1px; min-width: 0; }
+.home .get-files a { color: var(--brand); font-weight: 600; }
+.home .get-files .faint { overflow-wrap: anywhere; }
+html:not(.js) .home .get-more { display: none; }
+html:not(.js) .home .get-files[hidden] { display: grid; }
+
+/* The download page's Linux card: which Linux, which processor, then one
+ * button for the file that fits. */
+.home .dl-pick { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; width: 100%; }
+.home .dl-choices { display: grid; gap: 8px; width: 100%; margin: 0; padding: 0; border: 0; }
+.home .dl-choices legend { margin-bottom: 8px; padding: 0; font-size: 14px; font-weight: 700; color: var(--text); }
+.home .dl-choice { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px; cursor: pointer; }
+.home .dl-choice:has(input:checked) { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand); }
+.home .dl-choice input { flex: none; accent-color: var(--brand); }
+.home .dl-choice span { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.home .dl-pick .btn { max-width: 100%; white-space: normal; height: auto; min-height: 44px; padding-top: 8px; padding-bottom: 8px; overflow-wrap: anywhere; }
+.home .dl-pick .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.home .dl-terminal { display: grid; gap: 8px; width: 100%; padding-top: 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.home .dl-terminal p { margin: 0; }
+.home .dl-terminal > a { color: var(--brand); font-weight: 600; }

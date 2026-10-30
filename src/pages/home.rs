@@ -614,7 +614,7 @@ async fn account_section(signed_in: bool) -> Result<impl View> {
 async fn agents_section() -> Result<impl View> {
     Ok(view! {
         <section id="agents" class="section">
-            <div class="section-head">
+            <div class="section-head centered">
                 <span class="eyebrow">icon(name: "smart_toy") "AI Co-worker"</span>
                 <h2>"AI Native Tax Filing"</h2>
                 <p class="section-lead">

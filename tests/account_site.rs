@@ -1219,6 +1219,7 @@ impl FakeReleases {
 
 const SHA_MAC: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const SHA_DEB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const SHA_RPM: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 /// One file of a manifest.
 fn release_file(platform: &str, arch: &str, kind: &str, file: &str, size: u64, sha: &str) -> Value {
@@ -1226,8 +1227,8 @@ fn release_file(platform: &str, arch: &str, kind: &str, file: &str, size: u64, s
 }
 
 /// Version 1.2.0 as the release CI (buwiz-oss) writes it, named as it names
-/// them, before Android signing is set up: no Android file, and an iOS
-/// entry this server does not know, plus `extra` files.
+/// them, with what the first release had: no Android file, one Linux
+/// file, and an iOS entry this server does not know, plus `extra` files.
 fn latest_json(extra: &[Value]) -> Vec<u8> {
     let other = "0".repeat(64);
     let mut files = vec![
@@ -1242,18 +1243,33 @@ fn latest_json(extra: &[Value]) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Files the CI may add later: an AppImage, the signed Android APK, an MSI.
+/// The rest of what the CI uploads: the MSI, ARM64 debs, rpms and tarballs
+/// for both processors, the Linux install script and the signed APK.
 fn later_files() -> Vec<Value> {
     let other = "0".repeat(64);
     vec![
-        release_file("linux", "x64", "appimage", "Buwiz-1.2.0-linux-x64.AppImage", 90_000_000, &other),
-        release_file("android", "arm64", "apk", "Buwiz-1.2.0-android-arm64.apk", 40_000_000, &other),
         release_file("windows", "x64", "msi", "Buwiz-1.2.0-windows-x64.msi", 62_000_000, &other),
+        release_file("linux", "arm64", "deb", "buwiz_1.2.0_arm64.deb", 54_000_000, &other),
+        release_file("linux", "x64", "rpm", "Buwiz-1.2.0-linux-x64.rpm", 56_000_000, SHA_RPM),
+        release_file("linux", "arm64", "rpm", "Buwiz-1.2.0-linux-arm64.rpm", 55_500_000, &other),
+        release_file("linux", "x64", "targz", "Buwiz-1.2.0-linux-x64.tar.gz", 57_000_000, &other),
+        release_file("linux", "arm64", "targz", "Buwiz-1.2.0-linux-arm64.tar.gz", 56_500_000, &other),
+        release_file("linux", "universal", "sh", "Buwiz-1.2.0-linux-install.sh", 4_000, &other),
+        release_file("android", "arm64", "apk", "Buwiz-1.2.0-android-arm64.apk", 40_000_000, &other),
     ]
 }
 
 async fn download_from(site: &Site, path: &str) -> Response {
     site.on_host("buwiz.com", path).await
+}
+
+/// Asks for `path` on buwiz.com as a browser does, with `User-Agent`.
+async fn browse(site: &Site, path: &str, user_agent: &str) -> Response {
+    let request = Request::get(path)
+        .header(header::HOST, "buwiz.com")
+        .header(header::USER_AGENT, user_agent)
+        .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8");
+    site.send(request.body(Body::empty()).unwrap()).await
 }
 
 fn cache_control(response: &Response) -> &str {
@@ -1280,15 +1296,23 @@ async fn downloads_go_to_the_released_installer_without_caching(db: PgPool) {
         &site,
         &[
             ("/download/mac", file("Buwiz-1.2.0-macos-universal.dmg")),
+            ("/download/mac?arch=arm64", file("Buwiz-1.2.0-macos-universal.dmg")),
             ("/download/windows", file("Buwiz-1.2.0-windows-x64-setup.exe")),
-            // Today's Linux file is the deb.
+            ("/download/windows?kind=exe&arch=x64", file("Buwiz-1.2.0-windows-x64-setup.exe")),
+            // Linux is the x64 deb unless asked otherwise, and anything it
+            // does not know is too.
             ("/download/linux", file("buwiz_1.2.0_amd64.deb")),
-            ("/download/linux?kind=deb", file("buwiz_1.2.0_amd64.deb")),
-            // No such file: the download page, which lists what there is.
-            ("/download/android", "/download".into()),
-            ("/download/linux?kind=appimage", "/download".into()),
-            ("/download/linux?kind=msi", "/download".into()),
-            ("/download/mac?kind=nonsense", "/download".into()),
+            ("/download/linux?kind=deb&arch=x64", file("buwiz_1.2.0_amd64.deb")),
+            ("/download/linux?kind=nonsense&arch=nonsense", file("buwiz_1.2.0_amd64.deb")),
+            ("/download/linux?kind=msi", file("buwiz_1.2.0_amd64.deb")),
+            // No such file: the platform on the download page, with the
+            // choice made there.
+            ("/download/linux?kind=rpm&arch=arm64", "/download?kind=rpm&arch=arm64#linux".into()),
+            ("/download/linux?arch=arm64", "/download?kind=deb&arch=arm64#linux".into()),
+            ("/download/linux?kind=appimage", "/download?kind=appimage&arch=x64#linux".into()),
+            ("/download/windows?kind=msi", "/download#windows".into()),
+            ("/download/android", "/download#android".into()),
+            ("/download/mac?kind=nonsense", "/download#mac".into()),
         ],
     )
     .await;
@@ -1296,22 +1320,44 @@ async fn downloads_go_to_the_released_installer_without_caching(db: PgPool) {
         assert_eq!(download_from(&site, path).await.status(), StatusCode::NOT_FOUND, "{path}");
     }
     for host in ["account.buwiz.com", "api.buwiz.com"] {
-        assert_eq!(site.on_host(host, "/download/mac").await.status(), StatusCode::NOT_FOUND, "{host}");
-        assert_eq!(site.on_host(host, "/download").await.status(), StatusCode::NOT_FOUND, "{host}");
+        for path in ["/download/mac", "/download", "/install-linux.sh"] {
+            assert_eq!(site.on_host(host, path).await.status(), StatusCode::NOT_FOUND, "{host}{path}");
+        }
     }
+    // No install script yet: a browser goes to the Linux downloads, and
+    // curl gets a 404 rather than a web page to run.
+    let script = browse(&site, "/install-linux.sh", "Mozilla/5.0 (X11; Linux x86_64)").await;
+    assert_eq!((script.status(), location(&script)), (StatusCode::FOUND, "/download#linux".to_owned()));
+    let curl = site
+        .send(
+            Request::get("/install-linux.sh")
+                .header(header::HOST, "buwiz.com")
+                .header(header::ACCEPT, "*/*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(curl.status(), StatusCode::NOT_FOUND);
+    assert_eq!(cache_control(&curl), "no-store");
 
-    // Once the CI adds an AppImage, an MSI and the APK, they become the
-    // defaults; the others stay a `?kind=` away.
+    // With every file the CI makes, each kind and processor is a query
+    // away; Windows still defaults to the installer, not the MSI.
     releases.set_latest(&latest_json(&later_files()));
     let site = Site::with_downloads(db, &url);
     assert_redirects(
         &site,
         &[
-            ("/download/linux", file("Buwiz-1.2.0-linux-x64.AppImage")),
-            ("/download/linux?kind=deb", file("buwiz_1.2.0_amd64.deb")),
-            ("/download/windows", file("Buwiz-1.2.0-windows-x64.msi")),
-            ("/download/windows?kind=exe", file("Buwiz-1.2.0-windows-x64-setup.exe")),
+            ("/download/windows", file("Buwiz-1.2.0-windows-x64-setup.exe")),
+            ("/download/windows?kind=msi", file("Buwiz-1.2.0-windows-x64.msi")),
+            ("/download/linux", file("buwiz_1.2.0_amd64.deb")),
+            ("/download/linux?kind=deb&arch=arm64", file("buwiz_1.2.0_arm64.deb")),
+            ("/download/linux?kind=rpm", file("Buwiz-1.2.0-linux-x64.rpm")),
+            ("/download/linux?kind=rpm&arch=x64", file("Buwiz-1.2.0-linux-x64.rpm")),
+            ("/download/linux?kind=rpm&arch=arm64", file("Buwiz-1.2.0-linux-arm64.rpm")),
+            ("/download/linux?kind=targz&arch=x64", file("Buwiz-1.2.0-linux-x64.tar.gz")),
+            ("/download/linux?kind=targz&arch=arm64", file("Buwiz-1.2.0-linux-arm64.tar.gz")),
             ("/download/android", file("Buwiz-1.2.0-android-arm64.apk")),
+            ("/install-linux.sh", file("Buwiz-1.2.0-linux-install.sh")),
         ],
     )
     .await;
@@ -1326,30 +1372,50 @@ fn card<'a>(cards: &[&'a str], name: &str) -> &'a str {
     cards.iter().find(|card| card.contains(&format!("<h2>{name}</h2>"))).unwrap()
 }
 
+/// The home page hero's downloads, up to the platform logos.
+fn hero_downloads(home: &str) -> &str {
+    let get = &home[home.find(r#"<div class="get rise d3">"#).unwrap()..];
+    &get[..get.find(r#"<div class="platforms"#).unwrap()]
+}
+
+const MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
+const WINDOWS: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36";
+const LINUX: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0";
+const ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Mobile Safari/537.36";
+const IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148";
+const CHROMEBOOK: &str = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 Chrome/130.0 Safari/537.36";
+
 #[sqlx::test(migrations = "./migrations")]
 async fn the_download_page_lists_the_release_and_highlights_the_visitors_platform(db: PgPool) {
     let (releases, url) = FakeReleases::start().await;
     releases.set_latest(&latest_json(&[]));
     let site = Site::with_downloads(db.clone(), &url);
-    let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
-    let request = Request::get("/download").header(header::HOST, "buwiz.com").header(header::USER_AGENT, mac);
-    let page = text(site.send(request.body(Body::empty()).unwrap()).await).await;
+    let page = text(browse(&site, "/download", MAC).await).await;
     assert!(page.contains("<title>Download Buwiz for Windows, macOS, Linux and Android</title>"), "{page}");
     assert!(page.contains(r#"<link rel="canonical" href="https://buwiz.com/download">"#));
     assert!(!page.contains("noindex"));
     assert!(page.contains("Version 1.2.0, released November 2, 2026."));
-    for platform in ["mac", "windows", "linux"] {
+    for platform in ["mac", "windows"] {
         assert!(page.contains(&format!(r#"href="/download/{platform}""#)), "{platform}");
     }
     // The Mac card is the visitor's, with its installer's size and checksum.
     let cards = platform_cards(&page);
     assert_eq!(cards.len(), 5);
     let mac_card = card(&cards, "macOS");
-    assert!(mac_card.starts_with(" yours\""), "{mac_card}");
+    assert!(mac_card.starts_with(r#" yours" id="mac">"#), "{mac_card}");
     assert!(mac_card.contains("84.2 MB") && mac_card.contains(SHA_MAC), "{mac_card}");
     assert_eq!(cards.iter().filter(|card| card.starts_with(" yours\"")).count(), 1);
+    assert!(card(&cards, "Windows").contains("Installer (.exe) · x64"));
+    // One Linux file: no choices to make, just the button that names it.
     let linux = card(&cards, "Linux");
-    assert!(linux.contains("Debian, Ubuntu (.deb)") && linux.contains(SHA_DEB) && linux.contains("55.0 MB"), "{linux}");
+    assert!(linux.starts_with(r#"" id="linux">"#), "{linux}");
+    assert!(linux.contains(r#"<form class="dl-pick" method="get" action="/download/linux""#), "{linux}");
+    assert!(!linux.contains("<fieldset") && !linux.contains(r#"type="radio""#), "{linux}");
+    assert!(linux.contains(r#"<input type="hidden" name="kind" value="deb">"#), "{linux}");
+    assert!(linux.contains(r#"<input type="hidden" name="arch" value="x64">"#), "{linux}");
+    assert!(linux.contains("Download buwiz_1.2.0_amd64.deb</span></button>"), "{linux}");
+    assert!(linux.contains(SHA_DEB) && linux.contains("55.0 MB"), "{linux}");
+    assert!(!linux.contains("install-linux.sh"), "{linux}");
     // Android has no file yet; iOS will come from the App Store.
     let android = card(&cards, "Android");
     assert!(
@@ -1359,50 +1425,189 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
     let ios = card(&cards, "iOS");
     assert!(ios.contains("App Store, coming soon") && !ios.contains("href="), "{ios}");
     assert!(!page.contains("Buwiz.ipa") && !page.contains("/download/android"));
+    assert!(page.contains(r#"<script src="/assets/download.js" defer=""></script>"#));
 
     // The home page's platform row links here, Android and iOS still to come.
     let home = text(site.on_host("buwiz.com", "/").await).await;
     let row = &home[home.find(r#"<div class="platforms"#).unwrap()..];
     let row = &row[..row.find("</div>").unwrap()];
-    assert!(row.contains(r#"<a class="btn btn-solid" href="/download">"#), "{row}");
     for platform in ["mac", "windows", "linux"] {
         assert!(row.contains(&format!(r#"href="/download/{platform}""#)), "{platform}");
     }
     assert!(row.contains(r#"title="Android, coming soon""#) && row.contains(r#"title="iOS, coming soon""#), "{row}");
     assert!(!row.contains("soon-tag") && !row.contains("/download/android"), "{row}");
-
-    // A Mac visitor's button goes straight to the Mac installer; an iPhone,
-    // or a platform with no file yet, gets the download page.
-    let android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Mobile Safari/537.36";
-    let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148";
-    for (agent, button) in [
-        (mac, r#"<a class="btn btn-solid" href="/download/mac">"#),
-        (android, r#"<a class="btn btn-solid" href="/download">"#),
-        (iphone, r#"<a class="btn btn-solid" href="/download">"#),
-    ] {
-        let request = Request::get("/").header(header::HOST, "buwiz.com").header(header::USER_AGENT, agent);
-        let home = text(site.send(request.body(Body::empty()).unwrap()).await).await;
-        let row = &home[home.find(r#"<div class="platforms"#).unwrap()..];
-        let row = &row[..row.find("</div>").unwrap()];
-        assert!(row.contains(button), "{agent}: {row}");
+    // An unknown visitor gets the download page, and every file under
+    // "Other downloads", closed until asked for.
+    let get = hero_downloads(&home);
+    assert!(get.contains(r#"<a class="btn btn-solid btn-get" href="/download">"#), "{get}");
+    assert!(get.contains(r#"<button class="get-more" type="button" aria-expanded="false" aria-controls="get-files">"#));
+    let files = &get[get.find(r#"<ul class="get-files" id="get-files""#).unwrap()..];
+    assert!(files.starts_with(r#"<ul class="get-files" id="get-files" aria-label="Other downloads" hidden="">"#));
+    for name in ["Buwiz-1.2.0-macos-universal.dmg", "Buwiz-1.2.0-windows-x64-setup.exe", "buwiz_1.2.0_amd64.deb"] {
+        assert!(files.contains(&format!(r#"href="{url}/releases/v1.2.0/{name}""#)), "{name}");
     }
-    let request = Request::get("/").header(header::HOST, "buwiz.com").header(header::USER_AGENT, mac);
-    let home = text(site.send(request.body(Body::empty()).unwrap()).await).await;
-    assert!(home.contains("Download for macOS</a>"), "{home}");
+    assert!(files.contains("buwiz_1.2.0_amd64.deb · 1.2.0 · 55.0 MB"), "{files}");
+    assert!(!files.contains("Buwiz.ipa"), "{files}");
+    assert!(home.contains(r#"<script src="/assets/download.js" defer=""></script>"#));
 
     let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
     assert!(sitemap.contains("<loc>https://buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"), "{sitemap}");
+}
 
-    // With more files, each card lists the ones it does not default to.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_home_page_offers_the_visitors_installer(db: PgPool) {
+    let (releases, url) = FakeReleases::start().await;
+    releases.set_latest(&latest_json(&[]));
+    let site = Site::with_downloads(db.clone(), &url);
+    let hero = async |site: &Site, agent: &str| {
+        let home = text(browse(site, "/", agent).await).await;
+        hero_downloads(&home).to_owned()
+    };
+    let button =
+        |href: &str, label: &str| format!(r#"<a class="btn btn-solid btn-get" href="{href}" aria-label="{label}""#);
+
+    let windows = hero(&site, WINDOWS).await;
+    let exe = button("/download/windows?kind=exe&amp;arch=x64", "Download for Windows · Installer · 64-bit");
+    assert!(windows.contains(&exe), "{windows}");
+
+    // A Mac gets the dmg; the iPhone and iPad words are there, hidden, for
+    // an iPad that asked for the desktop site.
+    let mac = hero(&site, MAC).await;
+    assert!(mac.contains(&button("/download/mac", "Download for Mac · Apple and Intel chips")), "{mac}");
+    assert!(mac.contains(r#"<div class="get-main get-ios" data-get="ios" hidden="">"#), "{mac}");
+
+    let linux = hero(&site, LINUX).await;
+    let deb = button("/download/linux?kind=deb&amp;arch=x64", "Download for Linux · Ubuntu, Debian (.deb)");
+    assert!(linux.contains(&format!("{deb}>")), "no ARM64 deb to switch to: {linux}");
+    assert!(linux.contains(r#"<a class="get-alt" href="/download#linux">Not Ubuntu? Pick your Linux →</a>"#));
+    assert!(!linux.contains("Ubuntu?</") && !linux.contains("Fedora"), "never a guessed distro: {linux}");
+
+    let chromebook = hero(&site, CHROMEBOOK).await;
+    let deb = button("/download/linux?kind=deb&amp;arch=x64", "Download for Chromebook · Linux app (.deb) · 64-bit");
+    assert!(chromebook.contains(&deb) && chromebook.contains("Turn on Linux in your Chromebook"), "{chromebook}");
+
+    // No app for iPhones: the link to open on a computer, to copy.
+    let iphone = hero(&site, IPHONE).await;
+    assert!(!iphone.contains("btn-get"), "{iphone}");
+    assert!(iphone.contains(r#"<div class="get-main get-ios" data-get="ios">"#), "{iphone}");
+    assert!(iphone.contains("Buwiz runs on your computer"), "{iphone}");
+    assert!(iphone.contains(r#"<a href="/download">buwiz.com/download</a>"#), "{iphone}");
+    assert!(iphone.contains(r#"data-copy="https://buwiz.com/download" hidden="""#), "{iphone}");
+    assert!(iphone.contains(r#"<span class="copy-status" role="status"></span>"#), "{iphone}");
+
+    // No APK yet: Android gets the download page.
+    let android = hero(&site, ANDROID).await;
+    assert!(android.contains(r#"<a class="btn btn-solid btn-get" href="/download">"#), "{android}");
+
+    for (agent, hero) in [(WINDOWS, &windows), (MAC, &mac), (LINUX, &linux), (IPHONE, &iphone)] {
+        assert!(hero.contains(r#"aria-controls="get-files""#), "{agent}");
+        assert!(!hero.contains("alert(") && !hero.contains("confirm("), "{agent}");
+    }
+
+    // With the APK and an ARM64 deb out, Android gets its button and Linux
+    // the ARM64 deb for the script to switch to.
     releases.set_latest(&latest_json(&later_files()));
-    let page = text(download_from(&Site::with_downloads(db, &url), "/download").await).await;
-    let cards = platform_cards(&page);
-    let linux = card(&cards, "Linux");
-    assert!(linux.contains(r#"href="/download/linux""#) && linux.contains("AppImage · x64"), "{linux}");
-    let others = &linux[linux.find("dl-others").unwrap()..];
-    assert!(others.contains(&format!(r#"href="{url}/releases/v1.2.0/buwiz_1.2.0_amd64.deb""#)), "{others}");
-    assert!(others.contains(SHA_DEB) && !others.contains("AppImage"), "{others}");
-    assert!(card(&cards, "Android").contains(r#"href="/download/android""#));
+    let site = Site::with_downloads(db, &url);
+    let android = hero(&site, ANDROID).await;
+    assert!(android.contains(&button("/download/android", "Download for Android · APK")), "{android}");
+    let linux = hero(&site, LINUX).await;
+    assert!(linux.contains(r#"data-arm64-href="/download/linux?kind=deb&amp;arch=arm64""#), "{linux}");
+    assert!(linux.contains("Buwiz-1.2.0-linux-install.sh"), "every file is listed: {linux}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_linux_card_asks_which_linux_and_processor(db: PgPool) {
+    let (releases, url) = FakeReleases::start().await;
+    releases.set_latest(&latest_json(&later_files()));
+    let site = Site::with_downloads(db.clone(), &url);
+    let linux_card = async |path: &str| {
+        let page = text(browse(&site, path, LINUX).await).await;
+        card(&platform_cards(&page), "Linux").to_owned()
+    };
+
+    let linux = linux_card("/download").await;
+    for choice in [
+        "<legend>Which Linux do you use?</legend>",
+        r#"<input type="radio" name="kind" value="deb" checked="">"#,
+        "Ubuntu, Debian, Linux Mint",
+        r#"<input type="radio" name="kind" value="rpm">"#,
+        "Fedora, Red Hat, openSUSE",
+        r#"<input type="radio" name="kind" value="targz">"#,
+        "Any other Linux",
+        "<legend>Processor</legend>",
+        r#"<input type="radio" name="arch" value="x64" checked="">"#,
+        "64-bit Intel or AMD <code>uname -m → x86_64</code>",
+        r#"<input type="radio" name="arch" value="arm64">"#,
+        "ARM64 <code>uname -m → aarch64</code>",
+        "Download buwiz_1.2.0_amd64.deb</span></button>",
+    ] {
+        assert!(linux.contains(choice), "{choice}: {linux}");
+    }
+    // Every Linux file, with its facts, is in the page for the script and
+    // for anyone without it.
+    for name in [
+        "buwiz_1.2.0_amd64.deb",
+        "buwiz_1.2.0_arm64.deb",
+        "Buwiz-1.2.0-linux-x64.rpm",
+        "Buwiz-1.2.0-linux-arm64.rpm",
+        "Buwiz-1.2.0-linux-x64.tar.gz",
+        "Buwiz-1.2.0-linux-arm64.tar.gz",
+        "Buwiz-1.2.0-linux-install.sh",
+    ] {
+        assert!(linux.contains(&format!(r#"data-name="{name}""#)), "{name}");
+        assert!(linux.contains(&format!(r#"href="{url}/releases/v1.2.0/{name}""#)), "{name}");
+    }
+    assert!(linux.contains(&format!(r#"data-kind="rpm" data-arch="x64" data-name="Buwiz-1.2.0-linux-x64.rpm" data-size="56.0 MB" data-sha256="{SHA_RPM}""#)));
+    // The install script, to copy.
+    assert!(linux.contains("<code>curl -fsSL https://buwiz.com/install-linux.sh | sh</code>"), "{linux}");
+    assert!(linux.contains(r#"data-copy="curl -fsSL https://buwiz.com/install-linux.sh | sh" hidden="""#), "{linux}");
+    assert!(linux.contains(r#"<a href="/install-linux.sh">View the script</a>"#), "{linux}");
+    assert!(linux.contains(r#"<span class="copy-status" role="status"></span>"#), "{linux}");
+
+    // Sent back from `/download/linux` with a choice: it is made here.
+    let linux = linux_card("/download?kind=rpm&arch=arm64").await;
+    assert!(linux.contains(r#"<input type="radio" name="kind" value="rpm" checked="">"#), "{linux}");
+    assert!(linux.contains(r#"<input type="radio" name="arch" value="arm64" checked="">"#), "{linux}");
+    assert!(linux.contains("Download Buwiz-1.2.0-linux-arm64.rpm</span></button>"), "{linux}");
+
+    // The Windows card's button is the installer; the MSI says who it is for.
+    let page = text(browse(&site, "/download", WINDOWS).await).await;
+    let windows = card(&platform_cards(&page), "Windows");
+    assert!(windows.contains(r#"<a class="btn btn-solid" href="/download/windows">"#), "{windows}");
+    assert!(windows.contains("Installer (.exe) · x64"), "{windows}");
+    assert!(windows.contains("MSI package (.msi) · x64 · for IT / managed installs"), "{windows}");
+
+    // Only x64 files: which Linux, but no processor to choose; a choice
+    // with no file says so rather than linking.
+    let other = "0".repeat(64);
+    releases.set_latest(&latest_json(&[release_file(
+        "linux",
+        "x64",
+        "rpm",
+        "Buwiz-1.2.0-linux-x64.rpm",
+        56_000_000,
+        &other,
+    )]));
+    let site = Site::with_downloads(db.clone(), &url);
+    let page = text(browse(&site, "/download?kind=rpm&arch=arm64", LINUX).await).await;
+    let linux = card(&platform_cards(&page), "Linux");
+    assert_eq!(linux.matches("<fieldset").count(), 1, "{linux}");
+    assert!(linux.contains("Which Linux do you use?") && !linux.contains("Processor"), "{linux}");
+    assert!(linux.contains(r#"<input type="hidden" name="arch" value="x64">"#), "{linux}");
+    assert!(linux.contains("Download Buwiz-1.2.0-linux-x64.rpm"), "{linux}");
+    let only_arm = serde_json::json!({
+        "version": "1.2.0",
+        "files": [
+            release_file("linux", "arm64", "deb", "buwiz_1.2.0_arm64.deb", 1, &other),
+            release_file("linux", "x64", "rpm", "Buwiz-1.2.0-linux-x64.rpm", 1, &other),
+        ],
+    });
+    releases.set_latest(only_arm.to_string().as_bytes());
+    let site = Site::with_downloads(db, &url);
+    let page = text(browse(&site, "/download?kind=rpm&arch=arm64", LINUX).await).await;
+    let linux = card(&platform_cards(&page), "Linux");
+    assert!(linux.contains(r#"<button class="btn btn-solid" type="submit" disabled="">"#), "{linux}");
+    assert!(linux.contains("Not available for this choice yet"), "{linux}");
 }
 
 /// What every page says while nothing is released.
@@ -1411,6 +1616,8 @@ async fn assert_coming_soon(site: &Site, why: &str) {
     assert_eq!(response.status(), StatusCode::FOUND, "{why}");
     assert_eq!(location(&response), "/download", "{why}");
     assert_eq!(cache_control(&response), "no-store", "{why}");
+    let script = browse(site, "/install-linux.sh", LINUX).await;
+    assert_eq!(location(&script), "/download#linux", "{why}");
 
     let page = download_from(site, "/download").await;
     assert_eq!(page.status(), StatusCode::OK, "{why}");

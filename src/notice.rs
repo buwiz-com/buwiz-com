@@ -42,7 +42,7 @@ macro_rules! notices {
 
 notices! {
     EmailInvalid = "email_invalid" => error "Enter a valid email address.",
-    CodeSent = "code_sent" => info "We emailed you a 6-digit code. It works for 10 minutes.",
+    CodeSent = "code_sent" => info "Please check your email",
     CodeTooMany = "code_too_many" => error "Too many codes were sent to this address. Try again in an hour.",
     CodeInvalid = "code_invalid" => error "That code is wrong or has expired. Request a new one.",
     SignedOut = "signed_out" => info "You are signed out.",

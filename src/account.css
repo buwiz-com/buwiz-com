@@ -213,10 +213,10 @@
 .page.staff { padding-top: 22px; background: var(--staff-bg); }
 .page-in { max-width: var(--shell); margin: 0 auto; padding: 0 var(--shell-pad); display: flex; flex-direction: column; gap: 24px; }
 @media (min-width: 640px) { .page { padding-top: 36px; } }
-/* Staff pages are wider, the add and fix forms narrower; the header
-   above follows (site.css, --shell). */
-.staff-top, .page.staff { --shell: 1360px; }
-.page-in.narrow, body:has(.page-in.narrow) .top { --shell: 1000px; }
+/* Staff pages are wider, the add and fix forms narrower. The header keeps
+   its own width on every page (home.css), so it never moves. */
+.page.staff { --shell: 1360px; }
+.page-in.narrow { --shell: 1000px; }
 .page-in.staff-in { gap: 20px; }
 .page h1 { font-size: 28px; line-height: 1.15; font-weight: 800; letter-spacing: -0.03em; }
 @media (min-width: 640px) { .page h1 { font-size: 32px; } .page.staff h1 { font-size: 28px; } }
@@ -1135,6 +1135,16 @@
 .auth .consent .auth-hint { margin: 0; }
 .auth .consent .auth-actions .btn { height: 48px; font-size: 15px; }
 .consent-back { color: var(--muted); font-size: 12.5px; text-align: center; }
+
+/* The code page: its badge on the heading's line, and the countdown
+   (account.js), red once the code has run out, when the resend link
+   stands out. */
+.auth .auth-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.auth .auth-heading .auth-badge { flex: none; margin: 0; }
+.auth .auth-heading h1 { margin: 0; }
+.auth .code-timer { font-variant-numeric: tabular-nums; }
+.auth .code-timer.expired, .auth .code-timer.expired .icon { color: var(--danger); font-weight: 600; }
+.auth .auth-resend.due { color: var(--text); font-size: 14px; font-weight: 600; }
 
 
 /* My devices, under the TIN cards on My TINs. */

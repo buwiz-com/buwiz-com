@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 
-use time::{OffsetDateTime, UtcOffset};
+use time::{Duration, OffsetDateTime, UtcOffset};
 use topcoat::Result;
 use topcoat::context::{Cx, app_context};
 use topcoat::router::error::redirect;
@@ -13,7 +13,7 @@ use topcoat::router::{Router, Slot, layout, page};
 use topcoat::view::{View, component, view};
 use uuid::Uuid;
 
-use crate::accounts::Account;
+use crate::accounts::{self, Account};
 use crate::agents::{self, AuthorizeProblem};
 use crate::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::devices;
@@ -341,13 +341,15 @@ async fn auth_notice(notice: Option<Notice>) -> Result<impl View> {
 /// The BIR's ORUS site, where anyone with a TIN gets the free digital TIN ID.
 const ORUS: &str = "https://orus.bir.gov.ph/";
 
-/// Sign in and sign up: both email a code. `switch_*` links to the other;
-/// `orus` adds where to get a TIN ID (sign-up).
+/// Sign in and sign up: both email a code. `submit` labels the button,
+/// `switch_*` links to the other; `orus` adds where to get a TIN ID
+/// (sign-up).
 #[component]
 async fn email_form(
     cx: &Cx,
     title: &'static str,
     intro: &'static str,
+    submit: &'static str,
     switch_prompt: &'static str,
     switch_label: &'static str,
     switch_path: &'static str,
@@ -379,9 +381,9 @@ async fn email_form(
                             autofocus=(true)
                         >
                     </div>
-                    <button class="btn btn-solid auth-submit" type="submit">"Email me a code" icon(name: "arrow_forward")</button>
+                    <button class="btn btn-solid auth-submit" type="submit">(submit) icon(name: "arrow_forward")</button>
                 </form>
-                <p class="auth-hint">icon(name: "lock") "No password to remember. Each code works once, for 10 minutes."</p>
+                <p class="auth-hint">icon(name: "lock") "Passwordless login"</p>
                 if orus {
                     <p class="auth-hint">icon(name: "badge") <span>"No TIN ID yet? " <a href=(ORUS) target="_blank" rel="noopener">"Get the free digital TIN ID from ORUS"</a></span></p>
                 }
@@ -401,6 +403,7 @@ async fn login_page(cx: &Cx) -> Result<impl View> {
         email_form(
             title: "Sign in to Buwiz",
             intro: "Enter your email and we will send you a 6-digit code.",
+            submit: "Sign in",
             switch_prompt: "New to Buwiz?",
             switch_label: "Create an account",
             switch_path: "/signup"
@@ -416,7 +419,8 @@ async fn signup_page(cx: &Cx) -> Result<impl View> {
     Ok(view! {
         email_form(
             title: "Create your Buwiz account",
-            intro: "Enter your email. We will send a code to confirm it; that is all you need.",
+            intro: "Enter your email and we will send you a 6-digit code.",
+            submit: "Create account",
             switch_prompt: "Already have an account?",
             switch_label: "Sign in",
             switch_path: "/login",
@@ -430,17 +434,32 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
     let next = safe_next(query(cx, "next").as_deref());
     let email = query(cx, "email").unwrap_or_default();
     let restart = link("/login", None, &[("next", &next), ("email", &email)]);
+    // When the code runs out, in ms since 1970 (for `Date` in account.js),
+    // as /auth/email/start put it in the link. It comes from the link, not
+    // the database, so the page tells nothing about codes sent to an email
+    // someone typed in; editing it only changes this countdown.
+    let now = OffsetDateTime::now_utc();
+    let expires = query(cx, "expires")
+        .and_then(|ms| ms.parse::<i128>().ok())
+        .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(ms * 1_000_000).ok())
+        .map(|at| at.min(now + accounts::CODE_TTL));
+    let left = expires.map_or(Duration::ZERO, |at| at - now);
+    let expired = left.whole_seconds() <= 0;
+    let expires_at = expires.map(|at| (at.unix_timestamp_nanos() / 1_000_000).to_string()).unwrap_or_default();
     Ok(view! {
         <main class="home auth">
             <section class="auth-card">
                 auth_brand()
-                <span class="auth-badge">icon(name: "mark_email_unread")</span>
-                <h1>"Check your email"</h1>
+                <div class="auth-heading">
+                    <span class="auth-badge">icon(name: "mark_email_unread")</span>
+                    <h1>"Check your email"</h1>
+                </div>
                 <p class="auth-lead">"We sent a 6-digit code to " <strong>(email.clone())</strong> "."</p>
                 auth_notice(notice: notice(cx))
                 <form class="auth-form" method="post" action="/auth/email/verify" data-code-form="">
                     <input type="hidden" name="next" value=(next.clone())>
                     <input type="hidden" name="email" value=(email.clone())>
+                    <input type="hidden" name="expires" value=(expires_at.clone())>
                     <label class="auth-label" for="code">"Verification code"</label>
                     // One field without JavaScript; account.js splits it
                     // into six boxes and signs in on the last digit.
@@ -457,10 +476,17 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
                         autofocus=(true)
                         data-code=""
                     >
-                    <p class="auth-hint code-hint" hidden=(true)>icon(name: "content_paste") "Paste the 6-digit code"</p>
+                    // The time the code has left, from when it was sent;
+                    // account.js counts it down. Only its running out is
+                    // announced, by the status line after it.
+                    <p class=(if expired { "auth-hint code-timer expired" } else { "auth-hint code-timer" }) data-expires-at=(expires_at)>
+                        icon(name: "timer")
+                        <span data-timer-text="">(code_timer_text(left))</span>
+                    </p>
+                    <p class="visually-hidden" role="status" data-timer-status=""></p>
                     <button class="btn btn-solid auth-submit" type="submit">"Sign in" icon(name: "arrow_forward")</button>
                 </form>
-                <form class="auth-resend" method="post" action="/auth/email/start">
+                <form class=(if expired { "auth-resend due" } else { "auth-resend" }) method="post" action="/auth/email/start">
                     <input type="hidden" name="next" value=(next)>
                     <input type="hidden" name="email" value=(email)>
                     <span>"No code? Check spam, or"</span>
@@ -471,6 +497,13 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
             <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
         </main>
     })
+}
+
+/// The code page's countdown with `left` until the code runs out; the
+/// same words as `timerText` in account.js.
+fn code_timer_text(left: Duration) -> String {
+    let seconds = left.whole_seconds();
+    if seconds <= 0 { "Code expired".into() } else { format!("Code expires in {}:{:02}", seconds / 60, seconds % 60) }
 }
 
 /// Approves a sign-in from a Buwiz app (RFC 8628 device flow).

@@ -1805,11 +1805,12 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
         "<title>Meet Buwiz Bot | Buwiz</title>",
         r#"<meta name="description" content="Give your AI a job. Give it a computer. Let it work."#,
         r#"<link rel="canonical" href="https://buwiz.com/" />"#,
-        r#"<meta name="buwiz-account-origin" content="http://localhost:3008" />"#,
         r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {
         assert!(page.contains(part), "{part}: {page}");
     }
+    // Sign-in belongs to the filing site; the Bot page doesn't link it.
+    assert!(!page.contains("buwiz-account-origin"), "{page}");
     assert!(!page.contains("OpenGrok") && !page.contains("Goldcoders"), "{page}");
     assert!(!page.contains("og:image") && !page.contains("noindex"));
     let head = Request::head("/").header(header::HOST, "buwiz.com").body(Body::empty()).unwrap();
@@ -1825,9 +1826,9 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
     let script = page.split('"').find(|part| part.starts_with("/bot/") && part.ends_with(".js")).unwrap();
     let response = site.on_host("buwiz.com", script).await;
     assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript; charset=utf-8", "{script}");
-    let logo = site.on_host("buwiz.com", "/bot/assets/images/logos/stylar.png").await;
+    let logo = site.on_host("buwiz.com", "/bot/assets/brand/buwiz_wordmark.svg").await;
     assert_eq!(logo.status(), StatusCode::OK);
-    assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/svg+xml");
     for missing in ["/bot/index.html", "/bot/nothing.js", "/bot/assets/bir-certificate.pdf"] {
         assert_eq!(site.on_host("buwiz.com", missing).await.status(), StatusCode::NOT_FOUND, "{missing}");
     }
@@ -1839,8 +1840,45 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
     assert!(robots.starts_with("User-agent: *\nAllow: /\n"), "{robots}");
     assert!(robots.ends_with("Sitemap: https://buwiz.com/sitemap.xml\n"), "{robots}");
     let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
-    assert_eq!(sitemap.matches("<loc>").count(), 1, "{sitemap}");
+    assert_eq!(sitemap.matches("<loc>").count(), 2, "{sitemap}");
     assert!(sitemap.contains("<loc>https://buwiz.com/</loc>"), "{sitemap}");
+    assert!(sitemap.contains("<loc>https://buwiz.com/mini-apps</loc>"), "{sitemap}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn once_split_the_bot_host_serves_its_mini_apps_page(db: PgPool) {
+    let site = Site::split(db);
+    let home = text(site.on_host("buwiz.com", "/").await).await;
+    let page = site.on_host("buwiz.com", "/mini-apps").await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(page.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
+    let page = text(page).await;
+    // The same app, named and addressed for the page.
+    let wasm = |html: &str| html.split('"').find(|part| part.ends_with("_bg.wasm")).map(str::to_owned);
+    assert_eq!(wasm(&page), wasm(&home));
+    assert!(wasm(&page).is_some(), "{page}");
+    for part in [
+        "<title>Mini apps | Buwiz Bot</title>",
+        r#"<link rel="canonical" href="https://buwiz.com/mini-apps" />"#,
+        r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
+    ] {
+        assert!(page.contains(part), "{part}: {page}");
+    }
+    assert!(!page.contains("Meet Buwiz Bot"), "{page}");
+    let head = Request::head("/mini-apps").header(header::HOST, "buwiz.com").body(Body::empty()).unwrap();
+    assert_eq!(site.send(head).await.status(), StatusCode::OK);
+
+    // Only those paths: nothing else is the app's.
+    for path in ["/mini-apps/", "/mini-apps/books", "/minis"] {
+        let response = site.on_host("buwiz.com", path).await;
+        assert!(!text(response).await.contains("_bg.wasm"), "{path}");
+    }
+    // Not on the filing site, split or not.
+    for (site, host) in [(&site, "ebirforms.buwiz.com"), (&Site::new(site.db.clone()), "buwiz.com")] {
+        let response = site.on_host(host, "/mini-apps").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{host}");
+        assert!(!text(response).await.contains("Buwiz Bot"), "{host}");
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -39,8 +39,7 @@
   <meta name="description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
   <link rel="canonical" href="https://buwiz.com/" />
   <meta name="theme-color" content="#0F172A" />
-  <!-- The server fills these in with ACCOUNT_ORIGIN and FORMS_ORIGIN (src/bot_site.rs). -->
-  <meta name="buwiz-account-origin" content="https://account.buwiz.com" />
+  <!-- The server fills this in with FORMS_ORIGIN (src/bot_site.rs). -->
   <meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />
 
   <!-- Open Graph / Facebook -->
@@ -58,7 +57,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
   <!-- Add a plain CSS file: see https://trunkrs.dev/assets/#css -->
   <!-- If using Tailwind with Leptos CSR, see https://trunkrs.dev/assets/#tailwind instead-->
-  <link rel="stylesheet" href="/bot/tailwind-e44002850d18762a.css" integrity="sha384-ZT5xqXgoXZFd2Vo0gQ2eCwQ+HRIjdoBRuRlhYYgxHXweRv/O7ZNynRDaUfq50svd"/>
+  <link rel="stylesheet" href="/bot/tailwind-1f162e19dc2ad7e3.css" integrity="sha384-TmZANT/KItcVFeozv7HzG76eW94N+63tt26PoadyQKAlbmM0UhOdr6pqHQg2AlaH"/>
 
   <!-- The server's own Buwiz icons and manifest. -->
   <link rel="icon" type="image/svg+xml" href="/assets/brand/buwiz_favicon.svg" />
@@ -72,8 +71,8 @@
   <!-- include support for `wasm-bindgen --weak-refs` - see: https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html -->
   
 <script type="module">
-import init, * as bindings from '/bot/buwiz-bot-site-c8a355d1c3da3573.js';
-const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-c8a355d1c3da3573_bg.wasm' });
+import init, * as bindings from '/bot/buwiz-bot-site-ba4c17b46f2859be.js';
+const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-ba4c17b46f2859be_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -83,7 +82,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
 
-<link rel="modulepreload" href="/bot/buwiz-bot-site-c8a355d1c3da3573.js" crossorigin="anonymous" integrity="sha384-0iiEqg4tVrOC6h84EpwF96In6NDP/kqHX1AQg/zl2G0b5WGa697LXCp5RCFYSGzp"><link rel="preload" href="/bot/buwiz-bot-site-c8a355d1c3da3573_bg.wasm" crossorigin="anonymous" integrity="sha384-r0t5IGIHvnFfEOtuFcJRqFyUOLsswbleSSTo1W/9nDzcGWHHb3muqwbVYsos++Ch" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/bot/buwiz-bot-site-ba4c17b46f2859be.js" crossorigin="anonymous" integrity="sha384-+XKNdNY3iovAodIoQleY2aAtIIINFCDKcwPE+MJNBbU6DfwVCfjHdVFTsL86hP7y"><link rel="preload" href="/bot/buwiz-bot-site-ba4c17b46f2859be_bg.wasm" crossorigin="anonymous" integrity="sha384-XRLYRW1cA9ggG0z1SzYN3lxi1WVOH45coe4bJqMlFK3BESAcLE3JZbiq0Kc+dKVn" as="fetch" type="application/wasm"></head>
 
 <body></body>
 

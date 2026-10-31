@@ -1,8 +1,9 @@
 //! The Buwiz Bot site, on the bare domain once the site is split (see
 //! [`crate::canonical::Site`]). It is the Leptos app in `bot-site/`, built
 //! with Trunk into `bot-site/dist/` (`bot-site/build.sh`) and embedded in
-//! the binary: `/` is its `index.html`, and its bundle and images are under
-//! `/bot/`, apart from the server's own `/assets/`.
+//! the binary: `/` and the app's other [`PAGES`] are its `index.html`, and
+//! its bundle and images are under `/bot/`, apart from the server's own
+//! `/assets/`.
 
 use axum::response::{IntoResponse, Response};
 use http::{HeaderValue, StatusCode, header};
@@ -13,13 +14,27 @@ use crate::config::Config;
 #[folder = "bot-site/dist/"]
 struct Dist;
 
-/// The page at `/`, its origin metas filled in from `config` so its
-/// sign-in and eBIRForms links go to this server's hosts.
-pub fn index(config: &Config) -> Response {
+/// The app's pages, each served as its `index.html`: (path, title). The
+/// app routes them itself (bot-site/src/app.rs); only these paths are its.
+pub const PAGES: &[(&str, &str)] = &[("/", "Meet Buwiz Bot | Buwiz"), ("/mini-apps", "Mini apps | Buwiz Bot")];
+
+/// Whether `path` is one of the app's [`PAGES`].
+pub fn is_page(path: &str) -> bool {
+    PAGES.iter().any(|(page, _)| *page == path)
+}
+
+/// The page at `path`, one of [`PAGES`]: index.html with its forms-origin
+/// meta filled in from `config`, so its eBIRForms links go to this server's
+/// host, and its title and canonical address set for the page.
+pub fn index(config: &Config, path: &str) -> Response {
     let file = Dist::get("index.html").expect("bot-site/dist/index.html is built");
     let html = String::from_utf8_lossy(&file.data);
-    let html = with_meta(&html, "buwiz-account-origin", &config.account_origin);
-    let html = with_meta(&html, "buwiz-forms-origin", &config.forms_origin);
+    let mut html = with_meta(&html, "buwiz-forms-origin", &config.forms_origin);
+    let (home, home_title) = PAGES[0];
+    if let Some((_, title)) = PAGES.iter().find(|(page, _)| *page == path && *page != home) {
+        let url = format!("https://buwiz.com{path}\"");
+        html = html.replace(home_title, title).replace("https://buwiz.com/\"", &url);
+    }
     let mut response = html.into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
@@ -85,12 +100,11 @@ mod tests {
     }
 
     #[test]
-    fn the_built_page_has_both_metas_and_its_bundle_under_bot() {
+    fn the_built_page_has_its_meta_and_its_bundle_under_bot() {
         let index = String::from_utf8(Dist::get("index.html").unwrap().data.into_owned()).unwrap();
-        assert!(index.contains("<title>Meet Buwiz Bot | Buwiz</title>"));
-        for name in ["buwiz-account-origin", "buwiz-forms-origin"] {
-            assert!(index.contains(&format!(r#"<meta name="{name}" content=""#)), "{name}");
-        }
+        assert!(index.contains(&format!("<title>{}</title>", PAGES[0].1)));
+        assert!(index.contains(r#"<meta name="buwiz-forms-origin" content=""#));
+        assert!(!index.contains("buwiz-account-origin"));
         let wasm = Dist::iter().find(|path| path.ends_with("_bg.wasm")).expect("a wasm file");
         assert!(index.contains(&format!("/bot/{wasm}")), "{index}");
         assert!(!index.contains(r#"href="/assets/images"#) && !index.contains("sw.js"));

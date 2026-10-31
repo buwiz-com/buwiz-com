@@ -248,7 +248,7 @@
     50% { opacity: 0; }
   }
 
-  /* Portable toolchain demo: generative-UI cards slide into the chat; the composer's caret. */
+  /* Chat demos: generative-UI cards slide into the chat; the composer's caret. */
   .gc-card-in {
     animation: gc-card-in 0.3s ease-out both;
   }

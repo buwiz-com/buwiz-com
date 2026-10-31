@@ -47,7 +47,6 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/screens/{name}", get(screenshot))
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
-        .route("/assets/download.js", get(download_script))
         .route("/assets/{dir}/{name}", get(asset))
         // Search engines, browsers and home screens.
         .route("/favicon.ico", get(|| asset(Path(("brand".into(), "favicon.ico".into())))))
@@ -144,10 +143,6 @@ async fn account_script() -> Response {
 
 async fn demo_script() -> Response {
     text(include_str!("demo.js"), "text/javascript; charset=utf-8")
-}
-
-async fn download_script() -> Response {
-    text(include_str!("download.js"), "text/javascript; charset=utf-8")
 }
 
 async fn demo_stylesheet() -> Response {

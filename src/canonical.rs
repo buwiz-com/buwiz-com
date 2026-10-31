@@ -4,6 +4,9 @@
 //! is the signed-in dashboard, and the API host's root says what it is.
 //! Only the bare domain is for search engines: everything on the account
 //! and API hosts is sent with `X-Robots-Tag: noindex`.
+//!
+//! With `SITE_SPLIT=true` the bare domain is the Buwiz Bot site instead, and
+//! the filing site lives on its own host (`FORMS_ORIGIN`); see [`Site`].
 
 use std::sync::Arc;
 
@@ -11,8 +14,36 @@ use axum::Json;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use http::{HeaderValue, header};
+use http::{HeaderValue, Method, StatusCode, header};
 use serde_json::json;
+
+use crate::state::AppState;
+
+/// The site a host serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Site {
+    /// The Buwiz Bot page, on the bare domain once the site is split.
+    Bot,
+    /// The filing (eBIRForms) site.
+    Forms,
+    Account,
+    Api,
+}
+
+impl Site {
+    /// Told apart by the first label. Until `split`, every other host is
+    /// the filing site, as before.
+    pub fn for_host(host: &str, split: bool) -> Self {
+        let host = host.to_ascii_lowercase();
+        match host.split_once('.').map(|(label, _)| label) {
+            Some("account") => Site::Account,
+            Some("api") => Site::Api,
+            Some("forms" | "ebirforms") => Site::Forms,
+            _ if split => Site::Bot,
+            _ => Site::Forms,
+        }
+    }
+}
 
 pub async fn bare_domain(request: Request, next: Next) -> Response {
     let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok());
@@ -41,6 +72,44 @@ pub async fn host_roots(State(account_origin): State<Arc<str>>, request: Request
         }))
         .into_response(),
         None => next.run(request).await,
+    }
+}
+
+/// On the Bot site, sends the filing site's pages to [`Config::forms_origin`]
+/// and the sign-in pages to the account host, both with a 301. Everything
+/// else, and every host while the site is not split, passes on.
+///
+/// [`Config::forms_origin`]: crate::config::Config::forms_origin
+pub async fn split_site(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let config = &state.config;
+    let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let reading = request.method() == Method::GET || request.method() == Method::HEAD;
+    if !reading || Site::for_host(host, config.site_split) != Site::Bot {
+        return next.run(request).await;
+    }
+    let target = match moved_to(request.uri().path()) {
+        Some(Site::Forms) => &config.forms_origin,
+        Some(_) => &config.account_origin,
+        None => return next.run(request).await,
+    };
+    let path_and_query = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    let location = HeaderValue::from_str(&format!("{target}{path_and_query}")).expect("an origin and a request path");
+    (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, location)]).into_response()
+}
+
+/// Which site a path on the Bot host belongs to, if it moved off it.
+fn moved_to(path: &str) -> Option<Site> {
+    let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+    if under("/download")
+        || path == "/install-linux.sh"
+        || path.starts_with("/assets/demo")
+        || path.starts_with("/assets/screens/")
+    {
+        Some(Site::Forms)
+    } else if path == "/login" || path == "/signup" || path == "/login/verify" || under("/tins") {
+        Some(Site::Account)
+    } else {
+        None
     }
 }
 
@@ -112,6 +181,53 @@ mod tests {
         assert_eq!(root_for("api.buwiz.com", "/oauth/device/code"), None);
         // A local server keeps the home page at its root.
         assert_eq!(root_for("localhost:3008", "/"), None);
+    }
+
+    #[test]
+    fn hosts_name_their_site() {
+        for split in [false, true] {
+            assert_eq!(Site::for_host("account.buwiz.com", split), Site::Account);
+            assert_eq!(Site::for_host("API.buwiz.com", split), Site::Api);
+            assert_eq!(Site::for_host("ebirforms.buwiz.com", split), Site::Forms);
+            assert_eq!(Site::for_host("forms.localhost:3008", split), Site::Forms);
+        }
+        // Until the split, every other host is the filing site.
+        for host in ["buwiz.com", "localhost:3008", "", "accounting.buwiz.com"] {
+            assert_eq!(Site::for_host(host, false), Site::Forms, "{host}");
+            assert_eq!(Site::for_host(host, true), Site::Bot, "{host}");
+        }
+    }
+
+    #[test]
+    fn the_filing_and_sign_in_pages_move_off_the_bot_site() {
+        for path in [
+            "/download",
+            "/download/mac",
+            "/install-linux.sh",
+            "/assets/demo.js",
+            "/assets/demo.css",
+            "/assets/screens/palette_dark.webp",
+        ] {
+            assert_eq!(moved_to(path), Some(Site::Forms), "{path}");
+        }
+        for path in ["/login", "/signup", "/login/verify", "/tins", "/tins/new", "/tins/claims"] {
+            assert_eq!(moved_to(path), Some(Site::Account), "{path}");
+        }
+        for path in [
+            "/",
+            "/downloads",
+            "/api/devices",
+            "/mcp",
+            "/oauth/authorize",
+            "/.well-known/jwks.json",
+            "/auth/email/start",
+            "/device",
+            "/assets/site.css",
+            "/assets/brand/icon-512.png",
+            "/robots.txt",
+        ] {
+            assert_eq!(moved_to(path), None, "{path}");
+        }
     }
 
     #[test]

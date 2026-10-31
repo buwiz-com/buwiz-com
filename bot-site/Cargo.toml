@@ -1,0 +1,64 @@
+[package]
+name = "buwiz-bot-site"
+version = "0.1.70"
+edition = "2024"
+authors = ["codeitlikemiley <codeitlikemiley@gmail.com>"]
+
+# The Buwiz Bot page at the root of buwiz.com: the goldcoders.dev home page,
+# built with Trunk into dist/ and embedded in the server (see README.md).
+# Not part of the server's build: an empty [workspace] keeps it standalone.
+
+[workspace]
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+leptos_meta = { version = "0.8" }
+leptos_router = { version = "0.8" }
+console_log = "1"
+log = "0.4"
+console_error_panic_hook = "0.1"
+gloo-timers = "0.3"
+web-sys = { version = "0.3", features = [
+    "HtmlInputElement",
+    "KeyboardEvent",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
+    "Window",
+    "Storage",
+    "Document",
+    "HtmlDocument",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "HtmlVideoElement",
+    "HtmlMediaElement",
+    "HtmlElement",
+    "Element",
+    "Location",
+    "DomRect",
+    "CssStyleDeclaration",
+    "MediaQueryList",
+    "MouseEvent",
+    "PointerEvent",
+    "TouchEvent",
+    "TouchList",
+    "Touch",
+    "Performance",
+] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+send_wrapper = "0.6"
+
+
+[dev-dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = ["Document", "Window"] }
+
+
+
+# A small wasm: it is committed and embedded in the server.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

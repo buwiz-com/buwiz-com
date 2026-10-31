@@ -1,0 +1,3 @@
+/target
+# Built and committed: the server embeds it (build.sh).
+!/dist/

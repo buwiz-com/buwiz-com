@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use http::{HeaderValue, Method, StatusCode, header};
 use serde_json::json;
 
+use crate::bot_site;
 use crate::state::AppState;
 
 /// The site a host serves.
@@ -75,9 +76,11 @@ pub async fn host_roots(State(account_origin): State<Arc<str>>, request: Request
     }
 }
 
-/// On the Bot site, sends the filing site's pages to [`Config::forms_origin`]
-/// and the sign-in pages to the account host, both with a 301. Everything
-/// else, and every host while the site is not split, passes on.
+/// On the Bot site, serves the Bot page at `/` and its bundle under `/bot/`
+/// (see [`bot_site`]), and sends the filing site's pages to
+/// [`Config::forms_origin`] and the sign-in pages to the account host, both
+/// with a 301. Everything else, and every host while the site is not split,
+/// passes on.
 ///
 /// [`Config::forms_origin`]: crate::config::Config::forms_origin
 pub async fn split_site(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -87,7 +90,14 @@ pub async fn split_site(State(state): State<AppState>, request: Request, next: N
     if !reading || Site::for_host(host, config.site_split) != Site::Bot {
         return next.run(request).await;
     }
-    let target = match moved_to(request.uri().path()) {
+    let path = request.uri().path();
+    if path == "/" {
+        return bot_site::index(config);
+    }
+    if let Some(file) = path.strip_prefix("/bot/") {
+        return bot_site::file(file);
+    }
+    let target = match moved_to(path) {
         Some(Site::Forms) => &config.forms_origin,
         Some(_) => &config.account_origin,
         None => return next.run(request).await,

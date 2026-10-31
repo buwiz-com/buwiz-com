@@ -6,3 +6,4 @@
 scripts
 !scripts/ocr-models.sh
 ocr-models
+bot-site/target

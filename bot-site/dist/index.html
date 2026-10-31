@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <!-- FOUC Prevention: Set theme before any CSS/WASM loads -->
+  <script>
+    (function() {
+      function getCookie(name) {
+        var m = document.cookie.match('(?:^|; )' + name + '=([^;]*)');
+        return m ? m[1] : null;
+      }
+      function setCookie(name, value) {
+        var h = location.hostname;
+        var domain = "";
+        if (h.indexOf('goldcoders.dev') !== -1) {
+          domain = "; domain=.goldcoders.dev";
+        } else if (h.indexOf('.localhost') !== -1) {
+          domain = "; domain=localhost";
+        }
+        var cookie = name + '=' + value + '; path=/; max-age=31536000; SameSite=Lax' + domain;
+        document.cookie = cookie;
+      }
+      var theme = getCookie('gc-theme');
+      // Migrate from localStorage (one-time for existing users)
+      if (!theme) {
+        try {
+          var ls = localStorage.getItem('gc-theme');
+          if (ls) { theme = ls; setCookie('gc-theme', ls); localStorage.removeItem('gc-theme'); }
+        } catch(e) {}
+      }
+      if (!theme) {
+        theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      }
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
+  <title>Meet Buwiz Bot | Buwiz</title>
+  <meta name="description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
+  <link rel="canonical" href="https://buwiz.com/" />
+  <meta name="theme-color" content="#0F172A" />
+  <!-- The server fills these in with ACCOUNT_ORIGIN and FORMS_ORIGIN (src/bot_site.rs). -->
+  <meta name="buwiz-account-origin" content="https://account.buwiz.com" />
+  <meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://buwiz.com/" />
+  <meta property="og:title" content="Meet Buwiz Bot | Buwiz" />
+  <meta property="og:description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
+
+  <!-- Twitter -->
+  <meta property="twitter:card" content="summary" />
+  <meta property="twitter:url" content="https://buwiz.com/" />
+  <meta property="twitter:title" content="Meet Buwiz Bot | Buwiz" />
+  <meta property="twitter:description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+  <!-- Add a plain CSS file: see https://trunkrs.dev/assets/#css -->
+  <!-- If using Tailwind with Leptos CSR, see https://trunkrs.dev/assets/#tailwind instead-->
+  <link rel="stylesheet" href="/bot/tailwind-e44002850d18762a.css" integrity="sha384-ZT5xqXgoXZFd2Vo0gQ2eCwQ+HRIjdoBRuRlhYYgxHXweRv/O7ZNynRDaUfq50svd"/>
+
+  <!-- The server's own Buwiz icons and manifest. -->
+  <link rel="icon" type="image/svg+xml" href="/assets/brand/buwiz_favicon.svg" />
+  <link rel="icon" href="/favicon.ico" sizes="48x48" />
+  <link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+
+  <!-- Only the images the page uses, served under /bot/assets/. -->
+  
+
+  <!-- include support for `wasm-bindgen --weak-refs` - see: https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html -->
+  
+<script type="module">
+import init, * as bindings from '/bot/buwiz-bot-site-c8a355d1c3da3573.js';
+const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-c8a355d1c3da3573_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+
+<link rel="modulepreload" href="/bot/buwiz-bot-site-c8a355d1c3da3573.js" crossorigin="anonymous" integrity="sha384-0iiEqg4tVrOC6h84EpwF96In6NDP/kqHX1AQg/zl2G0b5WGa697LXCp5RCFYSGzp"><link rel="preload" href="/bot/buwiz-bot-site-c8a355d1c3da3573_bg.wasm" crossorigin="anonymous" integrity="sha384-r0t5IGIHvnFfEOtuFcJRqFyUOLsswbleSSTo1W/9nDzcGWHHb3muqwbVYsos++Ch" as="fetch" type="application/wasm"></head>
+
+<body></body>
+
+</html>

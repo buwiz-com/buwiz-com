@@ -1798,26 +1798,42 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
     let site = Site::split(db);
     let page = site.on_host("buwiz.com", "/").await;
     assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(page.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
     let page = text(page).await;
+    // The Bot site's own index.html (bot-site/dist), its origins filled in.
     for part in [
-        "<title>Buwiz Bot</title>",
-        r#"<meta name="description" content="Buwiz Bot is a native Mac assistant"#,
-        r#"<link rel="canonical" href="https://buwiz.com/">"#,
-        "<h1>Buwiz Bot</h1>",
-        "A native Mac assistant that runs your bots, your forms and your books in one fast app.",
-        "Coming soon · Mac with Apple silicon",
-        r#"Also from Buwiz: <a href="https://ebirforms.buwiz.com">eBIRForms</a> · Buwiz Books"#,
-        r#"<a class="btn btn-ghost" href="http://localhost:3008/login">Sign in</a>"#,
-        r#"<a class="btn btn-solid" href="http://localhost:3008/signup">Create account</a>"#,
+        "<title>Meet Buwiz Bot | Buwiz</title>",
+        r#"<meta name="description" content="Give your AI a job. Give it a computer. Let it work."#,
+        r#"<link rel="canonical" href="https://buwiz.com/" />"#,
+        r#"<meta name="buwiz-account-origin" content="http://localhost:3008" />"#,
+        r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {
         assert!(page.contains(part), "{part}: {page}");
     }
-    // Nothing to download, and the account buttons only in the header.
-    let main = page.split("<main").nth(1).unwrap();
-    for gone in ["download", "<button", "btn", "/login", "/signup", "demo.js", "og:image"] {
-        assert!(!main.contains(gone), "{gone}: {main}");
-    }
+    assert!(!page.contains("OpenGrok") && !page.contains("Goldcoders"), "{page}");
     assert!(!page.contains("og:image") && !page.contains("noindex"));
+    let head = Request::head("/").header(header::HOST, "buwiz.com").body(Body::empty()).unwrap();
+    assert_eq!(site.send(head).await.status(), StatusCode::OK);
+
+    // Its bundle is under /bot/, clear of the server's /assets/.
+    let wasm = page.split('"').find(|part| part.starts_with("/bot/") && part.ends_with("_bg.wasm")).unwrap();
+    let response = site.on_host("buwiz.com", wasm).await;
+    assert_eq!(response.status(), StatusCode::OK, "{wasm}");
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+    assert!(bytes(response).await.starts_with(b"\0asm"));
+    let script = page.split('"').find(|part| part.starts_with("/bot/") && part.ends_with(".js")).unwrap();
+    let response = site.on_host("buwiz.com", script).await;
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript; charset=utf-8", "{script}");
+    let logo = site.on_host("buwiz.com", "/bot/assets/images/logos/stylar.png").await;
+    assert_eq!(logo.status(), StatusCode::OK);
+    assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
+    for missing in ["/bot/index.html", "/bot/nothing.js", "/bot/assets/bir-certificate.pdf"] {
+        assert_eq!(site.on_host("buwiz.com", missing).await.status(), StatusCode::NOT_FOUND, "{missing}");
+    }
+    // Only the Bot host has it.
+    assert_eq!(site.on_host("ebirforms.buwiz.com", wasm).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(Site::new(site.db.clone()).on_host("buwiz.com", wasm).await.status(), StatusCode::NOT_FOUND);
 
     let robots = text(site.on_host("buwiz.com", "/robots.txt").await).await;
     assert!(robots.starts_with("User-agent: *\nAllow: /\n"), "{robots}");

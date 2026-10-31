@@ -28,8 +28,12 @@ async fn a_queued_1701q_is_sent_through_the_gatekeeper_and_sender() {
     let (submission, _store) = harness.signed_in().await;
 
     // The local app: Juana Santos and her 1701Q for Q1 2026, queued.
-    // SAFETY: set before any thread reads it.
-    unsafe { std::env::set_var("BIR_DB_KEY", TEST_DB_KEY) };
+    // SAFETY: set before any thread reads it. Buwiz reads BUWIZ_DB_KEY;
+    // BIR_DB_KEY is the name it read before buwiz-oss#24.
+    unsafe {
+        std::env::set_var("BUWIZ_DB_KEY", TEST_DB_KEY);
+        std::env::set_var("BIR_DB_KEY", TEST_DB_KEY);
+    }
     let dir = tempfile::tempdir().unwrap();
     let app = BirApp::open_at(dir.path().join("bir_data.db")).unwrap();
     let taxpayer = app

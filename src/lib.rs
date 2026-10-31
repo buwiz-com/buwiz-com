@@ -3,9 +3,9 @@
 
 pub mod accounts;
 pub mod agents;
-pub mod bot_site;
 #[cfg(feature = "bir")]
 pub mod bir;
+pub mod bot_site;
 pub mod canonical;
 pub mod claims;
 pub mod config;

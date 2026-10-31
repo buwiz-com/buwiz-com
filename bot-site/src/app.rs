@@ -3,13 +3,14 @@ use leptos_meta::*;
 use leptos_router::{components::*, path};
 
 use crate::pages::home::Home;
+use crate::pages::mini_apps::MiniAppsPage;
 
 /// Where the bundle's own files are served from (Trunk `public_url`).
 pub const ASSETS: &str = "/bot/assets";
 
 /// The `content` of `<meta name=...>` in index.html. The server fills in
-/// the origins (`buwiz-account-origin`, `buwiz-forms-origin`); a plain
-/// `trunk serve` keeps the production values written there.
+/// the forms origin (`buwiz-forms-origin`); a plain `trunk serve` keeps the
+/// production value written there.
 pub fn meta_content(name: &str) -> String {
     web_sys::window()
         .and_then(|w| w.document())
@@ -108,6 +109,7 @@ pub fn App() -> impl IntoView {
                 </div>
             }>
                 <Route path=path!("/") view=Home />
+                <Route path=path!("/mini-apps") view=MiniAppsPage />
             </Routes>
         </Router>
     }

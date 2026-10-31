@@ -372,14 +372,18 @@ pub fn is_download(user_agent: &str) -> bool {
             .any(|word| agent.contains(word))
 }
 
+/// The app this server hands out, in `download_counts.app`.
+const APP: &str = "ebirforms";
+
 /// Counts one download of `file`, of release `version`, on today's date in
 /// Manila.
 pub async fn count(db: &PgPool, version: &str, file: &File) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO download_counts (day, version, platform, arch, kind, count)
-         VALUES ((now() AT TIME ZONE 'Asia/Manila')::date, $1, $2, $3, $4, 1)
-         ON CONFLICT (day, version, platform, arch, kind) DO UPDATE SET count = download_counts.count + 1",
+        "INSERT INTO download_counts (app, day, version, platform, arch, kind, count)
+         VALUES ($1, (now() AT TIME ZONE 'Asia/Manila')::date, $2, $3, $4, $5, 1)
+         ON CONFLICT (app, day, version, platform, arch, kind) DO UPDATE SET count = download_counts.count + 1",
     )
+    .bind(APP)
     .bind(version)
     .bind(file.platform.manifest_name())
     .bind(file.arch.name())
@@ -399,12 +403,13 @@ pub struct Total {
 }
 
 /// Every file's downloads so far, most downloaded first: for showing on the
-/// site. Names this server no longer knows are left out.
+/// site. Only this server's app; names it no longer knows are left out.
 pub async fn totals(db: &PgPool) -> sqlx::Result<Vec<Total>> {
     let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT platform, arch, kind, sum(count)::bigint FROM download_counts
+        "SELECT platform, arch, kind, sum(count)::bigint FROM download_counts WHERE app = $1
          GROUP BY platform, arch, kind ORDER BY 4 DESC, 1, 2, 3",
     )
+    .bind(APP)
     .fetch_all(db)
     .await?;
     Ok(rows

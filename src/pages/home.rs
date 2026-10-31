@@ -257,15 +257,26 @@ const HERO_STATS: [(&str, &str, &str); 3] = [
 pub(super) const TITLE: &str = "Buwiz: Philippine tax filing, made modern";
 pub(super) const DESCRIPTION: &str = "Prepare and file your BIR returns from your computer, with your own data. Buwiz handles 1701Q, 2550Q and more, and lets you check every return before it's sent.";
 
-/// Who runs the site and what it is, for search engines (schema.org).
-/// Only what we can stand behind: no ratings, prices or social profiles.
-const JSON_LD: &str = r#"[{"@context":"https://schema.org","@type":"Organization","name":"Buwiz","url":"https://buwiz.com","logo":"https://buwiz.com/assets/brand/icon-512.png"},{"@context":"https://schema.org","@type":"WebSite","name":"Buwiz","url":"https://buwiz.com"}]"#;
+/// Who runs the site at `origin` and what it is, for search engines
+/// (schema.org). Only what we can stand behind: no ratings, prices or
+/// social profiles.
+fn json_ld(origin: &str) -> String {
+    format!(
+        r#"[{{"@context":"https://schema.org","@type":"Organization","name":"Buwiz","url":"{origin}","logo":"{origin}/assets/brand/icon-512.png"}},{{"@context":"https://schema.org","@type":"WebSite","name":"Buwiz","url":"{origin}"}}]"#
+    )
+}
 
 /// A public page's share card, canonical address and JSON-LD, in the
 /// layout's `<head>`. `url` is always the public address, whichever host
-/// served the page.
+/// served the page, and `origin` the filing site's.
 #[component]
-pub(super) async fn public_head(url: String, title: &'static str, description: &'static str) -> Result<impl View> {
+pub(super) async fn public_head(
+    url: String,
+    origin: String,
+    title: &'static str,
+    description: &'static str,
+) -> Result<impl View> {
+    let image = format!("{origin}/assets/brand/og-image.png");
     Ok(view! {
         <link rel="canonical" href=(url.clone())>
         <meta property="og:type" content="website">
@@ -274,50 +285,58 @@ pub(super) async fn public_head(url: String, title: &'static str, description: &
         <meta property="og:url" content=(url)>
         <meta property="og:title" content=(title)>
         <meta property="og:description" content=(description)>
-        <meta property="og:image" content="https://buwiz.com/assets/brand/og-image.png">
+        <meta property="og:image" content=(image.clone())>
         <meta property="og:image:width" content="1200">
         <meta property="og:image:height" content="630">
         <meta property="og:image:alt" content="Buwiz: Philippine tax filing, made modern">
         <meta name="twitter:card" content="summary_large_image">
         <meta name="twitter:title" content=(title)>
         <meta name="twitter:description" content=(description)>
-        <meta name="twitter:image" content="https://buwiz.com/assets/brand/og-image.png">
+        <meta name="twitter:image" content=(image)>
         // Text escaping leaves this JSON as it is: it has no `&`, `<` or `>`.
-        <script type="application/ld+json">(JSON_LD)</script>
+        <script type="application/ld+json">(json_ld(&origin))</script>
     })
 }
 
+/// The filing site's home page, or the Bot page on the Bot site.
 #[page("/")]
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
+    let forms_origin = state(cx).config.forms_origin.clone();
+    if site(cx) == Site::Bot {
+        return Ok(view! { super::bot::bot_page(forms_origin: forms_origin) }.boxed());
+    }
     let signed_in = current(cx).await?.is_some();
     let release = state(cx).downloads.latest().await;
     let user_agent = headers(cx).get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
     let yours = guess_device(user_agent);
+    let (sign_in, sign_up) = (account_url(cx, "/login"), account_url(cx, "/signup"));
     Ok(view! {
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap">
         <link rel="stylesheet" href="/assets/demo.css">
         <main class="home landing">
-            hero(release: release, yours: yours)
+            hero(release: release, yours: yours, forms_origin: forms_origin)
             tour()
-            account_section(signed_in: signed_in)
+            account_section(signed_in: signed_in, sign_in: sign_in, sign_up: sign_up)
             agents_section()
             faq()
             footer()
         </main>
         <script src="/assets/demo.js" defer=(true)></script>
-    })
+    }
+    .boxed())
 }
 
 /// Create account and sign in, or the way into the account when signed in.
+/// `sign_in` and `sign_up` are on the account host.
 #[component]
-async fn account_actions(signed_in: bool) -> Result<impl View> {
+async fn account_actions(signed_in: bool, sign_in: String, sign_up: String) -> Result<impl View> {
     Ok(view! {
         if signed_in {
             <a class="btn btn-solid" href="/tins">icon(name: "badge") "Open My TINs"</a>
             <a class="btn btn-ghost" href="/tins/new">"Add a TIN"</a>
         } else {
-            <a class="btn btn-solid" href="/signup">icon(name: "person_add") "Create account"</a>
-            <a class="btn btn-ghost" href="/login">"Sign in"</a>
+            <a class="btn btn-solid" href=(sign_up)>icon(name: "person_add") "Create account"</a>
+            <a class="btn btn-ghost" href=(sign_in)>"Sign in"</a>
         }
     })
 }
@@ -349,7 +368,7 @@ fn download_button(release: &Release, device: Option<Device>) -> (&'static str, 
 /// link to the other platforms. The row of platform logos only says where
 /// Buwiz runs; nothing in it is a link.
 #[component]
-async fn hero(release: Option<Arc<Release>>, yours: Option<Device>) -> Result<impl View> {
+async fn hero(release: Option<Arc<Release>>, yours: Option<Device>, forms_origin: String) -> Result<impl View> {
     let button = release.as_deref().map(|release| download_button(release, yours));
     let released = release.is_some();
     // The install script's line, for a Linux visitor, once it is released.
@@ -408,7 +427,7 @@ async fn hero(release: Option<Arc<Release>>, yours: Option<Device>) -> Result<im
                                 <a class="get-other" href="/download">"Other platforms"</a>
                             }
                             if script {
-                                install_line()
+                                install_line(origin: forms_origin)
                             }
                         </div>
                     }
@@ -481,9 +500,10 @@ pub(super) fn has_install_script(release: &Release) -> bool {
 
 /// The Linux install command on one line, selectable, with a Copy button
 /// that `/assets/account.js` shows where the clipboard can be written.
+/// `origin` is the filing site's.
 #[component]
-pub(super) async fn install_line() -> Result<impl View> {
-    let command = format!("curl -fsSL {}/install-linux.sh | sh", crate::seo::SITE);
+pub(super) async fn install_line(origin: String) -> Result<impl View> {
+    let command = format!("curl -fsSL {origin}/install-linux.sh | sh");
     Ok(view! {
         <div class="install-line" data-copy-group="">
             <code>(command.clone())</code>
@@ -648,7 +668,7 @@ async fn tour() -> Result<impl View> {
 }
 
 #[component]
-async fn account_section(signed_in: bool) -> Result<impl View> {
+async fn account_section(signed_in: bool, sign_in: String, sign_up: String) -> Result<impl View> {
     Ok(view! {
         <section id="account" class="section">
             <div class="section-head">
@@ -666,7 +686,7 @@ async fn account_section(signed_in: bool) -> Result<impl View> {
                     </li>
                 }
             </ol>
-            <div class="row-actions">account_actions(signed_in: signed_in)</div>
+            <div class="row-actions">account_actions(signed_in: signed_in, sign_in: sign_in, sign_up: sign_up)</div>
         </section>
     })
 }

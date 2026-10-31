@@ -10,11 +10,12 @@ use topcoat::context::{Cx, app_context};
 use topcoat::router::error::redirect;
 use topcoat::router::request::{headers, uri};
 use topcoat::router::{Router, Slot, layout, page};
-use topcoat::view::{View, component, view};
+use topcoat::view::{View, ViewExt, component, view};
 use uuid::Uuid;
 
 use crate::accounts::{self, Account};
 use crate::agents::{self, AuthorizeProblem};
+use crate::canonical::Site;
 use crate::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::devices;
 use crate::notice::Notice;
@@ -22,6 +23,7 @@ use crate::oauth;
 use crate::state::AppState;
 use crate::web::{link, safe_next, session_account};
 
+mod bot;
 mod download;
 mod home;
 mod staff;
@@ -55,6 +57,21 @@ fn state(cx: &Cx) -> &AppState {
 
 fn fail(error: impl Display) -> topcoat::Error {
     std::io::Error::other(error.to_string()).into()
+}
+
+/// The site the request's host serves (see [`Site::for_host`]).
+fn site(cx: &Cx) -> Site {
+    Site::for_host(host(cx), state(cx).config.site_split)
+}
+
+fn host(cx: &Cx) -> &str {
+    headers(cx).get(http::header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default()
+}
+
+/// `path` on the account host, for links that may be followed from
+/// another host.
+fn account_url(cx: &Cx, path: &str) -> String {
+    format!("{}{path}", state(cx).config.account_origin)
 }
 
 /// A query parameter of the current request.
@@ -109,11 +126,15 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let path = uri(cx).path().to_owned();
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let waiting = if staff_area { crate::staff::open_counts(&state(cx).db).await?.0 } else { 0 };
-    let mut head = head_for(&path);
+    let bot = path == "/" && site(cx) == Site::Bot;
+    let mut head = if bot { bot::HEAD } else { head_for(&path) };
     // Search engines find the download page once there is something on it.
     if path == "/download" && state(cx).downloads.latest().await.is_none() {
         head.index = false;
     }
+    let url = format!("{}{path}", crate::seo::public_origin(&state(cx).config, host(cx)));
+    let forms_origin = state(cx).config.forms_origin.clone();
+    let (sign_in, sign_up) = (account_url(cx, "/login"), account_url(cx, "/signup"));
     Ok(view! {
         <!DOCTYPE html>
         <html lang="en">
@@ -122,8 +143,10 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>(head.title)</title>
                 <meta name="description" content=(head.description)>
-                if head.index {
-                    home::public_head(url: format!("{}{path}", crate::seo::SITE), title: head.title, description: head.description)
+                if bot {
+                    <link rel="canonical" href=(url)>
+                } else if head.index {
+                    home::public_head(url: url, origin: forms_origin, title: head.title, description: head.description)
                 } else {
                     <meta name="robots" content="noindex">
                 }
@@ -144,7 +167,7 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 if staff_area {
                     staff_header(account: account.clone().expect("staff are signed in"), path: path.clone(), waiting: waiting)
                 } else {
-                    site_header(account: account.clone(), admin: admin, path: path.clone())
+                    site_header(account: account.clone(), admin: admin, path: path.clone(), sign_in: sign_in, sign_up: sign_up)
                 }
                 (slot)
             </body>
@@ -190,9 +213,16 @@ fn initials(email: &str) -> String {
     email.chars().filter(char::is_ascii_alphanumeric).take(2).collect::<String>().to_uppercase()
 }
 
-/// The light header of the account site.
+/// The light header of the account site. `sign_in` and `sign_up` are on
+/// the account host (see [`account_url`]).
 #[component]
-async fn site_header(account: Option<Account>, admin: bool, path: String) -> Result<impl View> {
+async fn site_header(
+    account: Option<Account>,
+    admin: bool,
+    path: String,
+    sign_in: String,
+    sign_up: String,
+) -> Result<impl View> {
     let on_tins = path.starts_with("/tins");
     Ok(view! {
         <header class="home top">
@@ -207,8 +237,8 @@ async fn site_header(account: Option<Account>, admin: bool, path: String) -> Res
                     account_menu(email: account.email.clone(), admin: admin, staff_area: false)
                 } else {
                     <nav class="top-nav top-guest" aria-label="Account">
-                        <a class="btn btn-ghost" href="/login">"Sign in"</a>
-                        <a class="btn btn-solid" href="/signup">"Create account"</a>
+                        <a class="btn btn-ghost" href=(sign_in)>"Sign in"</a>
+                        <a class="btn btn-solid" href=(sign_up)>"Create account"</a>
                     </nav>
                 }
             </div>

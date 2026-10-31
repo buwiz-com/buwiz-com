@@ -147,6 +147,8 @@ async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
         mail: MailConfig::Log,
         trust_list: None,
         downloads_url: "http://127.0.0.1:9".into(),
+        forms_origin: "https://buwiz.com".into(),
+        site_split: false,
     };
     let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
     let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);

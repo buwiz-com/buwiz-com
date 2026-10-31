@@ -890,6 +890,17 @@
   .home .btn, .home .faq-chevron { transition: none; }
 }
 
+/* The Buwiz Bot page (src/pages/bot.rs): one centered hero. */
+.home .bot-hero { padding-top: 96px; padding-bottom: 120px; text-align: center; }
+.home .bot-copy { max-width: 640px; margin: 0 auto; }
+.home .bot-copy h1 { margin-bottom: 22px; font-size: 48px; font-weight: 800; letter-spacing: -0.035em; line-height: 1.02; }
+@media (min-width: 768px) { .home .bot-copy h1 { font-size: 72px; } }
+.home .bot-copy .hero-lead { margin: 0 auto 28px; }
+.home .bot-soon { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.16em; color: var(--brand); }
+.home .bot-also { margin-top: 40px; font-size: 14px; color: var(--muted); }
+.home .bot-also a { color: var(--text); font-weight: 600; }
+.home .bot-also a:hover { color: var(--brand); }
+
 /* Sign-in pages (/login, /signup, /login/verify, /device): one card in the
  * home page's look, centred under the site header. */
 .home.auth {

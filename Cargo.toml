@@ -97,6 +97,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 russh = { version = "0.63", default-features = false, features = ["flate2", "ring"], optional = true }
 russh-sftp = { version = "3", optional = true }
+# The Bot site (`bot-site/dist/`), embedded in debug builds too.
+rust-embed = { version = "8", features = ["debug-embed"] }
 rusty-s3 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha1 = { version = "0.10", optional = true }

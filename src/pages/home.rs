@@ -298,13 +298,11 @@ pub(super) async fn public_head(
     })
 }
 
-/// The filing site's home page, or the Bot page on the Bot site.
+/// The filing site's home page. The Bot site's `/` is not a page; see
+/// [`crate::bot_site`].
 #[page("/")]
 pub async fn home_page(cx: &Cx) -> Result<impl View> {
     let forms_origin = state(cx).config.forms_origin.clone();
-    if site(cx) == Site::Bot {
-        return Ok(view! { super::bot::bot_page(forms_origin: forms_origin) }.boxed());
-    }
     let signed_in = current(cx).await?.is_some();
     let release = state(cx).downloads.latest().await;
     let user_agent = headers(cx).get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
@@ -322,8 +320,7 @@ pub async fn home_page(cx: &Cx) -> Result<impl View> {
             footer()
         </main>
         <script src="/assets/demo.js" defer=(true)></script>
-    }
-    .boxed())
+    })
 }
 
 /// Create account and sign in, or the way into the account when signed in.

@@ -150,6 +150,15 @@ The `Dockerfile` builds with `--features bir,ocr` and puts the models in
 `/usr/local/share/buwiz/ocr-models`. CI builds, lints and tests without
 them.
 
+## The Bot site
+
+With `SITE_SPLIT=true`, `/` on the bare domain is the Buwiz Bot page: the
+Leptos app in `bot-site/` (the goldcoders.dev home page), its bundle and
+images under `/bot/`. The built `bot-site/dist/` is committed and embedded
+in the binary. After changing `bot-site/`, rebuild it with
+`bot-site/build.sh` (needs `trunk` and the `wasm32-unknown-unknown`
+target) and commit the new `dist/`.
+
 ## Relay modes
 
 These need a build with `--features bir`.

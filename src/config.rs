@@ -32,6 +32,12 @@ pub struct Config {
     /// Where the app's installers are, e.g. `https://downloads.buwiz.com`
     /// (see [`crate::downloads`]).
     pub downloads_url: String,
+    /// Origin of the filing site, e.g. `https://buwiz.com`. Its pages'
+    /// canonical addresses, the sitemap and the install command use it.
+    pub forms_origin: String,
+    /// Whether the bare domain is the Buwiz Bot site and the filing site
+    /// has a host of its own (see [`crate::canonical::Site`]).
+    pub site_split: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +84,8 @@ impl Config {
                 .map(|raw| raw.trim().to_owned())
                 .filter(|raw| !raw.is_empty()),
             downloads_url: origin(&var_or("DOWNLOADS_URL", "https://downloads.buwiz.com")).context("DOWNLOADS_URL")?,
+            forms_origin: origin(&var_or("FORMS_ORIGIN", "https://buwiz.com")).context("FORMS_ORIGIN")?,
+            site_split: std::env::var("SITE_SPLIT").is_ok_and(|value| value == "true"),
         })
     }
 

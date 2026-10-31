@@ -34,6 +34,7 @@ pub async fn download_page(cx: &Cx) -> Result<impl View> {
         None => "Buwiz is coming soon to Windows, macOS, Linux and Android, and to the App Store for iOS. The installers will be here.".to_owned(),
     };
     let released = release.is_some();
+    let forms_origin = state(cx).config.forms_origin.clone();
     Ok(view! {
         <main class="home landing">
             <section class="section downloads">
@@ -50,6 +51,7 @@ pub async fn download_page(cx: &Cx) -> Result<impl View> {
                             paths: paths,
                             release: release.clone(),
                             yours: platform.is_some() && platform == yours,
+                            forms_origin: forms_origin.clone(),
                         )
                     }
                 </ul>
@@ -90,6 +92,7 @@ async fn platform_card(
     paths: Logo,
     release: Option<Arc<Release>>,
     yours: bool,
+    forms_origin: String,
 ) -> Result<impl View> {
     let main = release.as_deref().zip(platform).and_then(|(release, platform)| {
         let (file, href) = main_file(release, platform)?;
@@ -116,7 +119,7 @@ async fn platform_card(
                 <p class="dl-facts">(format!("Version {version} · {} · {}", short_label(&file), size(file.size)))</p>
                 <p class="dl-sha"><span>"SHA-256"</span> <code>(file.sha256.clone())</code></p>
                 if script {
-                    install_line()
+                    install_line(origin: forms_origin)
                 }
                 if !others.is_empty() {
                     <ul class="dl-others" aria-label=(format!("Other files for {name}"))>

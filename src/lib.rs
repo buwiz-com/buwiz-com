@@ -91,7 +91,8 @@ pub async fn run() -> anyhow::Result<()> {
 /// [`canonical`].
 pub fn app(state: AppState) -> axum::Router {
     let account_origin: std::sync::Arc<str> = state.config.account_origin.as_str().into();
-    web::router(state.clone(), pages::router(state))
+    web::router(state.clone(), pages::router(state.clone()))
+        .layer(axum::middleware::from_fn_with_state(state, canonical::split_site))
         .layer(axum::middleware::from_fn_with_state(account_origin, canonical::host_roots))
         .layer(axum::middleware::from_fn(canonical::no_index))
         .layer(axum::middleware::from_fn(canonical::bare_domain))

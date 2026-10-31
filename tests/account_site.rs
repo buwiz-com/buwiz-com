@@ -32,6 +32,8 @@ const PDF: &[u8] = b"%PDF-1.7\nscan";
 /// Nothing listens on the discard port: the downloads bucket is unreachable,
 /// so nothing is released.
 const NO_DOWNLOADS: &str = "http://127.0.0.1:9";
+/// The filing site's own host, once the site is split.
+const FORMS: &str = "https://ebirforms.buwiz.com";
 
 struct Site {
     db: PgPool,
@@ -52,7 +54,16 @@ impl Site {
         Self::build(db, DocumentStore::Database, downloads_url)
     }
 
+    /// A site split as `SITE_SPLIT=true` and `FORMS_ORIGIN` [`FORMS`] split it.
+    fn split(db: PgPool) -> Self {
+        Self::build_split(db, DocumentStore::Database, NO_DOWNLOADS, true)
+    }
+
     fn build(db: PgPool, store: DocumentStore, downloads_url: &str) -> Self {
+        Self::build_split(db, store, downloads_url, false)
+    }
+
+    fn build_split(db: PgPool, store: DocumentStore, downloads_url: &str, split: bool) -> Self {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
@@ -65,6 +76,8 @@ impl Site {
             mail: MailConfig::Log,
             trust_list: None,
             downloads_url: downloads_url.into(),
+            forms_origin: if split { FORMS } else { "https://buwiz.com" }.into(),
+            site_split: split,
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         // The account site never reaches the Sender in these tests.
@@ -1696,4 +1709,228 @@ async fn a_broken_or_unreachable_manifest_means_coming_soon(db: PgPool) {
         releases.set_latest(latest.as_bytes());
         assert_coming_soon(&Site::with_downloads(db.clone(), &url), why).await;
     }
+}
+
+/// What each of the filing site's routes answers on `host`: (path, status,
+/// `Location`).
+async fn answers(site: &Site, host: &str) -> Vec<(&'static str, StatusCode, String)> {
+    let mut answers = Vec::new();
+    for path in [
+        "/",
+        "/download",
+        "/download/mac?arch=arm64",
+        "/install-linux.sh",
+        "/assets/demo.js",
+        "/assets/screens/palette_dark.webp",
+        "/assets/site.css",
+        "/login",
+        "/signup",
+        "/tins",
+        "/account",
+        "/robots.txt",
+        "/sitemap.xml",
+        "/site.webmanifest",
+    ] {
+        let response = site.on_host(host, path).await;
+        answers.push((path, response.status(), location(&response)));
+    }
+    answers
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn until_the_split_every_host_answers_as_before(db: PgPool) {
+    let site = Site::new(db);
+    let ok = |path| (path, StatusCode::OK, String::new());
+    let expected = vec![
+        ok("/"),
+        ok("/download"),
+        ("/download/mac?arch=arm64", StatusCode::FOUND, "/download".to_owned()),
+        ("/install-linux.sh", StatusCode::NOT_FOUND, String::new()),
+        ok("/assets/demo.js"),
+        ok("/assets/screens/palette_dark.webp"),
+        ok("/assets/site.css"),
+        ok("/login"),
+        ok("/signup"),
+        ("/tins", StatusCode::TEMPORARY_REDIRECT, "/login?next=%2Ftins&notice=sign_in_first".to_owned()),
+        ("/account", StatusCode::PERMANENT_REDIRECT, "/tins".to_owned()),
+        ok("/robots.txt"),
+        ok("/sitemap.xml"),
+        ok("/site.webmanifest"),
+    ];
+    for host in ["buwiz.com", "localhost:3008", "ebirforms.buwiz.com"] {
+        assert_eq!(answers(&site, host).await, expected, "{host}");
+    }
+    let home = text(site.on_host("buwiz.com", "/").await).await;
+    assert!(home.contains("<title>Buwiz: Philippine tax filing, made modern</title>"));
+    assert!(!home.contains("Buwiz Bot"));
+    let robots = text(site.on_host("localhost:3008", "/robots.txt").await).await;
+    assert!(robots.ends_with("Sitemap: https://buwiz.com/sitemap.xml\n"), "{robots}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn once_split_the_filing_site_answers_on_its_own_host_as_before(db: PgPool) {
+    let before = Site::new(db.clone());
+    let split = Site::split(db);
+    assert_eq!(answers(&split, "ebirforms.buwiz.com").await, answers(&before, "buwiz.com").await);
+    for host in ["forms.buwiz.com", "ebirforms.buwiz.com"] {
+        let home = text(split.on_host(host, "/").await).await;
+        assert!(home.contains("<title>Buwiz: Philippine tax filing, made modern</title>"), "{host}");
+        assert!(home.contains(r#"<link rel="canonical" href="https://ebirforms.buwiz.com/">"#), "{host}");
+        assert!(
+            home.contains(
+                r#"<meta property="og:image" content="https://ebirforms.buwiz.com/assets/brand/og-image.png">"#
+            ),
+            "{host}"
+        );
+    }
+    let robots = text(split.on_host("ebirforms.buwiz.com", "/robots.txt").await).await;
+    assert!(robots.ends_with("Sitemap: https://ebirforms.buwiz.com/sitemap.xml\n"), "{robots}");
+    let sitemap = text(split.on_host("ebirforms.buwiz.com", "/sitemap.xml").await).await;
+    assert!(sitemap.contains("<loc>https://ebirforms.buwiz.com/</loc>"), "{sitemap}");
+    // The account and API hosts are as they were.
+    assert_eq!(location(&split.on_host("account.buwiz.com", "/").await), "/account");
+    assert_eq!(split.on_host("account.buwiz.com", "/login").await.status(), StatusCode::OK);
+    assert_eq!(split.on_host("api.buwiz.com", "/").await.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
+    let site = Site::split(db);
+    let page = site.on_host("buwiz.com", "/").await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = text(page).await;
+    for part in [
+        "<title>Buwiz Bot</title>",
+        r#"<meta name="description" content="Buwiz Bot is a native Mac assistant"#,
+        r#"<link rel="canonical" href="https://buwiz.com/">"#,
+        "<h1>Buwiz Bot</h1>",
+        "A native Mac assistant that runs your bots, your forms and your books in one fast app.",
+        "Coming soon · Mac with Apple silicon",
+        r#"Also from Buwiz: <a href="https://ebirforms.buwiz.com">eBIRForms</a> · Buwiz Books"#,
+        r#"<a class="btn btn-ghost" href="http://localhost:3008/login">Sign in</a>"#,
+        r#"<a class="btn btn-solid" href="http://localhost:3008/signup">Create account</a>"#,
+    ] {
+        assert!(page.contains(part), "{part}: {page}");
+    }
+    // Nothing to download, and the account buttons only in the header.
+    let main = page.split("<main").nth(1).unwrap();
+    for gone in ["download", "<button", "btn", "/login", "/signup", "demo.js", "og:image"] {
+        assert!(!main.contains(gone), "{gone}: {main}");
+    }
+    assert!(!page.contains("og:image") && !page.contains("noindex"));
+
+    let robots = text(site.on_host("buwiz.com", "/robots.txt").await).await;
+    assert!(robots.starts_with("User-agent: *\nAllow: /\n"), "{robots}");
+    assert!(robots.ends_with("Sitemap: https://buwiz.com/sitemap.xml\n"), "{robots}");
+    let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
+    assert_eq!(sitemap.matches("<loc>").count(), 1, "{sitemap}");
+    assert!(sitemap.contains("<loc>https://buwiz.com/</loc>"), "{sitemap}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn once_split_the_bot_host_sends_filing_and_sign_in_pages_on(db: PgPool) {
+    let site = Site::split(db);
+    for (path, target) in [
+        ("/download/mac?arch=arm64", format!("{FORMS}/download/mac?arch=arm64")),
+        ("/download", format!("{FORMS}/download")),
+        ("/install-linux.sh", format!("{FORMS}/install-linux.sh")),
+        ("/assets/demo.js", format!("{FORMS}/assets/demo.js")),
+        ("/assets/screens/palette_dark.webp", format!("{FORMS}/assets/screens/palette_dark.webp")),
+        ("/login?next=%2Ftins", format!("{ORIGIN}/login?next=%2Ftins")),
+        ("/signup", format!("{ORIGIN}/signup")),
+        ("/login/verify?email=a%40b.test", format!("{ORIGIN}/login/verify?email=a%40b.test")),
+        ("/tins", format!("{ORIGIN}/tins")),
+        ("/tins/new", format!("{ORIGIN}/tins/new")),
+    ] {
+        for method in [Method::GET, Method::HEAD] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header(header::HOST, "buwiz.com")
+                .body(Body::empty());
+            let response = site.send(request.unwrap()).await;
+            assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY, "{method} {path}");
+            assert_eq!(location(&response), target, "{method} {path}");
+        }
+    }
+    // Everything else is served here as before.
+    for path in ["/assets/site.css", "/assets/brand/icon-512.png", "/site.webmanifest"] {
+        assert_eq!(site.on_host("buwiz.com", path).await.status(), StatusCode::OK, "{path}");
+    }
+    for path in ["/.well-known/jwks.json", "/.well-known/oauth-authorization-server", "/me", "/device"] {
+        assert_ne!(site.on_host("buwiz.com", path).await.status(), StatusCode::MOVED_PERMANENTLY, "{path}");
+    }
+    assert_eq!(location(&site.on_host("buwiz.com", "/account").await), "/tins");
+    let sent = site
+        .send(
+            Request::post("/auth/email/start")
+                .header(header::HOST, "buwiz.com")
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("email=ana%40example.test"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(sent.status(), StatusCode::SEE_OTHER);
+    assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sign_in_links_go_to_the_account_host(db: PgPool) {
+    let site = Site::new(db);
+    let home = text(site.on_host("buwiz.com", "/").await).await;
+    let header = home.split("<header").nth(1).unwrap().split("</header>").next().unwrap();
+    assert!(header.contains(r#"<a class="btn btn-ghost" href="http://localhost:3008/login">Sign in</a>"#), "{header}");
+    assert!(header.contains(r#"<a class="btn btn-solid" href="http://localhost:3008/signup">"#), "{header}");
+    let account = home.split(r#"<section id="account""#).nth(1).unwrap().split("</section>").next().unwrap();
+    assert!(account.contains(r#"href="http://localhost:3008/signup""#), "{account}");
+    assert!(account.contains(r#"href="http://localhost:3008/login""#), "{account}");
+    assert!(!account.contains(r#"href="/login""#) && !account.contains(r#"href="/signup""#), "{account}");
+    // The sign-in pages' own switch links stay on their host.
+    let login = text(site.get("/login", "").await).await;
+    let card = login.split("</header>").nth(1).unwrap();
+    assert!(card.contains(r#"href="/signup"#), "{card}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn download_counts_are_kept_per_app(db: PgPool) {
+    let app: String =
+        sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_name = 'download_counts' AND column_name = 'app'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(app, "'ebirforms'::text");
+    let key: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+         WHERE i.indrelid = 'download_counts'::regclass AND i.indisprimary
+         ORDER BY array_position(i.indkey, a.attnum)",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(key, ["app", "day", "version", "platform", "arch", "kind"]);
+
+    let (releases, url) = FakeReleases::start().await;
+    releases.set_latest(&latest_json(&[]));
+    let site = Site::with_downloads(db.clone(), &url);
+    let person = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
+    let request = Request::get("/download/mac").header(header::HOST, "buwiz.com").header(header::USER_AGENT, person);
+    assert_eq!(site.send(request.body(Body::empty()).unwrap()).await.status(), StatusCode::FOUND);
+    // Another app's count of the same file and day is its own row, and not
+    // in this app's totals.
+    sqlx::query(
+        "INSERT INTO download_counts (app, day, version, platform, arch, kind, count)
+         SELECT 'bot', day, version, platform, arch, kind, 5 FROM download_counts",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT app, count FROM download_counts ORDER BY app").fetch_all(&db).await.unwrap();
+    assert_eq!(rows, [("bot".to_owned(), 5), ("ebirforms".to_owned(), 1)]);
+    assert_eq!(
+        downloads::totals(&db).await.unwrap(),
+        [Total { platform: Platform::Mac, arch: Arch::Universal, kind: Kind::Dmg, count: 1 }]
+    );
 }

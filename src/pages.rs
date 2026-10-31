@@ -10,12 +10,11 @@ use topcoat::context::{Cx, app_context};
 use topcoat::router::error::redirect;
 use topcoat::router::request::{headers, uri};
 use topcoat::router::{Router, Slot, layout, page};
-use topcoat::view::{View, ViewExt, component, view};
+use topcoat::view::{View, component, view};
 use uuid::Uuid;
 
 use crate::accounts::{self, Account};
 use crate::agents::{self, AuthorizeProblem};
-use crate::canonical::Site;
 use crate::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::devices;
 use crate::notice::Notice;
@@ -23,7 +22,6 @@ use crate::oauth;
 use crate::state::AppState;
 use crate::web::{link, safe_next, session_account};
 
-mod bot;
 mod download;
 mod home;
 mod staff;
@@ -57,11 +55,6 @@ fn state(cx: &Cx) -> &AppState {
 
 fn fail(error: impl Display) -> topcoat::Error {
     std::io::Error::other(error.to_string()).into()
-}
-
-/// The site the request's host serves (see [`Site::for_host`]).
-fn site(cx: &Cx) -> Site {
-    Site::for_host(host(cx), state(cx).config.site_split)
 }
 
 fn host(cx: &Cx) -> &str {
@@ -126,8 +119,7 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let path = uri(cx).path().to_owned();
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let waiting = if staff_area { crate::staff::open_counts(&state(cx).db).await?.0 } else { 0 };
-    let bot = path == "/" && site(cx) == Site::Bot;
-    let mut head = if bot { bot::HEAD } else { head_for(&path) };
+    let mut head = head_for(&path);
     // Search engines find the download page once there is something on it.
     if path == "/download" && state(cx).downloads.latest().await.is_none() {
         head.index = false;
@@ -143,9 +135,7 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>(head.title)</title>
                 <meta name="description" content=(head.description)>
-                if bot {
-                    <link rel="canonical" href=(url)>
-                } else if head.index {
+                if head.index {
                     home::public_head(url: url, origin: forms_origin, title: head.title, description: head.description)
                 } else {
                     <meta name="robots" content="noindex">

@@ -76,7 +76,8 @@ pub async fn host_roots(State(account_origin): State<Arc<str>>, request: Request
     }
 }
 
-/// On the Bot site, serves the Bot page at `/` and its bundle under `/bot/`
+/// On the Bot site, serves the Bot app's pages (`/`, `/mini-apps`) and its
+/// bundle under `/bot/`
 /// (see [`bot_site`]), and sends the filing site's pages to
 /// [`Config::forms_origin`] and the sign-in pages to the account host, both
 /// with a 301. Everything else, and every host while the site is not split,
@@ -91,8 +92,8 @@ pub async fn split_site(State(state): State<AppState>, request: Request, next: N
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if path == "/" {
-        return bot_site::index(config);
+    if bot_site::is_page(path) {
+        return bot_site::index(config, path);
     }
     if let Some(file) = path.strip_prefix("/bot/") {
         return bot_site::file(file);

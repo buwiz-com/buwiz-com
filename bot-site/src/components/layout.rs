@@ -1,4 +1,4 @@
-use crate::app::{ThemeContext, meta_content};
+use crate::app::ThemeContext;
 use leptos::ev;
 use leptos::prelude::*;
 use leptos_router::hooks::use_location;
@@ -87,11 +87,6 @@ pub fn Layout(children: Children) -> impl IntoView {
         set_is_menu_open.set(false);
     });
 
-    // Filled in by the server; see index.html.
-    let account = meta_content("buwiz-account-origin");
-    let (sign_in, sign_up) = (format!("{account}/login"), format!("{account}/signup"));
-    let forms = meta_content("buwiz-forms-origin");
-
     let is_dark = move || {
         if let Some(ctx) = theme_context {
             ctx.0.get() == "dark"
@@ -114,9 +109,7 @@ pub fn Layout(children: Children) -> impl IntoView {
                     // Desktop Navigation
                     <nav class="hidden md:flex items-center gap-8" aria-label="Primary">
                         <NavItem href="/" label="Home" base_class="text-xs tracking-widest uppercase font-semibold" />
-                        <a href=forms.clone() class="text-xs tracking-widest uppercase font-semibold border-b-2 pb-1 transition-colors duration-200 cursor-pointer active:opacity-80 text-gc-text-muted border-transparent hover:text-gc-brand hover:border-gc-brand">
-                            "eBIRForms"
-                        </a>
+                        <NavItem href="/mini-apps" label="Mini apps" base_class="text-xs tracking-widest uppercase font-semibold" />
                     </nav>
 
                     // Desktop CTA & Controls
@@ -126,12 +119,6 @@ pub fn Layout(children: Children) -> impl IntoView {
                                 {move || if is_dark() { "light_mode" } else { "dark_mode" }}
                             </span>
                         </button>
-                        <a href=sign_in.clone() class="text-gc-text-muted hover:text-gc-brand px-3 py-2.5 rounded-md text-xs tracking-widest uppercase font-semibold cursor-pointer active:opacity-80 transition-colors inline-block text-center">
-                            "Sign in"
-                        </a>
-                        <a href=sign_up.clone() class="bg-gc-brand text-white px-6 py-2.5 rounded-md text-xs tracking-widest uppercase font-semibold cursor-pointer active:opacity-80 hover:bg-gc-brand-hover transition-all inline-block text-center">
-                            "Create account"
-                        </a>
                     </div>
 
                     // Mobile controls
@@ -166,20 +153,13 @@ pub fn Layout(children: Children) -> impl IntoView {
                         base_class="text-3xl tracking-tighter uppercase font-black"
                         on_click=close_menu
                     />
-                    <a href=forms on:click=move |_| set_is_menu_open.set(false) class="text-3xl tracking-tighter uppercase font-black border-b-2 pb-1 transition-colors duration-200 cursor-pointer active:opacity-80 text-gc-text-muted border-transparent hover:text-gc-brand hover:border-gc-brand">
-                        "eBIRForms"
-                    </a>
+                    <NavItem
+                        href="/mini-apps"
+                        label="Mini apps"
+                        base_class="text-3xl tracking-tighter uppercase font-black"
+                        on_click=close_menu
+                    />
                 </nav>
-                // Mobile CTA
-                <a href=sign_up on:click=move |_| set_is_menu_open.set(false) class="bg-gc-brand text-white px-10 py-4 rounded-md text-sm tracking-widest uppercase font-bold hover:bg-gc-brand-hover transition-all text-center">
-                    "Create account"
-                </a>
-                // Mobile secondary link
-                <div class="mt-10 flex items-center gap-6">
-                    <a href=sign_in on:click=move |_| set_is_menu_open.set(false) class="text-xs tracking-widest uppercase text-gc-text-faint hover:text-gc-brand transition-colors">
-                        "Sign in"
-                    </a>
-                </div>
             </div>
 
             <main class="flex-grow w-full">

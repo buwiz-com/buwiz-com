@@ -13,6 +13,7 @@ document.documentElement.classList.add("js");
     for (const timer of document.querySelectorAll("[data-expires-at]")) codeTimer(timer);
     for (const form of document.querySelectorAll("form[data-addtin]")) addTin(form);
     for (const viewer of document.querySelectorAll(".viewer")) documentViewer(viewer);
+    for (const button of document.querySelectorAll("button[data-copy]")) copier(button);
 
     // Files chosen in a drop zone: show the name and size, flag big files.
     document.addEventListener("change", (event) => {
@@ -617,6 +618,30 @@ document.documentElement.classList.add("js");
       if (button.hasAttribute("data-rotate")) look.turn = (look.turn + 90) % 360;
       looks.set(image, look);
       image.style.transform = `rotate(${look.turn}deg) scale(${look.zoom})`;
+    });
+  }
+
+  // A Copy button beside text to copy (the Linux install command), shown
+  // only where the clipboard can be written; the text itself stays
+  // selectable. The group's status line says what happened, aloud too.
+  function copier(button) {
+    if (!navigator.clipboard) return;
+    button.hidden = false;
+    const status = button.closest("[data-copy-group]").querySelector('[role="status"]');
+    let clear = 0;
+    button.addEventListener("click", () => {
+      navigator.clipboard.writeText(button.dataset.copy).then(
+        () => {
+          status.textContent = "Copied";
+        },
+        () => {
+          status.textContent = "Could not copy; select the text instead";
+        },
+      );
+      clearTimeout(clear);
+      clear = setTimeout(() => {
+        status.textContent = "";
+      }, 4000);
     });
   }
 

@@ -33,7 +33,7 @@ pub fn Home() -> impl IntoView {
             <Title text="Buwiz Bot: AI coworkers that work on a computer you host" />
             <Meta
                 name="description"
-                content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents. For Mac, Windows and Linux."
+                content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents."
             />
 
             <div class="relative min-h-screen">

@@ -184,7 +184,6 @@ pub fn Layout(children: Children) -> impl IntoView {
                         <nav aria-label="Footer">
                             <ul class="flex flex-col gap-3 text-sm">
                                 <li><a href="/mini-apps" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Mini apps"</a></li>
-                                <li><a href="/download" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Download for Mac, Windows and Linux"</a></li>
                                 <li><a href="https://ebirforms.buwiz.com/" class="text-gc-text-muted hover:text-gc-brand transition-colors">"eBIRForms: BIR tax filing"</a></li>
                                 <li><a href="https://account.buwiz.com/" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Buwiz account"</a></li>
                                 <li><a href="https://github.com/buwiz-bot/buwiz-bot" rel="noopener" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Source code on GitHub"</a></li>

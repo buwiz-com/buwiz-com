@@ -32,7 +32,7 @@ pub const PAGES: &[Page] = &[
     Page {
         path: "/",
         title: "Buwiz Bot: AI coworkers that work on a computer you host",
-        description: "Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents. For Mac, Windows and Linux.",
+        description: "Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents.",
         prerender: "prerender/home.html",
     },
     Page {

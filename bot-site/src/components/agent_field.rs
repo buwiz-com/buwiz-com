@@ -43,10 +43,8 @@ fn prefers_reduced_motion() -> bool {
 }
 
 fn brand_rgb() -> (u8, u8, u8) {
-    let hex = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.document_element())
-        .and_then(|el| w_computed(&el));
+    let hex =
+        web_sys::window().and_then(|w| w.document()).and_then(|d| d.document_element()).and_then(|el| w_computed(&el));
     parse_hex(hex.as_deref().unwrap_or("#3b82f6"))
 }
 
@@ -55,11 +53,7 @@ fn w_computed(el: &web_sys::Element) -> Option<String> {
     let style = window.get_computed_style(el).ok().flatten()?;
     let value = style.get_property_value("--gc-brand").ok()?;
     let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
 fn parse_hex(input: &str) -> (u8, u8, u8) {
@@ -137,10 +131,7 @@ fn start_field(canvas: web_sys::HtmlCanvasElement) {
         let canvas = canvas.clone();
         window_event_listener(ev::mousemove, move |evt| {
             let rect = canvas.get_bounding_client_rect();
-            mouse.set((
-                evt.client_x() as f32 - rect.left() as f32,
-                evt.client_y() as f32 - rect.top() as f32,
-            ));
+            mouse.set((evt.client_x() as f32 - rect.left() as f32, evt.client_y() as f32 - rect.top() as f32));
         })
     });
 
@@ -182,17 +173,11 @@ fn start_field(canvas: web_sys::HtmlCanvasElement) {
 }
 
 fn context(canvas: &web_sys::HtmlCanvasElement) -> Option<web_sys::CanvasRenderingContext2d> {
-    canvas
-        .get_context("2d")
-        .ok()
-        .flatten()
-        .and_then(|obj| obj.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+    canvas.get_context("2d").ok().flatten().and_then(|obj| obj.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
 }
 
 fn size_canvas(canvas: &web_sys::HtmlCanvasElement) -> (f32, f32, f64) {
-    let dpr = web_sys::window()
-        .map(|w| w.device_pixel_ratio().clamp(1.0, 2.0))
-        .unwrap_or(1.0);
+    let dpr = web_sys::window().map(|w| w.device_pixel_ratio().clamp(1.0, 2.0)).unwrap_or(1.0);
     let w = canvas.client_width().max(1) as f32;
     let h = canvas.client_height().max(1) as f32;
     canvas.set_width((w as f64 * dpr) as u32);
@@ -200,11 +185,7 @@ fn size_canvas(canvas: &web_sys::HtmlCanvasElement) -> (f32, f32, f64) {
     (w, h, dpr)
 }
 
-fn rebuild(
-    canvas: &web_sys::HtmlCanvasElement,
-    particles: &Rc<RefCell<Vec<Particle>>>,
-    rng: &Rc<RefCell<Rng>>,
-) {
+fn rebuild(canvas: &web_sys::HtmlCanvasElement, particles: &Rc<RefCell<Vec<Particle>>>, rng: &Rc<RefCell<Rng>>) {
     let (w, h, _) = size_canvas(canvas);
     let cols = ((w / 88.0).round() as usize).clamp(6, 14);
     let rows = ((h / 88.0).round() as usize).clamp(4, 10);
@@ -214,14 +195,7 @@ fn rebuild(
         for col in 0..cols {
             let ox = (col as f32 + 0.5) * (w / cols as f32) + (rng.f32() - 0.5) * 18.0;
             let oy = (row as f32 + 0.5) * (h / rows as f32) + (rng.f32() - 0.5) * 18.0;
-            next.push(Particle {
-                x: ox,
-                y: oy,
-                vx: 0.0,
-                vy: 0.0,
-                ox,
-                oy,
-            });
+            next.push(Particle { x: ox, y: oy, vx: 0.0, vy: 0.0, ox, oy });
         }
     }
     *particles.borrow_mut() = next;
@@ -235,9 +209,7 @@ fn step(
     packets: &Rc<RefCell<Vec<Packet>>>,
     rng: &Rc<RefCell<Rng>>,
 ) {
-    let dpr = web_sys::window()
-        .map(|w| w.device_pixel_ratio().clamp(1.0, 2.0))
-        .unwrap_or(1.0);
+    let dpr = web_sys::window().map(|w| w.device_pixel_ratio().clamp(1.0, 2.0)).unwrap_or(1.0);
     let w = canvas.client_width().max(1) as f32;
     let h = canvas.client_height().max(1) as f32;
     let _ = ctx.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0);

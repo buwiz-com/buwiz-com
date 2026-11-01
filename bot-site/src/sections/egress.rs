@@ -1,7 +1,11 @@
 use leptos::{html, prelude::*};
 
-use crate::components::agent_window::{AgentScreen, AgentWindow, FINANCE, FINANCE_RAIL, PaneIcon, PaneIcons, box_desktop, chrome, dock_apps, svg_globe};
-use crate::components::demo_player::{DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible, in_view};
+use crate::components::agent_window::{
+    AgentScreen, AgentWindow, FINANCE, FINANCE_RAIL, PaneIcon, PaneIcons, box_desktop, chrome, dock_apps, svg_globe,
+};
+use crate::components::demo_player::{
+    DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible, in_view,
+};
 
 /// Egress, inside the NativeChat window: rail, chat, and Finance's computer pane. Finance's
 /// computer runs in a datacenter, so a Facebook login there trips new-location checks. Routing
@@ -19,8 +23,10 @@ const EMAIL: &str = "finance@goldcoders.dev";
 const DOTS: &str = "••••••••••";
 const CODE: &str = "482913";
 
-const TIP_OFF: &str = "Traffic goes out on its own. Click to route web traffic from all your computers through this desktop instead.";
-const TIP_ON: &str = "Routing traffic through this desktop for all your computers. New connections go out through it. Click to stop.";
+const TIP_OFF: &str =
+    "Traffic goes out on its own. Click to route web traffic from all your computers through this desktop instead.";
+const TIP_ON: &str =
+    "Routing traffic through this desktop for all your computers. New connections go out through it. Click to stop.";
 const TIP_NEVER: &str = "Use your network from this computer: Never. Click to change. Applies to this computer only.";
 const TIP_ASK: &str = "Use your network from this computer: Ask. Click to change. Applies to this computer only.";
 
@@ -48,7 +54,6 @@ enum Tip {
     Globe,
     Shield,
 }
-
 
 #[derive(Clone)]
 struct Msg {
@@ -148,7 +153,6 @@ impl E {
         self.tl.after(1900, move || self.pulse.set(false));
     }
 
-
     /// The thumbnail grows to fill the window.
     fn expand(self) {
         self.screen.expand();
@@ -192,14 +196,15 @@ fn fb_chrome(e: E) -> impl IntoView {
         FB_FONT,
         move || match e.page.get() {
             Page::Login => fb_login(e).into_any(),
-            Page::NewPlace => fb_check(e, "We noticed a login from a new location", 2, fb_new_place().into_any()).into_any(),
+            Page::NewPlace => {
+                fb_check(e, "We noticed a login from a new location", 2, fb_new_place().into_any()).into_any()
+            }
             Page::Code => fb_check(e, "Check your email", 3, fb_code(e).into_any()).into_any(),
             Page::Approve => fb_check(e, "Approve this login on your phone", 4, fb_approve().into_any()).into_any(),
             Page::Posted => fb_posted().into_any(),
         },
     )
 }
-
 
 const FB_FIELD: &str = "flex h-10 items-center rounded-md border border-[#dddfe2] bg-white px-3 text-[14px]";
 
@@ -372,12 +377,17 @@ fn box_screen(e: E) -> impl IntoView {
     )
 }
 
-
 const OPT: &str = "cursor-default rounded-full border border-gc-border bg-gc-bg-card px-3.5 py-1.5 text-[13px] font-medium text-gc-text";
-const OPT_PICKED: &str = "rounded-full border border-gc-text bg-gc-text px-3.5 py-1.5 text-[13px] font-medium text-gc-bg";
-const OPT_OFF: &str = "rounded-full border border-gc-border bg-gc-bg-card px-3.5 py-1.5 text-[13px] font-medium text-gc-text opacity-45";
+const OPT_PICKED: &str =
+    "rounded-full border border-gc-text bg-gc-text px-3.5 py-1.5 text-[13px] font-medium text-gc-bg";
+const OPT_OFF: &str =
+    "rounded-full border border-gc-border bg-gc-bg-card px-3.5 py-1.5 text-[13px] font-medium text-gc-text opacity-45";
 
-fn chips(picked: ArcRwSignal<Option<usize>>, labels: &'static [&'static str], aim: NodeRef<html::Div>) -> impl IntoView {
+fn chips(
+    picked: ArcRwSignal<Option<usize>>,
+    labels: &'static [&'static str],
+    aim: NodeRef<html::Div>,
+) -> impl IntoView {
     let picked = RwSignal::from(picked);
     view! {
         <div class="flex flex-wrap gap-2">
@@ -508,7 +518,8 @@ fn path_a(s: &mut Script, e: E) {
     ask_and_login(s, e);
     s.then(move || {
         e.fb(Page::NewPlace);
-        e.caption.set("Right password, wrong place. Facebook sees a hosting network in Singapore and flags a new location.");
+        e.caption
+            .set("Right password, wrong place. Facebook sees a hosting network in Singapore and flags a new location.");
     })
     .wait(1700);
     next_page(s, e, Page::Code);

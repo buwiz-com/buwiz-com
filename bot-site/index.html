@@ -14,9 +14,7 @@
       function setCookie(name, value) {
         var h = location.hostname;
         var domain = "";
-        if (h.indexOf('goldcoders.dev') !== -1) {
-          domain = "; domain=.goldcoders.dev";
-        } else if (h.indexOf('.localhost') !== -1) {
+        if (h.indexOf('.localhost') !== -1) {
           domain = "; domain=localhost";
         }
         var cookie = name + '=' + value + '; path=/; max-age=31536000; SameSite=Lax' + domain;

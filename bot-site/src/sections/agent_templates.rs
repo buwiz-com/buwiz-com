@@ -1,6 +1,8 @@
 use leptos::{html, prelude::*};
 
-use crate::components::agent_window::{AgentScreen, AgentWindow, Coworker, GENIE, GENIE_RAIL, PaneIcon, PaneIcons, box_desktop, dock_apps};
+use crate::components::agent_window::{
+    AgentScreen, AgentWindow, Coworker, GENIE, GENIE_RAIL, PaneIcon, PaneIcons, box_desktop, dock_apps,
+};
 use crate::components::demo_player::{Aim, DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible};
 use crate::components::tool_icons::{IconSize, Tool, tool_icon};
 
@@ -35,7 +37,8 @@ const C_SIGNIN: &str = "They sign in to their own accounts. Your logins never tr
 const C_READY: &str = "Same coworker, their logins. It files the form the way yours did.";
 
 const DESCRIPTION: &str = "Tax clerk: files BIR forms in Buwiz Forms, books entries in Buwiz Books.";
-const INSTRUCTIONS: &str = "Tax clerk. Files BIR forms in Buwiz Forms and books entries in Buwiz Books. Confirms totals before filing.";
+const INSTRUCTIONS: &str =
+    "Tax clerk. Files BIR forms in Buwiz Forms and books entries in Buwiz Books. Confirms totals before filing.";
 const MEMORIES: [&str; 4] = [
     "The owner wants receipts booked the same day.",
     "2550Q totals come from Buwiz Books, not from memory.",
@@ -61,15 +64,18 @@ const OWNER_ROUTINE: (&str, &str) = ("Quarter-end filing", "Quarterly");
 /// Buwiz Clerk's dock, in install order.
 const DOCK: [Tool; 5] = [Tool::Chromium, Tool::BuwizBooks, Tool::BuwizForms, Tool::Office, Tool::Terminal];
 /// The Computer & software page: four tools, then the recipes (None).
-const CARRIED: [Option<Tool>; 5] = [Some(Tool::BuwizForms), Some(Tool::BuwizBooks), Some(Tool::Chromium), Some(Tool::Office), None];
+const CARRIED: [Option<Tool>; 5] =
+    [Some(Tool::BuwizForms), Some(Tool::BuwizBooks), Some(Tool::Chromium), Some(Tool::Office), None];
 
 const ICO: &str = "grid h-7 w-7 shrink-0 place-items-center rounded-lg text-gc-text-muted";
 const SEC: &str = "text-[11.5px] font-semibold text-gc-text";
 const BOX: &str = "rounded-xl border border-gc-border px-3";
-const ROW: &str = "flex min-w-0 items-center gap-2.5 border-b border-gc-border py-2 text-[13px] text-gc-text last:border-b-0";
+const ROW: &str =
+    "flex min-w-0 items-center gap-2.5 border-b border-gc-border py-2 text-[13px] text-gc-text last:border-b-0";
 const TILE: &str = "grid shrink-0 place-items-center rounded-lg border border-gc-border bg-gc-bg-muted text-gc-text";
 const PUBLISH: &str = "shrink-0 rounded-full bg-gc-text px-3.5 py-1.5 text-[12.5px] font-semibold text-gc-bg";
-const OUTLINE: &str = "shrink-0 rounded-full border border-gc-border px-3 py-1.5 text-[12.5px] font-semibold text-gc-text";
+const OUTLINE: &str =
+    "shrink-0 rounded-full border border-gc-border px-3 py-1.5 text-[12.5px] font-semibold text-gc-text";
 const TAG: &str = "shrink-0 rounded-full border border-gc-accent/50 px-2 py-0.5 text-[11px] font-semibold text-gc-text";
 const CHIP_OFF: &str = "inline-flex items-center rounded-lg border border-dashed border-gc-border-strong bg-transparent px-2.5 py-1 font-mono text-[12px] text-gc-text-muted line-through";
 
@@ -239,25 +245,43 @@ impl T {
 }
 
 /// Glide to `aim`, light it, press, then `f`. No settle afterwards.
-fn press_on(s: &mut Script, cur: DemoCursor, aim: impl Into<Aim>, on: impl FnOnce() + 'static, f: impl FnOnce() + 'static) {
+fn press_on(
+    s: &mut Script,
+    cur: DemoCursor,
+    aim: impl Into<Aim>,
+    on: impl FnOnce() + 'static,
+    f: impl FnOnce() + 'static,
+) {
     s.move_to(cur, aim).then(on).wait(250).press(cur).wait(170).then(f);
 }
 
 /// The cursor rests on a toolbar icon, which lights up, then clicks it.
 fn tap(s: &mut Script, cur: DemoCursor, aim: impl Into<Aim>, lit: RwSignal<bool>, f: impl FnOnce() + 'static) {
-    press_on(s, cur, aim, move || lit.set(true), move || {
-        lit.set(false);
-        f();
-    });
+    press_on(
+        s,
+        cur,
+        aim,
+        move || lit.set(true),
+        move || {
+            lit.set(false);
+            f();
+        },
+    );
     s.wait(380);
 }
 
 /// The same for a menu item or a list row.
 fn tap_lit(s: &mut Script, t: T, aim: impl Into<Aim>, which: Lit, f: impl FnOnce() + 'static) {
-    press_on(s, t.cur, aim, move || t.lit.set(which), move || {
-        t.lit.set(Lit::None);
-        f();
-    });
+    press_on(
+        s,
+        t.cur,
+        aim,
+        move || t.lit.set(which),
+        move || {
+            t.lit.set(Lit::None);
+            f();
+        },
+    );
     s.wait(380);
 }
 
@@ -298,11 +322,17 @@ fn script(s: &mut Script, t: T) {
     s.wait(600).click(t.cur, t.back, move || go_page(t, Page::List, true)).wait(100);
     tap_lit(s, t, t.rows[1], Lit::Row(1), move || go_page(t, Page::Integrations, false));
     s.wait(500).click(t.cur, t.back, move || go_page(t, Page::List, true)).wait(100);
-    press_on(s, t.cur, t.rows[2], move || t.lit.set(Lit::Row(2)), move || {
-        t.lit.set(Lit::None);
-        t.ticks.set(0);
-        go_page(t, Page::Computer, false);
-    });
+    press_on(
+        s,
+        t.cur,
+        t.rows[2],
+        move || t.lit.set(Lit::Row(2)),
+        move || {
+            t.lit.set(Lit::None);
+            t.ticks.set(0);
+            go_page(t, Page::Computer, false);
+        },
+    );
     for i in 1..=5usize {
         s.wait(180).then(move || t.ticks.set(i));
     }
@@ -366,7 +396,9 @@ fn script(s: &mut Script, t: T) {
     .wait(600)
     .then(move || t.screen.expand())
     .wait(300)
-    .then(move || t.push(Body::Bot("Setting up Buwiz Clerk: starting its computer, installing Buwiz Forms and Buwiz Books.")))
+    .then(move || {
+        t.push(Body::Bot("Setting up Buwiz Clerk: starting its computer, installing Buwiz Forms and Buwiz Books."))
+    })
     .wait(460)
     .then(move || t.boot.set(Boot::Installing));
     for i in 1..=5usize {
@@ -394,7 +426,9 @@ fn script(s: &mut Script, t: T) {
         })
         .wait(500)
         .then(move || {
-            t.push(Body::Bot("Opened Buwiz Forms and filled the 2550Q from the Buwiz Books totals. Ready for your review."));
+            t.push(Body::Bot(
+                "Opened Buwiz Forms and filled the 2550Q from the Buwiz Books totals. Ready for your review.",
+            ));
             t.forms.set(true);
         })
         .wait(100)
@@ -595,7 +629,14 @@ fn desktop(t: T) -> impl IntoView {
 }
 
 /// A row in the details list: icon tile, name over a one-line description, and what sits right.
-fn entry(aim: NodeRef<html::Div>, icon: &'static str, name: impl IntoView + 'static, desc: String, lit: Signal<bool>, right: impl IntoView + 'static) -> impl IntoView {
+fn entry(
+    aim: NodeRef<html::Div>,
+    icon: &'static str,
+    name: impl IntoView + 'static,
+    desc: String,
+    lit: Signal<bool>,
+    right: impl IntoView + 'static,
+) -> impl IntoView {
     view! {
         <div
             node_ref=aim

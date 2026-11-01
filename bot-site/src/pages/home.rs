@@ -1,7 +1,5 @@
 use crate::components::layout::Layout;
-use crate::sections::{
-    AgentCompose, AgentTemplates, Allowly, DataSwap, Egress, HomeHero, MiniApps, SecureVault,
-};
+use crate::sections::{AgentCompose, AgentTemplates, Allowly, DataSwap, Egress, HomeHero, MiniApps, SecureVault};
 use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 use leptos_meta::*;

@@ -31,3 +31,23 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # The Buwiz Bot site (bot-site/), a crate of its own built for wasm. Its
+  # dist/ is committed (bot-site/build.sh) and checked by the server's tests.
+  bot-site:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot-site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99"
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bot-site
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown --locked -- -D warnings

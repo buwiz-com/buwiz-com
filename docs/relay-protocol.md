@@ -19,7 +19,7 @@ The server is two processes:
   and the HPKE private key. It has no public address; the Gatekeeper
   reaches it on a private network (section 6).
 
-buwiz-oss `bir-submit` is the v2 client. The reference v1 client
+eBIRForms `bir-submit` (eBIRForms/eBIRForms) is the v2 client. The reference v1 client
 (`src/relay/client.rs`, `src/bin/buwiz-relay.rs`) is part of the BIR relay
 code.
 

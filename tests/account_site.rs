@@ -1256,7 +1256,7 @@ fn release_file(platform: &str, arch: &str, kind: &str, file: &str, size: u64, s
     serde_json::json!({"platform": platform, "arch": arch, "kind": kind, "file": file, "size": size, "sha256": sha})
 }
 
-/// Version 1.2.0 as the release CI (buwiz-oss) writes it, named as it names
+/// Version 1.2.0 as the release CI (eBIRForms) writes it, named as it names
 /// them, with what the first release had: no Android file, one Linux
 /// file, and an iOS entry this server does not know, plus `extra` files.
 fn latest_json(extra: &[Value]) -> Vec<u8> {

@@ -90,7 +90,7 @@ a trusted machine, not on Fly:
 
 ```sh
 cargo run --release --bin buwiz-trust-sign -- keygen trust.key
-# prints the public key: put it in buwiz-oss crates/bir-submit/src/trust.rs TRUST_KEYS
+# prints the public key: put it in eBIRForms crates/bir-submit/src/trust.rs TRUST_KEYS
 fly ssh console -a buwiz-sender -C "buwiz-sender public" > sender-keys.json
 cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.json \
   <host:port> …   # BIR's dispatcher and upload hosts, from the BIR relay's private docs
@@ -116,7 +116,7 @@ Rotation, in this order, so no app ever meets a key its list lacks:
 ## Downloads
 
 The app's installers are in R2 bucket `buwiz-releases`, public at
-`https://downloads.buwiz.com` (`DOWNLOADS_URL`, the default). The buwiz-oss
+`https://downloads.buwiz.com` (`DOWNLOADS_URL`, the default). The eBIRForms
 release CI uploads each version as:
 
 - `releases/v{VERSION}/{file}`: the installers, never changed once uploaded.

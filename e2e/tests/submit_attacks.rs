@@ -116,8 +116,8 @@ async fn a_tin_not_active_on_the_account_gets_no_ticket() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO tin_claims (account_id, tin_root, branch_code, registered_name, status)
-         VALUES ($1, '000123454', '00000', 'Someone Else', 'approved')",
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status)
+         VALUES ($1, 'personal', '000123454', '00000', 'Someone Else', 'approved')",
     )
     .bind(stranger)
     .execute(&harness.db)

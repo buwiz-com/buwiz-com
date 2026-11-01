@@ -1,3 +1,0 @@
-[net]
-# buwiz-oss is private: fetch it with the git CLI and its credentials.
-git-fetch-with-cli = true

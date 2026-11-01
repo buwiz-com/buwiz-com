@@ -336,6 +336,9 @@ impl Harness {
             admin_emails: Vec::new(),
             mail: MailConfig::Log,
             trust_list: Some(trust_list),
+            downloads_url: "http://127.0.0.1:9".into(),
+            forms_origin: base.clone(),
+            site_split: false,
         };
         let state = AppState::new(
             config,
@@ -354,8 +357,8 @@ impl Harness {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO tin_claims (account_id, tin_root, branch_code, registered_name, status, decided_at)
-             VALUES ($1, $2, '00000', 'Juana Santos', 'approved', now())",
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at)
+             VALUES ($1, 'personal', $2, '00000', 'Juana Santos', 'approved', now())",
         )
         .bind(account_id)
         .bind(TIN_ROOT)

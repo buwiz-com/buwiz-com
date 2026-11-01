@@ -63,3 +63,4 @@ open = false
 [tools]
 # Must match wasm-bindgen in Cargo.lock.
 wasm_bindgen = "0.2.114"
+tailwindcss = "4.1.7"

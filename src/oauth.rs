@@ -18,10 +18,14 @@ use crate::error::{ApiError, OAuthError, OAuthFailure};
 use crate::state::AppState;
 
 /// Public clients allowed to sign in with the device flow, with the scope
-/// each gets. They hold no secret. Only the BIR app (`app`) may file and
-/// see full TINs.
-pub const CLIENTS: &[(&str, &str, &str)] =
-    &[("buwiz-desktop", "Buwiz", SCOPE_APP), ("buwiz-books", "Buwiz Books", SCOPE_BOOKS)];
+/// each gets. They hold no secret. Only the BIR apps (`app`) may file and
+/// see full TINs: the eBIRForms desktop app and the eBIRForms mini app in
+/// Buwiz Bot.
+pub const CLIENTS: &[(&str, &str, &str)] = &[
+    ("buwiz-desktop", "Buwiz", SCOPE_APP),
+    ("buwiz-ebirforms", "eBIRForms", SCOPE_APP),
+    ("buwiz-books", "Buwiz Books", SCOPE_BOOKS),
+];
 
 const DEVICE_TTL: Duration = Duration::minutes(15);
 const DEVICE_INTERVAL: i32 = 5;
@@ -449,6 +453,15 @@ mod tests {
             assert_eq!(&code[4..5], "-");
             assert!(code.bytes().filter(|byte| *byte != b'-').all(|byte| USER_CODE_ALPHABET.contains(&byte)));
         }
+    }
+
+    #[test]
+    fn the_ebirforms_mini_app_signs_in_as_a_bir_app() {
+        assert_eq!(client_name("buwiz-ebirforms"), Some("eBIRForms"));
+        assert_eq!(client_scope("buwiz-ebirforms"), SCOPE_APP);
+        assert_eq!(client_scope("buwiz-books"), SCOPE_BOOKS);
+        assert_eq!(client_scope("an-unknown-agent"), SCOPE_MCP);
+        assert!(known_client("buwiz-ebirforms").is_ok());
     }
 
     #[test]

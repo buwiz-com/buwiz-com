@@ -12,7 +12,7 @@ second process, the Sender, is the only part that talks to BIR.
 | (private) | The Sender: BIR's passphrases, the SFTP login and the IAF encryption | `src/sender/`, `src/bin/buwiz-sender.rs`, plus `src/bir/` (not in this repository) | [docs/relay.md](docs/relay.md) |
 
 `src/canonical.rs` decides which host serves what:
-- The bare domain is the Bot site (`SITE_SPLIT`, on by default).
+- The bare domain is the Bot site, and the filing site is on `FORMS_ORIGIN`.
 - The filing site's old paths on the bare domain (`/download`, `/install-linux.sh` and the demo assets) answer with a 301 to `FORMS_ORIGIN`.
 - `www.` always redirects to the bare domain.
 - The account and API hosts are `noindex`.

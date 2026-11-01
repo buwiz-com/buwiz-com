@@ -1,4 +1,4 @@
-//! The Buwiz Bot site, on the bare domain once the site is split (see
+//! The Buwiz Bot site, on the bare domain (see
 //! [`crate::canonical::Site`]). It is the Leptos app in `bot-site/`, built
 //! with Trunk into `bot-site/dist/` (`bot-site/build.sh`) and embedded in
 //! the binary: `/` and the app's other [`PAGES`] are its `index.html`, and

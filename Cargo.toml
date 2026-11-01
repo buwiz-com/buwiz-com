@@ -95,7 +95,7 @@ rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-russh = { version = "0.63", default-features = false, features = ["flate2", "ring"], optional = true }
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring"], optional = true }
 russh-sftp = { version = "3", optional = true }
 # The Bot site (`bot-site/dist/`), embedded in debug builds too.
 rust-embed = { version = "8", features = ["debug-embed"] }

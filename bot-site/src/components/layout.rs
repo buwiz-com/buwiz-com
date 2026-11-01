@@ -1,5 +1,8 @@
 use crate::app::ThemeContext;
+use crate::bot_meta::{BotMeta, REPO_URL};
+use crate::components::AgentField;
 use leptos::ev;
+use leptos::html;
 use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 
@@ -56,8 +59,41 @@ fn NavItem(
     }
 }
 
+/// The particle field and the mouse glow, fixed behind every page: one
+/// viewport-sized canvas, so it costs the same however long the page is.
+#[component]
+fn Backdrop() -> impl IntoView {
+    let layer = NodeRef::<html::Div>::new();
+
+    Effect::new(move |_| {
+        let Some(el) = layer.get() else {
+            return;
+        };
+        let node: web_sys::HtmlElement = el.clone().into();
+        let handle = window_event_listener(ev::mousemove, move |evt| {
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let width = window.inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(1.0).max(1.0);
+            let height = window.inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(1.0).max(1.0);
+            let x = evt.client_x() as f64 / width * 100.0;
+            let y = evt.client_y() as f64 / height * 100.0;
+            let _ = node.style().set_property("--mx", &format!("{x:.1}%"));
+            let _ = node.style().set_property("--my", &format!("{y:.1}%"));
+        });
+        on_cleanup(move || drop(handle));
+    });
+
+    view! {
+        <div node_ref=layer class="fixed inset-0 z-0 pointer-events-none gc-spot" aria-hidden="true">
+            <AgentField />
+        </div>
+    }
+}
+
 #[component]
 pub fn Layout(children: Children) -> impl IntoView {
+    let stars = use_context::<BotMeta>().unwrap_or_default().star_label();
     let (is_menu_open, set_is_menu_open) = signal(false);
 
     let theme_context = use_context::<ThemeContext>();
@@ -85,6 +121,7 @@ pub fn Layout(children: Children) -> impl IntoView {
 
     view! {
         <div class="min-h-screen bg-gc-bg text-gc-text font-sans selection:bg-gc-brand/20 selection:text-gc-brand flex flex-col">
+            <Backdrop />
             <header class="bg-gc-bg-elevated/95 backdrop-blur-md border-b border-gc-border sticky top-0 z-50">
                 <div class="flex justify-between items-center w-full px-6 md:px-8 h-16 md:h-20 max-w-[1440px] mx-auto">
                     // Logo
@@ -150,37 +187,36 @@ pub fn Layout(children: Children) -> impl IntoView {
                 </nav>
             </div>
 
-            <main class="flex-grow w-full">
+            <main class="relative z-10 flex-grow w-full">
                 {children()}
             </main>
 
-            // One short line on what Buwiz is, links to real pages only (each
-            // named for what it is, so the anchor text says it), and the
-            // copyright. index.html carries the same facts as JSON-LD and as
-            // plain links for crawlers that do not run the app.
-            <footer class="bg-gc-bg-elevated w-full border-t border-gc-border">
-                <div class="flex flex-col gap-8 px-6 md:px-8 py-12 max-w-[1440px] mx-auto">
-                    <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-8">
-                        <div class="flex flex-col gap-4 max-w-md">
+            // Two short rows: what Buwiz is and where to go, then the
+            // copyright and the licence. index.html carries the same facts as
+            // JSON-LD for crawlers that do not run the app.
+            <footer class="relative z-10 w-full border-t border-gc-border bg-gc-bg-elevated/70 backdrop-blur-sm">
+                <div class="flex flex-col gap-4 px-6 md:px-8 py-8 max-w-[1440px] mx-auto text-sm">
+                    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
                             <a href="/" aria-label="Buwiz home" class="w-fit">
-                                <span class="buwiz-wordmark h-7" role="img" aria-label="Buwiz"></span>
+                                <span class="buwiz-wordmark h-6" role="img" aria-label="Buwiz"></span>
                             </a>
-                            <p class="text-sm text-gc-text-muted leading-relaxed">
-                                "Buwiz Bot is an AI coworker for your desktop. Its mini apps open right in the chat, for you and your AI agent: eBIRForms to prepare and file BIR tax returns, Books for bookkeeping, and Word and Spreadsheet for documents."
-                            </p>
+                            <p class="text-gc-text-muted">"Free, open-source AI coworkers."</p>
                         </div>
-                        <nav aria-label="Footer">
-                            <ul class="flex flex-col gap-3 text-sm">
-                                <li><a href="/mini-apps" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Mini apps"</a></li>
-                                <li><a href="https://ebirforms.buwiz.com/" class="text-gc-text-muted hover:text-gc-brand transition-colors">"eBIRForms: BIR tax filing"</a></li>
-                                <li><a href="https://account.buwiz.com/" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Buwiz account"</a></li>
-                                <li><a href="https://github.com/buwiz-bot/buwiz-bot" rel="noopener" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Source code on GitHub"</a></li>
-                            </ul>
+                        <nav aria-label="Footer" class="flex items-center gap-6">
+                            <a href="/mini-apps" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Mini apps"</a>
+                            <a href=REPO_URL rel="noopener" class="inline-flex items-center gap-2 text-gc-text-muted hover:text-gc-brand transition-colors">
+                                "GitHub"
+                                {stars.map(|stars| view! { <span class="text-gc-text-faint tabular-nums">{stars}</span> })}
+                            </a>
                         </nav>
                     </div>
-                    <p class="pt-6 border-t border-gc-border text-xs text-gc-text-faint">
-                        "© 2026 Buwiz · Made in the Philippines"
-                    </p>
+                    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between text-xs">
+                        <p class="text-gc-text-faint">"© 2026 Buwiz · Made in the Philippines"</p>
+                        <span class="w-fit rounded-full border border-[#3fb58f]/30 bg-[#3fb58f]/10 px-2.5 py-0.5 font-semibold text-[#3fb58f]">
+                            "Free and open source · Apache-2.0"
+                        </span>
+                    </div>
                 </div>
             </footer>
         </div>

@@ -4,6 +4,7 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::redundant_static_lifetimes)]
 pub mod app;
+pub mod bot_meta;
 pub use app::*;
 
 pub mod components;

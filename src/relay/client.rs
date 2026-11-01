@@ -1,5 +1,5 @@
 //! The app's end of the pipe: a dumb byte forwarder that connects only to
-//! BIR. This is the reference for the buwiz-oss client.
+//! BIR. This is the reference for the eBIRForms client.
 
 use std::collections::HashMap;
 use std::time::Duration;

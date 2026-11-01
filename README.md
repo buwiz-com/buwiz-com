@@ -189,9 +189,10 @@ database, so `DATABASE_URL` must be set, e.g. from `.env`).
 `cargo test --features bir` adds the relay end to end in one process (fake
 dispatcher, SSH server with a pinned key, the app's allow-list).
 `scripts/v6.sh` runs `e2e/` (its own workspace): submission v2 with the
-real buwiz-oss client, from a queued 1701Q to a verified receipt, and the
-attacks it must refuse. It needs Docker, read access to buwiz-oss and the BIR files (e2e builds
-the server with `bir`). With `--features bir` and `BIR_IAF_PASSPHRASE` set,
+real eBIRForms client ([eBIRForms/eBIRForms](https://github.com/eBIRForms/eBIRForms), pinned by rev in
+`e2e/Cargo.toml`), from a queued 1701Q to a verified receipt, and the attacks it must refuse. It
+needs Docker and the BIR files (e2e builds the server with `bir`). `EBIRFORMS_PATH=<checkout>`
+tests a local eBIRForms checkout instead. With `--features bir` and `BIR_IAF_PASSPHRASE` set,
 `tests/iaf_golden.rs` checks the encryption against official `Encrypt.exe`
 output.
 `cargo test --features bir -- --include-ignored` also runs HTTPS through the pipe against
@@ -225,6 +226,6 @@ patch) do work under WASIX. Revisit when WASIX tokio catches up.
 ## Next
 
 1. Port the full marketing home page.
-2. The relay client in buwiz-oss (`bir-submit`), following
+2. The relay client in eBIRForms (`bir-submit`), following
    [docs/relay-protocol.md](docs/relay-protocol.md).
-3. Validate returns with buwiz-oss `bir-core` before sending.
+3. Validate returns with eBIRForms `bir-core` before sending.

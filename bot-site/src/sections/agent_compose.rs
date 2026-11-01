@@ -1,6 +1,8 @@
 use leptos::{html, prelude::*};
 
-use crate::components::agent_window::{AgentScreen, AgentWindow, GENIE, GENIE_RAIL, PaneIcon, PaneIcons, box_desktop, dock_apps};
+use crate::components::agent_window::{
+    AgentScreen, AgentWindow, GENIE, GENIE_RAIL, PaneIcon, PaneIcons, box_desktop, dock_apps,
+};
 use crate::components::demo_player::{Aim, DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible};
 use crate::components::demo_widgets::{DemoMenu, MenuItem, SelectPill, Toggle};
 
@@ -9,7 +11,8 @@ use crate::components::demo_widgets::{DemoMenu, MenuItem, SelectPill, Toggle};
 /// bot, picks skills, and sets what the Computer tools may do without asking.
 ///
 /// Everything clickable is a drawn box, never a real input or select.
-const STEPS: &[&str] = &["Add plugin", "Sign in on the web", "Pick account", "Share with bots", "Skills", "Tool permissions", "Ready"];
+const STEPS: &[&str] =
+    &["Add plugin", "Sign in on the web", "Pick account", "Share with bots", "Skills", "Tool permissions", "Ready"];
 
 const ACCOUNT: &str = "codeitlikemiley";
 const ALWAYS: &str = "Always allow";
@@ -69,7 +72,8 @@ enum Lit {
 const ICO: &str = "grid h-7 w-7 shrink-0 place-items-center rounded-lg text-gc-text-muted";
 const SEC: &str = "text-[11.5px] font-semibold text-gc-text";
 const CARD: &str = "rounded-xl bg-gc-bg-muted px-3";
-const ROW: &str = "flex min-w-0 items-center gap-2.5 border-b border-gc-border py-1.5 text-[13px] text-gc-text last:border-b-0";
+const ROW: &str =
+    "flex min-w-0 items-center gap-2.5 border-b border-gc-border py-1.5 text-[13px] text-gc-text last:border-b-0";
 const GRID: &str = "grid grid-cols-1 sm:grid-cols-2 gap-x-3.5 gap-y-0.5";
 const TILE: &str = "grid shrink-0 place-items-center rounded-lg border border-gc-border bg-gc-bg-muted text-gc-text";
 
@@ -205,11 +209,8 @@ pub fn AgentCompose() -> impl IntoView {
 
     let plug_lit = RwSignal::new(false);
     let tools_lit = RwSignal::new(false);
-    let icons = PaneIcons {
-        plug: PaneIcon::new().lit(plug_lit),
-        wrench: PaneIcon::new().lit(tools_lit),
-        ..PaneIcons::new()
-    };
+    let icons =
+        PaneIcons { plug: PaneIcon::new().lit(plug_lit), wrench: PaneIcon::new().lit(tools_lit), ..PaneIcons::new() };
     let screen = AgentScreen::new();
 
     let tl = Timeline::new();
@@ -246,7 +247,8 @@ pub fn AgentCompose() -> impl IntoView {
 
         s.then(move || {
             step.set(Some(1));
-            caption.set("Add an account. Sign-in happens on Cloudflare, through the server. The app never sees a token.");
+            caption
+                .set("Add an account. Sign-in happens on Cloudflare, through the server. The app never sees a token.");
         })
         .click(cur, add_acct, move || web.set(Web::Ask))
         .wait(700)
@@ -296,27 +298,29 @@ pub fn AgentCompose() -> impl IntoView {
         });
         tap(s, cur, tools, tools_lit, move || pane.set(Pane::Tools));
         s.move_to(cur, comp_row)
-        .then(move || lit.set(Lit::Computer))
-        .wait(250)
-        .click(cur, comp_row, move || {
-            pane.set(Pane::Computer);
-            lit.set(Lit::None);
-        })
-        .click(cur, perm_sel, move || perm_menu.set(true))
-        .move_to(cur, opt_ask)
-        .then(move || lit.set(Lit::Ask))
-        .wait(200)
-        .click(cur, opt_ask, move || {
-            restart_asks.set(true);
-            perm_menu.set(false);
-            lit.set(Lit::None);
-        })
-        .wait(500)
-        .click(cur, close, move || pane.set(Pane::Closed));
+            .then(move || lit.set(Lit::Computer))
+            .wait(250)
+            .click(cur, comp_row, move || {
+                pane.set(Pane::Computer);
+                lit.set(Lit::None);
+            })
+            .click(cur, perm_sel, move || perm_menu.set(true))
+            .move_to(cur, opt_ask)
+            .then(move || lit.set(Lit::Ask))
+            .wait(200)
+            .click(cur, opt_ask, move || {
+                restart_asks.set(true);
+                perm_menu.set(false);
+                lit.set(Lit::None);
+            })
+            .wait(500)
+            .click(cur, close, move || pane.set(Pane::Closed));
 
         s.then(move || {
             step.set(Some(6));
-            caption.set("Genie now has Cloudflare (codeitlikemiley), 3 of 4 skills, and asks before restarting its computer.");
+            caption.set(
+                "Genie now has Cloudflare (codeitlikemiley), 3 of 4 skills, and asks before restarting its computer.",
+            );
             ready.set(true);
         })
         .move_to(cur, composer);
@@ -326,164 +330,174 @@ pub fn AgentCompose() -> impl IntoView {
 
     let bots = move || if master.get() { 2 } else { 1 };
 
-    let plugins_view = move || view! {
-        {search("Search plugins")}
-        <div class=SEC>"Apps"</div>
-        <div class=GRID>
-            <Entry tile="G" name="Gmail" desc="Sign in with your Gmail accounts">{added()}</Entry>
-        </div>
-        <div class=SEC>"Development"</div>
-        <div class=GRID>
-            <Entry tile="C" name="cloudflare" desc="Skills for the Cloudflare developer platform" aim=cf_row>
-                {move || if cf_added.get() { added().into_any() } else { add(cf_add).into_any() }}
-            </Entry>
-            <Entry tile="B" name="browser-use" desc="Give it a real browser">{add(NodeRef::new())}</Entry>
-            <Entry tile="B" name="base44" desc="Build and deploy full-stack apps">{add(NodeRef::new())}</Entry>
-            <Entry tile="S" name="supabase" desc="Official Supabase plugin">{added()}</Entry>
-        </div>
-        <div class=SEC>"Productivity"</div>
-        <div class=GRID>
-            <Entry tile="C" name="calcom" desc="Cal.com scheduling">{add(NodeRef::new())}</Entry>
-            <Entry tile="Q" name="quo" desc="Send texts and calls">{add(NodeRef::new())}</Entry>
-        </div>
+    let plugins_view = move || {
+        view! {
+            {search("Search plugins")}
+            <div class=SEC>"Apps"</div>
+            <div class=GRID>
+                <Entry tile="G" name="Gmail" desc="Sign in with your Gmail accounts">{added()}</Entry>
+            </div>
+            <div class=SEC>"Development"</div>
+            <div class=GRID>
+                <Entry tile="C" name="cloudflare" desc="Skills for the Cloudflare developer platform" aim=cf_row>
+                    {move || if cf_added.get() { added().into_any() } else { add(cf_add).into_any() }}
+                </Entry>
+                <Entry tile="B" name="browser-use" desc="Give it a real browser">{add(NodeRef::new())}</Entry>
+                <Entry tile="B" name="base44" desc="Build and deploy full-stack apps">{add(NodeRef::new())}</Entry>
+                <Entry tile="S" name="supabase" desc="Official Supabase plugin">{added()}</Entry>
+            </div>
+            <div class=SEC>"Productivity"</div>
+            <div class=GRID>
+                <Entry tile="C" name="calcom" desc="Cal.com scheduling">{add(NodeRef::new())}</Entry>
+                <Entry tile="Q" name="quo" desc="Send texts and calls">{add(NodeRef::new())}</Entry>
+            </div>
+        }
     };
 
-    let cloudflare_view = move || view! {
-        {page_head("C", false, "cloudflare", "View Source · cloudflare/skills")}
-        <div class=SEC>"Accounts"</div>
-        <div class=CARD>
-            <Show when=move || has_account.get()>
-                <div class=ROW>
-                    <div class="min-w-0 flex-1">
-                        <div class="flex items-center gap-1 truncate">
-                            {ACCOUNT}
-                            <span class="material-symbols-outlined text-[13px] text-gc-text-muted">"edit"</span>
-                        </div>
-                        <div class="text-[11.5px] text-gc-accent">"Connected"</div>
-                    </div>
-                    <div node_ref=bots_btn class="inline-flex shrink-0 items-center gap-1 rounded-full border border-gc-border bg-gc-bg-elevated px-2.5 py-0.5 text-[12px] text-gc-text">
-                        <span class="material-symbols-outlined text-[14px]">"group"</span>
-                        {move || format!("{} Bot{}", bots(), if bots() > 1 { "s" } else { "" })}
-                    </div>
-                    <span class="material-symbols-outlined shrink-0 text-[16px] text-gc-text-muted">"sync"</span>
-                </div>
-            </Show>
-            <div class=ROW>
-                <div node_ref=add_acct class="flex items-center gap-1.5 text-gc-text-muted">
-                    <span class="material-symbols-outlined text-[16px]">"add"</span>
-                    "Add Another Account"
-                </div>
-            </div>
-        </div>
-        <div class=SEC>"Current Bot"</div>
-        <div class=CARD>
-            <div class=format!("{ROW} flex-wrap gap-y-1.5")>
-                <div class="min-w-[150px] flex-1">"Genie's default Cloudflare account"</div>
-                <SelectPill
-                    label=Signal::derive(move || if default_set.get() { ACCOUNT } else { "Always ask" })
-                    warn=Signal::derive(move || !default_set.get())
-                    aim=def_sel
-                >
-                    <Show when=move || def_menu.get()>
-                        <DemoMenu class="right-0 mt-1 min-w-full">
-                            <MenuItem label="Always ask" checked=true />
-                            <MenuItem label=ACCOUNT lit=Signal::derive(move || lit.get() == Lit::Account) aim=opt_acct />
-                        </DemoMenu>
-                    </Show>
-                </SelectPill>
-            </div>
-        </div>
-        <div class=SEC>"Tools"</div>
-        <div class=CARD>
-            <div class=ROW>
-                <div class="min-w-0 flex-1 truncate">"4 of 4 on for Genie"</div>
-                <span class="shrink-0 text-[12px] text-gc-text-muted">"Use in Genie"</span>
-                <Toggle on=true />
-            </div>
-        </div>
-        <div class=SEC>"Skills 14"</div>
-        <div class=CARD>
-            {SKILLS.iter().enumerate().map(|(i, name)| view! {
-                <div class=ROW>
-                    <div class="min-w-0 flex-1 truncate font-mono text-[12px]">{*name}</div>
-                    <Toggle on=Signal::derive(move || skills.get()[i]) aim=sk[i] />
-                    {chevron()}
-                </div>
-            }).collect_view()}
-        </div>
-    };
-
-    let bots_view = move || view! {
-        <div class="text-[12.5px] text-gc-text-muted">{move || format!("{} of 2 Bots can use this account", bots())}</div>
-        {search("Filter Bots")}
-        <div class=CARD>
-            <div class=ROW>
-                <span class=format!("{TILE} h-6 w-6 rounded-md text-[11px]")>"G"</span>
-                <div class="min-w-0 flex-1">"Genie"</div>
-                <Toggle on=true />
-            </div>
-            <div class=ROW>
-                <span class=format!("{TILE} h-6 w-6 rounded-md text-[11px]")>"M"</span>
-                <div class="min-w-0 flex-1">"Masterpowers"</div>
-                <Toggle on=master aim=bot_master />
-            </div>
-        </div>
-    };
-
-    let tools_view = move || view! {
-        {search("Search tools")}
-        <div class=SEC>"Built in"</div>
-        <div class=GRID>
-            {TOOLS.iter().map(|&(i, n, d)| view! {
-                <Entry tile=i icon=true name=n desc=d mono=true><Toggle on=true /></Entry>
-            }).collect_view()}
-            <Entry tile="extension" icon=true name="Plugins" desc="Finds, installs and removes plugins">
-                {chevron()}<Toggle on=true />
-            </Entry>
-            <Entry
-                tile="power_settings_new"
-                icon=true
-                name="Computer"
-                desc="Checks, starts, stops, restarts…"
-                aim=comp_row
-                lit=Signal::derive(move || lit.get() == Lit::Computer)
-            >
-                {chevron()}<Toggle on=true />
-            </Entry>
-        </div>
-    };
-
-    let computer_view = move || view! {
-        <div class="flex shrink-0 items-center gap-3">
-            {page_head("power_settings_new", true, "Computer", "Built in · 7 of 7 allowed")}
-            <div class="ml-auto"><Toggle on=true /></div>
-        </div>
-        <div class="text-[12.5px] text-gc-text-muted">"Resetting, updating and the network setting always ask you first."</div>
-        <div class=SEC>"Tools 7"</div>
-        <div class=CARD>
-            {PERMS.iter().enumerate().map(|(i, &(name, asks))| {
-                let restart = i == RESTART;
-                let asks = Signal::derive(move || if restart { restart_asks.get() } else { asks });
-                view! {
+    let cloudflare_view = move || {
+        view! {
+            {page_head("C", false, "cloudflare", "View Source · cloudflare/skills")}
+            <div class=SEC>"Accounts"</div>
+            <div class=CARD>
+                <Show when=move || has_account.get()>
                     <div class=ROW>
-                        <div class="min-w-0 flex-1 truncate font-mono text-[12px]">{name}</div>
-                        <SelectPill
-                            label=Signal::derive(move || if asks.get() { ASK } else { ALWAYS })
-                            warn=asks
-                            aim=if restart { perm_sel } else { NodeRef::new() }
-                        >
-                            <Show when=move || restart && perm_menu.get()>
-                                <DemoMenu class="right-0 mt-1 min-w-full">
-                                    <MenuItem label=ALWAYS checked=true />
-                                    <MenuItem label=ASK lit=Signal::derive(move || lit.get() == Lit::Ask) aim=opt_ask />
-                                    <MenuItem label="Never" />
-                                </DemoMenu>
-                            </Show>
-                        </SelectPill>
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-1 truncate">
+                                {ACCOUNT}
+                                <span class="material-symbols-outlined text-[13px] text-gc-text-muted">"edit"</span>
+                            </div>
+                            <div class="text-[11.5px] text-gc-accent">"Connected"</div>
+                        </div>
+                        <div node_ref=bots_btn class="inline-flex shrink-0 items-center gap-1 rounded-full border border-gc-border bg-gc-bg-elevated px-2.5 py-0.5 text-[12px] text-gc-text">
+                            <span class="material-symbols-outlined text-[14px]">"group"</span>
+                            {move || format!("{} Bot{}", bots(), if bots() > 1 { "s" } else { "" })}
+                        </div>
+                        <span class="material-symbols-outlined shrink-0 text-[16px] text-gc-text-muted">"sync"</span>
                     </div>
-                }
-            }).collect_view()}
-        </div>
+                </Show>
+                <div class=ROW>
+                    <div node_ref=add_acct class="flex items-center gap-1.5 text-gc-text-muted">
+                        <span class="material-symbols-outlined text-[16px]">"add"</span>
+                        "Add Another Account"
+                    </div>
+                </div>
+            </div>
+            <div class=SEC>"Current Bot"</div>
+            <div class=CARD>
+                <div class=format!("{ROW} flex-wrap gap-y-1.5")>
+                    <div class="min-w-[150px] flex-1">"Genie's default Cloudflare account"</div>
+                    <SelectPill
+                        label=Signal::derive(move || if default_set.get() { ACCOUNT } else { "Always ask" })
+                        warn=Signal::derive(move || !default_set.get())
+                        aim=def_sel
+                    >
+                        <Show when=move || def_menu.get()>
+                            <DemoMenu class="right-0 mt-1 min-w-full">
+                                <MenuItem label="Always ask" checked=true />
+                                <MenuItem label=ACCOUNT lit=Signal::derive(move || lit.get() == Lit::Account) aim=opt_acct />
+                            </DemoMenu>
+                        </Show>
+                    </SelectPill>
+                </div>
+            </div>
+            <div class=SEC>"Tools"</div>
+            <div class=CARD>
+                <div class=ROW>
+                    <div class="min-w-0 flex-1 truncate">"4 of 4 on for Genie"</div>
+                    <span class="shrink-0 text-[12px] text-gc-text-muted">"Use in Genie"</span>
+                    <Toggle on=true />
+                </div>
+            </div>
+            <div class=SEC>"Skills 14"</div>
+            <div class=CARD>
+                {SKILLS.iter().enumerate().map(|(i, name)| view! {
+                    <div class=ROW>
+                        <div class="min-w-0 flex-1 truncate font-mono text-[12px]">{*name}</div>
+                        <Toggle on=Signal::derive(move || skills.get()[i]) aim=sk[i] />
+                        {chevron()}
+                    </div>
+                }).collect_view()}
+            </div>
+        }
+    };
+
+    let bots_view = move || {
+        view! {
+            <div class="text-[12.5px] text-gc-text-muted">{move || format!("{} of 2 Bots can use this account", bots())}</div>
+            {search("Filter Bots")}
+            <div class=CARD>
+                <div class=ROW>
+                    <span class=format!("{TILE} h-6 w-6 rounded-md text-[11px]")>"G"</span>
+                    <div class="min-w-0 flex-1">"Genie"</div>
+                    <Toggle on=true />
+                </div>
+                <div class=ROW>
+                    <span class=format!("{TILE} h-6 w-6 rounded-md text-[11px]")>"M"</span>
+                    <div class="min-w-0 flex-1">"Masterpowers"</div>
+                    <Toggle on=master aim=bot_master />
+                </div>
+            </div>
+        }
+    };
+
+    let tools_view = move || {
+        view! {
+            {search("Search tools")}
+            <div class=SEC>"Built in"</div>
+            <div class=GRID>
+                {TOOLS.iter().map(|&(i, n, d)| view! {
+                    <Entry tile=i icon=true name=n desc=d mono=true><Toggle on=true /></Entry>
+                }).collect_view()}
+                <Entry tile="extension" icon=true name="Plugins" desc="Finds, installs and removes plugins">
+                    {chevron()}<Toggle on=true />
+                </Entry>
+                <Entry
+                    tile="power_settings_new"
+                    icon=true
+                    name="Computer"
+                    desc="Checks, starts, stops, restarts…"
+                    aim=comp_row
+                    lit=Signal::derive(move || lit.get() == Lit::Computer)
+                >
+                    {chevron()}<Toggle on=true />
+                </Entry>
+            </div>
+        }
+    };
+
+    let computer_view = move || {
+        view! {
+            <div class="flex shrink-0 items-center gap-3">
+                {page_head("power_settings_new", true, "Computer", "Built in · 7 of 7 allowed")}
+                <div class="ml-auto"><Toggle on=true /></div>
+            </div>
+            <div class="text-[12.5px] text-gc-text-muted">"Resetting, updating and the network setting always ask you first."</div>
+            <div class=SEC>"Tools 7"</div>
+            <div class=CARD>
+                {PERMS.iter().enumerate().map(|(i, &(name, asks))| {
+                    let restart = i == RESTART;
+                    let asks = Signal::derive(move || if restart { restart_asks.get() } else { asks });
+                    view! {
+                        <div class=ROW>
+                            <div class="min-w-0 flex-1 truncate font-mono text-[12px]">{name}</div>
+                            <SelectPill
+                                label=Signal::derive(move || if asks.get() { ASK } else { ALWAYS })
+                                warn=asks
+                                aim=if restart { perm_sel } else { NodeRef::new() }
+                            >
+                                <Show when=move || restart && perm_menu.get()>
+                                    <DemoMenu class="right-0 mt-1 min-w-full">
+                                        <MenuItem label=ALWAYS checked=true />
+                                        <MenuItem label=ASK lit=Signal::derive(move || lit.get() == Lit::Ask) aim=opt_ask />
+                                        <MenuItem label="Never" />
+                                    </DemoMenu>
+                                </Show>
+                            </SelectPill>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        }
     };
 
     let title = move || match pane.get() {

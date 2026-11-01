@@ -236,110 +236,114 @@ pub fn ModelCard(pick: ModelPick) -> impl IntoView {
     let last = (EFFORTS.len() - 1) as f32;
     let pct = move || effort.get() as f32 / last;
 
-    let effort_view = move || view! {
-        <div class="p-3">
-            <div class="grid grid-cols-[auto_1fr_auto] items-center gap-2">
-                <div
-                    node_ref=pick.fast_btn
-                    class=move || {
-                        let ring = if lit.get() == Lit::Fast { "ring-2 ring-gc-brand/50" } else { "" };
-                        if fast.get() {
-                            format!("grid h-8 w-8 place-items-center rounded-md border border-gc-gold/50 bg-gc-gold/10 text-gc-gold {ring}")
-                        } else {
-                            format!("grid h-8 w-8 place-items-center rounded-md border border-gc-border text-gc-text-faint opacity-60 grayscale {ring}")
-                        }
-                    }
-                >
-                    "⚡"
-                </div>
-                <div class="flex min-w-0 flex-col items-center">
-                    <span
-                        class="text-[13px] font-semibold"
-                        style=move || format!("color: hsl({:.0} 75% 62%)", effort_hue(effort.get()))
-                    >
-                        {move || EFFORTS[effort.get()]}
-                    </span>
+    let effort_view = move || {
+        view! {
+            <div class="p-3">
+                <div class="grid grid-cols-[auto_1fr_auto] items-center gap-2">
                     <div
-                        node_ref=pick.name
-                        class=move || if lit.get() == Lit::Name {
-                            "max-w-full truncate rounded px-1 text-[13px] text-gc-text underline"
-                        } else {
-                            "max-w-full truncate rounded px-1 text-[13px] text-gc-text"
+                        node_ref=pick.fast_btn
+                        class=move || {
+                            let ring = if lit.get() == Lit::Fast { "ring-2 ring-gc-brand/50" } else { "" };
+                            if fast.get() {
+                                format!("grid h-8 w-8 place-items-center rounded-md border border-gc-gold/50 bg-gc-gold/10 text-gc-gold {ring}")
+                            } else {
+                                format!("grid h-8 w-8 place-items-center rounded-md border border-gc-border text-gc-text-faint opacity-60 grayscale {ring}")
+                            }
                         }
                     >
-                        {move || MODELS[model.get()].name}" ›"
+                        "⚡"
                     </div>
+                    <div class="flex min-w-0 flex-col items-center">
+                        <span
+                            class="text-[13px] font-semibold"
+                            style=move || format!("color: hsl({:.0} 75% 62%)", effort_hue(effort.get()))
+                        >
+                            {move || EFFORTS[effort.get()]}
+                        </span>
+                        <div
+                            node_ref=pick.name
+                            class=move || if lit.get() == Lit::Name {
+                                "max-w-full truncate rounded px-1 text-[13px] text-gc-text underline"
+                            } else {
+                                "max-w-full truncate rounded px-1 text-[13px] text-gc-text"
+                            }
+                        >
+                            {move || MODELS[model.get()].name}" ›"
+                        </div>
+                    </div>
+                    <div class="grid h-8 w-8 place-items-center rounded-md text-gc-text-muted">"↺"</div>
                 </div>
-                <div class="grid h-8 w-8 place-items-center rounded-md text-gc-text-muted">"↺"</div>
-            </div>
-            // Track, fill and thumb. The fill is a pill ending at the thumb's center; it glows at
-            // Ultra.
-            <div
-                class="relative mt-3 h-7"
-                style=move || {
-                    let glow = if effort.get() == ULTRA { "0 0 14px hsl(266 75% 60% / .7)" } else { "0 0 0 transparent" };
-                    format!("--end: hsl({:.0} 75% 58%); --glow: {glow}", effort_hue(effort.get()))
-                }
-                role="slider"
-                aria-label="Effort"
-                aria-valuemin="0"
-                aria-valuemax=(EFFORTS.len() - 1).to_string()
-                aria-valuenow=move || effort.get().to_string()
-                aria-valuetext=move || EFFORTS[effort.get()]
-            >
-                <div class="og-effort-track absolute inset-x-0 top-0.5 h-6 rounded-full bg-gc-bg-muted">
-                    <div
-                        class="og-effort-fill absolute inset-y-0 left-0 rounded-full transition-[width] duration-150 ease-out"
-                        // At Low the thumb would leave a sliver of fill peeking past its round edge.
-                        style=move || if effort.get() == 0 {
-                            "width: 0px".to_string()
-                        } else {
-                            format!("width: calc(14px + {:.4} * (100% - 28px))", pct())
-                        }
-                    ></div>
-                </div>
+                // Track, fill and thumb. The fill is a pill ending at the thumb's center; it glows at
+                // Ultra.
                 <div
-                    class="absolute top-0 h-7 w-7 rounded-full bg-white shadow-[0_1px_4px_rgb(0_0_0/0.35)] transition-[left] duration-150 ease-out"
-                    style=move || format!("left: calc({:.4} * (100% - 28px))", pct())
-                ></div>
-                {(0..EFFORTS.len()).map(|i| view! {
+                    class="relative mt-3 h-7"
+                    style=move || {
+                        let glow = if effort.get() == ULTRA { "0 0 14px hsl(266 75% 60% / .7)" } else { "0 0 0 transparent" };
+                        format!("--end: hsl({:.0} 75% 58%); --glow: {glow}", effort_hue(effort.get()))
+                    }
+                    role="slider"
+                    aria-label="Effort"
+                    aria-valuemin="0"
+                    aria-valuemax=(EFFORTS.len() - 1).to_string()
+                    aria-valuenow=move || effort.get().to_string()
+                    aria-valuetext=move || EFFORTS[effort.get()]
+                >
+                    <div class="og-effort-track absolute inset-x-0 top-0.5 h-6 rounded-full bg-gc-bg-muted">
+                        <div
+                            class="og-effort-fill absolute inset-y-0 left-0 rounded-full transition-[width] duration-150 ease-out"
+                            // At Low the thumb would leave a sliver of fill peeking past its round edge.
+                            style=move || if effort.get() == 0 {
+                                "width: 0px".to_string()
+                            } else {
+                                format!("width: calc(14px + {:.4} * (100% - 28px))", pct())
+                            }
+                        ></div>
+                    </div>
                     <div
-                        node_ref=pick.stops[i]
-                        class="pointer-events-none absolute top-0 h-7 w-px"
-                        style=format!("left: calc(14px + {:.4} * (100% - 28px))", i as f32 / last)
+                        class="absolute top-0 h-7 w-7 rounded-full bg-white shadow-[0_1px_4px_rgb(0_0_0/0.35)] transition-[left] duration-150 ease-out"
+                        style=move || format!("left: calc({:.4} * (100% - 28px))", pct())
                     ></div>
-                }).collect_view()}
+                    {(0..EFFORTS.len()).map(|i| view! {
+                        <div
+                            node_ref=pick.stops[i]
+                            class="pointer-events-none absolute top-0 h-7 w-px"
+                            style=format!("left: calc(14px + {:.4} * (100% - 28px))", i as f32 / last)
+                        ></div>
+                    }).collect_view()}
+                </div>
+                // Each name sits centered under its stop, where the thumb's center lands.
+                <div class="relative mt-1 h-4 text-[10px] text-gc-text-faint">
+                    {EFFORTS.iter().enumerate().map(|(i, e)| view! {
+                        <span
+                            class="absolute top-0 -translate-x-1/2 whitespace-nowrap"
+                            style=format!("left: calc(14px + {:.4} * (100% - 28px))", i as f32 / last)
+                        >
+                            {*e}
+                        </span>
+                    }).collect_view()}
+                </div>
             </div>
-            // Each name sits centered under its stop, where the thumb's center lands.
-            <div class="relative mt-1 h-4 text-[10px] text-gc-text-faint">
-                {EFFORTS.iter().enumerate().map(|(i, e)| view! {
-                    <span
-                        class="absolute top-0 -translate-x-1/2 whitespace-nowrap"
-                        style=format!("left: calc(14px + {:.4} * (100% - 28px))", i as f32 / last)
-                    >
-                        {*e}
-                    </span>
-                }).collect_view()}
-            </div>
-        </div>
+        }
     };
 
-    let models_view = move || view! {
-        <div class="flex min-h-0 flex-col p-2">
-            <div class="flex shrink-0 items-center gap-1 px-1 py-1 text-[13px] font-semibold text-gc-text">
-                <span class="material-symbols-outlined text-[16px]">"chevron_left"</span>
-                "Models"
+    let models_view = move || {
+        view! {
+            <div class="flex min-h-0 flex-col p-2">
+                <div class="flex shrink-0 items-center gap-1 px-1 py-1 text-[13px] font-semibold text-gc-text">
+                    <span class="material-symbols-outlined text-[16px]">"chevron_left"</span>
+                    "Models"
+                </div>
+                <div class="shrink-0 px-2 pb-0.5 pt-1.5 text-[11px] text-gc-text-faint">"Current"</div>
+                <div class="flex shrink-0 items-center justify-between rounded-md bg-gc-bg-muted px-2 py-1.5 text-[13px] text-gc-text">
+                    <span class="truncate">{move || MODELS[model.get()].name}</span>
+                    <span class="text-[11px] text-gc-text-muted">{move || MODELS[model.get()].door.label()}</span>
+                </div>
+                <div class="min-h-0 overflow-hidden">
+                    {group(Door::Subscription)}
+                    {group(Door::Gateway)}
+                </div>
             </div>
-            <div class="shrink-0 px-2 pb-0.5 pt-1.5 text-[11px] text-gc-text-faint">"Current"</div>
-            <div class="flex shrink-0 items-center justify-between rounded-md bg-gc-bg-muted px-2 py-1.5 text-[13px] text-gc-text">
-                <span class="truncate">{move || MODELS[model.get()].name}</span>
-                <span class="text-[11px] text-gc-text-muted">{move || MODELS[model.get()].door.label()}</span>
-            </div>
-            <div class="min-h-0 overflow-hidden">
-                {group(Door::Subscription)}
-                {group(Door::Gateway)}
-            </div>
-        </div>
+        }
     };
 
     view! {

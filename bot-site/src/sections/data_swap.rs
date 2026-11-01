@@ -29,17 +29,8 @@ enum Seg {
 }
 use Seg::{T, V};
 
-const ASK: &[Seg] = &[
-    T("Email "),
-    V(0),
-    T(" his 2316. TIN "),
-    V(1),
-    T(", SSS "),
-    V(2),
-    T(". Mail it to "),
-    V(3),
-    T("."),
-];
+const ASK: &[Seg] =
+    &[T("Email "), V(0), T(" his 2316. TIN "), V(1), T(", SSS "), V(2), T(". Mail it to "), V(3), T(".")];
 const REPLY: &[Seg] =
     &[T("Done. Emailed "), V(0), T(" with TIN "), V(1), T(", and the hard copy goes to "), V(3), T(".")];
 const TYPED: &str =
@@ -63,7 +54,8 @@ const AI_CLOUD: &str = "rounded-bl-[5px] bg-gc-bg-card text-gc-text ring-1 ring-
 
 const ZONE_HEAD: &str =
     "flex items-center gap-2 font-mono text-[12px] font-semibold uppercase tracking-[0.06em] text-gc-text-muted";
-const PILL: &str = "ml-auto rounded-full border border-gc-border-hover px-[7px] py-px font-mono text-[10px] font-semibold";
+const PILL: &str =
+    "ml-auto rounded-full border border-gc-border-hover px-[7px] py-px font-mono text-[10px] font-semibold";
 const SIDE: &str =
     "absolute left-3.5 font-mono text-[10px] font-semibold uppercase tracking-[0.08em] text-gc-text-muted";
 
@@ -129,11 +121,7 @@ struct Demo {
 }
 
 fn reduced_motion() -> bool {
-    window()
-        .match_media("(prefers-reduced-motion: reduce)")
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.matches())
+    window().match_media("(prefers-reduced-motion: reduce)").ok().flatten().is_some_and(|m| m.matches())
 }
 
 fn ease(u: f64) -> f64 {

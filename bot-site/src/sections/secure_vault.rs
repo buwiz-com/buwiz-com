@@ -1,6 +1,8 @@
 use leptos::{html, prelude::*};
 
-use crate::components::agent_window::{AgentScreen, AgentWindow, FINANCE, FINANCE_RAIL, box_desktop, chrome, dock_apps};
+use crate::components::agent_window::{
+    AgentScreen, AgentWindow, FINANCE, FINANCE_RAIL, box_desktop, chrome, dock_apps,
+};
 use crate::components::demo_player::{DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible};
 use crate::components::demo_widgets::DemoMenu;
 
@@ -32,7 +34,8 @@ const STEPS: &[&str] = &["Form appears", "Saved logins", "Touch ID", "Continue",
 
 const GH_FONT: &str = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif;";
 const GH_FIELD: &str = "flex h-9 items-center rounded-md border border-[#d0d7de] px-3 text-[14px]";
-const GH_FIELD_ON: &str = "flex h-9 items-center rounded-md border border-[#0969da] bg-[#e8f0fe] px-3 text-[14px] ring-2 ring-[#0969da]/25";
+const GH_FIELD_ON: &str =
+    "flex h-9 items-center rounded-md border border-[#0969da] bg-[#e8f0fe] px-3 text-[14px] ring-2 ring-[#0969da]/25";
 
 const BUBBLE_ME: &str = "max-w-[88%] self-end rounded-[20px] bg-gc-text px-4 py-2.5 text-gc-bg";
 const BUBBLE_FI: &str = "max-w-[88%] self-start rounded-2xl bg-gc-bg-muted px-3.5 py-2.5 text-gc-text";

@@ -18,7 +18,9 @@ use crate::components::demo_player::{
 use crate::components::hero_apps::{
     App, BUG_WALK, CLAUDE_LINES, FIELD_COUNT, PAINT_MS, Run, Screens, desktop, lisa_svg, receipt_svg,
 };
-use crate::components::model_card::{ARGON, ASTRA, FABLE, HIGH, Lit, MAX, ModelPick, Pop, ReplyBadge, SettingsSheet, ULTRA};
+use crate::components::model_card::{
+    ARGON, ASTRA, FABLE, HIGH, Lit, MAX, ModelPick, Pop, ReplyBadge, SettingsSheet, ULTRA,
+};
 
 const ACTS: &[&str] = &["1 · Astra paints", "2 · Fable fixes the game", "3 · Argon books a receipt"];
 
@@ -174,20 +176,15 @@ fn pick_model(s: &mut Script, f: Film, model: usize, from: usize, to: usize, fas
 
 /// Type `text` into the composer and send it.
 fn send(s: &mut Script, f: Film, text: &'static str, body: Body) {
-    s.move_to(f.cur, f.composer)
-        .wait(150)
-        .typing(text, 34, move |t| f.draft.set(t))
-        .wait(300)
-        .then(move || {
-            f.draft.set("");
-            f.push(body);
-        });
+    s.move_to(f.cur, f.composer).wait(150).typing(text, 34, move |t| f.draft.set(t)).wait(300).then(move || {
+        f.draft.set("");
+        f.push(body);
+    });
 }
 
 fn act_paint(s: &mut Script, f: Film) {
     let sc = f.screens;
-    s.then(move || f.act(0, "Settings › Model: GPT-6 Astra from your subscription, effort Ultra, ⚡ Fast."))
-        .wait(500);
+    s.then(move || f.act(0, "Settings › Model: GPT-6 Astra from your subscription, effort Ultra, ⚡ Fast.")).wait(500);
     pick_model(s, f, ASTRA, HIGH, ULTRA, Some(true));
     send(s, f, ASK_PAINT, Body::Me(ASK_PAINT));
     s.wait(500)
@@ -281,8 +278,7 @@ fn act_maze(s: &mut Script, f: Film) {
 
 fn act_book(s: &mut Script, f: Film) {
     let sc = f.screens;
-    s.then(move || f.act(2, "Reading a photo: Gemini 4 Argon through the Gateway, effort High."))
-        .wait(400);
+    s.then(move || f.act(2, "Reading a photo: Gemini 4 Argon through the Gateway, effort High.")).wait(400);
     pick_model(s, f, ARGON, MAX, HIGH, None);
     // Drag the receipt in from the window's edge and drop it on the composer.
     s.move_to(f.cur, f.drag_from)

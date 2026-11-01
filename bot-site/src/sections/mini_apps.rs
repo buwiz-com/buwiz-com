@@ -90,7 +90,8 @@ const FULL_HOLD: u32 = 2400;
 const BTN: &str = "cursor-pointer rounded-full bg-gc-text px-3.5 py-1.5 text-[13px] font-semibold text-gc-bg outline-none focus-visible:ring-2 focus-visible:ring-gc-brand focus-visible:ring-offset-2 focus-visible:ring-offset-gc-bg-card";
 const BTN_QUIET: &str = "cursor-pointer rounded-full border border-gc-border px-3.5 py-1.5 text-[13px] font-semibold text-gc-text outline-none hover:border-gc-brand/40 focus-visible:ring-2 focus-visible:ring-gc-brand";
 const CARD: &str = "gc-card-in grid gap-3 rounded-2xl border border-gc-border bg-gc-bg-card p-3.5";
-const BADGE: &str = "rounded-[5px] border border-gc-accent/50 px-1.5 font-mono text-[10px] font-semibold text-gc-accent";
+const BADGE: &str =
+    "rounded-[5px] border border-gc-accent/50 px-1.5 font-mono text-[10px] font-semibold text-gc-accent";
 
 const TAB_ON: &str = "inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-gc-text bg-gc-text px-3 py-1 text-[12px] font-semibold text-gc-bg";
 const TAB_OFF: &str = "inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-gc-border px-3 py-1 text-[12px] text-gc-text-muted hover:border-gc-brand/40 hover:text-gc-text";
@@ -448,12 +449,14 @@ fn side_list(items: &'static [&'static str], on: usize) -> impl IntoView {
     }
 }
 
-const JOURNAL_COLS: &str = "grid grid-cols-[52px_1fr_84px] gap-3 px-3 py-2 sm:grid-cols-[64px_1.4fr_96px_1.1fr_110px] sm:px-4";
+const JOURNAL_COLS: &str =
+    "grid grid-cols-[52px_1fr_84px] gap-3 px-3 py-2 sm:grid-cols-[64px_1.4fr_96px_1.1fr_110px] sm:px-4";
 /// Columns the narrow journal leaves out.
 const WIDE_ONLY: &str = "hidden sm:block";
 const SHEET_COLS: &str = "grid grid-cols-[32px_1.6fr_0.8fr_1.2fr] sm:grid-cols-[40px_1.6fr_0.8fr_1.1fr_0.7fr_0.7fr]";
 const SHEET_CELL: &str = "truncate border-b border-r border-[#e3e5e8] px-2 py-1.5";
-const SHEET_HEAD: &str = "border-b border-r border-[#e3e5e8] bg-[#f1f3f4] px-2 py-1 text-center text-[11.5px] text-[#6b7280]";
+const SHEET_HEAD: &str =
+    "border-b border-r border-[#e3e5e8] bg-[#f1f3f4] px-2 py-1 text-center text-[11.5px] text-[#6b7280]";
 
 fn offline_saved() -> impl IntoView {
     view! {

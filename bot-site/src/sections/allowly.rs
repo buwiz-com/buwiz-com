@@ -1,6 +1,8 @@
 use leptos::{ev, html, prelude::*};
 
-use crate::components::demo_player::{DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible, in_view};
+use crate::components::demo_player::{
+    DemoBar, DemoCursor, DemoPointer, Script, Timeline, autoplay_when_visible, in_view,
+};
 
 /// Allowly: macOS permission prompts answered from the phone. A USB board on the Mac does the
 /// real clicking and typing, because macOS ignores synthetic clicks on its own prompts. Plays
@@ -8,9 +10,11 @@ use crate::components::demo_player::{DemoBar, DemoCursor, DemoPointer, Script, T
 ///
 /// The Mac and the iPhone keep their own real-world colors in both site themes. Every control is
 /// a drawn box, never a real input.
-const STEPS: &[&str] = &["Automation", "Gatekeeper", "Accessibility", "Trackpad", "Password", "Full Disk Access", "All clear"];
+const STEPS: &[&str] =
+    &["Automation", "Gatekeeper", "Accessibility", "Trackpad", "Password", "Full Disk Access", "All clear"];
 
-const MAC_FONT: &str = "font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',Helvetica,Arial,sans-serif;";
+const MAC_FONT: &str =
+    "font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',Helvetica,Arial,sans-serif;";
 const WALL: &str = "background:radial-gradient(120% 90% at 18% 8%,#8a7cf0 0%,#4a43a8 38%,#1d2257 72%,#121634 100%);";
 /// Where the board's pointer rests, as a fraction of the Mac's screen.
 const BOARD_HOME: (f64, f64) = (0.86, 0.84);
@@ -262,12 +266,15 @@ fn type_password(s: &mut Script, d: D, per_key: u32) {
 
 /// A modal prompt: it appears on the Mac and the phone, the visitor taps the answer, the board
 /// clicks it on the Mac.
-fn modal(s: &mut Script, d: D, dialog: Dialog, card: Card, toast: (&'static str, &'static str), log: (&'static str, &'static str)) {
-    s.wait(450)
-        .then(move || d.dialog.set(Some(dialog)))
-        .wait(650)
-        .then(move || d.request(card))
-        .wait(900);
+fn modal(
+    s: &mut Script,
+    d: D,
+    dialog: Dialog,
+    card: Card,
+    toast: (&'static str, &'static str),
+    log: (&'static str, &'static str),
+) {
+    s.wait(450).then(move || d.dialog.set(Some(dialog))).wait(650).then(move || d.request(card)).wait(900);
     tap(s, d, d.p_yes, card.yes, move || d.ask.set(Ask::Pressing));
     s.wait(150);
     board_click(s, d, d.m_yes, card.yes, move || {
@@ -748,7 +755,8 @@ fn mac_screen(d: D, live: bool) -> impl IntoView {
 }
 
 const PHONE_SEC: &str = "rounded-xl bg-white/10 py-2.5 text-center text-[14px] font-semibold text-white";
-const PHONE_PRI: &str = "rounded-xl bg-[#0a84ff] py-2.5 text-center text-[14px] font-semibold text-white transition-transform duration-100";
+const PHONE_PRI: &str =
+    "rounded-xl bg-[#0a84ff] py-2.5 text-center text-[14px] font-semibold text-white transition-transform duration-100";
 const PHONE_PRI_DOWN: &str = "scale-[.97] rounded-xl bg-[#0062cc] py-2.5 text-center text-[14px] font-semibold text-white transition-transform duration-100";
 
 fn card_head(app: &'static str, tag: &'static str) -> impl IntoView {

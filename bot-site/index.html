@@ -35,11 +35,15 @@
     })();
   </script>
   <title>Buwiz Bot: AI coworkers that work on a computer you host</title>
-  <meta name="description" content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
+  <meta name="description" content="Buwiz Bot is free and open source. Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
   <link rel="canonical" href="https://buwiz.com/" />
   <meta name="theme-color" content="#0F172A" />
   <!-- The server fills this in with FORMS_ORIGIN (src/bot_site.rs). -->
   <meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />
+  <!-- The server fills these in (src/bot_site.rs): Buwiz Bot's released
+       installers as JSON, and its GitHub star count. Empty while unknown. -->
+  <meta name="buwiz-bot-download" content="" />
+  <meta name="buwiz-bot-stars" content="" />
 
   <!-- Who and what Buwiz is, for search engines and AI answer engines.
        Plain HTML: the page itself is drawn by the app, which crawlers that
@@ -73,6 +77,9 @@
         "description": "An AI coworker for your desktop. Its mini apps open right in the chat, for you and your AI agent: eBIRForms to prepare and file BIR tax returns, Books for bookkeeping, and Word and Spreadsheet for documents.",
         "applicationCategory": "BusinessApplication",
         "url": "https://buwiz.com",
+        "license": "https://www.apache.org/licenses/LICENSE-2.0",
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
         "publisher": { "@id": "https://buwiz.com#org" }
       }
     ]
@@ -84,13 +91,13 @@
   <meta property="og:site_name" content="Buwiz" />
   <meta property="og:url" content="https://buwiz.com/" />
   <meta property="og:title" content="Buwiz Bot: AI coworkers that work on a computer you host" />
-  <meta property="og:description" content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
+  <meta property="og:description" content="Buwiz Bot is free and open source. Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
 
   <!-- Twitter -->
   <meta property="twitter:card" content="summary" />
   <meta property="twitter:url" content="https://buwiz.com/" />
   <meta property="twitter:title" content="Buwiz Bot: AI coworkers that work on a computer you host" />
-  <meta property="twitter:description" content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
+  <meta property="twitter:description" content="Buwiz Bot is free and open source. Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
   <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
   <!-- Add a plain CSS file: see https://trunkrs.dev/assets/#css -->

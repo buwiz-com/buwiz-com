@@ -148,6 +148,8 @@ async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
         trust_list: None,
         downloads_url: "http://127.0.0.1:9".into(),
         forms_origin: "https://buwiz.com".into(),
+        // Nothing listens there: the star count is unknown.
+        github_api_url: "http://127.0.0.1:9".into(),
     };
     let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
     let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);

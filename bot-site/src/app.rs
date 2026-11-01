@@ -57,6 +57,8 @@ pub fn App() -> impl IntoView {
 
     let theme = RwSignal::new(String::from("dark"));
     provide_context(ThemeContext(theme));
+    // What the server filled in about Buwiz Bot's release and stars.
+    provide_context(crate::bot_meta::BotMeta::read());
 
     // Client-side cookie initialization and localStorage migration
     #[cfg(target_arch = "wasm32")]

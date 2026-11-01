@@ -1,77 +1,25 @@
-# buwiz-cloud
+# buwiz-com
 
-Accounts, TIN activation and sign-in for the Buwiz apps. It replaces the
-Spin-based `buwiz-server`, keeping only what the apps call.
+The Buwiz server is one Rust binary that serves every public Buwiz host. A
+second process, the Sender, is the only part that talks to BIR.
 
-- **Accounts**: sign in with a 6-digit code sent by email. No passwords, no
-  organizations, no workspaces. One account can hold several TINs.
-- **TIN activation**: the person says whose TIN it is and uploads its papers.
-  - Personal: a TIN ID (card or ORUS digital TIN ID); a selfie and a photo
-    of the National ID are optional and strengthen the check.
-  - Business: BIR Form 2303 and a government ID, plus proof of authority
-    (secretary's certificate, board resolution or SPA) when the 2303 is in
-    a company's name.
-  - Staff review each claim by hand at `/staff`: approve, reject, or send
-    it back with reasons; the person fixes it from My TINs (`/tins`) and
-    resends it. An approved claim makes the TIN active, and a TIN has at
-    most one owner. People can prepare returns right away; sending them
-    waits for approval.
-  - While a claim waits, the person can replace any file or remove an
-    optional one from its Files page; staff see that files changed after
-    sending. A claim that never became active can be deleted, files and
-    all, by its owner or by staff with a reason. An active TIN is removed
-    by its owner or revoked by staff: it stops being active, its sent
-    returns stay, and it can be claimed again. Each of these leaves a line
-    (masked TIN) in the account's history on the staff pages.
-  - Files are encrypted (AES-256-GCM) before they are stored, in Cloudflare
-    R2 in production (any S3-compatible store; Postgres in development),
-    and deleted when the claim is decided or withdrawn, or the file is
-    replaced. Their hashes stay.
-  - The TIN ID or 2303 is read on this server when the claim is sent or
-    resent (PaddleOCR PP-OCRv5 mobile on ONNX Runtime; a digital PDF's text
-    layer first). Staff see the TIN, name, birth date or RDO code beside
-    what was typed, with a mark per row, and the queue flags "TIN matches
-    the ID" or "Name differs". Only those fields are kept, and they go with
-    the file. Nothing is sent to anyone else, and staff still decide.
-    Behind the `ocr` cargo feature; see
-    [Builds with and without BIR](#builds-with-and-without-bir).
-- **App sign-in**: the desktop and mini apps use the OAuth device flow
-  (RFC 8628). Refresh tokens rotate, and reusing an old one ends the whole
-  sign-in.
-- **Licence gate**: `GET /api/tax-profiles` lists the account's active TINs.
-  The apps unlock their BIR tools when any profile has permissions.
-  `?include=pending` also lists TINs still being checked or sent back, with
-  a `status` and no `filing.submit` permission.
-- **Submission relay**: files a return with BIR for an active TIN.
-  - Two processes: the public **Gatekeeper** (`buwiz-cloud`) and the
-    **Sender** (`buwiz-sender`), which alone keeps BIR's passphrases, the
-    SFTP login and the HPKE private key, and does the IAF encryption
-    (byte-identical to eBIRForms' `Encrypt.exe`).
-  - v2: the app signs requests with a registered device key, gets a
-    five-minute ticket for one return, and seals the XML to the Sender
-    (HPKE). The Gatekeeper stores the envelope without being able to open
-    it. v1 (plaintext XML over TLS) still works.
-  - The traffic leaves from the taxpayer's computer, so BIR sees their own
-    connection. The app is a dumb pipe that connects only to BIR's hosts.
-  - SSH runs end to end through it, with BIR's host key pinned.
-  - Each send ends in a signed receipt. See
-    [docs/relay-protocol.md](docs/relay-protocol.md).
-  - The BIR-specific code (BIR's dispatcher, the IAF encryption, the SFTP
-    upload, BIR's host list, the v1 reference client) is behind the `bir`
-    cargo feature, in files kept out of the public repository. BIR's hosts
-    and the other BIR details are documented with those files. See
-    [Builds with and without BIR](#builds-with-and-without-bir).
-- **MCP for AI agents**: `POST /mcp` with four read-only tools: active TINs,
-  TIN claims, sent returns, and one return with its receipt.
-  - Agents find the sign-in through the 401's `WWW-Authenticate` metadata
-    (RFC 9728 / RFC 8414), register themselves (RFC 7591), and sign in
-    with authorization code + PKCE after the person approves on a consent
-    page.
-  - Agent tokens carry the `mcp` scope and can never file a return.
+| Host | What it is | Code | Docs |
+|---|---|---|---|
+| `buwiz.com` | The Buwiz Bot site: `/` and `/mini-apps` | `bot-site/` (Leptos, built into `bot-site/dist/`), served by `src/bot_site.rs` | [docs/bot-site.md](docs/bot-site.md) |
+| `ebirforms.buwiz.com` | The eBIRForms filing site: its home page, `/download` and the installers | `src/pages/home.rs`, `src/pages/download.rs`, `src/downloads.rs` | [docs/ebirforms-site.md](docs/ebirforms-site.md) |
+| `account.buwiz.com` | Sign-in, My TINs and TIN claims, the staff pages, and app and agent sign-in | `src/pages.rs`, `src/web.rs`, `src/accounts.rs`, `src/claims.rs`, `src/staff.rs`, `src/oauth.rs`, `src/agents.rs` | [docs/accounts.md](docs/accounts.md) |
+| `api.buwiz.com` | What the apps and agents call: the licence gate, devices, tickets, the submission relay and `/mcp` | `src/web.rs`, `src/devices.rs`, `src/tickets.rs`, `src/submissions.rs`, `src/mcp.rs` | [docs/accounts.md](docs/accounts.md), [docs/relay.md](docs/relay.md) |
+| (private) | The Sender: BIR's passphrases, the SFTP login and the IAF encryption | `src/sender/`, `src/bin/buwiz-sender.rs`, plus `src/bir/` (not in this repository) | [docs/relay.md](docs/relay.md) |
 
-Built with [axum](https://github.com/tokio-rs/axum) for the API and
-[Topcoat](https://github.com/tokio-rs/topcoat) for the account site, on
-Postgres.
+`src/canonical.rs` decides which host serves what:
+- The bare domain is the Bot site (`SITE_SPLIT`, on by default).
+- The filing site's old paths on the bare domain (`/download`, `/install-linux.sh` and the demo assets) answer with a 301 to `FORMS_ORIGIN`.
+- `www.` always redirects to the bare domain.
+- The account and API hosts are `noindex`.
+
+The stack: [axum](https://github.com/tokio-rs/axum) for the API,
+[Topcoat](https://github.com/tokio-rs/topcoat) for the account and filing
+pages, and [Leptos](https://leptos.dev) for the Bot site, all on Postgres.
 
 ## Run it locally
 
@@ -85,147 +33,37 @@ set -a; . ./.env; set +a
 cargo run                                  # http://localhost:3008
 ```
 
-Migrations run at start. Without `SENDER_URL`, the Sender runs inside this
-process (development only; see [docs/relay-protocol.md](docs/relay-protocol.md)
-§6 for running `buwiz-sender` on its own). Built without the `bir` feature,
-that Sender answers every send with `failed`, "relay not built in". Without `RESEND_API_KEY`, sign-in codes appear in
-the server log; with it, they are emailed. Put your email in `ADMIN_EMAILS` to see
-the staff pages at `/staff` (claims queue and users); everyone else gets a 404 there.
+Migrations run at start. Sign-in codes are printed to the log. See
+[docs/development.md](docs/development.md) for:
+- the settings;
+- the cargo features (`bir` and `ocr`);
+- the hosts on localhost;
+- the tests.
 
-Smoke test of the whole flow (device sign-in, claim, review, licence gate,
-refresh rotation):
+## Repository layout
 
-```sh
-PORT=3018 ACCOUNT_ORIGIN=http://localhost:3018 ADMIN_EMAILS=admin@example.test \
-  cargo run > server.log 2>&1 &
-BASE=http://localhost:3018 LOG=server.log scripts/smoke.sh
-```
-
-## What the apps call
-
-The mini app reads `BUWIZ_SERVER_URL` (API) and `BUWIZ_ACCOUNT_URL` (browser
-pages). One deployment can serve both hostnames. Set `ACCOUNT_ORIGIN` to the
-account hostname and list the API hostname in `EXTRA_ORIGINS`.
-
-| Call | Notes |
+| Path | What |
 |---|---|
-| `POST /auth/device/start` `{"client_id"}` | Also `POST /oauth/device/code`. Clients: `buwiz-desktop`, `buwiz-books`. |
-| `POST /auth/device/poll` `{"client_id","device_code"}` | `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, then tokens. |
-| `POST /oauth/token` (form) | `grant_type=refresh_token` or `urn:ietf:params:oauth:grant-type:device_code`. Access tokens last 15 minutes, refresh tokens 90 days. |
-| `GET /me` | `{"user_id","email"}`. 401 means signed out. |
-| `GET /api/tax-profiles` | `{"profiles":[{"id","tin","tin_masked","registered_name","activated_at","permissions"}]}`. Link by `id`, not the TIN. `?include=pending` adds open claims and a `status` (`approved`, `pending`, `needs_fix`) to every profile; open ones have `activated_at: null` and can prepare but not submit. |
-| `POST /api/auth/logout` | Ends this app's sign-in. |
-| `POST /api/submissions`, `GET /api/submissions[/{id}]` | Create and read submissions. |
-| `GET /api/submissions/{id}/relay` (WebSocket) | The relay pipe. See [docs/relay-protocol.md](docs/relay-protocol.md). |
-| `GET /.well-known/jwks.json` | Key that verifies receipts. |
-| `POST /api/devices`, `GET /api/devices`, `POST /api/devices/{id}/revoke` | Device keys (v2). |
-| `POST /api/tickets` | A signed ticket for one return (v2, device-signed). |
-| `POST /api/v2/submissions` | `{ticket, envelope}` (v2, device-signed). |
-| `GET /.well-known/buwiz-hpke.json` | The Sender's sealing key (v2). |
-| `POST /mcp` | MCP (Streamable HTTP, JSON answers). App and agent tokens both work; tools only read. |
-| `GET /.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server` | OAuth discovery for agents. |
-| `POST /oauth/register`, `GET /oauth/authorize` | Agent registration and consent (PKCE S256). |
+| `src/` | The server (`buwiz-cloud`). Its other binaries are in `src/bin/` (`buwiz-sender`, `buwiz-relay`) |
+| `bot-site/` | The Buwiz Bot site, a separate Leptos crate. `bot-site/dist/` is committed and embedded in the binary |
+| `migrations/` | Postgres migrations, run at start |
+| `tests/` | Integration tests. `account_site.rs` needs `DATABASE_URL` |
+| `e2e/` | A workspace of its own: submission v2 end to end with the real eBIRForms client (`scripts/v6.sh`) |
+| `scripts/` | `v6.sh` (the e2e run), `ocr-models.sh` (fetches the OCR models) and `smoke.sh` |
+| `docs/` | One page per host or subsystem (below) |
 
-Browser pages the apps open: `/login?next=…`, `/signup?next=…`,
-`/device?user_code=…`.
+## Docs
 
-## Builds with and without BIR
-
-| | `cargo build` (public) | `cargo build --features bir` (production) |
-|---|---|---|
-| Needs the private BIR files (`src/bir/`, `src/relay/client.rs`, `examples/iaf-decrypt.rs`, `tests/relay.rs`, `tests/iaf_golden.rs`, `tests/fixtures/iaf/`) | No | Yes |
-| Accounts, TIN claims, devices, tickets, HPKE sealing, trust list, receipts | Yes | Yes |
-| Sender (`buwiz-sender` and the in-process development Sender) | Checks tickets and opens envelopes, then answers every send `failed`, "relay not built in". Nothing reaches BIR, so it is safe to retry. | Sends through the relay |
-| `buwiz-relay`, `iaf-decrypt`, the relay tests | Not built | Built |
-
-`--features ocr` reads claim documents on the server (`src/ocr/`): it adds
-ONNX Runtime, linked statically, and about 30 MB to the binary. That
-ONNX Runtime needs GCC 14's libstdc++, so the `Dockerfile` builds on
-Ubuntu 24.04. The models
-(13 MB, Apache-2.0) are files, not in git: `scripts/ocr-models.sh` fetches
-them, pinned and checked, into `ocr-models/`, and `OCR_MODEL_DIR` points
-elsewhere. Without the feature every reading ends "OCR not built in".
-
-The `Dockerfile` builds with `--features bir,ocr` and puts the models in
-`/usr/local/share/buwiz/ocr-models`. CI builds, lints and tests without
-them.
-
-## The Bot site
-
-With `SITE_SPLIT=true`, `/` on the bare domain is the Buwiz Bot page: the
-Leptos app in `bot-site/` (the goldcoders.dev home page), its bundle and
-images under `/bot/`. The built `bot-site/dist/` is committed and embedded
-in the binary. After changing `bot-site/`, rebuild it with
-`bot-site/build.sh` (needs `trunk` and the `wasm32-unknown-unknown`
-target) and commit the new `dist/`.
-
-## Relay modes
-
-These need a build with `--features bir`.
-
-`BIR_RELAY_MODE` decides how far a submission goes:
-
-- `dry_run` (default) encrypts and checks everything, sends nothing, and
-  returns a receipt marked `dry_run`.
-- `lab` uploads to a test SFTP server from `BIR_LAB_SFTP`.
-- `live` files with BIR.
-
-Lab test with a real OpenSSH server:
-
-```sh
-docker run -d -p 127.0.0.1:2222:22 atmoz/sftp lab:labpass:1001::1601Cv2018
-ssh-keyscan -p 2222 -t ed25519 127.0.0.1 | ssh-keygen -lf -      # pin this
-BIR_RELAY_MODE=lab BIR_LAB_SFTP=lab:labpass@127.0.0.1:2222 \
-  BIR_SSH_HOST_KEYS=SHA256:… BIR_IAF_PASSPHRASE=lab cargo run --features bir
-# Sign in, get a TIN approved, then act as the app:
-cargo run --features bir --bin buwiz-relay -- --server http://localhost:3008 --token <access token> \
-  --file return.xml --filename '12345678900000-1601Cv2018-062025#you@example.com#.xml' \
-  --allow 127.0.0.1:2222
-```
-
-Tests: `cargo test` runs everything that needs no BIR code, including the
-account site against Postgres (`tests/account_site.rs`: each test gets its own
-database, so `DATABASE_URL` must be set, e.g. from `.env`).
-`cargo test --features bir` adds the relay end to end in one process (fake
-dispatcher, SSH server with a pinned key, the app's allow-list).
-`scripts/v6.sh` runs `e2e/` (its own workspace): submission v2 with the
-real eBIRForms client ([eBIRForms/eBIRForms](https://github.com/eBIRForms/eBIRForms), pinned by rev in
-`e2e/Cargo.toml`), from a queued 1701Q to a verified receipt, and the attacks it must refuse. It
-needs Docker and the BIR files (e2e builds the server with `bir`). `EBIRFORMS_PATH=<checkout>`
-tests a local eBIRForms checkout instead. With `--features bir` and `BIR_IAF_PASSPHRASE` set,
-`tests/iaf_golden.rs` checks the encryption against official `Encrypt.exe`
-output.
-`cargo test --features bir -- --include-ignored` also runs HTTPS through the pipe against
-example.com.
-`scripts/ocr-models.sh && cargo test --features ocr` adds `tests/ocr.rs`:
-OCR of a synthetic TIN ID drawn in the test, alone and through a claim.
-
-## Configuration
-
-See [`.env.example`](.env.example). Required: `DATABASE_URL` and
-`DOCUMENT_KEY`. Public deployments must use `https://` in `ACCOUNT_ORIGIN`,
-which turns on secure cookies, and a `RESEND_API_KEY`. The server
-refuses to start if it would print codes on a public deployment.
-
-## Deploy
-
-The `Dockerfile` builds a small image, with `--features bir`, that listens
-on `$PORT` (8080 in the image). Any container host with Postgres works.
-
-**Wasmer** is the long-term target, but it can't run this yet (tested
-2026-10-29 with Wasmer 7.5 and the WASIX toolchain `v2026-09-18.1`, Rust 1.97):
-
-- Topcoat 0.11 needs tokio ≥ 1.51. The WASIX registry's patched tokio stops at 1.47.
-- Outbound TLS (rustls with ring) completes the handshake, then reads EOF.
-  The same code works natively, and plain TCP works under WASIX.
-- tokio-postgres doesn't compile for wasm without a patch.
-
-axum, outbound TCP and an SSH handshake (russh, with a one-line `russh-util`
-patch) do work under WASIX. Revisit when WASIX tokio catches up.
-
-## Next
-
-1. Port the full marketing home page.
-2. The relay client in eBIRForms (`bir-submit`), following
-   [docs/relay-protocol.md](docs/relay-protocol.md).
-3. Validate returns with eBIRForms `bir-core` before sending.
+- [docs/bot-site.md](docs/bot-site.md): buwiz.com, the Buwiz Bot site. Building it, prerendering and SEO.
+- [docs/ebirforms-site.md](docs/ebirforms-site.md): ebirforms.buwiz.com, the filing site. Downloads and releases.
+- [docs/accounts.md](docs/accounts.md):
+  - accounts;
+  - TIN activation and staff review;
+  - OCR;
+  - app sign-in;
+  - the licence gate;
+  - MCP for AI agents.
+- [docs/relay.md](docs/relay.md): the submission relay. The Gatekeeper and the Sender, the `bir` feature and the relay modes.
+- [docs/relay-protocol.md](docs/relay-protocol.md): the relay's wire protocol (v2), for app authors.
+- [docs/development.md](docs/development.md): settings, features and tests.
+- [docs/deploy.md](docs/deploy.md): production.

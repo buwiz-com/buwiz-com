@@ -2,11 +2,11 @@
 //! `DOWNLOADS_URL`. Each app has its own folder there: the release CI
 //! (eBIRForms) uploads `{app}/releases/v{version}/{file}` and that version's
 //! `manifest.json`, and the owner releases a version by copying its
-//! manifest to `{app}/latest.json`. Older releases were at the root
-//! (`releases/v{version}/`, `latest.json`); while an app has no
-//! `{app}/latest.json`, the root one is read instead. Until either exists
-//! nothing is released, and every download link on the site says "coming
-//! soon".
+//! manifest to `{app}/latest.json`. Older eBIRForms releases were at the
+//! root (`releases/v{version}/`, `latest.json`); while eBIRForms has no
+//! `ebirforms/latest.json`, the root one is read instead. Buwiz Bot
+//! ([`BOT_APP`]) only ever reads its own. Until one exists nothing is
+//! released, and every download link on the site says "coming soon".
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -379,6 +379,10 @@ pub fn is_download(user_agent: &str) -> bool {
 /// `download_counts.app`.
 pub const APP: &str = "ebirforms";
 
+/// Buwiz Bot, whose download button is on buwiz.com: its folder in the
+/// bucket.
+pub const BOT_APP: &str = "bot";
+
 /// Counts one download of `file`, of `app`'s release `version`, on today's
 /// date in Manila.
 pub async fn count(db: &PgPool, app: &str, version: &str, file: &File) -> sqlx::Result<()> {
@@ -429,10 +433,12 @@ pub async fn totals(db: &PgPool, app: &str) -> sqlx::Result<Vec<Total>> {
         .collect())
 }
 
-/// [`APP`]'s `latest.json`, fetched when asked for and kept for [`REFRESH`].
+/// An app's `latest.json`, fetched when asked for and kept for [`REFRESH`].
 pub struct Downloads {
     base: String,
     app: &'static str,
+    /// Whether the root `latest.json` stands in while the app has none.
+    root_fallback: bool,
     http: reqwest::Client,
     refresh: Duration,
     cache: Mutex<Cache>,
@@ -445,14 +451,16 @@ struct Cache {
 }
 
 impl Downloads {
-    /// `base` is `DOWNLOADS_URL`, without a trailing slash.
-    pub fn new(base: &str) -> Self {
-        Self::with_refresh(base, REFRESH)
+    /// `base` is `DOWNLOADS_URL`, without a trailing slash; `app` is the
+    /// app's folder there. With `root_fallback`, the root `latest.json` is
+    /// read while the app has none of its own (eBIRForms' older releases).
+    pub fn new(base: &str, app: &'static str, root_fallback: bool) -> Self {
+        Self::with_refresh(base, app, root_fallback, REFRESH)
     }
 
-    fn with_refresh(base: &str, refresh: Duration) -> Self {
+    fn with_refresh(base: &str, app: &'static str, root_fallback: bool, refresh: Duration) -> Self {
         let http = reqwest::Client::builder().timeout(TIMEOUT).build().expect("client");
-        Self { base: base.to_owned(), app: APP, http, refresh, cache: Mutex::default() }
+        Self { base: base.to_owned(), app, root_fallback, http, refresh, cache: Mutex::default() }
     }
 
     /// The app whose installers these are, for [`count`] and [`totals`].
@@ -482,7 +490,8 @@ impl Downloads {
     }
 
     /// The app's own `{app}/latest.json`, or while it has none the root
-    /// `latest.json`. `Ok(None)` when neither exists: nothing is released,
+    /// `latest.json` if it falls back to that. `Ok(None)` when neither
+    /// exists: nothing is released,
     /// or a release was taken back. Only a missing file falls back: a broken
     /// or unreachable one is an error, so the last good manifest is kept
     /// rather than swapped for an older one.
@@ -490,7 +499,8 @@ impl Downloads {
         let own = format!("{}/{}", self.base, self.app);
         match self.fetch_from(&own).await? {
             Some(release) => Ok(Some(release)),
-            None => self.fetch_from(&self.base).await,
+            None if self.root_fallback => self.fetch_from(&self.base).await,
+            None => Ok(None),
         }
     }
 
@@ -759,7 +769,7 @@ mod tests {
     async fn a_failed_refresh_keeps_the_last_good_manifest_and_a_404_takes_it_back() {
         let (bucket, base) = FakeBucket::start().await;
         bucket.put(ROOT, b"{broken".to_vec());
-        let downloads = Downloads::with_refresh(&base, Duration::ZERO);
+        let downloads = Downloads::with_refresh(&base, APP, true, Duration::ZERO);
         assert!(downloads.latest().await.is_none(), "never a good manifest: not released");
 
         bucket.put(ROOT, apk("1.2.0"));
@@ -774,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn the_manifest_is_asked_for_at_most_once_a_minute() {
         let (bucket, base) = FakeBucket::start().await;
-        let downloads = Downloads::new(&base);
+        let downloads = Downloads::new(&base, APP, true);
         assert!(downloads.latest().await.is_none());
         bucket.put(OWN, apk("1.2.0"));
         assert!(downloads.latest().await.is_none(), "still the answer from a moment ago");
@@ -784,7 +794,7 @@ mod tests {
     async fn the_apps_own_latest_json_alone_is_read_with_its_files_in_its_folder() {
         let (bucket, base) = FakeBucket::start().await;
         bucket.put(OWN, manifest("1.3.0", vec![entry("macos", "universal", "dmg", "Buwiz-1.3.0.dmg")]));
-        let downloads = Downloads::with_refresh(&base, Duration::ZERO);
+        let downloads = Downloads::with_refresh(&base, APP, true, Duration::ZERO);
         let release = downloads.latest().await.unwrap();
         assert_eq!(release.version, "1.3.0");
         assert_eq!(release.files[0].url, format!("{base}/ebirforms/releases/v1.3.0/Buwiz-1.3.0.dmg"));
@@ -801,7 +811,7 @@ mod tests {
     async fn without_its_own_latest_json_the_app_reads_the_root_one() {
         let (bucket, base) = FakeBucket::start().await;
         bucket.put(ROOT, manifest("1.2.0", vec![entry("macos", "universal", "dmg", "Buwiz-1.2.0.dmg")]));
-        let downloads = Downloads::with_refresh(&base, Duration::ZERO);
+        let downloads = Downloads::with_refresh(&base, APP, true, Duration::ZERO);
         let release = downloads.latest().await.unwrap();
         assert_eq!(release.version, "1.2.0");
         assert_eq!(release.files[0].url, format!("{base}/releases/v1.2.0/Buwiz-1.2.0.dmg"));
@@ -812,6 +822,25 @@ mod tests {
         // And taken back, the root one again.
         bucket.delete(OWN);
         assert_eq!(downloads.latest().await.unwrap().version, "1.2.0");
+    }
+
+    #[tokio::test]
+    async fn the_bot_reads_only_its_own_latest_json() {
+        let (bucket, base) = FakeBucket::start().await;
+        bucket.put(ROOT, apk("1.2.0"));
+        let bot = Downloads::with_refresh(&base, BOT_APP, false, Duration::ZERO);
+        assert_eq!(bot.app(), "bot");
+        assert!(bot.latest().await.is_none(), "the root latest.json is eBIRForms', not the bot's");
+        bucket.put(OWN, apk("1.3.0"));
+        assert!(bot.latest().await.is_none(), "nor is ebirforms/latest.json");
+
+        bucket.put("/bot/latest.json", manifest("0.4.0", vec![entry("macos", "universal", "dmg", "Buwiz-Bot.dmg")]));
+        let release = bot.latest().await.unwrap();
+        assert_eq!(release.version, "0.4.0");
+        assert_eq!(release.files[0].url, format!("{base}/bot/releases/v0.4.0/Buwiz-Bot.dmg"));
+        // Taken back: nothing is released, the root one never stands in.
+        bucket.delete("/bot/latest.json");
+        assert!(bot.latest().await.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -827,7 +856,7 @@ mod tests {
                 ],
             ),
         );
-        let downloads = Downloads::new(&base);
+        let downloads = Downloads::new(&base, APP, true);
         assert_eq!(downloads.app(), "ebirforms");
         let release = downloads.latest().await.unwrap();
         let mac = release.pick(Platform::Mac, None, None).unwrap();

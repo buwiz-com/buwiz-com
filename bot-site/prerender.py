@@ -88,6 +88,9 @@ def main():
                     "--no-first-run",
                     f"--user-data-dir={profile}",
                     "--window-size=1440,900",
+                    # No platform: the download button reads "Download for
+                    # desktop" until the app draws it for the visitor's own.
+                    "--user-agent=Mozilla/5.0 (Buwiz prerender)",
                     "--virtual-time-budget=8000",
                     "--dump-dom",
                     f"http://127.0.0.1:{port}{path}",

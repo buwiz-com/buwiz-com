@@ -946,7 +946,7 @@ pub fn AgentTemplates() -> impl IntoView {
     autoplay_when_visible(tl, win);
 
     view! {
-        <section id="templates" aria-labelledby="templates-title" class="relative py-24 md:py-32 border-t border-gc-border bg-gc-bg-card">
+        <section id="templates" aria-labelledby="templates-title" class="relative py-24 md:py-32 border-t border-gc-border bg-gc-bg-card/40">
             <div class="max-w-[1128px] mx-auto px-6">
                 <div class="max-w-2xl mb-10 md:mb-12">
                     <h2 id="templates-title" class="text-3xl md:text-5xl font-black tracking-tighter text-gc-text leading-[1.08] mb-4">

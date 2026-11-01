@@ -7,7 +7,8 @@ use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
 use crate::config::Config;
-use crate::downloads::Downloads;
+use crate::downloads::{self, Downloads};
+use crate::github::Stars;
 use crate::link::SenderLink;
 use crate::mail::Mailer;
 use crate::ocr::Reader;
@@ -28,8 +29,13 @@ pub struct Inner {
     pub sender: SenderLink,
     /// Reads claim documents on this server, one at a time.
     pub ocr: Reader,
-    /// The released version of the app, if any.
+    /// The released version of the app (eBIRForms), if any.
     pub downloads: Downloads,
+    /// The released version of Buwiz Bot, if any, for buwiz.com's download
+    /// button.
+    pub bot_downloads: Downloads,
+    /// Buwiz Bot's GitHub stars, for buwiz.com's GitHub links.
+    pub stars: Stars,
 }
 
 impl AppState {
@@ -41,8 +47,21 @@ impl AppState {
         sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
-        let downloads = Downloads::new(&config.downloads_url);
-        Self(Arc::new(Inner { config, db, mailer, documents, ticket_key, sender, ocr: Reader::from_env(), downloads }))
+        let downloads = Downloads::new(&config.downloads_url, downloads::APP, true);
+        let bot_downloads = Downloads::new(&config.downloads_url, downloads::BOT_APP, false);
+        let stars = Stars::new(&config.github_api_url);
+        Self(Arc::new(Inner {
+            config,
+            db,
+            mailer,
+            documents,
+            ticket_key,
+            sender,
+            ocr: Reader::from_env(),
+            downloads,
+            bot_downloads,
+            stars,
+        }))
     }
 }
 

@@ -74,6 +74,8 @@ impl Site {
             trust_list: None,
             downloads_url: downloads_url.into(),
             forms_origin: FORMS.into(),
+            // Nothing listens there: the star count is unknown.
+            github_api_url: "http://127.0.0.1:9".into(),
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         // The account site never reaches the Sender in these tests.
@@ -1869,7 +1871,11 @@ async fn the_bot_site_is_the_bare_domain(db: PgPool) {
     // The Bot site's own index.html (bot-site/dist), its origins filled in.
     for part in [
         "<title>Buwiz Bot: AI coworkers that work on a computer you host</title>",
-        r#"<meta name="description" content="Give your AI a job and a computer you host."#,
+        r#"<meta name="description" content="Buwiz Bot is free and open source. Give your AI a job and a computer you host."#,
+        // Nothing released, and GitHub is not reachable from the tests.
+        r#"<meta name="buwiz-bot-download" content="" />"#,
+        r#"<meta name="buwiz-bot-stars" content="" />"#,
+        r#""license": "https://www.apache.org/licenses/LICENSE-2.0""#,
         // Drawn already, for crawlers that do not run the app.
         r#"<div id="prerender">"#,
         "<h1",
@@ -1935,7 +1941,7 @@ async fn the_bot_site_serves_its_mini_apps_page(db: PgPool) {
     ] {
         assert!(page.contains(part), "{part}: {page}");
     }
-    assert!(!page.contains("Meet Buwiz Bot"), "{page}");
+    assert!(!page.contains("AI coworkers that work on a computer you control."), "{page}");
     let head = Request::head("/mini-apps").header(header::HOST, "buwiz.com").body(Body::empty()).unwrap();
     assert_eq!(site.send(head).await.status(), StatusCode::OK);
 

@@ -35,6 +35,9 @@ pub struct Config {
     /// Origin of the filing site, e.g. `https://ebirforms.buwiz.com`. Its pages'
     /// canonical addresses, the sitemap and the install command use it.
     pub forms_origin: String,
+    /// The GitHub API, `https://api.github.com`, read for Buwiz Bot's star
+    /// count (see [`crate::github`]).
+    pub github_api_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +85,7 @@ impl Config {
                 .filter(|raw| !raw.is_empty()),
             downloads_url: origin(&var_or("DOWNLOADS_URL", "https://downloads.buwiz.com")).context("DOWNLOADS_URL")?,
             forms_origin: origin(&var_or("FORMS_ORIGIN", "https://ebirforms.buwiz.com")).context("FORMS_ORIGIN")?,
+            github_api_url: origin(&var_or("GITHUB_API_URL", "https://api.github.com")).context("GITHUB_API_URL")?,
         })
     }
 

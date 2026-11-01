@@ -1,6 +1,6 @@
 //! The Buwiz app's installers, in the R2 bucket `buwiz-releases` served at
 //! `DOWNLOADS_URL`. Each app has its own folder there: the release CI
-//! uploads `{app}/releases/v{version}/{file}` and that version's
+//! (eBIRForms) uploads `{app}/releases/v{version}/{file}` and that version's
 //! `manifest.json`, and the owner releases a version by copying its
 //! manifest to `{app}/latest.json`. Older releases were at the root
 //! (`releases/v{version}/`, `latest.json`); while an app has no

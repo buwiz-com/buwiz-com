@@ -13,13 +13,16 @@ use leptos::{ev, html, prelude::*};
 type Job = Box<dyn FnOnce()>;
 type Frame = Box<dyn FnMut(f64) -> bool>;
 
+/// What a demo runs on each play (see [`Timeline::script`]).
+type ScriptFn = Rc<dyn Fn(&mut Script)>;
+
 #[derive(Default)]
 struct Clock {
     now: f64,
     last: f64,
     jobs: Vec<(f64, Job)>,
     frames: Vec<Frame>,
-    script: Option<Rc<dyn Fn(&mut Script)>>,
+    script: Option<ScriptFn>,
     /// The frame loop has stopped: the run ended or was stopped.
     stopped: bool,
 }
@@ -123,10 +126,10 @@ impl Timeline {
             }
             woke
         });
-        if woke == Some(true) {
-            if let Some(run) = self.run.try_get_value() {
-                self.tick(run);
-            }
+        if woke == Some(true)
+            && let Some(run) = self.run.try_get_value()
+        {
+            self.tick(run);
         }
     }
 
@@ -205,6 +208,12 @@ impl Timeline {
     }
 }
 
+impl Default for Timeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lays out a run's steps on the timeline. `t` is where the next step lands.
 pub struct Script {
     tl: Timeline,
@@ -233,7 +242,12 @@ impl Script {
     }
 
     /// Types `text` a character at a time, `per_char` ms apart, handing `f` what's typed so far.
-    pub fn typing(&mut self, text: &'static str, per_char: u32, f: impl Fn(&'static str) + Clone + 'static) -> &mut Self {
+    pub fn typing(
+        &mut self,
+        text: &'static str,
+        per_char: u32,
+        f: impl Fn(&'static str) + Clone + 'static,
+    ) -> &mut Self {
         for (i, c) in text.char_indices() {
             let f = f.clone();
             let end = i + c.len_utf8();
@@ -335,10 +349,10 @@ impl DemoCursor {
         };
         // Layout changes move the targets; keep the cursor on the one it rests on.
         let resize = window_event_listener(ev::resize, move |_| {
-            if let Some(Some(aim)) = cur.rest.try_get_value() {
-                if let Some(p) = cur.point(Goal::Aim(aim)) {
-                    cur.pos.set(Some(p));
-                }
+            if let Some(Some(aim)) = cur.rest.try_get_value()
+                && let Some(p) = cur.point(Goal::Aim(aim))
+            {
+                cur.pos.set(Some(p));
             }
         });
         on_cleanup(move || resize.remove());

@@ -81,11 +81,8 @@ pub struct AgentScreen {
 
 impl AgentScreen {
     pub fn new() -> Self {
-        let reduced = window()
-            .match_media("(prefers-reduced-motion: reduce)")
-            .ok()
-            .flatten()
-            .is_some_and(|m| m.matches());
+        let reduced =
+            window().match_media("(prefers-reduced-motion: reduce)").ok().flatten().is_some_and(|m| m.matches());
         Self {
             zoom: RwSignal::new(Zoom::Closed),
             style: RwSignal::new(String::new()),
@@ -153,7 +150,9 @@ impl AgentScreen {
         } else {
             (
                 format!("{}opacity:.55;transition:none;", self.over_thumb()),
-                format!("transform:none;opacity:1;transition:transform {GROW_MS}ms cubic-bezier(.2,.8,.2,1),opacity 160ms ease-out;"),
+                format!(
+                    "transform:none;opacity:1;transition:transform {GROW_MS}ms cubic-bezier(.2,.8,.2,1),opacity 160ms ease-out;"
+                ),
             )
         };
         style.set(from);

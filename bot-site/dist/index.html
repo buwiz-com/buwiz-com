@@ -3,6 +3,7 @@
 
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <!-- FOUC Prevention: Set theme before any CSS/WASM loads -->
   <script>
     (function() {
@@ -35,29 +36,68 @@
       document.documentElement.setAttribute('data-theme', theme);
     })();
   </script>
-  <title>Meet Buwiz Bot | Buwiz</title>
-  <meta name="description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
+  <title>Buwiz Bot: AI coworkers that work on a computer you host</title>
+  <meta name="description" content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
   <link rel="canonical" href="https://buwiz.com/" />
   <meta name="theme-color" content="#0F172A" />
   <!-- The server fills this in with FORMS_ORIGIN (src/bot_site.rs). -->
   <meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />
 
+  <!-- Who and what Buwiz is, for search engines and AI answer engines.
+       Plain HTML: the page itself is drawn by the app, which crawlers that
+       do not run JavaScript never see. Its URLs leave off the home
+       page's trailing slash: src/bot_site.rs rewrites that exact URL to
+       each page's canonical address. -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://buwiz.com#org",
+        "name": "Buwiz",
+        "url": "https://buwiz.com",
+        "logo": "https://buwiz.com/assets/brand/apple-touch-icon.png",
+        "areaServed": "PH",
+        "sameAs": ["https://github.com/buwiz-bot/buwiz-bot"]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://buwiz.com#site",
+        "name": "Buwiz",
+        "url": "https://buwiz.com",
+        "publisher": { "@id": "https://buwiz.com#org" }
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://buwiz.com#bot",
+        "name": "Buwiz Bot",
+        "description": "An AI coworker for your desktop. Its mini apps open right in the chat, for you and your AI agent: eBIRForms to prepare and file BIR tax returns, Books for bookkeeping, and Word and Spreadsheet for documents.",
+        "applicationCategory": "BusinessApplication",
+        "url": "https://buwiz.com",
+        "publisher": { "@id": "https://buwiz.com#org" }
+      }
+    ]
+  }
+  </script>
+
   <!-- Open Graph / Facebook -->
   <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Buwiz" />
   <meta property="og:url" content="https://buwiz.com/" />
-  <meta property="og:title" content="Meet Buwiz Bot | Buwiz" />
-  <meta property="og:description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
+  <meta property="og:title" content="Buwiz Bot: AI coworkers that work on a computer you host" />
+  <meta property="og:description" content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
 
   <!-- Twitter -->
   <meta property="twitter:card" content="summary" />
   <meta property="twitter:url" content="https://buwiz.com/" />
-  <meta property="twitter:title" content="Meet Buwiz Bot | Buwiz" />
-  <meta property="twitter:description" content="Give your AI a job. Give it a computer. Let it work. Specialized coworkers with skills, tools, knowledge, connectors, and a computer you host. No lock-in." />
+  <meta property="twitter:title" content="Buwiz Bot: AI coworkers that work on a computer you host" />
+  <meta property="twitter:description" content="Give your AI a job and a computer you host. Mini apps in the chat file BIR returns, keep the books and edit documents." />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
   <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
   <!-- Add a plain CSS file: see https://trunkrs.dev/assets/#css -->
   <!-- If using Tailwind with Leptos CSR, see https://trunkrs.dev/assets/#tailwind instead-->
-  <link rel="stylesheet" href="/bot/tailwind-17d3233dce01c49f.css" integrity="sha384-6dUDXnGv/TiCjNua9uXfFjbmNU1sjbVYAX6z6DJ8Sg1diYvfQa+wUfL5yDk11nJT"/>
+  <link rel="stylesheet" href="/bot/tailwind-77dd759b01207d33.css" integrity="sha384-I0PzEK7jfw1vUEpFenTMb9R9JU0EX2YxRSXTCf3tQwwbbZhVmV/gE082t1B3hygo"/>
 
   <!-- The server's own Buwiz icons and manifest. -->
   <link rel="icon" type="image/svg+xml" href="/assets/brand/buwiz_favicon.svg" />
@@ -71,8 +111,8 @@
   <!-- include support for `wasm-bindgen --weak-refs` - see: https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html -->
   
 <script type="module">
-import init, * as bindings from '/bot/buwiz-bot-site-41268b7a6a4065a0.js';
-const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-1aecfa98bc178e98_bg.wasm' });
+import init, * as bindings from '/bot/buwiz-bot-site-8bed601a2ec42c8b.js';
+const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-8bed601a2ec42c8b_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -82,7 +122,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
 
-<link rel="modulepreload" href="/bot/buwiz-bot-site-41268b7a6a4065a0.js" crossorigin="anonymous" integrity="sha384-fLEcTAIzkyvdfWEt6VgYkmtdm3fqBwFqOnMwFFKpjQk0scBTFNx64pQlETC2aSyq"><link rel="preload" href="/bot/buwiz-bot-site-1aecfa98bc178e98_bg.wasm" crossorigin="anonymous" integrity="sha384-5igpTUfEdNN2MfSWUHfkvOmiREJsa1uQtdvzE915EwvCa6VY+pjAKMf2RUp731D7" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/bot/buwiz-bot-site-8bed601a2ec42c8b.js" crossorigin="anonymous" integrity="sha384-+XKNdNY3iovAodIoQleY2aAtIIINFCDKcwPE+MJNBbU6DfwVCfjHdVFTsL86hP7y"><link rel="preload" href="/bot/buwiz-bot-site-8bed601a2ec42c8b_bg.wasm" crossorigin="anonymous" integrity="sha384-xPqqFXD0FX4JSpENAaedEGRyFETuTYy4LfUB9f2Hqh5JqBuOvwZE+uPF5XrdtdMs" as="fetch" type="application/wasm"></head>
 
 <body></body>
 

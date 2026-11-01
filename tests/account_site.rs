@@ -1883,8 +1883,12 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
     let page = text(page).await;
     // The Bot site's own index.html (bot-site/dist), its origins filled in.
     for part in [
-        "<title>Meet Buwiz Bot | Buwiz</title>",
-        r#"<meta name="description" content="Give your AI a job. Give it a computer. Let it work."#,
+        "<title>Buwiz Bot: AI coworkers that work on a computer you host</title>",
+        r#"<meta name="description" content="Give your AI a job and a computer you host."#,
+        // Drawn already, for crawlers that do not run the app.
+        r#"<div id="prerender">"#,
+        "<h1",
+        "<footer",
         r#"<link rel="canonical" href="https://buwiz.com/" />"#,
         r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {
@@ -1939,7 +1943,9 @@ async fn once_split_the_bot_host_serves_its_mini_apps_page(db: PgPool) {
     assert_eq!(wasm(&page), wasm(&home));
     assert!(wasm(&page).is_some(), "{page}");
     for part in [
-        "<title>Mini apps | Buwiz Bot</title>",
+        "<title>Mini apps: eBIRForms, Books, Word and Spreadsheet | Buwiz Bot</title>",
+        r#"<meta name="description" content="Buwiz mini apps run inside Buwiz Bot"#,
+        r#"<div id="prerender">"#,
         r#"<link rel="canonical" href="https://buwiz.com/mini-apps" />"#,
         r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {

@@ -1,9 +1,12 @@
 //! The Buwiz app's installers, in the R2 bucket `buwiz-releases` served at
-//! `DOWNLOADS_URL`. The release CI (buwiz-oss) uploads
-//! `releases/v{version}/{file}` and that version's `manifest.json`; the
-//! owner releases a version by copying its manifest to `latest.json` at the
-//! root. Until `latest.json` exists nothing is released, and every download
-//! link on the site says "coming soon".
+//! `DOWNLOADS_URL`. Each app has its own folder there: the release CI
+//! uploads `{app}/releases/v{version}/{file}` and that version's
+//! `manifest.json`, and the owner releases a version by copying its
+//! manifest to `{app}/latest.json`. Older releases were at the root
+//! (`releases/v{version}/`, `latest.json`); while an app has no
+//! `{app}/latest.json`, the root one is read instead. Until either exists
+//! nothing is released, and every download link on the site says "coming
+//! soon".
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -372,18 +375,19 @@ pub fn is_download(user_agent: &str) -> bool {
             .any(|word| agent.contains(word))
 }
 
-/// The app this server hands out, in `download_counts.app`.
-const APP: &str = "ebirforms";
+/// The app this server hands out: its folder in the bucket, and its name in
+/// `download_counts.app`.
+pub const APP: &str = "ebirforms";
 
-/// Counts one download of `file`, of release `version`, on today's date in
-/// Manila.
-pub async fn count(db: &PgPool, version: &str, file: &File) -> sqlx::Result<()> {
+/// Counts one download of `file`, of `app`'s release `version`, on today's
+/// date in Manila.
+pub async fn count(db: &PgPool, app: &str, version: &str, file: &File) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO download_counts (app, day, version, platform, arch, kind, count)
          VALUES ($1, (now() AT TIME ZONE 'Asia/Manila')::date, $2, $3, $4, $5, 1)
          ON CONFLICT (app, day, version, platform, arch, kind) DO UPDATE SET count = download_counts.count + 1",
     )
-    .bind(APP)
+    .bind(app)
     .bind(version)
     .bind(file.platform.manifest_name())
     .bind(file.arch.name())
@@ -402,14 +406,14 @@ pub struct Total {
     pub count: i64,
 }
 
-/// Every file's downloads so far, most downloaded first: for showing on the
-/// site. Only this server's app; names it no longer knows are left out.
-pub async fn totals(db: &PgPool) -> sqlx::Result<Vec<Total>> {
+/// Every file of `app`'s downloads so far, most downloaded first: for
+/// showing on the site. Names this server no longer knows are left out.
+pub async fn totals(db: &PgPool, app: &str) -> sqlx::Result<Vec<Total>> {
     let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
         "SELECT platform, arch, kind, sum(count)::bigint FROM download_counts WHERE app = $1
          GROUP BY platform, arch, kind ORDER BY 4 DESC, 1, 2, 3",
     )
-    .bind(APP)
+    .bind(app)
     .fetch_all(db)
     .await?;
     Ok(rows
@@ -425,9 +429,10 @@ pub async fn totals(db: &PgPool) -> sqlx::Result<Vec<Total>> {
         .collect())
 }
 
-/// `latest.json`, fetched when asked for and kept for [`REFRESH`].
+/// [`APP`]'s `latest.json`, fetched when asked for and kept for [`REFRESH`].
 pub struct Downloads {
     base: String,
+    app: &'static str,
     http: reqwest::Client,
     refresh: Duration,
     cache: Mutex<Cache>,
@@ -447,7 +452,12 @@ impl Downloads {
 
     fn with_refresh(base: &str, refresh: Duration) -> Self {
         let http = reqwest::Client::builder().timeout(TIMEOUT).build().expect("client");
-        Self { base: base.to_owned(), http, refresh, cache: Mutex::default() }
+        Self { base: base.to_owned(), app: APP, http, refresh, cache: Mutex::default() }
+    }
+
+    /// The app whose installers these are, for [`count`] and [`totals`].
+    pub fn app(&self) -> &'static str {
+        self.app
     }
 
     /// The released version, or `None` while nothing is. A failed refresh
@@ -471,20 +481,35 @@ impl Downloads {
         self.cache.lock().expect("downloads cache").release.clone()
     }
 
-    /// `Ok(None)` when there is no `latest.json`: nothing is released, or a
-    /// release was taken back.
+    /// The app's own `{app}/latest.json`, or while it has none the root
+    /// `latest.json`. `Ok(None)` when neither exists: nothing is released,
+    /// or a release was taken back. Only a missing file falls back: a broken
+    /// or unreachable one is an error, so the last good manifest is kept
+    /// rather than swapped for an older one.
     async fn fetch(&self) -> anyhow::Result<Option<Release>> {
-        let response = self.http.get(format!("{}/latest.json", self.base)).send().await?;
+        let own = format!("{}/{}", self.base, self.app);
+        match self.fetch_from(&own).await? {
+            Some(release) => Ok(Some(release)),
+            None => self.fetch_from(&self.base).await,
+        }
+    }
+
+    /// `{folder}/latest.json`, whose files are under `{folder}/releases/`.
+    async fn fetch_from(&self, folder: &str) -> anyhow::Result<Option<Release>> {
+        let url = format!("{folder}/latest.json");
+        let response = self.http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let body = response.error_for_status()?.bytes().await?;
-        Release::parse(&body, &self.base).map(Some)
+        let body = response.error_for_status()?.bytes().await.with_context(|| format!("GET {url}"))?;
+        Release::parse(&body, folder).with_context(|| url).map(Some)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     const BASE: &str = "https://downloads.buwiz.com";
@@ -688,51 +713,145 @@ mod tests {
         assert_eq!(guess_device("curl/8.7.1"), None);
     }
 
-    /// Serves `body` (or a 404 when `None`) as `/latest.json` on a free port.
-    async fn origin(body: Arc<Mutex<Option<Vec<u8>>>>) -> String {
-        let app = axum::Router::new().route(
-            "/latest.json",
-            axum::routing::get(move || {
-                let body = body.lock().unwrap().clone();
+    /// A stand-in for the `buwiz-releases` bucket: each path serves what
+    /// the test put there, any other a 404.
+    #[derive(Clone, Default)]
+    struct FakeBucket(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+
+    impl FakeBucket {
+        /// Serves the bucket on a free port; returns it and its URL.
+        async fn start() -> (Self, String) {
+            let bucket = Self::default();
+            let objects = bucket.0.clone();
+            let app = axum::Router::new().fallback(move |uri: http::Uri| {
+                let object = objects.lock().unwrap().get(uri.path()).cloned();
                 async move {
                     use axum::response::IntoResponse;
-                    match body {
+                    match object {
                         Some(body) => body.into_response(),
                         None => http::StatusCode::NOT_FOUND.into_response(),
                     }
                 }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        url
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (bucket, url)
+        }
+
+        fn put(&self, path: &str, body: Vec<u8>) {
+            self.0.lock().unwrap().insert(path.to_owned(), body);
+        }
+
+        fn delete(&self, path: &str) {
+            self.0.lock().unwrap().remove(path);
+        }
+    }
+
+    const OWN: &str = "/ebirforms/latest.json";
+    const ROOT: &str = "/latest.json";
+
+    fn apk(version: &str) -> Vec<u8> {
+        manifest(version, vec![entry("android", "universal", "apk", "Buwiz.apk")])
     }
 
     #[tokio::test]
     async fn a_failed_refresh_keeps_the_last_good_manifest_and_a_404_takes_it_back() {
-        let good = manifest("1.2.0", vec![entry("android", "universal", "apk", "Buwiz.apk")]);
-        let body = Arc::new(Mutex::new(Some(b"{broken".to_vec())));
-        let base = origin(body.clone()).await;
+        let (bucket, base) = FakeBucket::start().await;
+        bucket.put(ROOT, b"{broken".to_vec());
         let downloads = Downloads::with_refresh(&base, Duration::ZERO);
         assert!(downloads.latest().await.is_none(), "never a good manifest: not released");
 
-        *body.lock().unwrap() = Some(good);
+        bucket.put(ROOT, apk("1.2.0"));
         assert_eq!(downloads.latest().await.unwrap().version, "1.2.0");
-        *body.lock().unwrap() = Some(b"{broken".to_vec());
+        bucket.put(ROOT, b"{broken".to_vec());
         assert_eq!(downloads.latest().await.unwrap().version, "1.2.0", "kept the last good one");
 
-        *body.lock().unwrap() = None;
+        bucket.delete(ROOT);
         assert!(downloads.latest().await.is_none(), "latest.json removed: not released");
     }
 
     #[tokio::test]
     async fn the_manifest_is_asked_for_at_most_once_a_minute() {
-        let body = Arc::new(Mutex::new(None));
-        let base = origin(body.clone()).await;
+        let (bucket, base) = FakeBucket::start().await;
         let downloads = Downloads::new(&base);
         assert!(downloads.latest().await.is_none());
-        *body.lock().unwrap() = Some(manifest("1.2.0", vec![entry("android", "universal", "apk", "Buwiz.apk")]));
+        bucket.put(OWN, apk("1.2.0"));
         assert!(downloads.latest().await.is_none(), "still the answer from a moment ago");
+    }
+
+    #[tokio::test]
+    async fn the_apps_own_latest_json_alone_is_read_with_its_files_in_its_folder() {
+        let (bucket, base) = FakeBucket::start().await;
+        bucket.put(OWN, manifest("1.3.0", vec![entry("macos", "universal", "dmg", "Buwiz-1.3.0.dmg")]));
+        let downloads = Downloads::with_refresh(&base, Duration::ZERO);
+        let release = downloads.latest().await.unwrap();
+        assert_eq!(release.version, "1.3.0");
+        assert_eq!(release.files[0].url, format!("{base}/ebirforms/releases/v1.3.0/Buwiz-1.3.0.dmg"));
+
+        // With a root one too, the app's own wins.
+        bucket.put(ROOT, apk("1.2.0"));
+        assert_eq!(downloads.latest().await.unwrap().version, "1.3.0");
+        // A broken own one keeps the last good release, not the older root.
+        bucket.put(OWN, b"{broken".to_vec());
+        assert_eq!(downloads.latest().await.unwrap().version, "1.3.0");
+    }
+
+    #[tokio::test]
+    async fn without_its_own_latest_json_the_app_reads_the_root_one() {
+        let (bucket, base) = FakeBucket::start().await;
+        bucket.put(ROOT, manifest("1.2.0", vec![entry("macos", "universal", "dmg", "Buwiz-1.2.0.dmg")]));
+        let downloads = Downloads::with_refresh(&base, Duration::ZERO);
+        let release = downloads.latest().await.unwrap();
+        assert_eq!(release.version, "1.2.0");
+        assert_eq!(release.files[0].url, format!("{base}/releases/v1.2.0/Buwiz-1.2.0.dmg"));
+
+        // The app's own appears: it is read from then on.
+        bucket.put(OWN, apk("1.3.0"));
+        assert_eq!(downloads.latest().await.unwrap().version, "1.3.0");
+        // And taken back, the root one again.
+        bucket.delete(OWN);
+        assert_eq!(downloads.latest().await.unwrap().version, "1.2.0");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn downloads_are_counted_per_app(db: PgPool) {
+        let (bucket, base) = FakeBucket::start().await;
+        bucket.put(
+            OWN,
+            manifest(
+                "1.3.0",
+                vec![
+                    entry("macos", "universal", "dmg", "Buwiz-1.3.0.dmg"),
+                    entry("linux", "x64", "deb", "buwiz_1.3.0_amd64.deb"),
+                ],
+            ),
+        );
+        let downloads = Downloads::new(&base);
+        assert_eq!(downloads.app(), "ebirforms");
+        let release = downloads.latest().await.unwrap();
+        let mac = release.pick(Platform::Mac, None, None).unwrap();
+        let deb = release.pick(Platform::Linux, None, None).unwrap();
+        for file in [mac, mac, deb] {
+            count(&db, downloads.app(), &release.version, file).await.unwrap();
+        }
+        // Another app's downloads of the same file are its own.
+        count(&db, "bot", &release.version, mac).await.unwrap();
+
+        let total = |platform, arch, kind, count| Total { platform, arch, kind, count };
+        assert_eq!(
+            totals(&db, "ebirforms").await.unwrap(),
+            vec![total(Platform::Mac, Arch::Universal, Kind::Dmg, 2), total(Platform::Linux, Arch::X64, Kind::Deb, 1)]
+        );
+        assert_eq!(totals(&db, "bot").await.unwrap(), vec![total(Platform::Mac, Arch::Universal, Kind::Dmg, 1)]);
+        assert!(totals(&db, "nobody").await.unwrap().is_empty());
+
+        let rows: Vec<(String, String, String, i64)> =
+            sqlx::query_as("SELECT app, version, kind, count FROM download_counts ORDER BY app, kind")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        let row = |app: &str, kind: &str, count| (app.to_owned(), "1.3.0".to_owned(), kind.to_owned(), count);
+        assert_eq!(rows, vec![row("bot", "dmg", 1), row("ebirforms", "deb", 1), row("ebirforms", "dmg", 2)]);
     }
 }

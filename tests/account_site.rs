@@ -59,6 +59,11 @@ impl Site {
         Self::build_split(db, DocumentStore::Database, NO_DOWNLOADS, true)
     }
 
+    /// A split site whose installers are at `downloads_url`.
+    fn split_with_downloads(db: PgPool, downloads_url: &str) -> Self {
+        Self::build_split(db, DocumentStore::Database, downloads_url, true)
+    }
+
     fn build(db: PgPool, store: DocumentStore, downloads_url: &str) -> Self {
         Self::build_split(db, store, downloads_url, false)
     }
@@ -1198,18 +1203,20 @@ async fn claimants_replace_and_remove_files_while_open(db: PgPool) {
     }
 }
 
-/// A stand-in for the `buwiz-releases` bucket: `/latest.json` is whatever
-/// the test sets, or a 404 while unset.
+/// A stand-in for the `buwiz-releases` bucket: the root `/latest.json` and
+/// the app's own `/ebirforms/latest.json` are whatever the test sets, or a
+/// 404 while unset.
 #[derive(Clone, Default)]
-struct FakeReleases(Arc<Mutex<Option<Vec<u8>>>>);
+struct FakeReleases {
+    root: Arc<Mutex<Option<Vec<u8>>>>,
+    own: Arc<Mutex<Option<Vec<u8>>>>,
+}
 
 impl FakeReleases {
     /// Serves the bucket on a free port; returns it and its URL.
     async fn start() -> (Self, String) {
         let releases = Self::default();
-        let shared = releases.0.clone();
-        let app = axum::Router::new().route(
-            "/latest.json",
+        let serve = |shared: Arc<Mutex<Option<Vec<u8>>>>| {
             axum::routing::get(move || {
                 let latest = shared.lock().unwrap().clone();
                 async move {
@@ -1218,16 +1225,25 @@ impl FakeReleases {
                         None => StatusCode::NOT_FOUND.into_response(),
                     }
                 }
-            }),
-        );
+            })
+        };
+        let app = axum::Router::new()
+            .route("/latest.json", serve(releases.root.clone()))
+            .route("/ebirforms/latest.json", serve(releases.own.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (releases, url)
     }
 
+    /// The root `latest.json`, as before the bucket had a folder per app.
     fn set_latest(&self, latest: &[u8]) {
-        *self.0.lock().unwrap() = Some(latest.to_vec());
+        *self.root.lock().unwrap() = Some(latest.to_vec());
+    }
+
+    /// The app's own `ebirforms/latest.json`.
+    fn set_own_latest(&self, latest: &[u8]) {
+        *self.own.lock().unwrap() = Some(latest.to_vec());
     }
 }
 
@@ -1279,8 +1295,13 @@ async fn download_from(site: &Site, path: &str) -> Response {
 
 /// Asks for `path` on buwiz.com as a browser does, with `User-Agent`.
 async fn browse(site: &Site, path: &str, user_agent: &str) -> Response {
+    browse_on(site, "buwiz.com", path, user_agent).await
+}
+
+/// Asks for `path` on `host` as a browser does, with `User-Agent`.
+async fn browse_on(site: &Site, host: &str, path: &str, user_agent: &str) -> Response {
     let request = Request::get(path)
-        .header(header::HOST, "buwiz.com")
+        .header(header::HOST, host)
         .header(header::USER_AGENT, user_agent)
         .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8");
     site.send(request.body(Body::empty()).unwrap()).await
@@ -1407,7 +1428,7 @@ async fn downloads_are_counted_per_file_and_day_without_crawlers(db: PgPool) {
     }
     let total = |platform, arch, kind, count| Total { platform, arch, kind, count };
     assert_eq!(
-        downloads::totals(&db).await.unwrap(),
+        downloads::totals(&db, downloads::APP).await.unwrap(),
         vec![
             total(Platform::Mac, Arch::Universal, Kind::Dmg, 2),
             total(Platform::Linux, Arch::Arm64, Kind::Rpm, 1),
@@ -1429,6 +1450,66 @@ async fn downloads_are_counted_per_file_and_day_without_crawlers(db: PgPool) {
         rows,
         vec![row("linux", "arm64", "rpm", 1), row("linux", "universal", "sh", 1), row("macos", "universal", "dmg", 2)]
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ebirforms_reads_its_own_latest_json_or_else_the_root_one_and_counts_both_as_its_own(db: PgPool) {
+    let host = "ebirforms.buwiz.com";
+    let (releases, url) = FakeReleases::start().await;
+    // Only the root one, as before the bucket had a folder per app.
+    releases.set_latest(&latest_json(&[]));
+    let site = Site::split_with_downloads(db.clone(), &url);
+    let response = browse_on(&site, host, "/download/mac", MAC).await;
+    assert_eq!(location(&response), format!("{url}/releases/v1.2.0/Buwiz-1.2.0-macos-universal.dmg"));
+    assert!(text(browse_on(&site, host, "/download", MAC).await).await.contains("Version 1.2.0,"));
+
+    // Its own one: read first, with the files in its folder.
+    let own = String::from_utf8(latest_json(&[])).unwrap().replace("1.2.0", "1.3.0");
+    releases.set_own_latest(own.as_bytes());
+    let site = Site::split_with_downloads(db.clone(), &url);
+    let response = browse_on(&site, host, "/download/mac", MAC).await;
+    assert_eq!(location(&response), format!("{url}/ebirforms/releases/v1.3.0/Buwiz-1.3.0-macos-universal.dmg"));
+    let page = text(browse_on(&site, host, "/download", MAC).await).await;
+    assert!(page.contains("Version 1.3.0,") && !page.contains("1.2.0"), "{page}");
+    assert!(!page.contains(&url), "never straight to the bucket");
+
+    // One Download button per device: one per card, the visitor's marked once.
+    let cards = platform_cards(&page);
+    assert_eq!(cards.len(), 5);
+    assert_eq!(cards.iter().filter(|card| card.starts_with(" yours\"")).count(), 1);
+    for name in ["macOS", "Windows", "Linux"] {
+        let card = card(&cards, name);
+        assert_eq!(card.matches("btn-solid").count(), 1, "{card}");
+        assert_eq!(card.matches("Download for").count(), 1, "{card}");
+    }
+    for name in ["Android", "iOS"] {
+        assert!(!card(&cards, name).contains("btn-solid"), "{name}");
+    }
+    // The home page: one Download button for the device, nowhere else.
+    for (agent, href) in [(MAC, "/download/mac"), (WINDOWS, "/download/windows"), (LINUX, "/download/linux")] {
+        let home = text(browse_on(&site, host, "/", agent).await).await;
+        assert_eq!(home.matches("btn-get").count(), 1, "{agent}");
+        assert_eq!(home.matches("Download for").count(), 1, "{agent}");
+        assert_eq!(home.matches(r#"href="/download/"#).count(), 1, "{agent}");
+        assert!(home.contains(&format!(r#"href="{href}""#)), "{agent}");
+        assert_eq!(home.matches(r#"href="/download""#).count(), 1, "Other platforms, once: {agent}");
+    }
+
+    // Counted as eBIRForms' downloads, per version.
+    let fallback = Site::split_with_downloads(db.clone(), &url);
+    *releases.own.lock().unwrap() = None;
+    assert_eq!(browse_on(&fallback, host, "/download/mac", MAC).await.status(), StatusCode::FOUND);
+    let total = |platform, arch, kind, count| Total { platform, arch, kind, count };
+    assert_eq!(
+        downloads::totals(&db, downloads::APP).await.unwrap(),
+        vec![total(Platform::Mac, Arch::Universal, Kind::Dmg, 3)]
+    );
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT app, version, count FROM download_counts ORDER BY version")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![("ebirforms".into(), "1.2.0".into(), 2), ("ebirforms".into(), "1.3.0".into(), 1)]);
 }
 
 /// The download page's platform cards, each up to its end.
@@ -1984,7 +2065,7 @@ async fn download_counts_are_kept_per_app(db: PgPool) {
         sqlx::query_as("SELECT app, count FROM download_counts ORDER BY app").fetch_all(&db).await.unwrap();
     assert_eq!(rows, [("bot".to_owned(), 5), ("ebirforms".to_owned(), 1)]);
     assert_eq!(
-        downloads::totals(&db).await.unwrap(),
+        downloads::totals(&db, downloads::APP).await.unwrap(),
         [Total { platform: Platform::Mac, arch: Arch::Universal, kind: Kind::Dmg, count: 1 }]
     );
 }

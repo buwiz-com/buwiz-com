@@ -32,8 +32,13 @@ const PDF: &[u8] = b"%PDF-1.7\nscan";
 /// Nothing listens on the discard port: the downloads bucket is unreachable,
 /// so nothing is released.
 const NO_DOWNLOADS: &str = "http://127.0.0.1:9";
-/// The filing site's own host, once the site is split.
+/// The filing site's own host.
 const FORMS: &str = "https://ebirforms.buwiz.com";
+/// The filing site's host, as in [`FORMS`].
+const FORMS_HOST: &str = "ebirforms.buwiz.com";
+/// The account host that hostless test requests go to. Not [`ORIGIN`]'s own
+/// host: `localhost:3008` is the Bot site.
+const ACCOUNT_HOST: &str = "account.localhost:3008";
 
 struct Site {
     db: PgPool,
@@ -54,21 +59,8 @@ impl Site {
         Self::build(db, DocumentStore::Database, downloads_url)
     }
 
-    /// A site split as `SITE_SPLIT=true` and `FORMS_ORIGIN` [`FORMS`] split it.
-    fn split(db: PgPool) -> Self {
-        Self::build_split(db, DocumentStore::Database, NO_DOWNLOADS, true)
-    }
-
-    /// A split site whose installers are at `downloads_url`.
-    fn split_with_downloads(db: PgPool, downloads_url: &str) -> Self {
-        Self::build_split(db, DocumentStore::Database, downloads_url, true)
-    }
-
+    /// The filing site is on [`FORMS`], as `FORMS_ORIGIN` puts it.
     fn build(db: PgPool, store: DocumentStore, downloads_url: &str) -> Self {
-        Self::build_split(db, store, downloads_url, false)
-    }
-
-    fn build_split(db: PgPool, store: DocumentStore, downloads_url: &str, split: bool) -> Self {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
@@ -81,8 +73,7 @@ impl Site {
             mail: MailConfig::Log,
             trust_list: None,
             downloads_url: downloads_url.into(),
-            forms_origin: if split { FORMS } else { "https://buwiz.com" }.into(),
-            site_split: split,
+            forms_origin: FORMS.into(),
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         // The account site never reaches the Sender in these tests.
@@ -91,7 +82,9 @@ impl Site {
         Self { db, router: buwiz_cloud::app(state) }
     }
 
-    async fn send(&self, request: Request<Body>) -> Response {
+    /// A request without a `Host` goes to the account host, [`ACCOUNT_HOST`].
+    async fn send(&self, mut request: Request<Body>) -> Response {
+        request.headers_mut().entry(header::HOST).or_insert(header::HeaderValue::from_static(ACCOUNT_HOST));
         self.router.clone().oneshot(request).await.unwrap()
     }
 
@@ -680,18 +673,18 @@ fn content_type(response: &Response) -> &str {
 #[sqlx::test(migrations = "./migrations")]
 async fn robots_and_the_sitemap_follow_the_host(db: PgPool) {
     let site = Site::new(db);
-    let public = text(site.on_host("buwiz.com", "/robots.txt").await).await;
+    let public = text(site.on_host(FORMS_HOST, "/robots.txt").await).await;
     assert!(public.contains("User-agent: *\nAllow: /\nDisallow: /tins\n"), "{public}");
     assert!(public.contains("User-agent: Claude-SearchBot\n"), "{public}");
-    assert!(public.contains("Sitemap: https://buwiz.com/sitemap.xml"), "{public}");
+    assert!(public.contains("Sitemap: https://ebirforms.buwiz.com/sitemap.xml"), "{public}");
     for host in ["account.buwiz.com", "api.buwiz.com"] {
         assert_eq!(text(site.on_host(host, "/robots.txt").await).await, "User-agent: *\nDisallow: /\n", "{host}");
         assert_eq!(site.on_host(host, "/sitemap.xml").await.status(), StatusCode::NOT_FOUND, "{host}");
     }
-    let sitemap = site.on_host("buwiz.com", "/sitemap.xml").await;
+    let sitemap = site.on_host(FORMS_HOST, "/sitemap.xml").await;
     assert_eq!(content_type(&sitemap), "application/xml; charset=utf-8");
     let sitemap = text(sitemap).await;
-    assert!(sitemap.contains("<loc>https://buwiz.com/</loc>") && sitemap.contains("<lastmod>"), "{sitemap}");
+    assert!(sitemap.contains("<loc>https://ebirforms.buwiz.com/</loc>") && sitemap.contains("<lastmod>"), "{sitemap}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -703,20 +696,22 @@ async fn the_account_and_api_hosts_ask_not_to_be_indexed(db: PgPool) {
         let response = site.on_host(host, path).await;
         assert_eq!(response.headers().get("x-robots-tag").unwrap(), "noindex", "{host}{path}");
     }
-    for path in ["/", "/login", "/robots.txt"] {
-        assert!(site.on_host("buwiz.com", path).await.headers().get("x-robots-tag").is_none(), "{path}");
+    for host in ["buwiz.com", FORMS_HOST] {
+        for path in ["/", "/login", "/robots.txt"] {
+            assert!(site.on_host(host, path).await.headers().get("x-robots-tag").is_none(), "{host}{path}");
+        }
     }
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn the_home_page_alone_is_described_for_search_and_sharing(db: PgPool) {
     let site = Site::new(db);
-    let home = text(site.on_host("buwiz.com", "/").await).await;
+    let home = text(site.on_host(FORMS_HOST, "/").await).await;
     for tag in [
         "<title>Buwiz: Philippine tax filing, made modern</title>",
-        r#"<link rel="canonical" href="https://buwiz.com/">"#,
-        r#"<meta property="og:url" content="https://buwiz.com/">"#,
-        r#"<meta property="og:image" content="https://buwiz.com/assets/brand/og-image.png">"#,
+        r#"<link rel="canonical" href="https://ebirforms.buwiz.com/">"#,
+        r#"<meta property="og:url" content="https://ebirforms.buwiz.com/">"#,
+        r#"<meta property="og:image" content="https://ebirforms.buwiz.com/assets/brand/og-image.png">"#,
         r#"<meta property="og:type" content="website">"#,
         r#"<meta property="og:site_name" content="Buwiz">"#,
         r#"<meta property="og:locale" content="en_PH">"#,
@@ -732,7 +727,7 @@ async fn the_home_page_alone_is_described_for_search_and_sharing(db: PgPool) {
         home.split(r#"<script type="application/ld+json">"#).nth(1).unwrap().split("</script>").next().unwrap();
     let json_ld: Value = serde_json::from_str(json_ld).unwrap();
     assert_eq!(json_ld[0]["@type"], "Organization");
-    assert_eq!(json_ld[0]["logo"], "https://buwiz.com/assets/brand/icon-512.png");
+    assert_eq!(json_ld[0]["logo"], "https://ebirforms.buwiz.com/assets/brand/icon-512.png");
     assert_eq!(json_ld[1]["@type"], "WebSite");
 
     let login = text(site.get("/login", "").await).await;
@@ -1290,12 +1285,12 @@ fn later_files() -> Vec<Value> {
 }
 
 async fn download_from(site: &Site, path: &str) -> Response {
-    site.on_host("buwiz.com", path).await
+    site.on_host(FORMS_HOST, path).await
 }
 
-/// Asks for `path` on buwiz.com as a browser does, with `User-Agent`.
+/// Asks for `path` on the filing site as a browser does, with `User-Agent`.
 async fn browse(site: &Site, path: &str, user_agent: &str) -> Response {
-    browse_on(site, "buwiz.com", path, user_agent).await
+    browse_on(site, FORMS_HOST, path, user_agent).await
 }
 
 /// Asks for `path` on `host` as a browser does, with `User-Agent`.
@@ -1366,7 +1361,7 @@ async fn downloads_go_to_the_released_installer_without_caching(db: PgPool) {
     let curl = site
         .send(
             Request::get("/install-linux.sh")
-                .header(header::HOST, "buwiz.com")
+                .header(header::HOST, FORMS_HOST)
                 .header(header::ACCEPT, "*/*")
                 .body(Body::empty())
                 .unwrap(),
@@ -1407,7 +1402,7 @@ async fn downloads_are_counted_per_file_and_day_without_crawlers(db: PgPool) {
         Request::builder()
             .method(method)
             .uri(path)
-            .header(header::HOST, "buwiz.com")
+            .header(header::HOST, FORMS_HOST)
             .header(header::USER_AGENT, agent)
             .body(Body::empty())
             .unwrap()
@@ -1454,11 +1449,11 @@ async fn downloads_are_counted_per_file_and_day_without_crawlers(db: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn ebirforms_reads_its_own_latest_json_or_else_the_root_one_and_counts_both_as_its_own(db: PgPool) {
-    let host = "ebirforms.buwiz.com";
+    let host = FORMS_HOST;
     let (releases, url) = FakeReleases::start().await;
     // Only the root one, as before the bucket had a folder per app.
     releases.set_latest(&latest_json(&[]));
-    let site = Site::split_with_downloads(db.clone(), &url);
+    let site = Site::with_downloads(db.clone(), &url);
     let response = browse_on(&site, host, "/download/mac", MAC).await;
     assert_eq!(location(&response), format!("{url}/releases/v1.2.0/Buwiz-1.2.0-macos-universal.dmg"));
     assert!(text(browse_on(&site, host, "/download", MAC).await).await.contains("Version 1.2.0,"));
@@ -1466,7 +1461,7 @@ async fn ebirforms_reads_its_own_latest_json_or_else_the_root_one_and_counts_bot
     // Its own one: read first, with the files in its folder.
     let own = String::from_utf8(latest_json(&[])).unwrap().replace("1.2.0", "1.3.0");
     releases.set_own_latest(own.as_bytes());
-    let site = Site::split_with_downloads(db.clone(), &url);
+    let site = Site::with_downloads(db.clone(), &url);
     let response = browse_on(&site, host, "/download/mac", MAC).await;
     assert_eq!(location(&response), format!("{url}/ebirforms/releases/v1.3.0/Buwiz-1.3.0-macos-universal.dmg"));
     let page = text(browse_on(&site, host, "/download", MAC).await).await;
@@ -1496,7 +1491,7 @@ async fn ebirforms_reads_its_own_latest_json_or_else_the_root_one_and_counts_bot
     }
 
     // Counted as eBIRForms' downloads, per version.
-    let fallback = Site::split_with_downloads(db.clone(), &url);
+    let fallback = Site::with_downloads(db.clone(), &url);
     *releases.own.lock().unwrap() = None;
     assert_eq!(browse_on(&fallback, host, "/download/mac", MAC).await.status(), StatusCode::FOUND);
     let total = |platform, arch, kind, count| Total { platform, arch, kind, count };
@@ -1535,7 +1530,7 @@ fn platform_row(home: &str) -> &str {
 
 /// The Linux install command's row: selectable text, and a Copy button the
 /// script shows where it can copy.
-const INSTALL_LINE: &str = r#"<div class="install-line" data-copy-group=""><code>curl -fsSL https://buwiz.com/install-linux.sh | sh</code><button type="button" data-copy="curl -fsSL https://buwiz.com/install-linux.sh | sh" hidden="">Copy</button><span class="copy-status" role="status"></span></div>"#;
+const INSTALL_LINE: &str = r#"<div class="install-line" data-copy-group=""><code>curl -fsSL https://ebirforms.buwiz.com/install-linux.sh | sh</code><button type="button" data-copy="curl -fsSL https://ebirforms.buwiz.com/install-linux.sh | sh" hidden="">Copy</button><span class="copy-status" role="status"></span></div>"#;
 
 const MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
 const WINDOWS: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36";
@@ -1551,7 +1546,7 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
     let site = Site::with_downloads(db.clone(), &url);
     let page = text(browse(&site, "/download", MAC).await).await;
     assert!(page.contains("<title>Download Buwiz for Windows, macOS, Linux and Android</title>"), "{page}");
-    assert!(page.contains(r#"<link rel="canonical" href="https://buwiz.com/download">"#));
+    assert!(page.contains(r#"<link rel="canonical" href="https://ebirforms.buwiz.com/download">"#));
     assert!(!page.contains("noindex"));
     assert!(page.contains("Version 1.2.0, released November 2, 2026."));
     // One card per platform, the Mac one marked as the visitor's, each with
@@ -1597,8 +1592,11 @@ async fn the_download_page_lists_the_release_and_highlights_the_visitors_platfor
         assert!(!page.contains(gone), "{gone}");
     }
 
-    let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
-    assert!(sitemap.contains("<loc>https://buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"), "{sitemap}");
+    let sitemap = text(site.on_host(FORMS_HOST, "/sitemap.xml").await).await;
+    assert!(
+        sitemap.contains("<loc>https://ebirforms.buwiz.com/download</loc>\n    <lastmod>2026-11-02</lastmod>"),
+        "{sitemap}"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1666,7 +1664,7 @@ async fn the_home_page_has_one_download_button_for_the_visitors_device(db: PgPoo
     // Signed in, the hero still has just the download; the header has My TINs.
     let (_, cookie) = site.person("owner@example.com").await;
     let request = Request::get("/")
-        .header(header::HOST, "buwiz.com")
+        .header(header::HOST, FORMS_HOST)
         .header(header::USER_AGENT, MAC)
         .header(header::COOKIE, &cookie)
         .body(Body::empty())
@@ -1756,14 +1754,14 @@ async fn assert_coming_soon(site: &Site, why: &str) {
     assert!(!page.contains("href=\"/download/") && !page.contains("releases/v"), "{why}");
     assert!(page.contains(r#"<meta name="robots" content="noindex">"#), "{why}");
 
-    let home = text(site.on_host("buwiz.com", "/").await).await;
+    let home = text(site.on_host(FORMS_HOST, "/").await).await;
     assert!(
         home.contains(r#"<div class="platforms rise d3"><span class="soon-tag">Coming soon</span><p class="visually-hidden">Coming soon to Windows, macOS, Linux, Android and iOS</p><ul aria-hidden="true"><li class="platform" title="Windows, coming soon"><svg"#),
         "{why}"
     );
     assert!(!home.contains("/download") && !home.contains("btn-get"), "{why}");
 
-    let sitemap = text(site.on_host("buwiz.com", "/sitemap.xml").await).await;
+    let sitemap = text(site.on_host(FORMS_HOST, "/sitemap.xml").await).await;
     assert!(!sitemap.contains("/download"), "{why}");
 }
 
@@ -1819,7 +1817,7 @@ async fn answers(site: &Site, host: &str) -> Vec<(&'static str, StatusCode, Stri
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn until_the_split_every_host_answers_as_before(db: PgPool) {
+async fn the_filing_site_answers_on_its_own_host(db: PgPool) {
     let site = Site::new(db);
     let ok = |path| (path, StatusCode::OK, String::new());
     let expected = vec![
@@ -1838,24 +1836,11 @@ async fn until_the_split_every_host_answers_as_before(db: PgPool) {
         ok("/sitemap.xml"),
         ok("/site.webmanifest"),
     ];
-    for host in ["buwiz.com", "localhost:3008", "ebirforms.buwiz.com"] {
-        assert_eq!(answers(&site, host).await, expected, "{host}");
-    }
-    let home = text(site.on_host("buwiz.com", "/").await).await;
-    assert!(home.contains("<title>Buwiz: Philippine tax filing, made modern</title>"));
-    assert!(!home.contains("Buwiz Bot"));
-    let robots = text(site.on_host("localhost:3008", "/robots.txt").await).await;
-    assert!(robots.ends_with("Sitemap: https://buwiz.com/sitemap.xml\n"), "{robots}");
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn once_split_the_filing_site_answers_on_its_own_host_as_before(db: PgPool) {
-    let before = Site::new(db.clone());
-    let split = Site::split(db);
-    assert_eq!(answers(&split, "ebirforms.buwiz.com").await, answers(&before, "buwiz.com").await);
     for host in ["forms.buwiz.com", "ebirforms.buwiz.com"] {
-        let home = text(split.on_host(host, "/").await).await;
+        assert_eq!(answers(&site, host).await, expected, "{host}");
+        let home = text(site.on_host(host, "/").await).await;
         assert!(home.contains("<title>Buwiz: Philippine tax filing, made modern</title>"), "{host}");
+        assert!(!home.contains("Buwiz Bot"), "{host}");
         assert!(home.contains(r#"<link rel="canonical" href="https://ebirforms.buwiz.com/">"#), "{host}");
         assert!(
             home.contains(
@@ -1864,19 +1849,19 @@ async fn once_split_the_filing_site_answers_on_its_own_host_as_before(db: PgPool
             "{host}"
         );
     }
-    let robots = text(split.on_host("ebirforms.buwiz.com", "/robots.txt").await).await;
+    let robots = text(site.on_host("ebirforms.buwiz.com", "/robots.txt").await).await;
     assert!(robots.ends_with("Sitemap: https://ebirforms.buwiz.com/sitemap.xml\n"), "{robots}");
-    let sitemap = text(split.on_host("ebirforms.buwiz.com", "/sitemap.xml").await).await;
+    let sitemap = text(site.on_host("ebirforms.buwiz.com", "/sitemap.xml").await).await;
     assert!(sitemap.contains("<loc>https://ebirforms.buwiz.com/</loc>"), "{sitemap}");
     // The account and API hosts are as they were.
-    assert_eq!(location(&split.on_host("account.buwiz.com", "/").await), "/account");
-    assert_eq!(split.on_host("account.buwiz.com", "/login").await.status(), StatusCode::OK);
-    assert_eq!(split.on_host("api.buwiz.com", "/").await.status(), StatusCode::OK);
+    assert_eq!(location(&site.on_host("account.buwiz.com", "/").await), "/account");
+    assert_eq!(site.on_host("account.buwiz.com", "/login").await.status(), StatusCode::OK);
+    assert_eq!(site.on_host("api.buwiz.com", "/").await.status(), StatusCode::OK);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
-    let site = Site::split(db);
+async fn the_bot_site_is_the_bare_domain(db: PgPool) {
+    let site = Site::new(db);
     let page = site.on_host("buwiz.com", "/").await;
     assert_eq!(page.status(), StatusCode::OK);
     assert_eq!(page.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
@@ -1919,7 +1904,6 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
     }
     // Only the Bot host has it.
     assert_eq!(site.on_host("ebirforms.buwiz.com", wasm).await.status(), StatusCode::NOT_FOUND);
-    assert_eq!(Site::new(site.db.clone()).on_host("buwiz.com", wasm).await.status(), StatusCode::NOT_FOUND);
 
     let robots = text(site.on_host("buwiz.com", "/robots.txt").await).await;
     assert!(robots.starts_with("User-agent: *\nAllow: /\n"), "{robots}");
@@ -1931,8 +1915,8 @@ async fn once_split_the_bare_domain_is_the_bot_page(db: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn once_split_the_bot_host_serves_its_mini_apps_page(db: PgPool) {
-    let site = Site::split(db);
+async fn the_bot_site_serves_its_mini_apps_page(db: PgPool) {
+    let site = Site::new(db);
     let home = text(site.on_host("buwiz.com", "/").await).await;
     let page = site.on_host("buwiz.com", "/mini-apps").await;
     assert_eq!(page.status(), StatusCode::OK);
@@ -1960,17 +1944,15 @@ async fn once_split_the_bot_host_serves_its_mini_apps_page(db: PgPool) {
         let response = site.on_host("buwiz.com", path).await;
         assert!(!text(response).await.contains("_bg.wasm"), "{path}");
     }
-    // Not on the filing site, split or not.
-    for (site, host) in [(&site, "ebirforms.buwiz.com"), (&Site::new(site.db.clone()), "buwiz.com")] {
-        let response = site.on_host(host, "/mini-apps").await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{host}");
-        assert!(!text(response).await.contains("Buwiz Bot"), "{host}");
-    }
+    // Not on the filing site.
+    let response = site.on_host(FORMS_HOST, "/mini-apps").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!text(response).await.contains("Buwiz Bot"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn once_split_the_bot_host_sends_filing_and_sign_in_pages_on(db: PgPool) {
-    let site = Site::split(db);
+async fn the_bot_site_sends_filing_and_sign_in_pages_on(db: PgPool) {
+    let site = Site::new(db);
     for (path, target) in [
         ("/download/mac?arch=arm64", format!("{FORMS}/download/mac?arch=arm64")),
         ("/download", format!("{FORMS}/download")),
@@ -2019,7 +2001,7 @@ async fn once_split_the_bot_host_sends_filing_and_sign_in_pages_on(db: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn sign_in_links_go_to_the_account_host(db: PgPool) {
     let site = Site::new(db);
-    let home = text(site.on_host("buwiz.com", "/").await).await;
+    let home = text(site.on_host(FORMS_HOST, "/").await).await;
     let header = home.split("<header").nth(1).unwrap().split("</header>").next().unwrap();
     assert!(header.contains(r#"<a class="btn btn-ghost" href="http://localhost:3008/login">Sign in</a>"#), "{header}");
     assert!(header.contains(r#"<a class="btn btn-solid" href="http://localhost:3008/signup">"#), "{header}");
@@ -2056,7 +2038,7 @@ async fn download_counts_are_kept_per_app(db: PgPool) {
     releases.set_latest(&latest_json(&[]));
     let site = Site::with_downloads(db.clone(), &url);
     let person = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15";
-    let request = Request::get("/download/mac").header(header::HOST, "buwiz.com").header(header::USER_AGENT, person);
+    let request = Request::get("/download/mac").header(header::HOST, FORMS_HOST).header(header::USER_AGENT, person);
     assert_eq!(site.send(request.body(Body::empty()).unwrap()).await.status(), StatusCode::FOUND);
     // Another app's count of the same file and day is its own row, and not
     // in this app's totals.

@@ -2,8 +2,7 @@
 
 The public site of the eBIRForms desktop app
 ([eBIRForms/eBIRForms](https://github.com/eBIRForms/eBIRForms)). It is served
-on the host in `FORMS_ORIGIN`, and on every non-account, non-API host while
-`SITE_SPLIT` is off.
+on the host in `FORMS_ORIGIN`.
 
 | Path | What | Code |
 |---|---|---|

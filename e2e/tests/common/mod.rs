@@ -338,7 +338,6 @@ impl Harness {
             trust_list: Some(trust_list),
             downloads_url: "http://127.0.0.1:9".into(),
             forms_origin: base.clone(),
-            site_split: false,
         };
         let state = AppState::new(
             config,

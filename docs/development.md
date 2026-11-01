@@ -9,7 +9,7 @@ and `src/config.rs`.
 |---|---|
 | `DATABASE_URL`, `DOCUMENT_KEY` | Required. `DOCUMENT_KEY` encrypts claim files: losing it makes every stored file unreadable |
 | `ACCOUNT_ORIGIN` | The account host. If it starts with `https://`, secure cookies turn on, and a public deployment must send email (`RESEND_API_KEY`, `MAIL_FROM`). The server refuses to start if it would print sign-in codes on a public deployment |
-| `SITE_SPLIT`, `FORMS_ORIGIN` | On by default: the bare domain is the Bot site, and the filing site is on `FORMS_ORIGIN` (default `https://ebirforms.buwiz.com`). With `SITE_SPLIT=false`, every other host is the filing site ([bot-site.md](bot-site.md)) |
+| `FORMS_ORIGIN` | The filing site's host (default `https://ebirforms.buwiz.com`). The bare domain is the Bot site ([bot-site.md](bot-site.md)) |
 | `EXTRA_ORIGINS`, `ADMIN_EMAILS` | Additional allowed origins. Staff email addresses |
 | `DOWNLOADS_URL` | Where the release manifests and installers are ([ebirforms-site.md](ebirforms-site.md)) |
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | The claim file store. Without them, files go to Postgres |
@@ -22,7 +22,7 @@ and `src/config.rs`.
 - `account.localhost:3008` is the account site;
 - `api.localhost:3008` is the API;
 - `ebirforms.localhost:3008` or `forms.localhost:3008` is the filing site;
-- `localhost:3008` is the Bot site, or the filing site with `SITE_SPLIT=false`.
+- `localhost:3008`, like any other host, is the Bot site.
 
 ## Cargo features
 

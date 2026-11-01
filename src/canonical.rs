@@ -1,12 +1,10 @@
 //! Which host serves what. `www.` hosts redirect to the bare domain:
 //! www.buwiz.com/x goes to https://buwiz.com/x, so every page has one
-//! address. The home page lives on the bare domain; the account host's root
+//! address. The bare domain is the Buwiz Bot site, and the filing site lives
+//! on its own host (`FORMS_ORIGIN`); see [`Site`]. The account host's root
 //! is the signed-in dashboard, and the API host's root says what it is.
-//! Only the bare domain is for search engines: everything on the account
+//! Only the public sites are for search engines: everything on the account
 //! and API hosts is sent with `X-Robots-Tag: noindex`.
-//!
-//! With `SITE_SPLIT=true` the bare domain is the Buwiz Bot site instead, and
-//! the filing site lives on its own host (`FORMS_ORIGIN`); see [`Site`].
 
 use std::sync::Arc;
 
@@ -23,7 +21,7 @@ use crate::state::AppState;
 /// The site a host serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Site {
-    /// The Buwiz Bot page, on the bare domain once the site is split.
+    /// The Buwiz Bot page, on the bare domain.
     Bot,
     /// The filing (eBIRForms) site.
     Forms,
@@ -32,16 +30,15 @@ pub enum Site {
 }
 
 impl Site {
-    /// Told apart by the first label. Until `split`, every other host is
-    /// the filing site, as before.
-    pub fn for_host(host: &str, split: bool) -> Self {
+    /// Told apart by the first label. Every other host, the bare domain
+    /// among them, is the Bot site.
+    pub fn for_host(host: &str) -> Self {
         let host = host.to_ascii_lowercase();
         match host.split_once('.').map(|(label, _)| label) {
             Some("account") => Site::Account,
             Some("api") => Site::Api,
             Some("forms" | "ebirforms") => Site::Forms,
-            _ if split => Site::Bot,
-            _ => Site::Forms,
+            _ => Site::Bot,
         }
     }
 }
@@ -80,15 +77,14 @@ pub async fn host_roots(State(account_origin): State<Arc<str>>, request: Request
 /// bundle under `/bot/`
 /// (see [`bot_site`]), and sends the filing site's pages to
 /// [`Config::forms_origin`] and the sign-in pages to the account host, both
-/// with a 301. Everything else, and every host while the site is not split,
-/// passes on.
+/// with a 301. Everything else passes on.
 ///
 /// [`Config::forms_origin`]: crate::config::Config::forms_origin
 pub async fn split_site(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let config = &state.config;
     let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
     let reading = request.method() == Method::GET || request.method() == Method::HEAD;
-    if !reading || Site::for_host(host, config.site_split) != Site::Bot {
+    if !reading || Site::for_host(host) != Site::Bot {
         return next.run(request).await;
     }
     let path = request.uri().path();
@@ -196,16 +192,13 @@ mod tests {
 
     #[test]
     fn hosts_name_their_site() {
-        for split in [false, true] {
-            assert_eq!(Site::for_host("account.buwiz.com", split), Site::Account);
-            assert_eq!(Site::for_host("API.buwiz.com", split), Site::Api);
-            assert_eq!(Site::for_host("ebirforms.buwiz.com", split), Site::Forms);
-            assert_eq!(Site::for_host("forms.localhost:3008", split), Site::Forms);
-        }
-        // Until the split, every other host is the filing site.
+        assert_eq!(Site::for_host("account.buwiz.com"), Site::Account);
+        assert_eq!(Site::for_host("API.buwiz.com"), Site::Api);
+        assert_eq!(Site::for_host("ebirforms.buwiz.com"), Site::Forms);
+        assert_eq!(Site::for_host("forms.localhost:3008"), Site::Forms);
+        // Every other host is the Bot site.
         for host in ["buwiz.com", "localhost:3008", "", "accounting.buwiz.com"] {
-            assert_eq!(Site::for_host(host, false), Site::Forms, "{host}");
-            assert_eq!(Site::for_host(host, true), Site::Bot, "{host}");
+            assert_eq!(Site::for_host(host), Site::Bot, "{host}");
         }
     }
 

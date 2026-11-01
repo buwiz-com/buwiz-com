@@ -89,7 +89,8 @@ pub async fn split_site(State(state): State<AppState>, request: Request, next: N
     }
     let path = request.uri().path();
     if bot_site::is_page(path) {
-        return bot_site::index(config, path);
+        let (release, stars) = tokio::join!(state.bot_downloads.latest(), state.stars.count());
+        return bot_site::index(config, path, release.as_deref(), stars);
     }
     if let Some(file) = path.strip_prefix("/bot/") {
         return bot_site::file(file);

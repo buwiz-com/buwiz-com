@@ -12,6 +12,7 @@ and `src/config.rs`.
 | `FORMS_ORIGIN` | The filing site's host (default `https://ebirforms.buwiz.com`). The bare domain is the Bot site ([bot-site.md](bot-site.md)) |
 | `EXTRA_ORIGINS`, `ADMIN_EMAILS` | Additional allowed origins. Staff email addresses |
 | `DOWNLOADS_URL` | Where the release manifests and installers are ([ebirforms-site.md](ebirforms-site.md)) |
+| `GITHUB_API_URL` | Where Buwiz Bot's GitHub star count is read (default `https://api.github.com`; [bot-site.md](bot-site.md)) |
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | The claim file store. Without them, files go to Postgres |
 | `TICKET_SIGNING_KEY`, `RECEIPT_SIGNING_KEY`, `SENDER_URL`, `SENDER_SECRET`, `BIR_*` | The relay ([relay.md](relay.md)) |
 | `OCR_MODEL_DIR` | The OCR models, with `--features ocr` |

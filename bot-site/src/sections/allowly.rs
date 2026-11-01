@@ -1166,7 +1166,7 @@ pub fn Allowly() -> impl IntoView {
     autoplay_when_visible(tl, stage);
 
     view! {
-        <section id="allowly" class="relative py-24 md:py-32 border-t border-gc-border bg-gc-bg-card overflow-hidden">
+        <section id="allowly" class="relative py-24 md:py-32 border-t border-gc-border bg-gc-bg-card/40 overflow-hidden">
             <div class="max-w-[1240px] mx-auto px-6 md:px-12">
                 <div class="max-w-2xl mb-10 md:mb-12">
                     <div class="text-[11px] font-bold tracking-wide uppercase text-gc-text-faint mb-3">"Allowly · Mac"</div>

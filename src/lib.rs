@@ -14,6 +14,7 @@ pub mod devices;
 pub mod downloads;
 pub mod envelope;
 pub mod error;
+pub mod github;
 pub mod jws;
 pub mod link;
 pub mod mail;

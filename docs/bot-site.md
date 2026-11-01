@@ -2,7 +2,7 @@
 
 The bare domain serves the Buwiz Bot site. It has two pages:
 
-- `/`: Meet Buwiz Bot.
+- `/`: Buwiz Bot, free and open-source AI coworkers.
 - `/mini-apps`: eBIRForms, Books, Word and Spreadsheet.
 
 Every other path on this host either:
@@ -50,6 +50,25 @@ would see an empty `<body>`. So each page is served already drawn:
 - Add it to `PAGES` in `prerender.py`.
 - Add it to `BOT_PAGES` in `src/seo.rs` (the sitemap).
 - Add the route in `bot-site/src/app.rs`.
+
+## Download button and GitHub stars
+
+`bot_site::index` fills two more metas in `index.html`, both empty while
+unknown:
+
+- `buwiz-bot-download`: Buwiz Bot's release, from `bot/latest.json` in the
+  downloads bucket (`AppState::bot_downloads`; unlike eBIRForms it never reads
+  the root `latest.json`). It is compact JSON with the `version` and, for
+  `mac`, `windows` and `linux`, the default installer's `url` and `size`, picked
+  as the filing site's `/download/{platform}` picks it.
+- `buwiz-bot-stars`: the `stargazers_count` of `buwiz-bot/buwiz-bot`, read
+  from the GitHub API (`GITHUB_API_URL`) at most every 10 minutes
+  (`src/github.rs`). The site shows it from 25 stars.
+
+The hero's download button guesses the computer from `navigator.userAgent`.
+While nothing is released it is disabled and says "Coming soon". It links
+straight to the installer in the bucket: `/download` on this host is the
+filing site's, and Bot downloads are not counted.
 
 ## SEO
 

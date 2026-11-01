@@ -38,9 +38,7 @@ pub async fn sitemap(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::NOT_FOUND.into_response();
     }
     let body = match Site::for_host(host, state.config.site_split) {
-        Site::Bot => {
-            sitemap_xml(&public_origin(&state.config, host), BOT_PAGES, state.downloads.latest().await.as_deref())
-        }
+        Site::Bot => sitemap_xml(&public_origin(&state.config, host), BOT_PAGES, None),
         _ => sitemap_xml(&state.config.forms_origin, PAGES, state.downloads.latest().await.as_deref()),
     };
     text(body, "application/xml; charset=utf-8")

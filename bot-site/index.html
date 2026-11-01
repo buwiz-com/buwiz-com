@@ -42,6 +42,46 @@
   <!-- The server fills this in with FORMS_ORIGIN (src/bot_site.rs). -->
   <meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />
 
+  <!-- Who and what Buwiz is, for search engines and AI answer engines.
+       Plain HTML: the page itself is drawn by the app, which crawlers that
+       do not run JavaScript never see. Its URLs leave off the home
+       page's trailing slash: src/bot_site.rs rewrites that exact URL to
+       each page's canonical address. -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://buwiz.com#org",
+        "name": "Buwiz",
+        "url": "https://buwiz.com",
+        "logo": "https://buwiz.com/assets/brand/apple-touch-icon.png",
+        "areaServed": "PH",
+        "sameAs": ["https://github.com/buwiz-bot/buwiz-bot"]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://buwiz.com#site",
+        "name": "Buwiz",
+        "url": "https://buwiz.com",
+        "publisher": { "@id": "https://buwiz.com#org" }
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://buwiz.com#bot",
+        "name": "Buwiz Bot",
+        "description": "An AI coworker for your desktop. Its mini apps open right in the chat, for you and your AI agent: eBIRForms to prepare and file BIR tax returns, Books for bookkeeping, and Word and Spreadsheet for documents.",
+        "applicationCategory": "BusinessApplication",
+        "operatingSystem": "macOS, Windows, Linux",
+        "downloadUrl": "https://buwiz.com/download",
+        "url": "https://buwiz.com",
+        "publisher": { "@id": "https://buwiz.com#org" }
+      }
+    ]
+  }
+  </script>
+
   <!-- Open Graph / Facebook -->
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://buwiz.com/" />
@@ -73,6 +113,20 @@
 
 </head>
 
-<body></body>
+<body>
+  <!-- What a crawler that does not run the app reads; the app draws the
+       real page and footer over it. -->
+  <noscript>
+    <p>Buwiz Bot is an AI coworker for your desktop. Its mini apps open right in the chat, for you and your AI agent: eBIRForms to prepare and file BIR tax returns, Books for bookkeeping, and Word and Spreadsheet for documents.</p>
+    <nav aria-label="Footer">
+      <a href="/mini-apps">Mini apps</a> ·
+      <a href="/download">Download for Mac, Windows and Linux</a> ·
+      <a href="https://ebirforms.buwiz.com/">eBIRForms: BIR tax filing</a> ·
+      <a href="https://account.buwiz.com/">Buwiz account</a> ·
+      <a href="https://github.com/buwiz-bot/buwiz-bot">Source code on GitHub</a>
+    </nav>
+    <p>© 2026 Buwiz · Made in the Philippines</p>
+  </noscript>
+</body>
 
 </html>

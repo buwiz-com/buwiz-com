@@ -166,54 +166,34 @@ pub fn Layout(children: Children) -> impl IntoView {
                 {children()}
             </main>
 
+            // One short line on what Buwiz is, links to real pages only (each
+            // named for what it is, so the anchor text says it), and the
+            // copyright. index.html carries the same facts as JSON-LD and as
+            // plain links for crawlers that do not run the app.
             <footer class="bg-gc-bg-elevated w-full border-t border-gc-border">
-                <div class="grid grid-cols-1 md:grid-cols-12 gap-8 px-8 py-16 max-w-[1440px] mx-auto">
-                    <div class="md:col-span-4">
-                        <div class="flex items-center gap-4 mb-6">
-                            <span class="buwiz-wordmark h-8" role="img" aria-label="Buwiz"></span>
-                            <a href="https://goldcoders.dev" class="font-bold text-gc-text text-xl hover:text-gc-brand transition-colors">"by Goldcoders"</a>
+                <div class="flex flex-col gap-8 px-6 md:px-8 py-12 max-w-[1440px] mx-auto">
+                    <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-8">
+                        <div class="flex flex-col gap-4 max-w-md">
+                            <a href="/" aria-label="Buwiz home" class="w-fit">
+                                <span class="buwiz-wordmark h-7" role="img" aria-label="Buwiz"></span>
+                            </a>
+                            <p class="text-sm text-gc-text-muted leading-relaxed">
+                                "Buwiz Bot is an AI coworker for your desktop. Its mini apps open right in the chat, for you and your AI agent: eBIRForms to prepare and file BIR tax returns, Books for bookkeeping, and Word and Spreadsheet for documents."
+                            </p>
                         </div>
-                        <p class="text-xs tracking-tight text-gc-text-muted leading-relaxed max-w-xs">
-                            "Goldcoders builds AI-native software, high-performance Rust systems, web apps, mobile apps, desktop apps, automation platforms, and agentic AI solutions for companies in the Philippines and worldwide."
-                        </p>
+                        <nav aria-label="Footer">
+                            <ul class="flex flex-col gap-3 text-sm">
+                                <li><a href="/mini-apps" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Mini apps"</a></li>
+                                <li><a href="/download" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Download for Mac, Windows and Linux"</a></li>
+                                <li><a href="https://ebirforms.buwiz.com/" class="text-gc-text-muted hover:text-gc-brand transition-colors">"eBIRForms: BIR tax filing"</a></li>
+                                <li><a href="https://account.buwiz.com/" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Buwiz account"</a></li>
+                                <li><a href="https://github.com/buwiz-bot/buwiz-bot" rel="noopener" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Source code on GitHub"</a></li>
+                            </ul>
+                        </nav>
                     </div>
-
-                    <div class="md:col-span-2 md:col-start-7">
-                        <div class="text-xs tracking-tight font-bold text-gc-text mb-6 uppercase">"Company"</div>
-                        <ul class="space-y-3">
-                            <li><a href="https://goldcoders.dev/#about" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"About"</a></li>
-                            <li><a href="https://goldcoders.dev/services" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"Services"</a></li>
-                            <li><a href="https://goldcoders.dev/projects" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"Projects"</a></li>
-                            <li><a href="https://goldcoders.dev/techstacks" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"Tech Stack"</a></li>
-                        </ul>
-                    </div>
-
-                    <div class="md:col-span-2">
-                        <div class="text-xs tracking-tight font-bold text-gc-text mb-6 uppercase">"Connect"</div>
-                        <ul class="space-y-3">
-                            <li><a href="https://github.com/goldcoders-corp" target="_blank" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"GitHub"</a></li>
-                            <li><a href="https://www.linkedin.com/company/goldcoders-corp" target="_blank" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"LinkedIn"</a></li>
-                            <li><a href="https://www.facebook.com/goldcoders.corp" target="_blank" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"Facebook"</a></li>
-                            <li><a href="mailto:support@goldcoders.dev" class="text-xs tracking-tight text-gc-text-muted hover:text-gc-brand transition-all duration-200">"Email"</a></li>
-                        </ul>
-                    </div>
-
-                    <div class="md:col-span-2">
-                        <div class="text-xs tracking-tight font-bold text-gc-text mb-6 uppercase">"Availability"</div>
-                        <div class="flex items-center gap-2 mb-2">
-                            <span class="w-2 h-2 rounded-full bg-gc-accent animate-pulse"></span>
-                            <p class="font-mono text-[10px] text-gc-text-muted uppercase tracking-widest">"Systems Nominal"</p>
-                        </div>
-                    </div>
-
-                    <div class="md:col-span-12 pt-8 mt-8 border-t border-gc-border flex flex-col md:flex-row justify-between items-center gap-4">
-                        <p class="text-xs tracking-tight text-gc-text-muted">
-                            "© 2026 Buwiz Bot by Goldcoders. AI-Native Software, Rust Systems, and Agentic Automation."
-                        </p>
-                        <div class="flex gap-6">
-                            <span class="font-mono text-[10px] uppercase tracking-tighter text-gc-text-faint">"MANILA / SINGAPORE / DISTRIBUTED"</span>
-                        </div>
-                    </div>
+                    <p class="pt-6 border-t border-gc-border text-xs text-gc-text-faint">
+                        "© 2026 Buwiz · Made in the Philippines"
+                    </p>
                 </div>
             </footer>
         </div>

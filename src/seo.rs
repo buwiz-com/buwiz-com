@@ -17,7 +17,7 @@ use crate::state::AppState;
 const PAGES: &[(&str, &str)] = &[("/", "2026-10-30")];
 
 /// The Bot site's pages in its sitemap, likewise.
-const BOT_PAGES: &[(&str, &str)] = &[("/", "2026-10-31"), ("/mini-apps", "2026-10-31")];
+const BOT_PAGES: &[(&str, &str)] = &[("/", "2026-11-01"), ("/mini-apps", "2026-11-01")];
 
 /// Signed-in, sign-in and API paths, kept out of search results.
 const PRIVATE_PATHS: &[&str] =
@@ -38,7 +38,9 @@ pub async fn sitemap(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::NOT_FOUND.into_response();
     }
     let body = match Site::for_host(host, state.config.site_split) {
-        Site::Bot => sitemap_xml(&public_origin(&state.config, host), BOT_PAGES, None),
+        Site::Bot => {
+            sitemap_xml(&public_origin(&state.config, host), BOT_PAGES, state.downloads.latest().await.as_deref())
+        }
         _ => sitemap_xml(&state.config.forms_origin, PAGES, state.downloads.latest().await.as_deref()),
     };
     text(body, "application/xml; charset=utf-8")
@@ -169,7 +171,7 @@ mod tests {
         assert!(robots.ends_with("Sitemap: https://buwiz.com/sitemap.xml\n"));
         let sitemap = sitemap_xml("https://buwiz.com", BOT_PAGES, None);
         assert_eq!(sitemap.matches("<loc>").count(), 2, "{sitemap}");
-        assert!(sitemap.contains("<loc>https://buwiz.com/</loc>\n    <lastmod>2026-10-31</lastmod>"), "{sitemap}");
+        assert!(sitemap.contains("<loc>https://buwiz.com/</loc>\n    <lastmod>2026-11-01</lastmod>"), "{sitemap}");
         assert!(sitemap.contains("<loc>https://buwiz.com/mini-apps</loc>"), "{sitemap}");
     }
 }

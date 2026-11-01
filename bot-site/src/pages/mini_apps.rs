@@ -12,7 +12,7 @@ pub fn MiniAppsPage() -> impl IntoView {
 
     view! {
         <Layout>
-            <Title text="Mini apps | Buwiz Bot" />
+            <Title text="Mini apps: eBIRForms, Books, Word and Spreadsheet | Buwiz Bot" />
             <Meta
                 name="description"
                 content="Buwiz mini apps run inside Buwiz Bot, in the chat and full screen: eBIRForms, Books, Word and Spreadsheet."

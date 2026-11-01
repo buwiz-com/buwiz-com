@@ -372,7 +372,7 @@ async fn hand_out(state: &AppState, method: &Method, headers: &HeaderMap, versio
     let agent = headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or_default();
     if method != Method::HEAD
         && downloads::is_download(agent)
-        && let Err(error) = downloads::count(&state.db, version, file).await
+        && let Err(error) = downloads::count(&state.db, state.downloads.app(), version, file).await
     {
         tracing::warn!(%error, file = file.name, "could not count a download");
     }

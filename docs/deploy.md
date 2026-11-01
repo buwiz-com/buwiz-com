@@ -1,45 +1,61 @@
-# Deploy (Fly.io)
+# Deploy
 
-App `buwiz-cloud` in Singapore (`sin`). Postgres is on Neon (Singapore,
-`aws-ap-southeast-1`).
+Production runs on AWS EC2, behind a Cloudflare Tunnel. It moved there from
+Fly on 2026-10-30, and Fly is retired.
+
+- **The machine:** one arm64 instance, a t4g.micro on Ubuntu 24.04, in
+  `ap-southeast-1`. It runs three systemd services:
+  - `buwiz.service`, the Gatekeeper, on 127.0.0.1:8080;
+  - `buwiz-sender.service`, the Sender, on 127.0.0.1:3009;
+  - `cloudflared-buwiz.service`, the tunnel.
+- **Public hosts:** `buwiz.com`, `www.`, `account.`, `api.` and `ebirforms.`
+  are proxied CNAMEs to the tunnel. Nothing on the instance listens publicly.
+- **Database:** Postgres on Neon (Singapore, `aws-ap-southeast-1`).
+  Migrations run at start.
+- **Settings:** in SSM Parameter Store under `/buwiz/*`. They are written to
+  `/etc/buwiz/env` at each start.
 
 ## Secrets
 
-Set once with `fly secrets import -a buwiz-cloud < file`. Keep a copy in a
-password manager. **Losing `DOCUMENT_KEY` makes every stored claim
-document unreadable.**
+Keep a copy of every secret in a password manager. **If `DOCUMENT_KEY` is
+lost, every stored claim document becomes unreadable.**
 
 | Secret | |
 |---|---|
 | `DATABASE_URL` | Neon connection string (`sslmode=require`) |
 | `DOCUMENT_KEY` | `openssl rand -base64 32` |
 | `TICKET_SIGNING_KEY` | `openssl rand -base64 32` |
-| `SENDER_URL`, `SENDER_SECRET` | The Sender's private address (below) and a shared secret, `openssl rand -base64 32` |
+| `SENDER_URL`, `SENDER_SECRET` | The Sender's private address (`http://127.0.0.1:3009`) and a shared secret, `openssl rand -base64 32` |
 | `RESEND_API_KEY`, `MAIL_FROM` | Resend, with buwiz.com verified as the sending domain |
-| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | R2 API token, "Object Read & Write", limited to the `buwiz` and `assets` buckets |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | An R2 API token, "Object Read & Write", limited to the `buwiz` and `assets` buckets |
 
-Claim documents live in R2 bucket `buwiz` as `claims/{claim}/{document}`. They
-are encrypted with `DOCUMENT_KEY` before upload, and deleted when the claim is
-decided or withdrawn.
+Claim documents live in the R2 bucket `buwiz` as `claims/{claim}/{document}`.
+They are encrypted with `DOCUMENT_KEY` before upload. They are deleted when
+the claim is decided or withdrawn.
 
-Settings that aren't secret are in `fly.toml` under `[env]`.
+## Releasing a build
 
-## Deploy
+The release is built on the owner's Mac, from a checkout that has the
+private BIR files restored (`src/bir/` and the rest; see
+[relay.md](relay.md)). The `Dockerfile` builds with `--features bir,ocr`.
+Without those files, the build fails, so it never ships a Sender that
+cannot send.
 
-```sh
-fly deploy            # builds the Dockerfile remotely; migrations run at start
-fly logs              # look for "listening on http://0.0.0.0:8080"
-curl https://buwiz-cloud.fly.dev/healthz
-```
+1. `docker build --platform linux/arm64`. The binaries `buwiz-cloud` and
+   `buwiz-sender` and the OCR models are copied out of the image.
+2. The binaries, the models and `install.sh` are uploaded to the deploy
+   bucket under `releases/<sha>/`.
+3. SSM `send-command` runs `install.sh <sha>` on the instance. It swaps the
+   binaries and restarts the services.
 
-The `Dockerfile` builds with `--features bir`, so deploy from a checkout
-that has the private BIR relay files restored (`src/bir/` and the rest; see
-the README). Without them the build fails rather than shipping a Sender
-that cannot send.
+Smoke-test after each deploy:
+- `/healthz` on each host;
+- `buwiz.com/` and `/mini-apps`;
+- `ebirforms.buwiz.com/download`;
+- `account.buwiz.com/login`.
 
-If Fly's remote builder fails (503, `failed_precondition`), build on your
-machine instead: `fly deploy --local-only`. To change only settings, redeploy
-the last image: `fly deploy --image registry.fly.io/buwiz-cloud:<tag>`.
+The build and deploy scripts are kept outside this repository for now.
+Committing them as `deploy/ec2/` is an open owner decision.
 
 ## OCR of claim documents
 
@@ -60,15 +76,13 @@ rather than growing. A document takes 1 to 2 seconds on an M-series Mac and
 should take 3 to 6 on a t4g.micro, which uses one of its two cores for it.
 Move to a t4g.small (2 GB) when the server's own memory passes about
 350 MB, when the host starts to swap, or when claims queue faster than one
-every few seconds. Fly's machine has 512 MB: give it 1 GB while it still
-runs this image.
+every few seconds.
 
 ## The Sender
 
-Submission runs in a second app, `buwiz-sender`, from the same image with
-`CMD ["buwiz-sender"]`, no public IP and no `[http_service]`; the Gatekeeper
-reaches it over Fly's private network (`SENDER_URL=http://buwiz-sender.internal:3009`,
-`SENDER_HOST=::`). Only the Sender gets the BIR secrets:
+The Sender runs on the same instance as `buwiz-sender.service`. It listens
+on 127.0.0.1:3009 only, and the Gatekeeper reaches it there
+(`SENDER_URL`). Only the Sender gets the BIR secrets:
 
 | Secret (`buwiz-sender`) | |
 |---|---|
@@ -86,15 +100,15 @@ and `TICKET_SIGNING_KEY`. See [relay-protocol.md](relay-protocol.md) §6.
 Apps trust three things only through a list signed offline with a key this
 server never holds: the hosts the relay pipe may open, the Sender's HPKE
 sealing key, and the Sender's receipt key. Make the key and sign the list on
-a trusted machine, not on Fly:
+a trusted machine, not on the server:
 
 ```sh
 cargo run --release --bin buwiz-trust-sign -- keygen trust.key
 # prints the public key: put it in eBIRForms crates/bir-submit/src/trust.rs TRUST_KEYS
-fly ssh console -a buwiz-sender -C "buwiz-sender public" > sender-keys.json
+# on the instance (through SSM): buwiz-sender public > sender-keys.json
 cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.json \
   <host:port> …   # BIR's dispatcher and upload hosts, from the BIR relay's private docs
-# prints the JWS: fly secrets set -a buwiz-cloud TRUST_LIST_JWS=<it>
+# prints the JWS: store it as TRUST_LIST_JWS in /buwiz/* and restart buwiz.service
 ```
 
 The `host:port` list is every host the Sender opens through the pipe: BIR's
@@ -150,12 +164,12 @@ names, and platforms or kinds the server doesn't know, are left out.
 
 ## Domains
 
-`buwiz.com`, `www.buwiz.com`, `account.buwiz.com` and `api.buwiz.com` have
-A and AAAA records in Cloudflare pointing at the app's IPs (`fly ips list`).
-The records are **DNS only** (grey cloud), because Fly issues the
-certificates (`fly certs check <name>`). The app sends any `www.` host to the
-bare domain with a permanent redirect. MX, SPF and site-verification records
-on `buwiz.com` belong to email; leave them alone.
+`buwiz.com`, `www.`, `account.`, `api.` and `ebirforms.buwiz.com` are
+proxied CNAMEs in Cloudflare that point to the tunnel. Cloudflare issues the
+certificates, and Always Use HTTPS is on. The app redirects any `www.` host
+to the bare domain with a permanent redirect. The MX, SPF, DKIM, DMARC and
+site-verification records on `buwiz.com` belong to email. Do not change
+them.
 
 ## Switch the mini app
 
@@ -164,4 +178,4 @@ BUWIZ_SERVER_URL=https://api.buwiz.com BUWIZ_ACCOUNT_URL=https://account.buwiz.c
 ```
 
 Sign in from the app, add your TIN at `/tins/new`, approve it as
-`ADMIN_EMAILS` at `/admin/claims`, and the licence gate opens.
+`ADMIN_EMAILS` at `/staff/claims`, and the licence gate opens.

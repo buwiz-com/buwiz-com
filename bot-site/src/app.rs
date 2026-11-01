@@ -25,10 +25,7 @@ pub struct ThemeContext(pub RwSignal<String>);
 /// Read a cookie value by name from document.cookie
 fn get_cookie(name: &str) -> Option<String> {
     use wasm_bindgen::JsCast;
-    let document = web_sys::window()?
-        .document()?
-        .dyn_into::<web_sys::HtmlDocument>()
-        .ok()?;
+    let document = web_sys::window()?.document()?.dyn_into::<web_sys::HtmlDocument>().ok()?;
     let cookies = document.cookie().ok()?;
     for part in cookies.split(';') {
         let part = part.trim();
@@ -42,26 +39,14 @@ fn get_cookie(name: &str) -> Option<String> {
 /// Set a cookie with proper domain handling for both prod and local dev
 fn set_theme_cookie(value: &str) {
     use wasm_bindgen::JsCast;
-    if let Some(document) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.dyn_into::<web_sys::HtmlDocument>().ok())
+    if let Some(document) =
+        web_sys::window().and_then(|w| w.document()).and_then(|d| d.dyn_into::<web_sys::HtmlDocument>().ok())
     {
-        let hostname = web_sys::window()
-            .and_then(|w| w.location().hostname().ok())
-            .unwrap_or_default();
+        let hostname = web_sys::window().and_then(|w| w.location().hostname().ok()).unwrap_or_default();
 
-        let domain = if hostname.ends_with("goldcoders.dev") {
-            "; domain=.goldcoders.dev"
-        } else if hostname.ends_with(".localhost") {
-            "; domain=localhost"
-        } else {
-            ""
-        };
+        let domain = if hostname.ends_with(".localhost") { "; domain=localhost" } else { "" };
 
-        let cookie = format!(
-            "gc-theme={}; path=/; max-age=31536000; SameSite=Lax{}",
-            value, domain
-        );
+        let cookie = format!("gc-theme={}; path=/; max-age=31536000; SameSite=Lax{}", value, domain);
         let _ = document.set_cookie(&cookie);
     }
 }
@@ -81,12 +66,12 @@ pub fn App() -> impl IntoView {
             theme.set(cookie_theme);
         } else if let Some(window) = web_sys::window() {
             // 2. Migrate from localStorage if cookie doesn't exist yet
-            if let Ok(Some(storage)) = window.local_storage() {
-                if let Ok(Some(stored_theme)) = storage.get_item("gc-theme") {
-                    theme.set(stored_theme.clone());
-                    set_theme_cookie(&stored_theme);
-                    let _ = storage.remove_item("gc-theme");
-                }
+            if let Ok(Some(storage)) = window.local_storage()
+                && let Ok(Some(stored_theme)) = storage.get_item("gc-theme")
+            {
+                theme.set(stored_theme.clone());
+                set_theme_cookie(&stored_theme);
+                let _ = storage.remove_item("gc-theme");
             }
         }
 

@@ -95,7 +95,7 @@ const PALETTE: [(u8, &str); 21] = [
     (b'K', "#b28452"),
 ];
 /// The swatches in Paint's toolbar.
-const SWATCHES: [u8; 9] = [b'h', b'f', b'F', b'n', b'g', b'c', b'd', b's', b'k'];
+const SWATCHES: [u8; 9] = *b"hfFngcdsk";
 
 fn cell_color(cell: usize) -> u8 {
     LISA[cell / W].as_bytes()[cell % W]
@@ -178,7 +178,7 @@ fn wall(r: u8, c: u8) -> bool {
 /// The shortest way from the start to the exit, through open cells only.
 fn solve() -> Vec<(u8, u8)> {
     let mut prev = vec![None::<(u8, u8)>; MW * MH];
-    let mut seen = vec![false; MW * MH];
+    let mut seen = [false; MW * MH];
     let idx = |(r, c): (u8, u8)| r as usize * MW + c as usize;
     let mut queue = std::collections::VecDeque::from([START]);
     seen[idx(START)] = true;
@@ -253,7 +253,10 @@ pub const CLAUDE_LINES: usize = CLAUDE.len();
 // The receipt and what the vision model finds on it.
 
 /// Field, value, color, and its box on the receipt (x, y, w, h in the receipt's units).
-const FIELDS: [(&str, &str, &str, (f64, f64, f64, f64)); 6] = [
+/// x, y, w, h in the receipt's units.
+type Rect = (f64, f64, f64, f64);
+
+const FIELDS: [(&str, &str, &str, Rect); 6] = [
     ("VENDOR", "Jollibee · Makati", "#2563eb", (134., 28., 220., 55.)),
     ("DATE", "Oct 8, 2026 · 12:41", "#7c3aed", (113., 131., 158., 19.)),
     ("ITEM", "2pc Chickenjoy ×3 · ₱897.00", "#0e7490", (113., 167., 264., 19.)),
@@ -422,7 +425,12 @@ fn block_center(cell: usize) -> (f64, f64) {
 // The desktop and its windows.
 
 /// A window on the Box, the same size and place as Chrome. `dark` for the terminal and viewer.
-fn app_win(icon: impl IntoView + 'static, title: &'static str, dark: bool, body: impl IntoView + 'static) -> impl IntoView {
+fn app_win(
+    icon: impl IntoView + 'static,
+    title: &'static str,
+    dark: bool,
+    body: impl IntoView + 'static,
+) -> impl IntoView {
     let (frame, bar) = if dark {
         (
             "absolute bottom-[68px] left-1/2 top-11 flex w-[min(94%,780px)] -translate-x-1/2 flex-col overflow-hidden rounded-[10px] bg-[#0d1117] shadow-[0_18px_40px_rgba(0,0,0,.45)] ring-1 ring-white/10",
@@ -452,7 +460,8 @@ fn app_win(icon: impl IntoView + 'static, title: &'static str, dark: bool, body:
 
 /// Genie's Box: whichever app the script has up, and a dock that marks it.
 pub fn desktop(s: Screens) -> impl IntoView {
-    let dock = [("palette", "Paint"), ("public", "Chrome"), ("terminal", "Terminal"), ("center_focus_strong", "Vision")];
+    let dock =
+        [("palette", "Paint"), ("public", "Chrome"), ("terminal", "Terminal"), ("center_focus_strong", "Vision")];
     let on = move |i: usize| match s.app.get() {
         App::Paint => i == 0,
         App::Maze | App::Ledger => i == 1,
@@ -473,19 +482,21 @@ pub fn desktop(s: Screens) -> impl IntoView {
         },
         dock.into_iter()
             .enumerate()
-            .map(|(i, (glyph, label))| view! {
-                <span class="relative" aria-label=label>
-                    <span class=move || if on(i) {
-                        "lx-dock-item material-symbols-outlined bg-white/20 text-[20px] text-white"
-                    } else {
-                        "lx-dock-item material-symbols-outlined text-[20px] text-[#cbd5e1]"
-                    }>{glyph}</span>
-                    <span class=move || if on(i) {
-                        "absolute -bottom-1 left-1/2 h-1 w-1 -translate-x-1/2 rounded-full bg-white"
-                    } else {
-                        "hidden"
-                    }></span>
-                </span>
+            .map(|(i, (glyph, label))| {
+                view! {
+                    <span class="relative" aria-label=label>
+                        <span class=move || if on(i) {
+                            "lx-dock-item material-symbols-outlined bg-white/20 text-[20px] text-white"
+                        } else {
+                            "lx-dock-item material-symbols-outlined text-[20px] text-[#cbd5e1]"
+                        }>{glyph}</span>
+                        <span class=move || if on(i) {
+                            "absolute -bottom-1 left-1/2 h-1 w-1 -translate-x-1/2 rounded-full bg-white"
+                        } else {
+                            "hidden"
+                        }></span>
+                    </span>
+                }
             })
             .collect_view(),
     )
@@ -762,7 +773,10 @@ pub fn receipt_svg(class: &'static str, boxes: Option<RwSignal<usize>>) -> impl 
         view! { {line(118., y, size, ll, "start", bold, l)}{line(372., y, size, rl, "end", bold, r)} }
     };
     let dash = |y: f64| view! { <path d=format!("M116 {y}H372") stroke="#555" stroke-width="1" stroke-dasharray="4 3"></path> };
-    let bars = [3., 1., 2., 1., 1., 3., 2., 1., 1., 2., 3., 1., 2., 2., 1., 3., 1., 1., 2., 1., 3., 2., 1., 2., 1., 1., 3., 1., 2., 1., 2., 3., 1., 1., 2., 1., 1., 3., 2., 1., 2., 1., 3., 1.];
+    let bars = [
+        3., 1., 2., 1., 1., 3., 2., 1., 1., 2., 3., 1., 2., 2., 1., 3., 1., 1., 2., 1., 3., 2., 1., 2., 1., 1., 3., 1.,
+        2., 1., 2., 3., 1., 1., 2., 1., 1., 3., 2., 1., 2., 1., 3., 1.,
+    ];
     let mut bx = 150.;
     let mut bar_d = String::new();
     for (i, w) in bars.iter().enumerate() {
@@ -885,26 +899,99 @@ struct Entry {
 
 /// JE-0412, posted by Genie: the source chip is its avatar.
 const JE: [Entry; 3] = [
-    Entry { day: "8", party: "Jollibee Makati", color: "#dc2626", initials: "JM", memo: "JE-0412 · Meal · client", src: ("Ge", "#b9a5ff", "#1a1a1a"), category: "Representation", debit: "₱1,152.61", credit: "" },
-    Entry { day: "8", party: "Jollibee Makati", color: "#dc2626", initials: "JM", memo: "JE-0412 · VAT 12%", src: ("Ge", "#b9a5ff", "#1a1a1a"), category: "Input VAT", debit: "₱138.39", credit: "" },
-    Entry { day: "8", party: "Jollibee Makati", color: "#dc2626", initials: "JM", memo: "JE-0412 · paid in cash", src: ("Ge", "#b9a5ff", "#1a1a1a"), category: "Cash", debit: "", credit: "₱1,291.00" },
+    Entry {
+        day: "8",
+        party: "Jollibee Makati",
+        color: "#dc2626",
+        initials: "JM",
+        memo: "JE-0412 · Meal · client",
+        src: ("Ge", "#b9a5ff", "#1a1a1a"),
+        category: "Representation",
+        debit: "₱1,152.61",
+        credit: "",
+    },
+    Entry {
+        day: "8",
+        party: "Jollibee Makati",
+        color: "#dc2626",
+        initials: "JM",
+        memo: "JE-0412 · VAT 12%",
+        src: ("Ge", "#b9a5ff", "#1a1a1a"),
+        category: "Input VAT",
+        debit: "₱138.39",
+        credit: "",
+    },
+    Entry {
+        day: "8",
+        party: "Jollibee Makati",
+        color: "#dc2626",
+        initials: "JM",
+        memo: "JE-0412 · paid in cash",
+        src: ("Ge", "#b9a5ff", "#1a1a1a"),
+        category: "Cash",
+        debit: "",
+        credit: "₱1,291.00",
+    },
 ];
 
 const BEFORE: [Entry; 4] = [
-    Entry { day: "7", party: "Meralco", color: "#f97316", initials: "ME", memo: "Electricity · September", src: ("B", "#d97706", "#fff"), category: "Utilities", debit: "₱8,412.50", credit: "" },
-    Entry { day: "6", party: "PLDT Home", color: "#2563eb", initials: "PH", memo: "Fiber 1 Gbps", src: ("B", "#d97706", "#fff"), category: "Communication", debit: "₱2,899.00", credit: "" },
-    Entry { day: "5", party: "Grab Philippines", color: "#16a34a", initials: "GP", memo: "Client visit, BGC", src: ("I", "#6366f1", "#fff"), category: "Transportation", debit: "₱486.00", credit: "" },
-    Entry { day: "3", party: "Acme Retail Inc.", color: "#7c3aed", initials: "AR", memo: "INV-0193", src: ("INV", "#0891b2", "#fff"), category: "Sales Revenue", debit: "", credit: "₱64,000.00" },
+    Entry {
+        day: "7",
+        party: "Meralco",
+        color: "#f97316",
+        initials: "ME",
+        memo: "Electricity · September",
+        src: ("B", "#d97706", "#fff"),
+        category: "Utilities",
+        debit: "₱8,412.50",
+        credit: "",
+    },
+    Entry {
+        day: "6",
+        party: "PLDT Home",
+        color: "#2563eb",
+        initials: "PH",
+        memo: "Fiber 1 Gbps",
+        src: ("B", "#d97706", "#fff"),
+        category: "Communication",
+        debit: "₱2,899.00",
+        credit: "",
+    },
+    Entry {
+        day: "5",
+        party: "Grab Philippines",
+        color: "#16a34a",
+        initials: "GP",
+        memo: "Client visit, BGC",
+        src: ("I", "#6366f1", "#fff"),
+        category: "Transportation",
+        debit: "₱486.00",
+        credit: "",
+    },
+    Entry {
+        day: "3",
+        party: "Acme Retail Inc.",
+        color: "#7c3aed",
+        initials: "AR",
+        memo: "INV-0193",
+        src: ("INV", "#0891b2", "#fff"),
+        category: "Sales Revenue",
+        debit: "",
+        credit: "₱64,000.00",
+    },
 ];
 
 const LEDGER_COLS: &str = "grid grid-cols-[56px_minmax(0,1fr)_34px_118px_86px_86px] items-center";
 
 fn ledger_row(e: &'static Entry, new: bool) -> impl IntoView {
-    let avatar = |size: &'static str| view! {
-        <span class=format!("grid {size} shrink-0 place-items-center rounded-full text-[9.5px] font-bold text-white") style=format!("background:{}", e.color)>{e.initials}</span>
+    let avatar = |size: &'static str| {
+        view! {
+            <span class=format!("grid {size} shrink-0 place-items-center rounded-full text-[9.5px] font-bold text-white") style=format!("background:{}", e.color)>{e.initials}</span>
+        }
     };
     let (src, src_bg, src_fg) = e.src;
-    let amount = if e.debit.is_empty() { ("Cr", e.credit, "text-[#16a34a]") } else { ("Dr", e.debit, "text-[#1e293b]") };
+    let amount =
+        if e.debit.is_empty() { ("Cr", e.credit, "text-[#16a34a]") } else { ("Dr", e.debit, "text-[#1e293b]") };
     view! {
         <div class=if new {
             "hv-row-in relative border-b border-[#bbf7d0] bg-[#f0fdf4]"
@@ -952,7 +1039,15 @@ fn ledger_row(e: &'static Entry, new: bool) -> impl IntoView {
 }
 
 fn buwiz_app(s: Screens) -> impl IntoView {
-    let nav = [("home", "Home"), ("inbox", "Inbox"), ("menu_book", "Ledger"), ("receipt_long", "Invoices"), ("request_quote", "Bills"), ("bar_chart", "Reports"), ("account_balance", "Taxes")];
+    let nav = [
+        ("home", "Home"),
+        ("inbox", "Inbox"),
+        ("menu_book", "Ledger"),
+        ("receipt_long", "Invoices"),
+        ("request_quote", "Bills"),
+        ("bar_chart", "Reports"),
+        ("account_balance", "Taxes"),
+    ];
     chrome(
         view! { <span class="grid h-3.5 w-3.5 shrink-0 place-items-center rounded-[3px] bg-[#22c55e] text-[9px] font-bold leading-none text-white">"B"</span> },
         "Ledger · Buwiz Books",

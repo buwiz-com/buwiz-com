@@ -14,9 +14,7 @@
       function setCookie(name, value) {
         var h = location.hostname;
         var domain = "";
-        if (h.indexOf('goldcoders.dev') !== -1) {
-          domain = "; domain=.goldcoders.dev";
-        } else if (h.indexOf('.localhost') !== -1) {
+        if (h.indexOf('.localhost') !== -1) {
           domain = "; domain=localhost";
         }
         var cookie = name + '=' + value + '; path=/; max-age=31536000; SameSite=Lax' + domain;
@@ -111,8 +109,8 @@
   <!-- include support for `wasm-bindgen --weak-refs` - see: https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html -->
   
 <script type="module">
-import init, * as bindings from '/bot/buwiz-bot-site-8bed601a2ec42c8b.js';
-const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-8bed601a2ec42c8b_bg.wasm' });
+import init, * as bindings from '/bot/buwiz-bot-site-d3c5516f88b1d19c.js';
+const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-d3c5516f88b1d19c_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -122,7 +120,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
 
-<link rel="modulepreload" href="/bot/buwiz-bot-site-8bed601a2ec42c8b.js" crossorigin="anonymous" integrity="sha384-+XKNdNY3iovAodIoQleY2aAtIIINFCDKcwPE+MJNBbU6DfwVCfjHdVFTsL86hP7y"><link rel="preload" href="/bot/buwiz-bot-site-8bed601a2ec42c8b_bg.wasm" crossorigin="anonymous" integrity="sha384-xPqqFXD0FX4JSpENAaedEGRyFETuTYy4LfUB9f2Hqh5JqBuOvwZE+uPF5XrdtdMs" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/bot/buwiz-bot-site-d3c5516f88b1d19c.js" crossorigin="anonymous" integrity="sha384-+XKNdNY3iovAodIoQleY2aAtIIINFCDKcwPE+MJNBbU6DfwVCfjHdVFTsL86hP7y"><link rel="preload" href="/bot/buwiz-bot-site-d3c5516f88b1d19c_bg.wasm" crossorigin="anonymous" integrity="sha384-3JoSAU/zAM/zXeJXOoWXXn/SShZJU+IW4oDsP5dQFMmNy93L5btSN4sDTbQcD8Mc" as="fetch" type="application/wasm"></head>
 
 <body></body>
 

@@ -7,11 +7,7 @@ use leptos_router::hooks::use_location;
 fn path_is_active(pathname: &str, href: &str) -> bool {
     let path = pathname.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
-    if href == "/" {
-        path == "/"
-    } else {
-        path == href || path.starts_with(&format!("{href}/"))
-    }
+    if href == "/" { path == "/" } else { path == href || path.starts_with(&format!("{href}/")) }
 }
 
 /// Desktop / mobile nav link with active + hover underline (theme tokens).
@@ -69,11 +65,7 @@ pub fn Layout(children: Children) -> impl IntoView {
     let toggle_theme = move |_| {
         if let Some(ctx) = theme_context {
             ctx.0.update(|theme| {
-                *theme = if *theme == "dark" {
-                    String::from("light")
-                } else {
-                    String::from("dark")
-                };
+                *theme = if *theme == "dark" { String::from("light") } else { String::from("dark") };
             });
         }
     };
@@ -88,11 +80,7 @@ pub fn Layout(children: Children) -> impl IntoView {
     });
 
     let is_dark = move || {
-        if let Some(ctx) = theme_context {
-            ctx.0.get() == "dark"
-        } else {
-            true
-        }
+        if let Some(ctx) = theme_context { ctx.0.get() == "dark" } else { true }
     };
 
     view! {

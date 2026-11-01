@@ -1,7 +1,6 @@
 # buwiz.com: the Buwiz Bot site
 
-The bare domain serves the Buwiz Bot site (`SITE_SPLIT`, on by default). It has
-two pages:
+The bare domain serves the Buwiz Bot site. It has two pages:
 
 - `/`: Meet Buwiz Bot.
 - `/mini-apps`: eBIRForms, Books, Word and Spreadsheet.

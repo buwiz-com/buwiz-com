@@ -35,10 +35,6 @@ pub struct Config {
     /// Origin of the filing site, e.g. `https://ebirforms.buwiz.com`. Its pages'
     /// canonical addresses, the sitemap and the install command use it.
     pub forms_origin: String,
-    /// Whether the bare domain is the Buwiz Bot site and the filing site
-    /// has a host of its own (see [`crate::canonical::Site`]). On unless
-    /// `SITE_SPLIT=false`.
-    pub site_split: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +82,6 @@ impl Config {
                 .filter(|raw| !raw.is_empty()),
             downloads_url: origin(&var_or("DOWNLOADS_URL", "https://downloads.buwiz.com")).context("DOWNLOADS_URL")?,
             forms_origin: origin(&var_or("FORMS_ORIGIN", "https://ebirforms.buwiz.com")).context("FORMS_ORIGIN")?,
-            site_split: std::env::var("SITE_SPLIT").as_deref() != Ok("false"),
         })
     }
 

@@ -37,7 +37,7 @@ pub async fn sitemap(State(state): State<AppState>, headers: HeaderMap) -> Respo
     if is_app_host(host) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let body = match Site::for_host(host, state.config.site_split) {
+    let body = match Site::for_host(host) {
         Site::Bot => sitemap_xml(&public_origin(&state.config, host), BOT_PAGES, None),
         _ => sitemap_xml(&state.config.forms_origin, PAGES, state.downloads.latest().await.as_deref()),
     };
@@ -47,7 +47,7 @@ pub async fn sitemap(State(state): State<AppState>, headers: HeaderMap) -> Respo
 /// The public address of the site on `host`: the Bot host's own, or else
 /// the filing site's, whichever host a request came in on.
 pub fn public_origin(config: &Config, host: &str) -> String {
-    match Site::for_host(host, config.site_split) {
+    match Site::for_host(host) {
         Site::Bot => format!("https://{host}"),
         _ => config.forms_origin.clone(),
     }

@@ -36,8 +36,8 @@ the claim is decided or withdrawn.
 ## Releasing a build
 
 The release is built on the owner's Mac, from a checkout that has the
-private BIR files restored (`src/bir/` and the rest; see
-[relay.md](relay.md)). The `Dockerfile` builds with `--features bir,ocr`.
+private BIR files restored from the private stow repository (see
+[relay.md](relay.md#restoring-the-private-files)). The `Dockerfile` builds with `--features bir,ocr`.
 Without those files, the build fails, so it never ships a Sender that
 cannot send.
 

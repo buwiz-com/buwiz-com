@@ -28,7 +28,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Without the `bir` feature: the public build, which has no BIR relay
       # files. Production builds use `--features bir` (see the Dockerfile).
-      - run: cargo fmt --check
+      # rustfmt per file: `cargo fmt` stops on the private targets that
+      # Cargo.toml declares but this repository does not have.
+      - run: git ls-files -z -- '*.rs' ':!:bot-site/' ':!:e2e/' | xargs -0 rustfmt --check --edition 2024
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 

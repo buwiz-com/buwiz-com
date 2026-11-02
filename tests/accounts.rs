@@ -1,6 +1,6 @@
 //! The account site against Postgres: the staff pages, old links, the
 //! licence gate's opt-in for open claims, signing an account out
-//! everywhere, and the sign-in pages.
+//! everywhere, the sign-in pages, and who may use `/mcp`.
 //! Each test gets its own database from `#[sqlx::test]`, so DATABASE_URL
 //! must point at a Postgres the tests may create databases in
 //! (`docker compose up -d`, then the URL from `.env.example`).
@@ -275,4 +275,103 @@ async fn sign_in_and_add_tin_pages_render(db: PgPool) {
     }
     assert_eq!(site.get("/assets/account.css", "").await.status(), StatusCode::OK);
     assert_eq!(site.get("/assets/account.js", "").await.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn only_an_agent_token_may_use_mcp(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person("ana@example.test").await;
+    const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    const CALL: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_tin_claims"}}"#;
+    let call = |token: Option<&str>, body: &'static str| {
+        let mut request = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(Body::from(body)).unwrap()
+    };
+    let challenge = |response: &axum::response::Response| {
+        response.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap().to_owned()
+    };
+    add_claim(&site.db, ana, "123456789", "approved").await;
+
+    for body in [LIST, CALL] {
+        let response = site.send(call(None, body)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{body}");
+        assert!(challenge(&response).contains(r#"error="invalid_token""#), "{body}");
+    }
+
+    for (client, scope) in [("buwiz-desktop", "app"), ("buwiz-books", "books")] {
+        let token = token(&site.db, ana, client, scope).await;
+        for body in [LIST, CALL] {
+            let response = site.send(call(Some(&token), body)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{scope} {body}");
+            let challenge = challenge(&response);
+            assert!(challenge.contains(r#"error="insufficient_scope""#), "{scope} {body}");
+            assert!(challenge.contains(r#"scope="mcp""#), "{scope} {body}");
+            assert!(!text(response).await.contains("123"), "{scope} {body}");
+        }
+    }
+
+    let token = token(&site.db, ana, "an-agent", "mcp").await;
+    let response = site.send(call(Some(&token), LIST)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(text(response).await.contains("list_tin_claims"));
+    let response = site.send(call(Some(&token), CALL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer: serde_json::Value = serde_json::from_str(&text(response).await).unwrap();
+    let claims = &answer["result"]["structuredContent"]["claims"];
+    assert_eq!(claims.as_array().map(Vec::len), Some(1), "{answer}");
+    assert_eq!(claims[0]["status"], "approved", "{answer}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn only_the_bir_apps_see_a_returns_full_tin(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "123456789", "approved").await;
+    let filename = "12345678900000-1601Cv2018-062025#ana@example.test#.xml";
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO submissions (account_id, claim_id, form_type, period, filename, xml_sha256, status, remote_path, receipt_jws)
+         VALUES ($1, $2, '1601Cv2018', '062025', $3, '\\x00', 'sent', '/in/' || $3, 'head.body.sig')
+         RETURNING id",
+    )
+    .bind(ana)
+    .bind(claim)
+    .bind(filename)
+    .fetch_one(&site.db)
+    .await
+    .unwrap();
+    let get = |token: &str, path: String| {
+        Request::get(path).header(header::AUTHORIZATION, format!("Bearer {token}")).body(Body::empty()).unwrap()
+    };
+    let mcp = |token: &str, tool: &str| {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"id":"{id}"}}}}}}"#
+        );
+        Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let app = app_token(&site.db, ana).await;
+    let full = text(site.send(get(&app, format!("/api/submissions/{id}"))).await).await;
+    assert!(full.contains(filename) && full.contains("head.body.sig"), "{full}");
+
+    let books = token(&site.db, ana, "buwiz-books", "books").await;
+    let agent = token(&site.db, ana, "an-agent", "mcp").await;
+    let answers = [
+        text(site.send(get(&books, "/api/submissions".to_owned())).await).await,
+        text(site.send(get(&books, format!("/api/submissions/{id}"))).await).await,
+        text(site.send(mcp(&agent, "list_submissions")).await).await,
+        text(site.send(mcp(&agent, "get_submission")).await).await,
+    ];
+    for answer in answers {
+        assert!(answer.contains("***-***-789-00000-1601Cv2018-062025.xml"), "{answer}");
+        for secret in ["123456789", "ana@example.test", "head.body.sig", "/in/"] {
+            assert!(!answer.contains(secret), "{secret} in {answer}");
+        }
+    }
 }

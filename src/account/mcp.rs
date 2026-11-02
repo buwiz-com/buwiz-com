@@ -3,8 +3,10 @@
 //!
 //! Every request needs an access token. Without a valid one the answer is
 //! 401 with a `WWW-Authenticate` header naming the RFC 9728 metadata, which
-//! is how MCP clients find where to sign in. All tools only read; filing
-//! stays in the Buwiz app.
+//! is how MCP clients find where to sign in. Only an agent's token (scope
+//! `mcp`) is accepted: an app's token answers 403 `insufficient_scope`, so
+//! every agent shows on the account page and can be removed there. All
+//! tools only read; filing stays in the Buwiz app.
 
 use axum::Json;
 use axum::extract::State;
@@ -15,7 +17,7 @@ use uuid::Uuid;
 
 use crate::account::agents::request_origin;
 use crate::account::claims;
-use crate::account::oauth::Bearer;
+use crate::account::oauth::{Bearer, SCOPE_MCP};
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
 use crate::filing::submissions;
@@ -43,9 +45,12 @@ pub async fn handle(
     }
     let bearer = match bearer {
         Ok(bearer) => bearer,
-        Err(ApiError::InvalidToken) => return unauthorized(&state, &headers),
+        Err(ApiError::InvalidToken) => return challenge(&state, &headers, StatusCode::UNAUTHORIZED, "invalid_token"),
         Err(error) => return error.into_response(),
     };
+    if bearer.scope != SCOPE_MCP {
+        return challenge(&state, &headers, StatusCode::FORBIDDEN, "insufficient_scope");
+    }
     let message: Value = match serde_json::from_str(&body) {
         Ok(message) => message,
         Err(_) => return rpc_error(Value::Null, PARSE_ERROR, "not JSON"),
@@ -75,12 +80,14 @@ pub async fn handle(
     }
 }
 
-fn unauthorized(state: &AppState, headers: &HeaderMap) -> Response {
+/// A refusal with the RFC 6750 `WWW-Authenticate` challenge that sends the
+/// client to the RFC 9728 metadata to sign in again.
+fn challenge(state: &AppState, headers: &HeaderMap, status: StatusCode, error: &str) -> Response {
     let origin = request_origin(&state.config, headers);
     let challenge = format!(
-        r#"Bearer error="invalid_token", resource_metadata="{origin}/.well-known/oauth-protected-resource/mcp", scope="mcp""#
+        r#"Bearer error="{error}", resource_metadata="{origin}/.well-known/oauth-protected-resource/mcp", scope="{SCOPE_MCP}""#
     );
-    let mut response = (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_token" }))).into_response();
+    let mut response = (status, Json(json!({ "error": error }))).into_response();
     if let Ok(value) = HeaderValue::from_str(&challenge) {
         response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
     }
@@ -173,14 +180,17 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
             json!({ "claims": claims })
         }
         "list_submissions" => {
-            json!({ "submissions": submissions::recent(&state.db, account_id).await.map_err(internal)? })
+            let views = submissions::recent(&state.db, account_id).await.map_err(internal)?;
+            let views: Vec<_> = views.into_iter().map(|view| view.for_bearer(bearer)).collect();
+            json!({ "submissions": views })
         }
         "get_submission" => {
             let Some(id) = arguments.get("id").and_then(Value::as_str).and_then(|raw| raw.parse::<Uuid>().ok()) else {
                 return Ok(tool_error("id must be a submission id (UUID)"));
             };
             match submissions::find(&state.db, account_id, id).await.map_err(internal)? {
-                Some(view) => serde_json::to_value(view).map_err(|_| (INTERNAL_ERROR, "encoding".to_owned()))?,
+                Some(view) => serde_json::to_value(view.for_bearer(bearer))
+                    .map_err(|_| (INTERNAL_ERROR, "encoding".to_owned()))?,
                 None => return Ok(tool_error("no submission with that id on this account")),
             }
         }

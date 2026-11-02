@@ -202,13 +202,19 @@ pub async fn text(response: Response) -> String {
 
 /// An app sign-in for `account_id` with the BIR app's scope.
 pub async fn app_token(db: &PgPool, account_id: Uuid) -> String {
-    let grant: Uuid = sqlx::query_scalar(
-        "INSERT INTO oauth_grants (account_id, client_id, scope) VALUES ($1, 'buwiz-desktop', 'app') RETURNING id",
-    )
-    .bind(account_id)
-    .fetch_one(db)
-    .await
-    .unwrap();
+    token(db, account_id, "buwiz-desktop", "app").await
+}
+
+/// A sign-in for `account_id` by `client_id`, with `scope`.
+pub async fn token(db: &PgPool, account_id: Uuid, client_id: &str, scope: &str) -> String {
+    let grant: Uuid =
+        sqlx::query_scalar("INSERT INTO oauth_grants (account_id, client_id, scope) VALUES ($1, $2, $3) RETURNING id")
+            .bind(account_id)
+            .bind(client_id)
+            .bind(scope)
+            .fetch_one(db)
+            .await
+            .unwrap();
     let token = crypto::new_token("bwa_");
     sqlx::query("INSERT INTO oauth_access_tokens (grant_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '15 minutes')")
         .bind(grant)

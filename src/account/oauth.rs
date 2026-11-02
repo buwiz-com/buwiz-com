@@ -395,6 +395,11 @@ pub struct Bearer {
 }
 
 impl Bearer {
+    /// Only the BIR apps see full TINs. Books and AI agents get them masked.
+    pub fn sees_full_tins(&self) -> bool {
+        self.scope == SCOPE_APP
+    }
+
     /// Refuses every token but the BIR app's: Books and AI agents never file.
     pub fn require_app(&self) -> Result<(), ApiError> {
         if self.scope == SCOPE_APP {

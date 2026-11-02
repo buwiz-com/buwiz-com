@@ -93,11 +93,20 @@ those has a `status` and no `filing.submit` permission.
 - active TINs;
 - TIN claims;
 - sent returns;
-- one return with its receipt.
+- one return.
+
+Agents and Buwiz Books see TINs masked (`***-***-789-00000`), on `/mcp`
+and on `/api/submissions`. A return's file name comes with the TIN masked
+and without the email, and without its remote path or signed receipt, which
+carry the full TIN (`SubmissionView::for_bearer`). Only the BIR apps (`app`)
+see full TINs.
 
 How an agent signs in (`src/account/agents.rs`):
 1. It finds the sign-in through the 401's `WWW-Authenticate` metadata (RFC 9728 and RFC 8414).
 2. It registers itself (RFC 7591).
 3. It signs in with an authorization code and PKCE, after the person approves it on a consent page.
 
-Agent tokens carry the `mcp` scope and can never file a return.
+Agent tokens carry the `mcp` scope and can never file a return. `/mcp`
+accepts only those: an app's token (`app`, `books`) gets 403
+`insufficient_scope`. So every agent that reads an account shows on the
+account page, where the person can remove it.

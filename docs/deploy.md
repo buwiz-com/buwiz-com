@@ -124,7 +124,7 @@ a trusted machine, not on the server:
 
 ```sh
 cargo run --release --bin buwiz-trust-sign -- keygen trust.key
-# prints the public key: put it in eBIRForms crates/bir-submit/src/trust.rs TRUST_KEYS
+# prints the public key: put it in eBIRForms crates/bir-submit/src/filing/trust.rs TRUST_KEYS
 # on the instance (through SSM): buwiz-sender public > sender-keys.json
 cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.json \
   <host:port> …   # BIR's dispatcher and upload hosts, from the BIR relay's private docs

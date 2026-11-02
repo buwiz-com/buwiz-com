@@ -5,13 +5,13 @@ second process, the Sender, is the only part that talks to BIR.
 
 | Host | What it is | Code | Docs |
 |---|---|---|---|
-| `buwiz.com` | The Buwiz Bot site: `/` and `/mini-apps` | `bot-site/` (Leptos, built into `bot-site/dist/`), served by `src/bot_site.rs` | [docs/bot-site.md](docs/bot-site.md) |
-| `ebirforms.buwiz.com` | The eBIRForms filing site: its home page, `/download` and the installers | `src/pages/home.rs`, `src/pages/download.rs`, `src/downloads.rs` | [docs/ebirforms-site.md](docs/ebirforms-site.md) |
-| `account.buwiz.com` | Sign-in, My TINs and TIN claims, the staff pages, and app and agent sign-in | `src/pages.rs`, `src/web.rs`, `src/accounts.rs`, `src/claims.rs`, `src/staff.rs`, `src/oauth.rs`, `src/agents.rs` | [docs/accounts.md](docs/accounts.md) |
-| `api.buwiz.com` | What the apps and agents call: the licence gate, devices, tickets, the submission relay and `/mcp` | `src/web.rs`, `src/devices.rs`, `src/tickets.rs`, `src/submissions.rs`, `src/mcp.rs` | [docs/accounts.md](docs/accounts.md), [docs/relay.md](docs/relay.md) |
+| `buwiz.com` | The Buwiz Bot site: `/` and `/mini-apps` | `bot-site/` (Leptos, built into `bot-site/dist/`), served by `src/sites/bot_site.rs` | [docs/bot-site.md](docs/bot-site.md) |
+| `ebirforms.buwiz.com` | The eBIRForms filing site: its home page, `/download` and the installers | `src/account/pages/home.rs`, `src/account/pages/download.rs`, `src/sites/downloads.rs` | [docs/ebirforms-site.md](docs/ebirforms-site.md) |
+| `account.buwiz.com` | Sign-in, My TINs and TIN claims, the staff pages, and app and agent sign-in | `src/account/pages.rs`, `src/account/web.rs`, `src/account/accounts.rs`, `src/account/claims.rs`, `src/account/staff.rs`, `src/account/oauth.rs`, `src/account/agents.rs` | [docs/accounts.md](docs/accounts.md) |
+| `api.buwiz.com` | What the apps and agents call: the licence gate, devices, tickets, the submission relay and `/mcp` | `src/account/web.rs`, `src/filing/devices.rs`, `src/filing/tickets.rs`, `src/filing/submissions.rs`, `src/account/mcp.rs` | [docs/accounts.md](docs/accounts.md), [docs/relay.md](docs/relay.md) |
 | (private) | The Sender: BIR's passphrases, the SFTP login and the IAF encryption | `src/sender/`, `src/bin/buwiz-sender.rs`, plus `src/bir/` (not in this repository) | [docs/relay.md](docs/relay.md) |
 
-`src/canonical.rs` decides which host serves what:
+`src/sites/canonical.rs` decides which host serves what:
 - The bare domain is the Bot site, and the filing site is on `FORMS_ORIGIN`.
 - The filing site's old paths on the bare domain (`/download`, `/install-linux.sh` and the demo assets) answer with a 301 to `FORMS_ORIGIN`.
 - `www.` always redirects to the bare domain.
@@ -47,7 +47,7 @@ Migrations run at start. Sign-in codes are printed to the log. See
 | `src/` | The server (`buwiz-cloud`). Its other binaries are in `src/bin/` (`buwiz-sender`, `buwiz-relay`) |
 | `bot-site/` | The Buwiz Bot site, a separate Leptos crate. `bot-site/dist/` is committed and embedded in the binary |
 | `migrations/` | Postgres migrations, run at start |
-| `tests/` | Integration tests. `account_site.rs` needs `DATABASE_URL` |
+| `tests/` | Integration tests. The site tests (`accounts.rs`, `claims.rs`, `filing_site.rs`, `bot_site.rs`, `seo.rs`, sharing `common/`) need `DATABASE_URL` |
 | `e2e/` | A workspace of its own: submission v2 end to end with the real eBIRForms client (`scripts/v6.sh`) |
 | `scripts/` | `v6.sh` (the e2e run), `ocr-models.sh` (fetches the OCR models) and `smoke.sh` |
 | `docs/` | One page per host or subsystem (below) |

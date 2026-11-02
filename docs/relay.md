@@ -21,9 +21,9 @@ process (development only).
 
 ## v2 flow
 
-1. The app signs each request with a registered device key (`src/devices.rs`).
-2. It gets a five-minute ticket for one return (`src/tickets.rs`).
-3. It seals the XML to the Sender with HPKE (`src/envelope.rs`).
+1. The app signs each request with a registered device key (`src/filing/devices.rs`).
+2. It gets a five-minute ticket for one return (`src/filing/tickets.rs`).
+3. It seals the XML to the Sender with HPKE (`src/filing/envelope.rs`).
 
 v1 still works: plaintext XML over TLS.
 

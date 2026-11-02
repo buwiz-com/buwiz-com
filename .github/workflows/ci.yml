@@ -7,7 +7,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # tests/account_site.rs makes a database per test here.
+    # The site tests (tests/accounts.rs and the others) make a database per test here.
     services:
       postgres:
         image: postgres:17-alpine

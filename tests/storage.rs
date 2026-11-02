@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use buwiz_cloud::storage::ObjectStore;
+use buwiz_cloud::base::storage::ObjectStore;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 
 #[tokio::test]

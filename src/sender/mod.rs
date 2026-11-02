@@ -44,11 +44,12 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::envelope::{Envelope, SealingKey};
+use crate::account::tin::Tin;
+use crate::base::{config, crypto};
+use crate::filing::envelope::{Envelope, SealingKey};
+use crate::filing::jws;
+use crate::filing::tickets;
 use crate::relay::{self, Control, Pipe};
-use crate::tickets;
-use crate::tin::Tin;
-use crate::{config, crypto, jws};
 
 pub const RECEIPT_TYP: &str = "buwiz-receipt+jwt";
 
@@ -350,7 +351,7 @@ async fn relay_job(State(sender): State<Arc<Sender>>, headers: HeaderMap, upgrad
     if !authorized(&sender, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    upgrade.max_message_size(crate::submissions::BODY_LIMIT).on_upgrade(move |socket| run_job(sender, socket))
+    upgrade.max_message_size(crate::filing::submissions::BODY_LIMIT).on_upgrade(move |socket| run_job(sender, socket))
 }
 
 async fn run_job(sender: Arc<Sender>, mut socket: WebSocket) {

@@ -3,7 +3,7 @@
 ## Settings
 
 All settings are environment variables. See [`.env.example`](../.env.example)
-and `src/config.rs`.
+and `src/base/config.rs`.
 
 | Setting | What |
 |---|---|
@@ -19,7 +19,7 @@ and `src/config.rs`.
 | `HOST`, `PORT`, `RUST_LOG` | Listening address and logs |
 
 **The hosts on localhost:** the first label of the host picks the site
-(`src/canonical.rs`):
+(`src/sites/canonical.rs`):
 - `account.localhost:3008` is the account site;
 - `api.localhost:3008` is the API;
 - `ebirforms.localhost:3008` or `forms.localhost:3008` is the filing site;
@@ -40,7 +40,7 @@ tests without them.
 
 | Command | Runs |
 |---|---|
-| `cargo test` | Everything that needs no BIR code. That includes the account site against Postgres (`tests/account_site.rs`), where each test gets its own database. `DATABASE_URL` must be set, for example from `.env` |
+| `cargo test` | Everything that needs no BIR code. That includes the account site against Postgres (`tests/accounts.rs`, `tests/claims.rs`, `tests/filing_site.rs`, `tests/bot_site.rs`, `tests/seo.rs`), where each test gets its own database. `DATABASE_URL` must be set, for example from `.env` |
 | `cargo test --features bir` | Adds the relay end to end in one process: a fake dispatcher, an SSH server with a pinned key, and the app's allow-list |
 | `cargo test --features bir -- --include-ignored` | Also runs HTTPS through the pipe against example.com |
 | `--features bir` with `BIR_IAF_PASSPHRASE` | `tests/iaf_golden.rs` checks the encryption against official `Encrypt.exe` output |

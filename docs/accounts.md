@@ -7,12 +7,12 @@ call).
 
 You sign in with a 6-digit code sent by email. There are no passwords, no
 organizations and no workspaces. One account can hold several TINs. People
-in `ADMIN_EMAILS` see the staff pages. Code: `src/accounts.rs`,
-`src/pages.rs` (the Topcoat pages) and `src/web.rs` (the form posts).
+in `ADMIN_EMAILS` see the staff pages. Code: `src/account/accounts.rs`,
+`src/account/pages.rs` (the Topcoat pages) and `src/account/web.rs` (the form posts).
 
 ## TIN activation
 
-The person says whose TIN it is, and uploads its papers (`src/claims.rs`):
+The person says whose TIN it is, and uploads its papers (`src/account/claims.rs`):
 
 - **Personal:** a TIN ID, either the card or the ORUS digital TIN ID. A selfie
   and a photo of the National ID are optional, and they make the check
@@ -23,7 +23,7 @@ The person says whose TIN it is, and uploads its papers (`src/claims.rs`):
 
 ### Staff review
 
-Staff review each claim by hand at `/staff` (`src/staff.rs`). They can:
+Staff review each claim by hand at `/staff` (`src/account/staff.rs`). They can:
 - approve it;
 - reject it;
 - send it back with reasons. The person fixes it from My TINs (`/tins`) and resends it.
@@ -72,7 +72,7 @@ The desktop app and the mini apps use the OAuth device flow (RFC 8628):
 `/oauth/device/code` and `/oauth/token`. Refresh tokens rotate, and reusing
 an old one ends the whole sign-in.
 
-The clients and their scopes are in `CLIENTS` in `src/oauth.rs`:
+The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 
 | Client | Scope |
 |---|---|
@@ -89,13 +89,13 @@ those has a `status` and no `filing.submit` permission.
 
 ## MCP for AI agents
 
-`POST /mcp` has four read-only tools (`src/mcp.rs`):
+`POST /mcp` has four read-only tools (`src/account/mcp.rs`):
 - active TINs;
 - TIN claims;
 - sent returns;
 - one return with its receipt.
 
-How an agent signs in (`src/agents.rs`):
+How an agent signs in (`src/account/agents.rs`):
 1. It finds the sign-in through the 401's `WWW-Authenticate` metadata (RFC 9728 and RFC 8414).
 2. It registers itself (RFC 7591).
 3. It signs in with an authorization code and PKCE, after the person approves it on a consent page.

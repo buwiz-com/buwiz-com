@@ -11,13 +11,13 @@ Every other path on this host either:
 - answers with a 301 to the account host, for `/login`, `/signup` and `/tins`;
 - or falls through to the shared routes: `robots.txt`, `sitemap.xml`, `/healthz`, `/.well-known/*`.
 
-See `moved_to` in `src/canonical.rs`.
+See `moved_to` in `src/sites/canonical.rs`.
 
 ## How it is built
 
 `bot-site/` is a Leptos app (client-side rendering), a crate of its own.
 Trunk builds it into `bot-site/dist/`. The server embeds `dist/` with
-`rust-embed` (`src/bot_site.rs`). It serves:
+`rust-embed` (`src/sites/bot_site.rs`). It serves:
 
 - the pages at their paths;
 - the bundle and images under `/bot/`, clear of the server's `/assets/`.
@@ -46,9 +46,9 @@ would see an empty `<body>`. So each page is served already drawn:
    shows twice.
 
 **To add a page:**
-- Add it to `PAGES` in `src/bot_site.rs`, with its title, description and prerender file.
+- Add it to `PAGES` in `src/sites/bot_site.rs`, with its title, description and prerender file.
 - Add it to `PAGES` in `prerender.py`.
-- Add it to `BOT_PAGES` in `src/seo.rs` (the sitemap).
+- Add it to `BOT_PAGES` in `src/sites/seo.rs` (the sitemap).
 - Add the route in `bot-site/src/app.rs`.
 
 ## Download button and GitHub stars
@@ -63,7 +63,7 @@ unknown:
   as the filing site's `/download/{platform}` picks it.
 - `buwiz-bot-stars`: the `stargazers_count` of `buwiz-bot/buwiz-bot`, read
   from the GitHub API (`GITHUB_API_URL`) at most every 10 minutes
-  (`src/github.rs`). The site shows it from 25 stars.
+  (`src/sites/github.rs`). The site shows it from 25 stars.
 
 The hero's download button guesses the computer from `navigator.userAgent`.
 While nothing is released it is disabled and says "Coming soon". It links
@@ -81,6 +81,6 @@ filing site's, and Bot downloads are not counted.
   page's canonical address.
 - There is no share image yet. `src/assets/brand/og-image.png` is the filing
   site's card.
-- `robots.txt` and the sitemap come from `src/seo.rs`. The sitemap lists only
+- `robots.txt` and the sitemap come from `src/sites/seo.rs`. The sitemap lists only
   `BOT_PAGES`. It leaves out `/download`, which is a 301 to the filing site.
-- Tests: `bot_site::tests`, plus `once_split_*` in `tests/account_site.rs`.
+- Tests: `bot_site::tests`, plus `tests/bot_site.rs`.

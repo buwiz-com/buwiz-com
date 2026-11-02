@@ -1,7 +1,7 @@
 # Deploy
 
 Production runs on AWS EC2, behind a Cloudflare Tunnel. It moved there from
-Fly on 2026-10-30, and Fly is retired.
+Fly on 2026-10-30. Fly is retired and `fly.toml` is gone.
 
 - **The machine:** one arm64 instance, a t4g.micro on Ubuntu 24.04, in
   `ap-southeast-1`. It runs three systemd services:
@@ -41,21 +41,41 @@ private BIR files restored (`src/bir/` and the rest; see
 Without those files, the build fails, so it never ships a Sender that
 cannot send.
 
-1. `docker build --platform linux/arm64`. The binaries `buwiz-cloud` and
-   `buwiz-sender` and the OCR models are copied out of the image.
-2. The binaries, the models and `install.sh` are uploaded to the deploy
-   bucket under `releases/<sha>/`.
-3. SSM `send-command` runs `install.sh <sha>` on the instance. It swaps the
-   binaries and restarts the services.
+The scripts are in `deploy/ec2/`. Copy `deploy/ec2/settings.example` to
+`deploy/ec2/settings` (git-ignored) and set the deploy bucket and the
+instance ID. Then, with `aws login --profile buwiz` current:
 
-Smoke-test after each deploy:
-- `/healthz` on each host;
+```sh
+deploy/ec2/build-release.sh "$(git rev-parse --short HEAD)"   # build, upload
+deploy/ec2/deploy.sh <sha>                                     # install, smoke-test
+```
+
+1. `build-release.sh` runs `docker build --platform linux/arm64` and copies
+   the binaries `buwiz-cloud` and `buwiz-sender` and the OCR models out of
+   the image, into `target/ec2-releases/<sha>/`. It uploads them, with
+   `install.sh`, to the deploy bucket under `releases/<sha>/`. It refuses a
+   sha that is not `HEAD`.
+2. `deploy.sh` runs `install.sh <sha> <bucket> <region>` on the instance
+   through SSM `send-command`. It swaps the binaries, rewrites the unit and
+   tunnel settings, and restarts the services. Then it prints the last log
+   lines and checks the public hosts.
+
+Build one release at a time: the Docker build needs most of a 16 GB Mac.
+
+Smoke-test after each deploy (`deploy.sh` does the first four):
 - `buwiz.com/` and `/mini-apps`;
 - `ebirforms.buwiz.com/download`;
-- `account.buwiz.com/login`.
+- `account.buwiz.com/login`;
+- `/healthz` on each host.
 
-The build and deploy scripts are kept outside this repository for now.
-Committing them as `deploy/ec2/` is an open owner decision.
+The rest of `deploy/ec2/` sets up a new instance:
+- `user-data.sh`: first boot (updates, cloudflared, the AWS CLI, the systemd
+  units, `/usr/local/bin/buwiz-env`, which writes `/etc/buwiz/env` from
+  `/buwiz/*` at each start).
+- `role-policy.json` and `trust.json`: the instance role. Replace `REGION`,
+  `ACCOUNT_ID` and `DEPLOY_BUCKET` before use.
+- `sender-keys.sh`: creates the Sender's keys in Parameter Store. It prints
+  only names and versions, and refuses to replace a key that exists.
 
 ## OCR of claim documents
 

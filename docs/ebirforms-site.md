@@ -6,10 +6,10 @@ on the host in `FORMS_ORIGIN`.
 
 | Path | What | Code |
 |---|---|---|
-| `/` | The home page: the app tour, the AI coworker demos and the FAQ | `src/pages/home.rs`, `src/home.css`, `src/demo.js`, `src/demo.css` |
-| `/download` | One card per platform, with one Download button and the version, size and SHA-256 | `src/pages/download.rs` |
-| `/download/{platform}` | A counted redirect to the installer in R2 | `src/downloads.rs` |
-| `/install-linux.sh` | The Linux install script, once a version is released | `src/downloads.rs` |
+| `/` | The home page: the app tour, the AI coworker demos and the FAQ | `src/account/pages/home.rs`, `src/sites/home.css`, `src/sites/demo.js`, `src/sites/demo.css` |
+| `/download` | One card per platform, with one Download button and the version, size and SHA-256 | `src/account/pages/download.rs` |
+| `/download/{platform}` | A counted redirect to the installer in R2 | `src/sites/downloads.rs` |
+| `/install-linux.sh` | The Linux install script, once a version is released | `src/sites/downloads.rs` |
 | `/assets/screens/*`, `/assets/demo/*` | The tour screenshots and the demo assets | `src/assets/` |
 
 The page renders server-side, with no client framework:
@@ -36,6 +36,6 @@ good one.
 
 ## SEO
 
-`robots.txt` and the sitemap come from `src/seo.rs`. The sitemap lists `/`
+`robots.txt` and the sitemap come from `src/sites/seo.rs`. The sitemap lists `/`
 and, once a version is released, `/download` with the release date. The
 account and API hosts send `X-Robots-Tag: noindex`.

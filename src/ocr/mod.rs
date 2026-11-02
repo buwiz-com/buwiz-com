@@ -26,9 +26,9 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::claims;
-use crate::state::AppState;
-use crate::tin::Tin;
+use crate::account::claims;
+use crate::account::tin::Tin;
+use crate::base::state::AppState;
 use extract::{Confidence, Fields, Line, Verdict};
 
 /// Why every reading fails in a build without the `ocr` feature.

@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tin::Tin;
+use crate::account::tin::Tin;
 
 /// One line of text, top to bottom, with how sure the reader was (0 to 1).
 #[derive(Clone, Debug, PartialEq)]

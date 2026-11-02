@@ -93,7 +93,13 @@ those has a `status` and no `filing.submit` permission.
 - active TINs;
 - TIN claims;
 - sent returns;
-- one return with its receipt.
+- one return.
+
+Agents and Buwiz Books see TINs masked (`***-***-789-00000`), on `/mcp`
+and on `/api/submissions`. A return's file name comes with the TIN masked
+and without the email, and without its remote path or signed receipt, which
+carry the full TIN (`SubmissionView::for_bearer`). Only the BIR apps (`app`)
+see full TINs.
 
 How an agent signs in (`src/account/agents.rs`):
 1. It finds the sign-in through the 401's `WWW-Authenticate` metadata (RFC 9728 and RFC 8414).

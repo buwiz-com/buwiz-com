@@ -1051,7 +1051,7 @@ pub async fn tax_profiles(
     Query(query): Query<HashMap<String, String>>,
     bearer: Bearer,
 ) -> Result<Json<Value>, ApiError> {
-    let full = bearer.scope == crate::account::oauth::SCOPE_APP;
+    let full = bearer.sees_full_tins();
     let include_open =
         query.get("include").is_some_and(|include| include.split(',').any(|item| item.trim() == "pending"));
     let profiles = if include_open {

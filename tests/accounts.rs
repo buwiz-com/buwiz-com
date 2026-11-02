@@ -324,3 +324,54 @@ async fn only_an_agent_token_may_use_mcp(db: PgPool) {
     assert_eq!(claims.as_array().map(Vec::len), Some(1), "{answer}");
     assert_eq!(claims[0]["status"], "approved", "{answer}");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn only_the_bir_apps_see_a_returns_full_tin(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "123456789", "approved").await;
+    let filename = "12345678900000-1601Cv2018-062025#ana@example.test#.xml";
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO submissions (account_id, claim_id, form_type, period, filename, xml_sha256, status, remote_path, receipt_jws)
+         VALUES ($1, $2, '1601Cv2018', '062025', $3, '\\x00', 'sent', '/in/' || $3, 'head.body.sig')
+         RETURNING id",
+    )
+    .bind(ana)
+    .bind(claim)
+    .bind(filename)
+    .fetch_one(&site.db)
+    .await
+    .unwrap();
+    let get = |token: &str, path: String| {
+        Request::get(path).header(header::AUTHORIZATION, format!("Bearer {token}")).body(Body::empty()).unwrap()
+    };
+    let mcp = |token: &str, tool: &str| {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"id":"{id}"}}}}}}"#
+        );
+        Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let app = app_token(&site.db, ana).await;
+    let full = text(site.send(get(&app, format!("/api/submissions/{id}"))).await).await;
+    assert!(full.contains(filename) && full.contains("head.body.sig"), "{full}");
+
+    let books = token(&site.db, ana, "buwiz-books", "books").await;
+    let agent = token(&site.db, ana, "an-agent", "mcp").await;
+    let answers = [
+        text(site.send(get(&books, "/api/submissions".to_owned())).await).await,
+        text(site.send(get(&books, format!("/api/submissions/{id}"))).await).await,
+        text(site.send(mcp(&agent, "list_submissions")).await).await,
+        text(site.send(mcp(&agent, "get_submission")).await).await,
+    ];
+    for answer in answers {
+        assert!(answer.contains("***-***-789-00000-1601Cv2018-062025.xml"), "{answer}");
+        for secret in ["123456789", "ana@example.test", "head.body.sig", "/in/"] {
+            assert!(!answer.contains(secret), "{secret} in {answer}");
+        }
+    }
+}

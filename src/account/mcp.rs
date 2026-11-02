@@ -180,14 +180,17 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
             json!({ "claims": claims })
         }
         "list_submissions" => {
-            json!({ "submissions": submissions::recent(&state.db, account_id).await.map_err(internal)? })
+            let views = submissions::recent(&state.db, account_id).await.map_err(internal)?;
+            let views: Vec<_> = views.into_iter().map(|view| view.for_bearer(bearer)).collect();
+            json!({ "submissions": views })
         }
         "get_submission" => {
             let Some(id) = arguments.get("id").and_then(Value::as_str).and_then(|raw| raw.parse::<Uuid>().ok()) else {
                 return Ok(tool_error("id must be a submission id (UUID)"));
             };
             match submissions::find(&state.db, account_id, id).await.map_err(internal)? {
-                Some(view) => serde_json::to_value(view).map_err(|_| (INTERNAL_ERROR, "encoding".to_owned()))?,
+                Some(view) => serde_json::to_value(view.for_bearer(bearer))
+                    .map_err(|_| (INTERNAL_ERROR, "encoding".to_owned()))?,
                 None => return Ok(tool_error("no submission with that id on this account")),
             }
         }

@@ -181,6 +181,23 @@ pub struct SubmissionView {
     relay_path: String,
 }
 
+impl SubmissionView {
+    /// What a token that may not see full TINs gets (`Bearer::sees_full_tins`):
+    /// the file name with the TIN masked and no email, and no remote path or
+    /// receipt, which carry the full TIN. The receipt stays in the BIR apps.
+    pub fn for_bearer(mut self, bearer: &Bearer) -> Self {
+        if !bearer.sees_full_tins() {
+            self.filename = match parse_filename(&self.filename) {
+                Ok(name) => format!("{}-{}-{}.xml", name.tin.masked(), name.form_type, name.period),
+                Err(_) => String::new(),
+            };
+            self.remote_path = None;
+            self.receipt_jws = None;
+        }
+        self
+    }
+}
+
 const VIEW_COLUMNS: &str =
     "id, status, filename, form_type, period, mode, attempts, error, remote_path, receipt_jws, created_at, sent_at";
 
@@ -203,12 +220,15 @@ pub async fn show(
     bearer: Bearer,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SubmissionView>, ApiError> {
-    find(&state.db, bearer.account.id, id).await?.map(Json).ok_or_else(ApiError::not_found)
+    let view = find(&state.db, bearer.account.id, id).await?.ok_or_else(ApiError::not_found)?;
+    Ok(Json(view.for_bearer(&bearer)))
 }
 
 /// `GET /api/submissions`: the 50 newest.
 pub async fn list(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "submissions": recent(&state.db, bearer.account.id).await? })))
+    let views: Vec<SubmissionView> =
+        recent(&state.db, bearer.account.id).await?.into_iter().map(|view| view.for_bearer(&bearer)).collect();
+    Ok(Json(json!({ "submissions": views })))
 }
 
 pub async fn recent(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<SubmissionView>> {

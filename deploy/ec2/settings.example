@@ -1,0 +1,7 @@
+# Copy to deploy/ec2/settings (git-ignored) and fill in. The scripts read it.
+AWS_PROFILE=buwiz
+AWS_REGION=ap-southeast-1
+# S3 bucket that holds releases/<sha>/ (the instance role can read it).
+BUWIZ_DEPLOY_BUCKET=
+# The EC2 instance that runs buwiz.service (i-…).
+BUWIZ_INSTANCE_ID=

@@ -6,3 +6,6 @@
 e2e/target/
 e2e/Cargo.lock
 /ocr-models
+
+# EC2 deploy settings (bucket, instance)
+/deploy/ec2/settings

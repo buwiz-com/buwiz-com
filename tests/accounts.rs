@@ -1,6 +1,6 @@
 //! The account site against Postgres: the staff pages, old links, the
 //! licence gate's opt-in for open claims, signing an account out
-//! everywhere, and the sign-in pages.
+//! everywhere, the sign-in pages, and who may use `/mcp`.
 //! Each test gets its own database from `#[sqlx::test]`, so DATABASE_URL
 //! must point at a Postgres the tests may create databases in
 //! (`docker compose up -d`, then the URL from `.env.example`).
@@ -275,4 +275,35 @@ async fn sign_in_and_add_tin_pages_render(db: PgPool) {
     }
     assert_eq!(site.get("/assets/account.css", "").await.status(), StatusCode::OK);
     assert_eq!(site.get("/assets/account.js", "").await.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn only_an_agent_token_may_use_mcp(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person("ana@example.test").await;
+    let call = |token: Option<String>| {
+        let mut request = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)).unwrap()
+    };
+    let challenge = |response: &axum::response::Response| {
+        response.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap().to_owned()
+    };
+
+    let response = site.send(call(None)).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(challenge(&response).contains(r#"error="invalid_token""#));
+
+    for (client, scope) in [("buwiz-desktop", "app"), ("buwiz-books", "books")] {
+        let response = site.send(call(Some(token(&site.db, ana, client, scope).await))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{scope}");
+        assert!(challenge(&response).contains(r#"error="insufficient_scope""#), "{scope}");
+        assert!(challenge(&response).contains(r#"scope="mcp""#), "{scope}");
+    }
+
+    let response = site.send(call(Some(token(&site.db, ana, "an-agent", "mcp").await))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(text(response).await.contains("list_tin_claims"));
 }

@@ -100,4 +100,7 @@ How an agent signs in (`src/account/agents.rs`):
 2. It registers itself (RFC 7591).
 3. It signs in with an authorization code and PKCE, after the person approves it on a consent page.
 
-Agent tokens carry the `mcp` scope and can never file a return.
+Agent tokens carry the `mcp` scope and can never file a return. `/mcp`
+accepts only those: an app's token (`app`, `books`) gets 403
+`insufficient_scope`. So every agent that reads an account shows on the
+account page, where the person can remove it.

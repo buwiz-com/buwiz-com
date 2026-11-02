@@ -27,7 +27,7 @@ and `src/base/config.rs`.
 
 ## Cargo features
 
-- **`bir`:** the BIR relay code. It needs the private files. See [relay.md](relay.md).
+- **`bir`:** the BIR relay code. It needs the private files, which are not in this repository. See [relay.md](relay.md#restoring-the-private-files).
 - **`ocr`:** reads claim documents on the server (`src/ocr/`).
   - It adds ONNX Runtime, linked statically, and about 30 MB to the binary. That ONNX Runtime needs GCC 14's libstdc++, so the `Dockerfile` builds on Ubuntu 24.04.
   - The models are 13 MB, Apache-2.0, and are not in git. `scripts/ocr-models.sh` fetches them, pinned and checked, into `ocr-models/`. `OCR_MODEL_DIR` points somewhere else.

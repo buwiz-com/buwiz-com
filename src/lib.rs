@@ -4,6 +4,8 @@
 pub mod account;
 pub mod base;
 #[cfg(feature = "bir")]
+// Not in this repository (docs/relay.md); rustfmt must not look for it.
+#[rustfmt::skip]
 pub mod bir;
 pub mod filing;
 pub mod ocr;

@@ -37,8 +37,10 @@ is served at `/.well-known/buwiz-trust.json`.
 
 ## The `bir` feature
 
-The BIR-specific code is behind the `bir` cargo feature, in files kept out
-of this public repository. That code is:
+The BIR-specific code is behind the `bir` cargo feature. Its files are not
+in this public repository: they live in the private repository
+`buwiz-com/buwiz-com-stow` and are restored into a checkout only for
+production builds and the relay tests. That code is:
 - BIR's dispatcher;
 - the IAF encryption;
 - the SFTP upload;
@@ -47,12 +49,27 @@ of this public repository. That code is:
 
 | | `cargo build` (public) | `cargo build --features bir` (production) |
 |---|---|---|
-| Needs the private BIR files (`src/bir/`, `src/relay/client.rs`, `examples/iaf-decrypt.rs`, `tests/relay.rs`, `tests/iaf_golden.rs`, `tests/fixtures/iaf/`) | No | Yes |
+| Needs the private BIR files (`src/bir/`, `src/relay/client.rs`, `src/bin/buwiz-relay.rs`, `examples/iaf-decrypt.rs`, `tests/relay.rs`, `tests/iaf_golden.rs`, `tests/fixtures/iaf/`) | No | Yes |
 | Accounts, TIN claims, devices, tickets, HPKE sealing, trust list, receipts | Yes | Yes |
 | The Sender | Checks tickets and opens envelopes, then answers every send `failed`, "relay not built in". Nothing reaches BIR, so it is safe to retry. | Sends through the relay |
 | `buwiz-relay`, `iaf-decrypt`, the relay tests | Not built | Built |
 
 BIR's hosts and the other BIR details are documented with those files.
+
+### Restoring the private files
+
+You need read access to `buwiz-com/buwiz-com-stow`. The files are listed
+in `.gitignore`, so they cannot be committed here by mistake. In the root
+of a checkout:
+
+```sh
+git clone --bare https://github.com/buwiz-com/buwiz-com-stow.git .stow/.git-bare
+git --git-dir=.stow/.git-bare --work-tree=. checkout main -- .
+```
+
+To change one of them, edit it in place, then commit and push it with
+`git --git-dir=.stow/.git-bare --work-tree=. commit` and `push`. Pulling
+this repository never touches them.
 
 ## Relay modes
 

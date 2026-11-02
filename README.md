@@ -44,7 +44,7 @@ Migrations run at start. Sign-in codes are printed to the log. See
 
 | Path | What |
 |---|---|
-| `src/` | The server (`buwiz-cloud`). Its other binaries are in `src/bin/` (`buwiz-sender`, `buwiz-relay`) |
+| `src/` | The server (`buwiz-cloud`). Its other binaries are in `src/bin/` (`buwiz-sender`, `buwiz-trust-sign`; `buwiz-relay` is one of the private BIR files, see [docs/relay.md](docs/relay.md)) |
 | `bot-site/` | The Buwiz Bot site, a separate Leptos crate. `bot-site/dist/` is committed and embedded in the binary |
 | `migrations/` | Postgres migrations, run at start |
 | `tests/` | Integration tests. The site tests (`accounts.rs`, `claims.rs`, `filing_site.rs`, `bot_site.rs`, `seo.rs`, sharing `common/`) need `DATABASE_URL` |

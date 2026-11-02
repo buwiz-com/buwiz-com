@@ -10,6 +10,8 @@
 //! ends with one `result`. See `docs/relay-protocol.md`.
 
 #[cfg(feature = "bir")]
+// Not in this repository (docs/relay.md); rustfmt must not look for it.
+#[rustfmt::skip]
 pub mod client;
 
 use std::collections::HashMap;

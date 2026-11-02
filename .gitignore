@@ -9,3 +9,15 @@ e2e/Cargo.lock
 
 # EC2 deploy settings (bucket, instance)
 /deploy/ec2/settings
+
+# Private BIR relay files: kept in the private stow repo, restored for
+# production builds (see docs/relay.md). Never commit them here.
+/src/bir/
+/src/relay/client.rs
+/src/bin/buwiz-relay.rs
+/examples/iaf-decrypt.rs
+/tests/relay.rs
+/tests/iaf_golden.rs
+/tests/fixtures/iaf/
+# The private repository's git directory (docs/relay.md).
+/.stow/

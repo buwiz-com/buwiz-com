@@ -1,4 +1,4 @@
-//! Offline tool for the relay trust list (see `buwiz_cloud::trust`). Run it
+//! Offline tool for the relay trust list (see `buwiz_cloud::filing::trust`). Run it
 //! on a machine that keeps the trust signing key; the server never sees it.
 //!
 //! buwiz-trust-sign keygen KEY_FILE
@@ -12,7 +12,7 @@
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use buwiz_cloud::trust::{self, Contents};
+use buwiz_cloud::filing::trust::{self, Contents};
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -41,7 +41,7 @@ fn keygen(path: &str) -> anyhow::Result<()> {
     std::io::Write::write_all(&mut file, STANDARD.encode(seed.as_ref()).as_bytes())?;
     let public = key.verifying_key();
     println!("public key (pin in bir-submit TRUST_KEYS): {}", URL_SAFE_NO_PAD.encode(public.as_bytes()));
-    println!("kid: {}", buwiz_cloud::jws::key_id(&public));
+    println!("kid: {}", buwiz_cloud::filing::jws::key_id(&public));
     Ok(())
 }
 

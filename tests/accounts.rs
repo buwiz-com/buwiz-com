@@ -281,29 +281,46 @@ async fn sign_in_and_add_tin_pages_render(db: PgPool) {
 async fn only_an_agent_token_may_use_mcp(db: PgPool) {
     let site = Site::new(db);
     let (ana, _) = site.person("ana@example.test").await;
-    let call = |token: Option<String>| {
+    const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    const CALL: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_tin_claims"}}"#;
+    let call = |token: Option<&str>, body: &'static str| {
         let mut request = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
         if let Some(token) = token {
             request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
-        request.body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)).unwrap()
+        request.body(Body::from(body)).unwrap()
     };
     let challenge = |response: &axum::response::Response| {
         response.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap().to_owned()
     };
+    add_claim(&site.db, ana, "123456789", "approved").await;
 
-    let response = site.send(call(None)).await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(challenge(&response).contains(r#"error="invalid_token""#));
-
-    for (client, scope) in [("buwiz-desktop", "app"), ("buwiz-books", "books")] {
-        let response = site.send(call(Some(token(&site.db, ana, client, scope).await))).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{scope}");
-        assert!(challenge(&response).contains(r#"error="insufficient_scope""#), "{scope}");
-        assert!(challenge(&response).contains(r#"scope="mcp""#), "{scope}");
+    for body in [LIST, CALL] {
+        let response = site.send(call(None, body)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{body}");
+        assert!(challenge(&response).contains(r#"error="invalid_token""#), "{body}");
     }
 
-    let response = site.send(call(Some(token(&site.db, ana, "an-agent", "mcp").await))).await;
+    for (client, scope) in [("buwiz-desktop", "app"), ("buwiz-books", "books")] {
+        let token = token(&site.db, ana, client, scope).await;
+        for body in [LIST, CALL] {
+            let response = site.send(call(Some(&token), body)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{scope} {body}");
+            let challenge = challenge(&response);
+            assert!(challenge.contains(r#"error="insufficient_scope""#), "{scope} {body}");
+            assert!(challenge.contains(r#"scope="mcp""#), "{scope} {body}");
+            assert!(!text(response).await.contains("123"), "{scope} {body}");
+        }
+    }
+
+    let token = token(&site.db, ana, "an-agent", "mcp").await;
+    let response = site.send(call(Some(&token), LIST)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(text(response).await.contains("list_tin_claims"));
+    let response = site.send(call(Some(&token), CALL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer: serde_json::Value = serde_json::from_str(&text(response).await).unwrap();
+    let claims = &answer["result"]["structuredContent"]["claims"];
+    assert_eq!(claims.as_array().map(Vec::len), Some(1), "{answer}");
+    assert_eq!(claims[0]["status"], "approved", "{answer}");
 }

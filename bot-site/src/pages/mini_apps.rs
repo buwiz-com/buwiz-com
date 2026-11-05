@@ -87,7 +87,7 @@ pub fn MiniAppsPage() -> impl IntoView {
                         </div>
 
                         <p class="mt-8 text-base text-gc-text-muted max-w-[60ch]">
-                            "You'll submit your app to Buwiz, and we'll review it and sign it. Only apps signed by Buwiz will install, so you won't need a signing key of your own."
+                            "You'll submit your mini app to Buwiz, and we'll review it and sign it. Only mini apps signed by Buwiz will install, so you won't need a signing key of your own."
                         </p>
                     </div>
                 </section>

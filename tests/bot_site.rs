@@ -92,7 +92,7 @@ async fn the_bot_site_serves_its_mini_apps_page(db: PgPool) {
         r#"id="build""#,
         "Build your own mini app",
         "Coming soon",
-        "submit your app to Buwiz",
+        "submit your mini app to Buwiz",
         r#"<link rel="canonical" href="https://buwiz.com/mini-apps" />"#,
         r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {

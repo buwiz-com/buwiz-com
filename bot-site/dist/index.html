@@ -116,8 +116,8 @@
   <!-- include support for `wasm-bindgen --weak-refs` - see: https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html -->
   
 <script type="module">
-import init, * as bindings from '/bot/buwiz-bot-site-45af81d54d285777.js';
-const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-45af81d54d285777_bg.wasm' });
+import init, * as bindings from '/bot/buwiz-bot-site-f0c7d16c98d2d4f.js';
+const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-f0c7d16c98d2d4f_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -127,7 +127,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
 
-<link rel="modulepreload" href="/bot/buwiz-bot-site-45af81d54d285777.js" crossorigin="anonymous" integrity="sha384-cQ7GnGjzd01WNgpC4rVZmBhBTgV7wWtYzoilXq6ZGYXx6RICh9RtTt0+lPqnHond"><link rel="preload" href="/bot/buwiz-bot-site-45af81d54d285777_bg.wasm" crossorigin="anonymous" integrity="sha384-6kMusWpHo4+Ra0Y5CuEPUdrtch6C8/cRnOc2ml8PMG3ak+pJC/fXAmikiSSEMQMr" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/bot/buwiz-bot-site-f0c7d16c98d2d4f.js" crossorigin="anonymous" integrity="sha384-cQ7GnGjzd01WNgpC4rVZmBhBTgV7wWtYzoilXq6ZGYXx6RICh9RtTt0+lPqnHond"><link rel="preload" href="/bot/buwiz-bot-site-f0c7d16c98d2d4f_bg.wasm" crossorigin="anonymous" integrity="sha384-796an9alLRTYWMaw1ijpgTrOmUI0XGT89CzEEd6H5W7VUYAKbRLwV65DrZfO5wcX" as="fetch" type="application/wasm"></head>
 
 <body></body>
 

@@ -30,6 +30,9 @@ async fn the_bot_site_is_the_bare_domain(db: PgPool) {
         r#"<div id="prerender">"#,
         "<h1",
         "<footer",
+        r#"href="/mini-apps#build""#,
+        "Build your own",
+        "Build a mini app",
         r#"<link rel="canonical" href="https://buwiz.com/" />"#,
         r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {
@@ -86,6 +89,10 @@ async fn the_bot_site_serves_its_mini_apps_page(db: PgPool) {
         "<title>Mini apps: eBIRForms, Books, Word and Spreadsheet | Buwiz Bot</title>",
         r#"<meta name="description" content="Buwiz mini apps run inside Buwiz Bot"#,
         r#"<div id="prerender">"#,
+        r#"id="build""#,
+        "Build your own mini app",
+        "Coming soon",
+        "submit your mini app to Buwiz",
         r#"<link rel="canonical" href="https://buwiz.com/mini-apps" />"#,
         r#"<meta name="buwiz-forms-origin" content="https://ebirforms.buwiz.com" />"#,
     ] {

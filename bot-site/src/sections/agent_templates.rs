@@ -76,7 +76,8 @@ const TILE: &str = "grid shrink-0 place-items-center rounded-lg border border-gc
 const PUBLISH: &str = "shrink-0 rounded-full bg-gc-text px-3.5 py-1.5 text-[12.5px] font-semibold text-gc-bg";
 const OUTLINE: &str =
     "shrink-0 rounded-full border border-gc-border px-3 py-1.5 text-[12.5px] font-semibold text-gc-text";
-const TAG: &str = "shrink-0 rounded-full border border-gc-accent/50 px-2 py-0.5 text-[11px] font-semibold text-gc-text";
+pub const TAG: &str =
+    "shrink-0 rounded-full border border-gc-accent/50 px-2 py-0.5 text-[11px] font-semibold text-gc-text";
 const CHIP_OFF: &str = "inline-flex items-center rounded-lg border border-dashed border-gc-border-strong bg-transparent px-2.5 py-1 font-mono text-[12px] text-gc-text-muted line-through";
 
 #[derive(Clone, Copy, PartialEq)]

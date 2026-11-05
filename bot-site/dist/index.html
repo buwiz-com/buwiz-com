@@ -102,7 +102,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
   <!-- Add a plain CSS file: see https://trunkrs.dev/assets/#css -->
   <!-- If using Tailwind with Leptos CSR, see https://trunkrs.dev/assets/#tailwind instead-->
-  <link rel="stylesheet" href="/bot/tailwind-b18c18d25b3a9cbe.css" integrity="sha384-zfvadbLOVqLiiPvruacuJVOZplbRzXBqtF459BFADFu5Iag9PQxIBCp13zYsEy2I"/>
+  <link rel="stylesheet" href="/bot/tailwind-762cfa385a593975.css" integrity="sha384-3ChhHls7BqxkeK/M/NU3RlB307bf9JSj41rljzdKv1bfoS3ekjhaQD4EEmZu1m7g"/>
 
   <!-- The server's own Buwiz icons and manifest. -->
   <link rel="icon" type="image/svg+xml" href="/assets/brand/buwiz_favicon.svg" />
@@ -116,8 +116,8 @@
   <!-- include support for `wasm-bindgen --weak-refs` - see: https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html -->
   
 <script type="module">
-import init, * as bindings from '/bot/buwiz-bot-site-8c581c3b4c32ddf8.js';
-const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-8c581c3b4c32ddf8_bg.wasm' });
+import init, * as bindings from '/bot/buwiz-bot-site-45af81d54d285777.js';
+const wasm = await init({ module_or_path: '/bot/buwiz-bot-site-45af81d54d285777_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -127,7 +127,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
 
-<link rel="modulepreload" href="/bot/buwiz-bot-site-8c581c3b4c32ddf8.js" crossorigin="anonymous" integrity="sha384-H5MIaqQmG/A7lgX5QKJP5WlKucpDQNxiff+uRuS8S3QB4W2iWcdtF+3gk3v7M7Et"><link rel="preload" href="/bot/buwiz-bot-site-8c581c3b4c32ddf8_bg.wasm" crossorigin="anonymous" integrity="sha384-J7r3MGZreKO1z7tMgyAUDjhOcNwsE5JDfTSayxDKZaEWFKw4YJpqjcWRBh3V/fYB" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/bot/buwiz-bot-site-45af81d54d285777.js" crossorigin="anonymous" integrity="sha384-cQ7GnGjzd01WNgpC4rVZmBhBTgV7wWtYzoilXq6ZGYXx6RICh9RtTt0+lPqnHond"><link rel="preload" href="/bot/buwiz-bot-site-45af81d54d285777_bg.wasm" crossorigin="anonymous" integrity="sha384-6kMusWpHo4+Ra0Y5CuEPUdrtch6C8/cRnOc2ml8PMG3ak+pJC/fXAmikiSSEMQMr" as="fetch" type="application/wasm"></head>
 
 <body></body>
 

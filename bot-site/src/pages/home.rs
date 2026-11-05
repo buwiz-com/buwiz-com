@@ -4,7 +4,7 @@ use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 use leptos_meta::*;
 
-fn scroll_hash_into_view() {
+pub fn scroll_hash_into_view() {
     let Some(window) = web_sys::window() else {
         return;
     };

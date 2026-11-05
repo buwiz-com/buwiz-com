@@ -646,7 +646,7 @@ fn scene(s: &mut Script, d: Demo, app: usize, composer: NodeRef<html::Div>, draf
     }
 }
 
-fn point(title: &'static str, text: &'static str) -> impl IntoView {
+pub fn point(title: &'static str, text: &'static str) -> impl IntoView {
     view! {
         <div class="grid content-start gap-1 rounded-2xl border border-gc-border bg-gc-bg p-4 text-[13.5px]">
             <span class="text-[15px] font-bold text-gc-text">{title}</span>
@@ -749,10 +749,16 @@ pub fn MiniApps() -> impl IntoView {
                     {point("Signed plugins", "Each mini app is a signed plugin with its own id, and runs inside Buwiz Bot.")}
                 </div>
 
-                <a href="/mini-apps" class="mt-8 inline-flex items-center gap-2 text-sm font-semibold text-gc-text hover:text-gc-brand transition-colors">
-                    "See all mini apps"
-                    <span class="material-symbols-outlined text-[16px]">"arrow_forward"</span>
-                </a>
+                <div class="mt-8 flex flex-wrap items-center gap-x-8 gap-y-3">
+                    <a href="/mini-apps" class="inline-flex items-center gap-2 text-sm font-semibold text-gc-text hover:text-gc-brand transition-colors">
+                        "See all mini apps"
+                        <span class="material-symbols-outlined text-[16px]">"arrow_forward"</span>
+                    </a>
+                    <a href="/mini-apps#build" class="inline-flex items-center gap-2 text-sm font-semibold text-gc-text hover:text-gc-brand transition-colors">
+                        "Build your own"
+                        <span class="material-symbols-outlined text-[16px]">"arrow_forward"</span>
+                    </a>
+                </div>
             </div>
         </section>
     }

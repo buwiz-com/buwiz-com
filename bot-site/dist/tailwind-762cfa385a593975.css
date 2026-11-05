@@ -1189,6 +1189,9 @@
   .resize {
     resize: both;
   }
+  .scroll-mt-16 {
+    scroll-margin-top: calc(var(--spacing) * 16);
+  }
   .scroll-mt-24 {
     scroll-margin-top: calc(var(--spacing) * 24);
   }
@@ -1331,6 +1334,9 @@
   .gap-x-6 {
     column-gap: calc(var(--spacing) * 6);
   }
+  .gap-x-8 {
+    column-gap: calc(var(--spacing) * 8);
+  }
   .gap-y-0\.5 {
     row-gap: calc(var(--spacing) * 0.5);
   }
@@ -1342,6 +1348,9 @@
   }
   .gap-y-2 {
     row-gap: calc(var(--spacing) * 2);
+  }
+  .gap-y-3 {
+    row-gap: calc(var(--spacing) * 3);
   }
   .self-end {
     align-self: flex-end;
@@ -3876,6 +3885,11 @@
   .md\:w-\[272px\] {
     @media (width >= 48rem) {
       width: 272px;
+    }
+  }
+  .md\:scroll-mt-20 {
+    @media (width >= 48rem) {
+      scroll-margin-top: calc(var(--spacing) * 20);
     }
   }
   .md\:grid-cols-2 {

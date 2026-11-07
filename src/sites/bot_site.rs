@@ -15,6 +15,12 @@ use crate::sites::downloads::{Platform, Release};
 #[folder = "bot-site/dist/"]
 struct Dist;
 
+/// What the prerendered page says before the first release, as the app's
+/// `NO_RELEASE` (bot-site/src/bot_meta.rs). `dist/` is built with nothing
+/// released, and crawlers read this body as it is: [`page_html`] swaps it out
+/// once there is a release.
+const NO_RELEASE: &str = "No release yet";
+
 /// One of the app's pages: its path, the title and description its HTML
 /// head gets, and its prerendered body in `dist/prerender/` (see
 /// `bot-site/prerender.py`, which lists the same pages).
@@ -83,6 +89,10 @@ fn page_html(forms_origin: &str, path: &str, release: Option<&Release>, stars: O
     }
     if let Some(body) = Dist::get(page.prerender) {
         let body = String::from_utf8_lossy(&body.data);
+        let body = match release {
+            Some(release) => body.replace(NO_RELEASE, &format!("Version {} is out", release.version)),
+            None => body.into_owned(),
+        };
         html = html.replacen("<body>", &format!("<body>\n<div id=\"prerender\">{body}</div>"), 1);
     }
     html
@@ -90,10 +100,11 @@ fn page_html(forms_origin: &str, path: &str, release: Option<&Release>, stars: O
 
 /// What the download button needs, as compact JSON: the version and, for
 /// each desktop platform with an installer, the one `/download/{platform}`
-/// would give ([`Release::pick`]), as its address in the bucket and its
-/// size in bytes. For example
-/// `{"mac":{"size":84213000,"url":"https://…/bot/releases/v0.4.0/Buwiz-Bot.dmg"},"version":"0.4.0"}`.
-/// Empty while nothing is released.
+/// would give ([`Release::pick`]), as its address in the bucket, size in
+/// bytes, processor and SHA-256. For example
+/// `{"mac":{"arch":"arm64","sha256":"…","size":84213000,"url":"https://…/bot/releases/v0.4.0/Buwiz-Bot.dmg"},"version":"0.4.0"}`.
+/// A platform with no build has no key, so the page doesn't offer it. Empty
+/// while nothing is released.
 fn download_meta(release: Option<&Release>) -> String {
     let Some(release) = release else {
         return String::new();
@@ -102,7 +113,8 @@ fn download_meta(release: Option<&Release>) -> String {
     meta.insert("version".into(), release.version.clone().into());
     for platform in [Platform::Mac, Platform::Windows, Platform::Linux] {
         if let Some(file) = release.pick(platform, None, None) {
-            meta.insert(platform.slug().into(), serde_json::json!({"url": file.url, "size": file.size}));
+            let installer = serde_json::json!({"url": file.url, "size": file.size, "arch": file.arch.name(), "sha256": file.sha256});
+            meta.insert(platform.slug().into(), installer);
         }
     }
     serde_json::Value::Object(meta).to_string()
@@ -234,8 +246,8 @@ mod tests {
             parsed,
             serde_json::json!({
                 "version": "0.4.0",
-                "mac": {"url": "https://downloads.buwiz.com/bot/releases/v0.4.0/Buwiz-Bot-0.4.0-universal.dmg", "size": 84_213_000},
-                "windows": {"url": "https://downloads.buwiz.com/bot/releases/v0.4.0/Buwiz-Bot-0.4.0-x64-setup.exe", "size": 60_000_000},
+                "mac": {"url": "https://downloads.buwiz.com/bot/releases/v0.4.0/Buwiz-Bot-0.4.0-universal.dmg", "size": 84_213_000, "arch": "universal", "sha256": SHA},
+                "windows": {"url": "https://downloads.buwiz.com/bot/releases/v0.4.0/Buwiz-Bot-0.4.0-x64-setup.exe", "size": 60_000_000, "arch": "x64", "sha256": SHA},
             })
         );
         assert!(!meta.contains(' ') && !meta.contains('\n'), "compact: {meta}");
@@ -245,5 +257,43 @@ mod tests {
         assert!(html.contains(&format!(r#"<meta name="buwiz-bot-download" content="{escaped}" />"#)), "{html}");
         assert!(html.contains(r#"<meta name="buwiz-bot-stars" content="128" />"#));
         assert!(!html.contains(r#"{"mac""#), "the JSON is escaped");
+    }
+
+    /// The manifest Buwiz Bot's release publishes: scripts/release/manifest.py
+    /// there, for its one build so far.
+    #[test]
+    fn the_bot_releases_manifest_offers_only_its_mac_build() {
+        let json = serde_json::json!({
+            "version": "0.1.0",
+            "published_at": "2026-11-07T14:44:20Z",
+            "files": [{
+                "platform": "macos", "arch": "arm64", "kind": "dmg",
+                "file": "Buwiz-Bot-0.1.0-macos-arm64.dmg", "size": 153_137_147, "sha256": SHA,
+            }],
+        });
+        let release = Release::parse(json.to_string().as_bytes(), "https://downloads.buwiz.com/bot").unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&download_meta(Some(&release))).unwrap();
+        assert_eq!(
+            meta,
+            serde_json::json!({
+                "version": "0.1.0",
+                "mac": {
+                    "url": "https://downloads.buwiz.com/bot/releases/v0.1.0/Buwiz-Bot-0.1.0-macos-arm64.dmg",
+                    "size": 153_137_147,
+                    "arch": "arm64",
+                    "sha256": SHA,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn the_prerendered_home_page_says_no_release_only_while_there_is_none() {
+        let html = page_html("https://ebirforms.buwiz.com", "/", None, None);
+        assert!(html.contains(NO_RELEASE), "built with nothing released: rebuild dist/");
+        let release = bot_release(&[("macos", "arm64", "dmg", "Buwiz-Bot-0.4.0-arm64.dmg", 80_000_000)]);
+        let html = page_html("https://ebirforms.buwiz.com", "/", Some(&release), None);
+        assert!(!html.contains(NO_RELEASE));
+        assert!(html.contains("Version 0.4.0 is out"));
     }
 }

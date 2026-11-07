@@ -1,4 +1,4 @@
-use crate::bot_meta::{self, BotMeta, REPO_URL};
+use crate::bot_meta::{self, BotMeta, NO_RELEASE, REPO_URL};
 use crate::components::{GithubMark, HeroFilm};
 use leptos::prelude::*;
 
@@ -17,27 +17,22 @@ pub fn HomeHero() -> impl IntoView {
     let installer = desktop.zip(release.as_ref()).and_then(|(desktop, release)| release.installer(desktop).cloned());
     let target = desktop.map_or("desktop", |desktop| desktop.name());
 
-    // The installer for this computer, or a button that says when.
-    let download = match &installer {
-        Some(installer) => {
+    // The installer for this computer; else, with a release out, the list of
+    // what there is; else a button that says there is nothing yet.
+    let download = match (&installer, &release) {
+        (Some(installer), _) => {
             view! { <a href=installer.url.clone() class=PRIMARY>{format!("Download for {target}")}</a> }.into_any()
         }
-        None => {
-            let label = match (&release, desktop) {
-                // Released, but this is a phone or a computer we cannot tell.
-                (Some(_), None) => format!("Download for {target}"),
-                _ => format!("Download for {target} · Coming soon"),
-            };
-            view! { <a aria-disabled="true" class=UNAVAILABLE>{label}</a> }.into_any()
-        }
+        (None, Some(_)) => view! { <a href="#download" class=PRIMARY>"See downloads"</a> }.into_any(),
+        (None, None) => view! { <a aria-disabled="true" class=UNAVAILABLE>{NO_RELEASE}</a> }.into_any(),
     };
 
     let mut note = String::from("Free and open source · Apache-2.0");
     if let Some(release) = &release {
         note.push_str(&format!(" · v{}", release.version));
-        if let Some(installer) = &installer {
-            note.push_str(&format!(" · {}", bot_meta::size(installer.size)));
-        }
+    }
+    if let Some((installer, desktop)) = installer.as_ref().zip(desktop) {
+        note.push_str(&format!(" · {} · {}", installer.processor(desktop), bot_meta::size(installer.size)));
     }
 
     view! {

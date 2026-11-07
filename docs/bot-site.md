@@ -59,16 +59,30 @@ unknown:
 - `buwiz-bot-download`: Buwiz Bot's release, from `bot/latest.json` in the
   downloads bucket (`AppState::bot_downloads`; unlike eBIRForms it never reads
   the root `latest.json`). It is compact JSON with the `version` and, for
-  `mac`, `windows` and `linux`, the default installer's `url` and `size`, picked
-  as the filing site's `/download/{platform}` picks it.
+  each of `mac`, `windows` and `linux` that has a build, the default
+  installer's `url`, `size`, `arch` and `sha256`, picked as the filing site's
+  `/download/{platform}` picks it.
 - `buwiz-bot-stars`: the `stargazers_count` of `buwiz-bot/buwiz-bot`, read
   from the GitHub API (`GITHUB_API_URL`) at most every 10 minutes
   (`src/sites/github.rs`). The site shows it from 25 stars.
 
-The hero's download button guesses the computer from `navigator.userAgent`.
-While nothing is released it is disabled and says "Coming soon". It links
-straight to the installer in the bucket: `/download` on this host is the
-filing site's, and Bot downloads are not counted.
+The hero's download button guesses the computer from `navigator.userAgent`,
+and links straight to the installer in the bucket: `/download` on this host
+is the filing site's, and Bot downloads are not counted. The home page's
+`#download` section (`bot-site/src/sections/download.rs`) has one card per
+platform in the manifest, with its processor, version, size and SHA-256. A
+platform with no build has no card, and a visitor on one gets a hero button
+to that section.
+
+Before the first release the hero's button is disabled, and both it and the
+section say "No release yet". Nothing links to a file that isn't there. The
+prerendered page is built that way, and the server swaps the words out of it
+once there is a release (`NO_RELEASE` in `src/sites/bot_site.rs`, which must
+match `bot-site/src/bot_meta.rs`).
+
+Buwiz Bot's release workflow (`just publish` in `buwiz-bot`, its
+`docs/release.md`) writes `bot/latest.json` itself. The site shows a new
+release within about a minute, with no deploy.
 
 ## SEO
 

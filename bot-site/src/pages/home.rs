@@ -1,5 +1,7 @@
 use crate::components::layout::Layout;
-use crate::sections::{AgentCompose, AgentTemplates, Allowly, DataSwap, Egress, HomeHero, MiniApps, SecureVault};
+use crate::sections::{
+    AgentCompose, AgentTemplates, Allowly, DataSwap, Download, Egress, HomeHero, MiniApps, SecureVault,
+};
 use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 use leptos_meta::*;
@@ -44,6 +46,7 @@ pub fn Home() -> impl IntoView {
                 <DataSwap />
                 <Allowly />
                 <Egress />
+                <Download />
             </div>
         </Layout>
     }

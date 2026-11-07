@@ -166,6 +166,10 @@ to take it back, delete it. While there is no `ebirforms/latest.json`, the
 server reads the root `latest.json` instead, whose files are under the root
 `releases/v{VERSION}/` (where releases went before the per-app folders). A
 broken or unreachable `ebirforms/latest.json` does not fall back; see below.
+Buwiz Bot's are in `bot/` in the same shape, except that its release
+workflow writes `bot/latest.json` itself (`docs/release.md` in `buwiz-bot`),
+and there is no root fallback.
+
 The server reads them at most once a minute, so a change shows within about
 a minute. While neither exists, `/download` and the home page say "Coming
 soon". Once one exists, `/download` lists every file with its size and

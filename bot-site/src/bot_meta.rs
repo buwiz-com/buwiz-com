@@ -10,6 +10,11 @@ use wasm_bindgen::JsValue;
 /// Buwiz Bot's source code.
 pub const REPO_URL: &str = "https://github.com/buwiz-bot/buwiz-bot";
 
+/// What the page says before the first release. The server swaps it out of
+/// the prerendered page once there is one (`RELEASED` in src/sites/bot_site.rs),
+/// so change both together.
+pub const NO_RELEASE: &str = "No release yet";
+
 /// Star counts below this are not shown.
 const STARS_SHOWN_FROM: u64 = 25;
 
@@ -40,11 +45,30 @@ impl Desktop {
     }
 }
 
-/// One installer: where it is and how big.
+/// One installer: where it is, how big, what it runs on and its checksum.
 #[derive(Clone, Debug)]
 pub struct Installer {
     pub url: String,
     pub size: u64,
+    /// `arm64`, `x64` or `universal`.
+    arch: String,
+    /// Lowercase hex.
+    pub sha256: String,
+}
+
+impl Installer {
+    /// What people call its processor on `desktop`, as the filing site's
+    /// download page says it.
+    pub fn processor(&self, desktop: Desktop) -> &'static str {
+        match (self.arch.as_str(), desktop) {
+            ("universal", Desktop::Mac) => "Apple silicon and Intel",
+            ("arm64", Desktop::Mac) => "Apple silicon",
+            ("x64", Desktop::Mac) => "Intel",
+            ("universal", _) => "All processors",
+            ("arm64", _) => "ARM64",
+            _ => "x64",
+        }
+    }
 }
 
 /// The released version and its default installer per desktop.
@@ -63,6 +87,14 @@ impl BotRelease {
             Desktop::Windows => self.windows.as_ref(),
             Desktop::Linux => self.linux.as_ref(),
         }
+    }
+
+    /// The desktops with an installer, and each one's.
+    pub fn installers(&self) -> Vec<(Desktop, Installer)> {
+        [Desktop::Mac, Desktop::Windows, Desktop::Linux]
+            .into_iter()
+            .filter_map(|desktop| Some((desktop, self.installer(desktop)?.clone())))
+            .collect()
     }
 }
 
@@ -100,7 +132,9 @@ fn parse_release(raw: &str) -> Option<BotRelease> {
             .as_string()
             .filter(|url| url.starts_with("https://") || url.starts_with("http://"))?;
         let size = Reflect::get(&entry, &"size".into()).ok()?.as_f64()?;
-        Some(Installer { url, size: size.max(0.0) as u64 })
+        let arch = Reflect::get(&entry, &"arch".into()).ok()?.as_string()?;
+        let sha256 = Reflect::get(&entry, &"sha256".into()).ok()?.as_string()?;
+        Some(Installer { url, size: size.max(0.0) as u64, arch, sha256 })
     };
     Some(BotRelease {
         mac: installer(Desktop::Mac),

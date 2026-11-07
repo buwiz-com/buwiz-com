@@ -204,6 +204,7 @@ pub fn Layout(children: Children) -> impl IntoView {
                             <p class="text-gc-text-muted">"Free, open-source AI coworkers."</p>
                         </div>
                         <nav aria-label="Footer" class="flex flex-wrap items-center gap-x-6 gap-y-2">
+                            <a href="/#download" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Download"</a>
                             <a href="/mini-apps" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Mini apps"</a>
                             <a href="/mini-apps#build" class="text-gc-text-muted hover:text-gc-brand transition-colors">"Build a mini app"</a>
                             <a href=REPO_URL rel="noopener" class="inline-flex items-center gap-2 text-gc-text-muted hover:text-gc-brand transition-colors">

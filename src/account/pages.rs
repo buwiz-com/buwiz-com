@@ -326,7 +326,7 @@ async fn brand_mark(height: u32) -> Result<impl View> {
     Ok(view! { <span class="brand-mark" aria-hidden="true" style=(format!("--mark-h: {height}px"))></span> })
 }
 
-/// The Buwiz wordmark (the mark as its "b", then "uwiz"), painted like
+/// The Buwiz wordmark (the grin-hat mark, then "buwiz"), painted like
 /// [`brand_mark`]. It names itself, for links with no other text.
 #[component]
 async fn brand_wordmark(height: u32) -> Result<impl View> {

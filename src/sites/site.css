@@ -60,13 +60,13 @@ a { color: var(--brand); }
   display: inline-block;
   flex: none;
   height: var(--mark-h, 28px);
-  aspect-ratio: 316 / 378;
+  aspect-ratio: 1;
   background-color: var(--brand);
   -webkit-mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
   mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
 }
 .brand-wordmark {
-  aspect-ratio: 674 / 215;
+  aspect-ratio: 564 / 170;
   -webkit-mask-image: url("/assets/brand/buwiz_wordmark.svg");
   mask-image: url("/assets/brand/buwiz_wordmark.svg");
 }

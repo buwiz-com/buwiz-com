@@ -66,7 +66,7 @@ a { color: var(--brand); }
   mask: url("/assets/brand/buwiz_mark.svg") center / contain no-repeat;
 }
 .brand-wordmark {
-  aspect-ratio: 564 / 170;
+  aspect-ratio: 894 / 219;
   -webkit-mask-image: url("/assets/brand/buwiz_wordmark.svg");
   mask-image: url("/assets/brand/buwiz_wordmark.svg");
 }

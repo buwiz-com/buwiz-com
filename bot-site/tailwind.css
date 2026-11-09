@@ -191,7 +191,7 @@
   .buwiz-wordmark {
     display: inline-block;
     flex: none;
-    aspect-ratio: 674 / 215;
+    aspect-ratio: 564 / 170;
     background-color: #3fb58f;
     -webkit-mask: url("/bot/assets/brand/buwiz_wordmark.svg") center / contain no-repeat;
     mask: url("/bot/assets/brand/buwiz_wordmark.svg") center / contain no-repeat;

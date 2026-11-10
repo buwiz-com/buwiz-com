@@ -27,3 +27,13 @@ for url in https://buwiz.com/ https://buwiz.com/mini-apps https://ebirforms.buwi
   https://account.buwiz.com/login https://api.buwiz.com/healthz; do
   curl -sS -o /dev/null -w "$url -> %{http_code} %{redirect_url}\n" "$url"
 done
+# Apps stop sending when the signed trust list expires: warn a month ahead.
+curl -fsS https://api.buwiz.com/.well-known/buwiz-trust.json 2>/dev/null | python3 -c '
+import base64, json, sys, time
+jws = sys.stdin.read().strip()
+if not jws:
+    sys.exit("WARNING: no trust list: apps cannot send (deploy/ec2/trust-list.sh)")
+payload = jws.split(".")[1]
+days = (json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["exp"] - time.time()) / 86400
+print(f"trust list: expires in {days:.0f} days" + ("; WARNING: renew it now with deploy/ec2/trust-list.sh" if days < 30 else ""))
+' || true

@@ -8,6 +8,11 @@
 //!     Prints the signed list, valid for DAYS, for `TRUST_LIST_JWS`.
 //!     SENDER_KEYS_FILE is what `buwiz-sender public` prints, or a JSON
 //!     array of several (old and new Sender keys while rotating).
+//! buwiz-trust-sign public KEY_FILE
+//!     Prints the public key of KEY_FILE (base64url), as `keygen` did.
+//! buwiz-trust-sign verify PUBLIC_KEY JWS_FILE
+//!     Checks that JWS_FILE is a trust list signed by PUBLIC_KEY and not
+//!     expired, and prints what it lists.
 
 use anyhow::{Context, bail};
 use base64::Engine;
@@ -25,7 +30,15 @@ fn main() -> anyhow::Result<()> {
             let days: i64 = args[2].parse().context("DAYS must be a number")?;
             sign(&args[1], days, &args[3], &args[4..])
         }
-        _ => bail!("usage: buwiz-trust-sign keygen KEY_FILE | sign KEY_FILE DAYS SENDER_KEYS_FILE HOST:PORT..."),
+        Some("public") if args.len() == 2 => {
+            println!("{}", URL_SAFE_NO_PAD.encode(read_key(&args[1])?.verifying_key().as_bytes()));
+            Ok(())
+        }
+        Some("verify") if args.len() == 3 => verify(&args[1], &args[2]),
+        _ => bail!(
+            "usage: buwiz-trust-sign keygen KEY_FILE | sign KEY_FILE DAYS SENDER_KEYS_FILE HOST:PORT... \
+             | public KEY_FILE | verify PUBLIC_KEY JWS_FILE"
+        ),
     }
 }
 
@@ -49,10 +62,7 @@ fn sign(path: &str, days: i64, sender_keys: &str, hosts: &[String]) -> anyhow::R
     if !(1..=730).contains(&days) {
         bail!("DAYS must be 1 to 730");
     }
-    let raw = Zeroizing::new(std::fs::read_to_string(path).with_context(|| format!("could not read {path}"))?);
-    let seed = Zeroizing::new(STANDARD.decode(raw.trim()).context("the key file is not base64")?);
-    let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?;
-    let key = SigningKey::from_bytes(&seed);
+    let key = read_key(path)?;
     let senders: Value = serde_json::from_str(
         &std::fs::read_to_string(sender_keys).with_context(|| format!("could not read {sender_keys}"))?,
     )
@@ -64,5 +74,37 @@ fn sign(path: &str, days: i64, sender_keys: &str, hosts: &[String]) -> anyhow::R
     }
     let iat = time::OffsetDateTime::now_utc().unix_timestamp();
     println!("{}", trust::sign_list(&key, &contents, iat, iat + days * 86_400)?);
+    Ok(())
+}
+
+fn read_key(path: &str) -> anyhow::Result<SigningKey> {
+    let raw = Zeroizing::new(std::fs::read_to_string(path).with_context(|| format!("could not read {path}"))?);
+    let seed = Zeroizing::new(STANDARD.decode(raw.trim()).context("the key file is not base64")?);
+    let seed: Zeroizing<[u8; 32]> =
+        Zeroizing::new(seed.as_slice().try_into().map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?);
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+fn verify(public: &str, path: &str) -> anyhow::Result<()> {
+    let bytes = URL_SAFE_NO_PAD.decode(public.trim()).context("PUBLIC_KEY is not base64url")?;
+    let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("PUBLIC_KEY must be 32 bytes"))?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes).context("PUBLIC_KEY is not an Ed25519 key")?;
+    let jws = std::fs::read_to_string(path).with_context(|| format!("could not read {path}"))?;
+    let claims = buwiz_cloud::filing::jws::verify(&[key], trust::TYP, jws.trim())
+        .map_err(|error| anyhow::anyhow!("not a trust list signed by this key: {error}"))?;
+    let exp = claims["exp"].as_i64().context("the list has no exp")?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if exp <= now {
+        bail!("the list expired");
+    }
+    let count = |field: &str| claims[field].as_array().map_or(0, Vec::len);
+    let expires = time::OffsetDateTime::from_unix_timestamp(exp)?.date();
+    println!(
+        "ok: signed by {}, {} hosts, {} sealing keys, {} receipt keys, expires {expires}",
+        buwiz_cloud::filing::jws::key_id(&key),
+        count("hosts"),
+        count("sealing_keys"),
+        count("receipt_keys"),
+    );
     Ok(())
 }

@@ -168,7 +168,21 @@ cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.jso
 The `host:port` list is every host the Sender opens through the pipe: BIR's
 dispatcher (HTTPS and HTTP, primary and backup) and its SFTP upload server.
 
-Keep `trust.key` offline (password manager or hardware). The list expires
+Keep `trust.key` offline (password manager or hardware). It is the only
+thing that exists only on the owner's Mac: everything else is in Parameter
+Store, the stow repo or the AWS console. To restore it on a new machine,
+copy it from the password manager, then:
+
+```sh
+mkdir -p ~/buwiz-trust && chmod 700 ~/buwiz-trust
+pbpaste > ~/buwiz-trust/trust.key && chmod 600 ~/buwiz-trust/trust.key && pbcopy </dev/null
+target/release/buwiz-trust-sign public ~/buwiz-trust/trust.key   # must print the pinned key
+```
+
+If it is lost for good, the served list keeps working until it expires.
+Before then, make a new key, release apps that pin it, and sign a new list.
+
+The list expires
 (here after 365 days); sign a new one before then, or apps stop sending.
 
 Rotation, in this order, so no app ever meets a key its list lacks:

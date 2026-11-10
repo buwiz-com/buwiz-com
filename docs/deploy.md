@@ -115,12 +115,46 @@ on 127.0.0.1:3009 only, and the Gatekeeper reaches it there
 The Gatekeeper refuses to start on a public origin without `SENDER_URL`
 and `TICKET_SIGNING_KEY`. See [relay-protocol.md](relay-protocol.md) §6.
 
+## Going live with BIR (once)
+
+A new server files nothing: `BIR_RELAY_MODE` is `dry_run` and there is no
+trust list. To file for real, run this once from the owner's Mac (after
+`aws login --profile buwiz`, with the private BIR files restored):
+
+```sh
+deploy/ec2/go-live.sh
+```
+
+It waits until BIR's upload server answers (it checks every 2 minutes, for
+up to 12 hours), then runs:
+
+1. `bir-env-from-forms.sh`: reads the BIR settings from the old buwiz-forms
+   app (the IAF and dispatcher passphrases are eBIRForms protocol constants
+   in its code, and the upload host is in its `.env`), checks the IAF
+   passphrase against BIR's sample files, and reads the upload server's SSH
+   key. It writes them to `~/buwiz-trust/bir-live.env`.
+2. `bir-live.sh`: stores them in `/buwiz/*`, sets `BIR_RELAY_MODE=live` and
+   restarts. If the server doesn't start, it goes back to `dry_run`.
+3. `trust-list.sh`: signs the trust list and serves it (see below).
+
+Deploys don't undo it: the settings stay in Parameter Store. `deploy.sh`
+prints how long the trust list has left. Run `go-live.sh` again only to
+renew the list (yearly) or when uploads stop with "host key is not pinned".
+
 ## The relay trust list (human step)
 
 Apps trust three things only through a list signed offline with a key this
 server never holds: the hosts the relay pipe may open, the Sender's HPKE
 sealing key, and the Sender's receipt key. Make the key and sign the list on
-a trusted machine, not on the server:
+a trusted machine, not on the server.
+
+`deploy/ec2/trust-list.sh` does all of it in one run, with `aws login
+--profile buwiz` and the private BIR files restored. The first time, it makes
+`~/buwiz-trust/trust.key` and puts it on the clipboard for the password
+manager. It reads the Sender's public keys through SSM and checks them
+against `/.well-known/`. It signs and verifies the list, stores it as
+`/buwiz/TRUST_LIST_JWS`, restarts `buwiz.service`, waits until `api.` serves
+it, and prints the public key to pin. Run it again to renew. The manual steps:
 
 ```sh
 cargo run --release --bin buwiz-trust-sign -- keygen trust.key

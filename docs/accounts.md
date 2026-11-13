@@ -16,19 +16,28 @@ A staff role is kept on the account (`accounts.role`,
 `src/account/roles.rs`): **Support** or **Admin**. `ADMIN_EMAILS` is a
 break-glass list: anyone in it is always an Admin, whatever the account
 says, and the staff pages cannot change their role or ban them. The setting
-never writes a role. A banned account has no role.
+never writes a role. A banned account has no role. Separate its addresses
+with commas; at start-up the server logs each entry that is not a plain
+address (spaces, semicolons, quotes) and starts anyway. Only `roles.rs`
+reads the list.
 
 | | Support | Admin |
 |---|---|---|
 | See the queue, claims, their files, and every account | ✓ | ✓ |
-| Approve, reject, send back (never one's own claim) | ✓ | ✓ |
+| Approve, reject, send back (never one's own claim) | ✓ (approving a TIN that was ever paused is an Admin's) | ✓ |
 | Confirm a TIN activated automatically (never one's own) | ✓ | ✓ |
 | Sign an account out everywhere, or out of one app (never an Admin) | ✓ | ✓ |
 | Delete a claim, revoke an ownership, activate without papers (one's own too), pause and resume, ban and lift a ban, the test label, change a role | – | ✓ |
 
 Staff without a power are sent back with "Only an admin can do this";
-everyone who is not staff gets a 404. Role changes refuse one's own account,
-an `ADMIN_EMAILS` person, and a change that would leave no Admin.
+everyone who is not staff gets a 404. Each action checks its actor's role
+again inside its own transaction, so one whose page check passed just
+before the actor was demoted or banned does nothing. Role changes refuse
+one's own account, an `ADMIN_EMAILS` person, and a change that would leave
+no Admin; a change to the role the account has says nothing changed. Every
+staff action takes a reason (500 characters at most, like the review
+notes), signing one app out included. Nobody pauses or resumes their own
+TIN.
 
 ### Bans and test accounts
 
@@ -40,9 +49,17 @@ app can say why. Lifting the ban restores everything. An Admin can't be
 banned. The **test label** is for staff only: they see and filter it, and
 sends work as usual.
 
+A ban that commits while a request for the account is under way wins:
+activation, approval, an app's sign-in approval and an agent's consent
+lock the account and look again as they write, and no token is issued to a
+banned account.
+
 Every staff action on an account goes to `account_audit` with who, when and
-why; actions on claims go to `claim_audit`. Both are on the user's page
-under History.
+why; actions on claims go to `claim_audit`, review decisions (approved,
+rejected, sent back) included, so who decided outlives the claim. Both are
+on the user's page under History, which staff never see for their own
+account (`/staff/users/{self}` sends them back to the list: another staff
+member looks), so nobody reads the reasons written about them.
 
 ## TIN activation
 
@@ -75,7 +92,9 @@ Staff review each claim by hand at `/staff` (`src/account/staff.rs`). They can:
 - send it back with reasons. The person fixes it from My TINs (`/tins`) and resends it.
 
 An approved claim makes the TIN active. A TIN has at most one owner. People
-can prepare returns right away, but sending them waits for approval.
+can prepare returns right away, but sending them waits for approval. A
+TIN that was ever paused, on any account, is approved only by an Admin:
+Support reads "An admin must decide this one" and the claim stays waiting.
 
 The queue's tabs: Waiting, Sent back, Not verified, **Activated
 automatically** (with a count), Approved, Paused, Rejected, Removed.
@@ -83,7 +102,9 @@ automatically** (with a count), Approved, Paused, Rejected, Removed.
 An Admin can also:
 - **activate without papers**, with a reason, a TIN not verified, waiting
   or sent back, their own too (refused while another account owns it, or
-  for a banned account). The reason stays in the audit only;
+  for a banned account). The reason stays in the audit only. Their own
+  reads as "Staff … activated their own TIN …" and is flagged "Activated
+  by its owner, an admin" in the queue and on the claim;
 - **pause** an active TIN, with a reason the owner reads: it stays owned
   but nothing sends (`tin_paused`) until resumed. The owner cannot remove a
   paused TIN. A "Paused before" card shows every pause of the TIN, on any

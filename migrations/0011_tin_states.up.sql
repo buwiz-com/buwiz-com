@@ -60,12 +60,14 @@ CREATE UNIQUE INDEX tin_claims_one_live ON tin_claims (account_id, tin_root, bra
     WHERE status IN ('unverified', 'pending', 'needs_fix', 'approved');
 CREATE INDEX tin_claims_tin ON tin_claims (tin_root, branch_code);
 
--- New claim actions, and where an action came from.
+-- New claim actions, and where an action came from. `created` is a claim
+-- the seed tool made (saved as not verified). `claim_status` is the status
+-- before the action; `new` for a row the action itself made.
 ALTER TABLE claim_audit DROP CONSTRAINT claim_audit_action_check;
 ALTER TABLE claim_audit ADD CONSTRAINT claim_audit_action_check
     CHECK (action IN ('deleted', 'removed', 'revoked', 'file_replaced', 'file_removed',
                       'activated', 'auto_activated', 'auto_confirmed', 'paused', 'resumed',
-                      'approved', 'rejected', 'sent_back'));
+                      'approved', 'rejected', 'sent_back', 'created'));
 -- Every line so far came from the website. From now on each writer says
 -- where its line comes from: there is no default to fall back on.
 ALTER TABLE claim_audit ADD COLUMN source text NOT NULL DEFAULT 'web' CHECK (source IN ('web', 'auto', 'seed'));

@@ -1371,6 +1371,7 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "removed" => format!("removed {tin}"),
         "revoked" => format!("revoked the ownership of {tin}"),
         "file_replaced" => format!("replaced the {file} on {tin}"),
+        "created" => format!("added {tin} without papers"),
         "activated" => format!("activated {tin} without papers"),
         "auto_activated" => format!("activated {tin} automatically"),
         "auto_confirmed" => format!("confirmed the automatic activation of {tin}"),

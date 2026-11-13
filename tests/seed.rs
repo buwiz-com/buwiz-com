@@ -753,3 +753,96 @@ async fn the_seed_never_changes_the_role_of_whoever_runs_it(db: PgPool) {
     }
     assert_eq!(account(&db, "eve@example.test").await.1.as_deref(), Some("admin"));
 }
+
+/// Every account and claim the seed makes has an audit line: the `--as`
+/// account too when the run makes it, and a TIN saved as not verified. A
+/// row the run makes has no status before it.
+#[sqlx::test(migrations = "./migrations")]
+async fn every_account_and_claim_the_seed_makes_has_an_audit_line(db: PgPool) {
+    let report = seed(&db, EXAMPLE, &listing("root@example.test", false, &["root@example.test"])).await.unwrap();
+    assert!(
+        report.lines.iter().any(|line| line == "created login root@example.test (runs this seed)"),
+        "{:?}",
+        report.lines
+    );
+    let (root, ..) = account(&db, "root@example.test").await;
+    let lines = account_audit_lines(&db, root).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        (lines[0].0.as_str(), lines[0].3.as_str(), lines[0].4.as_str()),
+        ("created", "root@example.test", "seed")
+    );
+    let (shop, ..) = account(&db, "shop@example.test").await;
+    let shop_lines = claim_audit_lines(&db, shop).await;
+    assert_eq!(shop_lines.len(), 1, "{shop_lines:?}");
+    assert_eq!(
+        (shop_lines[0].0.as_str(), shop_lines[0].1.as_str(), shop_lines[0].3.as_str()),
+        ("created", "new", "seed")
+    );
+    let (jane, ..) = account(&db, "jane@example.test").await;
+    let jane_lines = claim_audit_lines(&db, jane).await;
+    assert_eq!((jane_lines[0].0.as_str(), jane_lines[0].1.as_str()), ("activated", "new"));
+    // Every account the run made, and every claim, has its line.
+    let unaudited: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM accounts a WHERE NOT EXISTS (SELECT 1 FROM account_audit l WHERE l.account_id = a.id))
+              + (SELECT count(*) FROM tin_claims c WHERE NOT EXISTS (SELECT 1 FROM claim_audit l WHERE l.claim_id = c.id))",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(unaudited, 0);
+    // Run again, nothing is made and nothing is said to be.
+    let again = seed(&db, EXAMPLE, &listing("root@example.test", false, &["root@example.test"])).await.unwrap();
+    assert_eq!(again.changes, 0, "{:?}", again.lines);
+}
+
+/// A waiting claim a move deletes may have its files in object storage:
+/// without the object store the run is refused, and a file it could not
+/// delete there is reported, never said to be deleted.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_move_that_deletes_stored_files_needs_the_object_store(db: PgPool) {
+    seed(&db, "[[login]]\nemail = \"admin@example.test\"\nrole = \"admin\"\n", &options("admin@example.test", false))
+        .await
+        .unwrap();
+    let waiting: Uuid = sqlx::query_scalar("INSERT INTO accounts (email) VALUES ('waiting@example.test') RETURNING id")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let claim = add_claim(&db, waiting, "000123457", "pending").await;
+    sqlx::query(
+        "INSERT INTO claim_documents (claim_id, kind, filename, content_type, size_bytes, sha256, nonce, object_key)
+         VALUES ($1, 'form_2303', 'f.png', 'image/png', 5, decode('00', 'hex'), decode('01', 'hex'), 'claims/' || $1 || '/f')",
+    )
+    .bind(claim)
+    .execute(&db)
+    .await
+    .unwrap();
+    let file = "[[login]]\nemail = \"new@example.test\"\n[[login.tin]]\ntin = \"000-123-457\"\nkind = \"business\"\nname = \"N\"\nstate = \"active\"\nreason = \"Moves\"\nmove_from = \"waiting@example.test\"\n";
+    let before = counts(&db).await;
+    for dry_run in [true, false] {
+        let problem = refused(seed(&db, file, &options("admin@example.test", dry_run)).await);
+        assert!(problem.contains("stored files in object storage") && problem.contains("S3_"), "{problem}");
+    }
+    assert_eq!(counts(&db).await, before);
+
+    // The command, with an object store that cannot be reached: the move
+    // is made, and the file left behind is named on stderr, exit 1.
+    let (dir, path, command) = command_in(&db).await;
+    std::fs::write(&path, file).unwrap();
+    let target = target_of(&db).await;
+    let unreachable = [
+        ("S3_ENDPOINT", "http://127.0.0.1:9"),
+        ("S3_BUCKET", "buwiz-test"),
+        ("S3_ACCESS_KEY_ID", "test"),
+        ("S3_SECRET_ACCESS_KEY", "test"),
+        ("ADMIN_EMAILS", ""),
+    ];
+    let run =
+        command(&["seed", &path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target], &unreachable);
+    let (out, err) = (String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+    assert_eq!(run.status.code(), Some(1), "{out}{err}");
+    assert!(err.contains(&format!("claims/{claim}/f")) && err.contains("could not be deleted"), "{err}");
+    assert!(!out.contains("files deleted") && !out.contains("file(s) deleted"), "{out}");
+    assert_eq!(count(&db, "tin_claims").await, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -61,6 +61,25 @@ pub enum DocumentStore {
 }
 
 impl DocumentStore {
+    /// Whether files live in object storage (so deleting rows leaves
+    /// objects to delete).
+    pub fn is_objects(&self) -> bool {
+        matches!(self, Self::Objects(_))
+    }
+
+    /// Removes objects whose rows were purged, and answers the ones it
+    /// could not remove: (key, why). Nothing to do for the database store.
+    pub async fn delete_each(&self, keys: &[String]) -> Vec<(String, anyhow::Error)> {
+        let Self::Objects(store) = self else { return Vec::new() };
+        let mut failed = Vec::new();
+        for key in keys {
+            if let Err(error) = store.delete(key).await {
+                failed.push((key.clone(), error));
+            }
+        }
+        failed
+    }
+
     /// Removes objects whose rows were purged. Failures are logged; the
     /// bytes are ciphertext and the key that opens them stays with us.
     pub async fn delete_all(&self, keys: &[String]) {

@@ -186,6 +186,11 @@ pub struct Report {
     pub target: String,
     /// The digest of the plan, for `--expect`.
     pub digest: String,
+    /// Stored files the run deleted from the database but could not delete
+    /// from object storage: `key: error`.
+    pub storage_failures: Vec<String>,
+    /// Stored files it deleted from object storage.
+    pub deleted_files: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -420,7 +425,6 @@ pub struct Pending {
 /// until [`Pending::finish`]. A real run must name the database it is
 /// connected to (`--target`), so it never writes to another by accident.
 pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Options) -> Result<Pending, SeedError> {
-    let _ = store;
     let full = options.dry_run;
     let (logins, refused_tins) = plan(file, full)?;
     let actor_email = accounts::normalize_email(&options.actor)
@@ -465,6 +469,7 @@ pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &
         changes: Vec::new(),
         problems: Vec::new(),
         objects: Vec::new(),
+        object_store: store.is_objects(),
         bootstrapped: None,
         bootstrap: false,
     };
@@ -501,6 +506,8 @@ pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &
         dry_run: options.dry_run,
         target,
         digest,
+        storage_failures: Vec::new(),
+        deleted_files: 0,
     };
     Ok(Pending {
         tx,
@@ -551,11 +558,14 @@ impl Pending {
         .bind(&summary)
         .execute(&mut *tx)
         .await?;
+        let mut report = report;
         if report.dry_run {
             tx.rollback().await?;
         } else {
             tx.commit().await?;
-            store.delete_all(&objects).await;
+            report.storage_failures =
+                store.delete_each(&objects).await.into_iter().map(|(key, error)| format!("{key}: {error:#}")).collect();
+            report.deleted_files = objects.len() - report.storage_failures.len();
             tracing::info!(run_id = %report.run_id, changes = report.changes, "seed run");
         }
         Ok(report)
@@ -579,6 +589,8 @@ struct Seed<'a> {
     problems: Vec<String>,
     /// Stored files to delete once committed.
     objects: Vec<String>,
+    /// The run can delete files in object storage (`S3_*` given).
+    object_store: bool,
     /// The account of `--as`, when this run made it.
     bootstrapped: Option<Uuid>,
     /// This run makes `--as` the first Admin (a database with none).
@@ -666,10 +678,25 @@ impl Seed<'_> {
         }
         self.bootstrap = bootstrap;
         let (id, made) = self.create_account(email).await?;
-        if made {
+        let actor = Account { id, email: email.to_owned() };
+        if made && logins.iter().any(|login| login.email == email) {
+            // Its line comes with its login's.
             self.bootstrapped = Some(id);
+        } else if made {
+            let reason = self.reason("the Admin running this seed, from ADMIN_EMAILS");
+            let line = Line {
+                account_id: id,
+                action: "created",
+                old_value: None,
+                new_value: None,
+                source: Source::Seed,
+                reason: Some(&reason),
+            };
+            self.account_line(&actor, line).await?;
+            let text = format!("created login {email} (runs this seed)");
+            self.changed(text.clone(), text);
         }
-        Ok(Account { id, email: email.to_owned() })
+        Ok(actor)
     }
 
     /// The account for `email`, made if missing: (id, made now).
@@ -936,17 +963,22 @@ impl Seed<'_> {
                         ));
                         return Ok(());
                     }
-                    sqlx::query(
+                    let claim_id: Uuid = sqlx::query_scalar(
                         "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status)
-                         VALUES ($1, $2, $3, $4, $5, 'unverified')",
+                         VALUES ($1, $2, $3, $4, $5, 'unverified')
+                         RETURNING id",
                     )
                     .bind(account_id)
                     .bind(entry.kind.as_str())
                     .bind(tin.root())
                     .bind(tin.branch())
                     .bind(&entry.name)
-                    .execute(&mut *self.tx)
+                    .fetch_one(&mut *self.tx)
                     .await?;
+                    let reason = self.reason("saved as not verified by the seed file");
+                    let line =
+                        ClaimLine { claim_id, account_id, action: "created", status_before: "new", reason: &reason };
+                    self.claim_line(actor, tin, line).await?;
                     let masked = tin.masked();
                     self.changed(
                         format!("TIN {shown} not verified on {email} (new)"),
@@ -1061,6 +1093,16 @@ impl Seed<'_> {
                 .bind(waiting_id)
                 .fetch_all(&mut *self.tx)
                 .await?;
+                if !objects.is_empty() && !self.object_store {
+                    self.problems.push(format!(
+                        "TIN {shown} for {email}: the claim waiting for review on {from} has {} stored files in \
+                         object storage, and this run has no object store to delete them from: run it with the \
+                         server's settings (S3_*)",
+                        objects.len()
+                    ));
+                    return Ok(());
+                }
+                let files = objects.len();
                 sqlx::query("DELETE FROM tin_claims WHERE id = $1").bind(waiting_id).execute(&mut *self.tx).await?;
                 self.objects.extend(objects);
                 let reason = move_reason(self);
@@ -1072,7 +1114,13 @@ impl Seed<'_> {
                     reason: &reason,
                 };
                 self.claim_line(actor, tin, line).await?;
-                how = format!("moved from {from}, whose claim waiting for review was deleted");
+                how = match files {
+                    0 => format!("moved from {from}, whose claim waiting for review was deleted"),
+                    files => format!(
+                        "moved from {from}, whose claim waiting for review was deleted; its {files} stored file(s) are \
+                         deleted from object storage once this is written"
+                    ),
+                };
             }
             (None, None) => {}
         }
@@ -1112,7 +1160,8 @@ impl Seed<'_> {
             }
         };
         let reason = self.reason(&entry.reason);
-        let status_before = if unverified.is_some() { "unverified" } else { "approved" };
+        // A row this run made had no status before.
+        let status_before = if unverified.is_some() { "unverified" } else { "new" };
         let line = ClaimLine { claim_id, account_id, action: "activated", status_before, reason: &reason };
         self.claim_line(actor, tin, line).await?;
         let how = how.trim_start_matches("new; ").to_owned();
@@ -1188,7 +1237,19 @@ pub async fn cli(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     match cli_run(args).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(report) if report.storage_failures.is_empty() => ExitCode::SUCCESS,
+        Ok(report) => {
+            eprintln!(
+                "The changes were made (seed run {}), but {} stored file(s) could not be deleted from object storage. \
+                 Delete them by hand:",
+                report.run_id,
+                report.storage_failures.len()
+            );
+            for failure in &report.storage_failures {
+                eprintln!("  {failure}");
+            }
+            ExitCode::FAILURE
+        }
         Err(SeedError::Refused(problems)) => {
             eprintln!("Refused; nothing was written:");
             for problem in problems {
@@ -1241,7 +1302,7 @@ fn operator() -> Operator {
     Operator { os_user, host: output("hostname", &[]).unwrap_or_else(|| "unknown".to_owned()) }
 }
 
-async fn cli_run(args: Args) -> Result<(), SeedError> {
+async fn cli_run(args: Args) -> Result<Report, SeedError> {
     let path = &args.file;
     let bytes =
         std::fs::read(path).map_err(|error| SeedError::Refused(vec![format!("cannot read {path}: {error}")]))?;
@@ -1297,13 +1358,16 @@ async fn cli_run(args: Args) -> Result<(), SeedError> {
             let _ = writeln!(out, "{count} change(s) made, recorded as seed run {}.", report.run_id);
         }
     }
+    if report.deleted_files > 0 {
+        let _ = writeln!(out, "{} stored file(s) deleted from object storage.", report.deleted_files);
+    }
     if report.dry_run {
         let _ = writeln!(out, "Plan digest: {}", report.digest);
         let _ = writeln!(out, "To make these changes, run it again without --dry-run, adding:");
         let _ = writeln!(out, "  --target {} --expect {}", report.target, report.digest);
     }
     print!("{out}");
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]

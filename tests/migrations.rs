@@ -591,7 +591,8 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
              VALUES ('{activated}', '{bob}', '***-***-462-00000', 'activated', 'unverified', '{bob}', 'bob@example.test', 'Known to us.', 'web'),
                     ('{pending}', '{ana}', '***-***-451-00000', 'approved', 'pending', '{bob}', 'bob@example.test', NULL, 'web'),
                     ('{pending}', '{ana}', '***-***-451-00000', 'rejected', 'pending', '{bob}', 'bob@example.test', 'No.', 'web'),
-                    ('{pending}', '{ana}', '***-***-451-00000', 'sent_back', 'pending', '{bob}', 'bob@example.test', NULL, 'web')",
+                    ('{pending}', '{ana}', '***-***-451-00000', 'sent_back', 'pending', '{bob}', 'bob@example.test', NULL, 'web'),
+                    ('{seeded_tin}', '{bob}', '***-***-464-00000', 'created', 'new', '{bob}', 'bob@example.test', 'seed run', 'seed')",
             pending = seeded.pending
         ),
     )
@@ -663,7 +664,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
     assert_eq!(
         archived(&db, "claim_audit", "action").await,
-        ["activated", "approved", "paused", "rejected", "sent_back"]
+        ["activated", "approved", "created", "paused", "rejected", "sent_back"]
     );
     assert_eq!(archived(&db, "account_audit", "action").await, ["banned"]);
     assert_eq!(archived(&db, "seed_runs", "actor_email").await, ["bob@example.test"]);

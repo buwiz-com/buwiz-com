@@ -271,7 +271,8 @@ file, in one transaction (`docs/seed.example.toml`; `src/account/seed.rs`):
 
 ```text
 usage: buwiz-cloud seed <FILE> --as <admin email> --dry-run [--no-admin-emails]
-       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> [--expect <digest>] [--no-admin-emails]
+       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> --expect <digest> [--no-admin-emails]
+       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> --no-dry-run-check [--no-admin-emails]
 ```
 
 It reads `DATABASE_URL`, `ADMIN_EMAILS` and the `S3_*` settings, so it runs
@@ -289,11 +290,14 @@ of its own.
   cannot change its own role.
 - **The database** it writes to must be named: a real run needs `--target
   host:port/name`, equal to the database it is connected to (the host and
-  port of `DATABASE_URL`, the name the server reports). The dry run prints
-  the exact value, and a plan digest for `--expect`: a real run given it
-  refuses if the plan is no longer the one the dry run showed (the
-  database, `--as`, `ADMIN_EMAILS`, the file, or anything it would change
-  or keep).
+  port of `DATABASE_URL`, the name the server reports). Only the dry run
+  prints the value; a real run without it says to take it from there.
+- **The plan** a real run commits is the one a dry run showed: it needs
+  `--expect <digest>`, the plan digest the dry run printed, and refuses if
+  the plan is no longer that one (the database, `--as`, `ADMIN_EMAILS`, the
+  file, or anything it would change or keep). `--no-dry-run-check` runs it
+  without, on purpose (it then commits a plan nobody read in full, and
+  says so on stderr); the runbook below never uses it.
 - **Before it writes**, a real run prints the database, the account and
   claim counts, `ADMIN_EMAILS`, the file's SHA-256, the plan digest and
   every planned line, then commits.

@@ -22,6 +22,7 @@ fn options(actor: &str, dry_run: bool) -> Options {
         admin_emails: None,
         target: None,
         expect: None,
+        no_dry_run_check: false,
         operator: Operator { os_user: "ops (sudo from ana)".into(), host: "box.example.test".into() },
     }
 }
@@ -38,12 +39,22 @@ async fn target_of(db: &PgPool) -> String {
     format!("{}:{}/{name}", options.get_host(), options.get_port())
 }
 
-/// Runs the file as `options` say; a real run without a `--target` gets
-/// the test database's, as an operator would type it.
+/// Runs the file as `options` say. A real run goes as the operator runs
+/// it: without a `--target` it gets the test database's, and without an
+/// `--expect` (or `--no-dry-run-check`) the dry run goes first and the real
+/// run expects its digest. When that dry run refuses, the real run is still
+/// made, unchecked, so the answer is the real run's own.
 async fn seed(db: &PgPool, file: &str, options: &Options) -> Result<Report, SeedError> {
     let mut options = options.clone();
     if !options.dry_run && options.target.is_none() {
         options.target = Some(target_of(db).await);
+    }
+    if !options.dry_run && options.expect.is_none() && !options.no_dry_run_check {
+        let dry = Options { dry_run: true, target: None, ..options.clone() };
+        match seed::run(db, &DocumentStore::Database, file.as_bytes(), &dry).await {
+            Ok(dry) => options.expect = Some(dry.digest),
+            Err(_) => options.no_dry_run_check = true,
+        }
     }
     seed::run(db, &DocumentStore::Database, file.as_bytes(), &options).await
 }
@@ -435,8 +446,36 @@ async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
     let made = out.find("change(s) made").expect(&out);
     assert!(out.find(&format!("Database: {target}")).unwrap() < planned && planned < made, "{out}");
     assert!(!out.contains("000-123-453"), "{out}");
+    // A real run without the dry run's digest is refused, unless it says
+    // on purpose that it has none.
     let again = command(&["seed", path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target]);
-    assert!(String::from_utf8_lossy(&again.stdout).contains("Nothing to change."));
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert_eq!(again.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--expect") && stderr.contains("Refused; nothing was written"), "{stderr}");
+    let again = command(&[
+        "seed",
+        path,
+        "--as",
+        "admin@example.test",
+        "--no-admin-emails",
+        "--target",
+        &target,
+        "--no-dry-run-check",
+    ]);
+    let out = String::from_utf8_lossy(&again.stdout);
+    assert_eq!(again.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&again.stderr));
+    assert!(out.contains("Nothing to change."), "{out}");
+    assert!(String::from_utf8_lossy(&again.stderr).contains("--no-dry-run-check"), "it says it was not checked");
+    // The missing --target is refused without printing the value to paste.
+    let blind = String::from_utf8_lossy(&blind.stderr).into_owned();
+    assert!(blind.contains("--target") && blind.contains("dry run") && !blind.contains(&target), "{blind}");
+    // Nor can a run be both checked and unchecked, or a dry run unchecked.
+    for args in [
+        &["seed", path, "--as", "a@example.test", "--target", &target, "--expect", "d", "--no-dry-run-check"][..],
+        &["seed", path, "--as", "a@example.test", "--dry-run", "--no-dry-run-check"][..],
+    ] {
+        assert_eq!(command(args).status.code(), Some(2), "{args:?}");
+    }
 
     std::fs::write(dir.join("seed.toml"), "[[login]]\nemail = \"x@example.test\"\nwho = 1\n").unwrap();
     let bad = command(&["seed", path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target]);
@@ -493,15 +532,42 @@ async fn a_real_run_must_name_the_database_it_is_connected_to(db: PgPool) {
     let dry = run(options("admin@example.test", true)).await.unwrap();
     assert_eq!(dry.target, target);
     let problem = refused(run(options("admin@example.test", false)).await);
-    assert!(problem.contains("--target"), "{problem}");
+    // It says where to find the value, and does not print it: a real run
+    // pastes the dry run's line, after reading that dry run.
+    assert!(problem.contains("--target") && problem.contains("dry run"), "{problem}");
+    assert!(!problem.contains(&target), "{problem}");
     for wrong in ["127.0.0.1:54330/buwiz_cloud".to_owned(), target.replace(":54330/", ":5432/"), format!("{target}x")] {
         let problem =
             refused(run(Options { target: Some(wrong.clone()), ..options("admin@example.test", false) }).await);
         assert!(problem.contains(&format!("connected to {target}, not {wrong}")), "{problem}");
     }
     assert_eq!(counts(&db).await, [0; 5]);
-    let real = run(Options { target: Some(target.clone()), ..options("admin@example.test", false) }).await.unwrap();
+    let real = Options {
+        target: Some(target.clone()),
+        expect: Some(dry.digest.clone()),
+        ..options("admin@example.test", false)
+    };
+    let real = run(real).await.unwrap();
     assert!(real.changes > 0);
+}
+
+/// A real run commits only the plan a dry run showed: it needs that dry
+/// run's `--expect`, unless `--no-dry-run-check` says on purpose that no
+/// dry run was read.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_real_run_needs_the_dry_run_digest_or_says_it_has_none(db: PgPool) {
+    let target = target_of(&db).await;
+    let run = |options: Options| {
+        let db = db.clone();
+        async move { seed::run(&db, &DocumentStore::Database, EXAMPLE.as_bytes(), &options).await }
+    };
+    let blind = Options { target: Some(target.clone()), ..options("admin@example.test", false) };
+    let problem = refused(run(blind.clone()).await);
+    assert!(problem.contains("--expect") && problem.contains("dry run"), "{problem}");
+    assert!(problem.contains("--no-dry-run-check"), "{problem}");
+    assert_eq!(counts(&db).await, [0; 5]);
+    let unchecked = run(Options { no_dry_run_check: true, ..blind }).await.unwrap();
+    assert!(unchecked.changes > 0);
 }
 
 /// `--expect` ties a real run to the dry run read before it: if the plan
@@ -847,8 +913,9 @@ async fn a_move_that_deletes_stored_files_needs_the_object_store(db: PgPool) {
         ("S3_SECRET_ACCESS_KEY", "test"),
         ("ADMIN_EMAILS", ""),
     ];
-    let run =
-        command(&["seed", &path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target], &unreachable);
+    let args =
+        ["seed", &path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target, "--no-dry-run-check"];
+    let run = command(&args, &unreachable);
     let (out, err) = (String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
     assert_eq!(run.status.code(), Some(1), "{out}{err}");
     assert!(err.contains(&format!("claims/{claim}/f")) && err.contains("could not be deleted"), "{err}");

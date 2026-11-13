@@ -11,8 +11,9 @@
 //! migrations and starts no server: it refuses a database whose applied
 //! migrations are not exactly this release's (by number and checksum). It
 //! waits at most [`LOCK_TIMEOUT`] for a lock another change holds. A real
-//! run writes only to the database `--target` names, and with `--expect`
-//! only the plan the dry run showed.
+//! run writes only to the database `--target` names, and only the plan the
+//! dry run showed (`--expect`), unless `--no-dry-run-check` says on purpose
+//! that no dry run was read.
 //!
 //! What it refuses, before anything is written (the whole file):
 //! - a file that does not parse, or has a key it does not know;
@@ -156,6 +157,8 @@ pub struct Options {
     pub target: Option<String>,
     /// `--expect <digest>`: the plan digest the dry run printed.
     pub expect: Option<String>,
+    /// `--no-dry-run-check`: a real run without `--expect`, on purpose.
+    pub no_dry_run_check: bool,
     /// Who runs it, as far as the machine knows.
     pub operator: Operator,
 }
@@ -441,12 +444,22 @@ pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &
                 "this run is connected to {target}, not {named}; nothing was written"
             )]));
         }
+        // Not printed here: the value comes from the dry run, read first.
         None if !options.dry_run => {
-            return Err(SeedError::Refused(vec![format!(
-                "a real run names its database: --target {target} (the dry run prints it); nothing was written"
-            )]));
+            return Err(SeedError::Refused(vec![
+                "a real run names its database with --target: take it from the last line of the dry run, after \
+                 reading that dry run; nothing was written"
+                    .to_owned(),
+            ]));
         }
         _ => {}
+    }
+    if !options.dry_run && options.expect.is_none() && !options.no_dry_run_check {
+        return Err(SeedError::Refused(vec![
+            "a real run commits only the plan its dry run showed: give --expect <digest> from the last line of the \
+             dry run (or --no-dry-run-check to run a plan nobody has read); nothing was written"
+                .to_owned(),
+        ]));
     }
     check_migrations(db).await?;
     let (accounts_before, claims_before): (i64, i64) =
@@ -1188,12 +1201,15 @@ fn database_target(url: &str) -> String {
 }
 
 const USAGE: &str = "usage: buwiz-cloud seed <FILE> --as <admin email> --dry-run [--no-admin-emails]
-       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> [--expect <digest>] [--no-admin-emails]
+       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> --expect <digest> [--no-admin-emails]
+       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> --no-dry-run-check [--no-admin-emails]
 
 Run it with the server's own settings (DATABASE_URL, ADMIN_EMAILS, S3_*): see docs/deploy.md.
+Dry-run first, read every line, then run it with the --target and --expect the dry run's last line gives.
   --dry-run            make every change, show it (TINs in full), then roll back
   --target T           a real run: the database it must be connected to, as the dry run prints it
   --expect D           a real run: refuse unless the plan's digest is D, as the dry run printed it
+  --no-dry-run-check   a real run without --expect, on purpose: it commits a plan nobody has read
   --no-admin-emails    the server has no ADMIN_EMAILS (without this, ADMIN_EMAILS must be set)";
 
 /// The command line, parsed.
@@ -1203,16 +1219,18 @@ struct Args {
     dry_run: bool,
     target: Option<String>,
     expect: Option<String>,
+    no_dry_run_check: bool,
     no_admin_emails: bool,
 }
 
 fn parse_args(args: &[String]) -> Option<Args> {
-    let (mut file, mut actor, mut dry_run, mut target, mut expect, mut no_admin_emails) =
-        (None, None, false, None, None, false);
+    let (mut file, mut actor, mut dry_run, mut target, mut expect) = (None, None, false, None, None);
+    let (mut no_dry_run_check, mut no_admin_emails) = (false, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--no-dry-run-check" => no_dry_run_check = true,
             "--no-admin-emails" => no_admin_emails = true,
             "--as" => actor = Some(args.next()?.clone()),
             "--target" => target = Some(args.next()?.clone()),
@@ -1221,10 +1239,12 @@ fn parse_args(args: &[String]) -> Option<Args> {
             _ => return None,
         }
     }
-    if dry_run && expect.is_some() {
+    // A dry run checks nothing against itself; a real run is checked
+    // against its dry run or says it is not.
+    if dry_run && (expect.is_some() || no_dry_run_check) || expect.is_some() && no_dry_run_check {
         return None;
     }
-    Some(Args { file: file?, actor: actor?, dry_run, target, expect, no_admin_emails })
+    Some(Args { file: file?, actor: actor?, dry_run, target, expect, no_dry_run_check, no_admin_emails })
 }
 
 /// The command line: see [`USAGE`]. Reads `DATABASE_URL` and
@@ -1329,6 +1349,7 @@ async fn cli_run(args: Args) -> Result<Report, SeedError> {
         admin_emails,
         target: args.target,
         expect: args.expect,
+        no_dry_run_check: args.no_dry_run_check,
         operator: operator(),
     };
     let pending = prepare(&db, &store, &bytes, &options).await?;
@@ -1344,6 +1365,10 @@ async fn cli_run(args: Args) -> Result<Report, SeedError> {
     let _ = writeln!(out, "File sha256: {}", report.file_sha256);
     if report.dry_run {
         let _ = writeln!(out, "Dry run: nothing is written. TINs are shown in full; check every digit.");
+    } else if options.no_dry_run_check {
+        eprintln!("Warning: --no-dry-run-check: this plan is not checked against a dry run.");
+        let _ = writeln!(out, "Plan digest: {}", report.digest);
+        let _ = writeln!(out, "Seed run {}, writing:", report.run_id);
     } else {
         let _ = writeln!(out, "Plan digest: {}", report.digest);
         let _ = writeln!(out, "Seed run {}, writing:", report.run_id);

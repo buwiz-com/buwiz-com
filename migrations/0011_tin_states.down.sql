@@ -2,6 +2,7 @@
 -- database with every return, ticket and receipt kept. Run after
 -- 0012_staff_roles.down.sql. `MIGRATOR.undo(&pool, 10)` runs both; by hand,
 -- run each file with psql (`psql -v ON_ERROR_STOP=1 -1 -f …`) in that order.
+-- docs/deploy.md has the whole rollback.
 --
 -- It refuses to run while a TIN is paused (the release before this one
 -- would send for it again), while a TIN saved without papers has files
@@ -10,6 +11,8 @@
 -- a person to confirm it (the release before this one has no such list,
 -- and its papers would be kept with nobody to look at them). Resume or end
 -- the pauses, decide those files, and confirm or revoke those TINs first.
+-- 0012's down file makes the same checks before it changes anything, so a
+-- rollback either goes all the way to 10 or changes nothing.
 --
 -- What a rollback loses:
 -- - TINs added without papers (`unverified`). They never have tickets,
@@ -20,9 +23,13 @@
 --   was ever active `staff` when it names a reviewer (`decided_by`: staff
 --   approval, an admin, the seed tool) and `unknown` when it does not (the
 --   automatic check).
--- - Audit lines of the new actions (activated, paused, …) and every line's
---   source.
+-- - Each audit line's source, from the lines that stay.
+-- Audit lines of the new actions (activated, paused, approved, …) are not
+-- lost: they move, whole, to `rollback_archive.claim_audit`, outside the
+-- schema the release before this one reads. They are the only record of
+-- why a TIN that stays active was activated without papers.
 
+-- BEGIN checks of 0011 (0012's down file repeats this block word for word)
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM tin_claims WHERE paused_at IS NOT NULL) THEN
@@ -37,6 +44,14 @@ BEGIN
             (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL);
     END IF;
 END $$;
+-- END checks of 0011
+
+CREATE SCHEMA IF NOT EXISTS rollback_archive;
+CREATE TABLE IF NOT EXISTS rollback_archive.claim_audit AS
+    SELECT now() AS archived_at, * FROM claim_audit WITH NO DATA;
+INSERT INTO rollback_archive.claim_audit
+    SELECT now(), * FROM claim_audit
+     WHERE action NOT IN ('deleted', 'removed', 'revoked', 'file_replaced', 'file_removed');
 
 DELETE FROM tin_claims WHERE status = 'unverified';
 DELETE FROM claim_audit

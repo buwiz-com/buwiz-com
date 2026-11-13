@@ -582,17 +582,37 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
 
-    // A rollback never lifts a ban or a pause by itself: each down file
-    // refuses while one exists, and so does 0011's while a TIN saved
-    // without papers has files.
-    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
-    assert!(refused.contains("account(s) are banned"), "{refused}");
-    assert_eq!(versions(&db).await, (1..=12).collect::<Vec<_>>());
+    // Review decisions and an activation without papers have audit lines
+    // of their own.
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO claim_audit (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
+             VALUES ('{activated}', '{bob}', '***-***-462-00000', 'activated', 'unverified', '{bob}', 'bob@example.test', 'Known to us.', 'web'),
+                    ('{pending}', '{ana}', '***-***-451-00000', 'approved', 'pending', '{bob}', 'bob@example.test', NULL, 'web'),
+                    ('{pending}', '{ana}', '***-***-451-00000', 'rejected', 'pending', '{bob}', 'bob@example.test', 'No.', 'web'),
+                    ('{pending}', '{ana}', '***-***-451-00000', 'sent_back', 'pending', '{bob}', 'bob@example.test', NULL, 'web')",
+            pending = seeded.pending
+        ),
+    )
+    .await;
+
+    // A rollback either goes all the way or changes nothing. 0012's down
+    // file refuses first for every reason 0011's would, so each refusal
+    // leaves the database at 12 with nothing dropped.
+    let untouched = at_12(&db).await;
+    let refuses = |words: &'static str| {
+        let db = db.clone();
+        let untouched = untouched.clone();
+        async move {
+            let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
+            assert!(refused.contains(words), "{refused}");
+            assert_eq!(at_12(&db).await, untouched, "{words}");
+        }
+    };
+    refuses("account(s) are banned").await;
     exec(&db, "UPDATE accounts SET banned_at = NULL, banned_by = NULL, ban_reason = NULL").await;
-    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
-    assert!(refused.contains("TIN(s) are paused"), "{refused}");
-    // 0012 went back; 0011 refused and changed nothing.
-    assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
+    refuses("TIN(s) are paused").await;
     let paused: i64 =
         sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE paused_at IS NOT NULL").fetch_one(&db).await.unwrap();
     assert_eq!(paused, 1);
@@ -606,9 +626,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         ),
     )
     .await;
-    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
-    assert!(refused.contains("TINs saved without papers have files"), "{refused}");
-    assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
+    refuses("TINs saved without papers have files").await;
     exec(&db, &format!("DELETE FROM claim_documents WHERE claim_id = '{unverified}'")).await;
     let auto = id(
         &db,
@@ -618,15 +636,43 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         ),
     )
     .await;
-    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
-    assert!(refused.contains("activated automatically wait for a person"), "{refused}");
-    assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
+    refuses("activated automatically wait for a person").await;
     exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{auto}'")).await;
+    // Bob is an Admin by stored role: the release before this one would
+    // not know him.
+    refuses("have a stored staff role").await;
+    // Run by hand, each down file refuses a pause on its own too.
+    for (down, words) in [
+        (include_str!("../migrations/0012_staff_roles.down.sql"), "TIN(s) are paused"),
+        (include_str!("../migrations/0011_tin_states.down.sql"), "TIN(s) are paused"),
+    ] {
+        exec(&db, "UPDATE tin_claims SET paused_at = now(), paused_by = account_id, pause_reason = 'Again.' WHERE id = (SELECT id FROM tin_claims WHERE status = 'approved' AND paused_at IS NULL LIMIT 1)").await;
+        let mut tx = db.begin().await.unwrap();
+        let refused = sqlx::raw_sql(down).execute(&mut *tx).await.unwrap_err().to_string();
+        assert!(refused.contains(words), "{refused}");
+        drop(tx);
+        exec(&db, "UPDATE tin_claims SET paused_at = NULL, paused_by = NULL, pause_reason = NULL").await;
+    }
+    assert_eq!(at_12(&db).await, untouched);
+    exec(&db, "UPDATE accounts SET role = NULL").await;
 
     // Back to 10 the way sqlx reverts, then the release before this one
-    // starts on it.
+    // starts on it. The audit lines 10 cannot hold, the account history
+    // and the seed runs are kept in `rollback_archive`.
     MIGRATOR.undo(&db, 10).await.unwrap();
     assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
+    assert_eq!(
+        archived(&db, "claim_audit", "action").await,
+        ["activated", "approved", "paused", "rejected", "sent_back"]
+    );
+    assert_eq!(archived(&db, "account_audit", "action").await, ["banned"]);
+    assert_eq!(archived(&db, "seed_runs", "actor_email").await, ["bob@example.test"]);
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT reason FROM rollback_archive.claim_audit WHERE action = 'activated'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(reason.as_deref(), Some("Known to us."));
 
     // The new release can come back on it, and the down files also work run
     // by hand (as psql runs them), newest first.
@@ -647,15 +693,66 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     assert_eq!(verified_by(seeded_tin).await.as_deref(), Some("staff"));
     assert_eq!(verified_by(seeded.approved).await.as_deref(), Some("staff"));
     assert_eq!(verified_by(seeded.revoked).await.as_deref(), Some("staff"));
-    for down in [
-        include_str!("../migrations/0012_staff_roles.down.sql"),
-        include_str!("../migrations/0011_tin_states.down.sql"),
+    // A stored role again: by hand, the operator drops it on purpose.
+    exec(
+        &db,
+        &format!(
+            "UPDATE accounts SET role = 'admin' WHERE id = '{bob}';
+             INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary)
+             VALUES (gen_random_uuid(), '{bob}', 'bob@example.test', decode('01', 'hex'), '{{}}')"
+        ),
+    )
+    .await;
+    for (down, set) in [
+        (include_str!("../migrations/0012_staff_roles.down.sql"), "SET LOCAL buwiz.rollback_drop_roles = 'yes'"),
+        (include_str!("../migrations/0011_tin_states.down.sql"), ""),
     ] {
         let mut tx = db.begin().await.unwrap();
+        sqlx::raw_sql(set).execute(&mut *tx).await.unwrap();
         sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
     }
     assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
+    // A second rollback adds to the archive.
+    assert_eq!(archived(&db, "seed_runs", "actor_email").await, ["bob@example.test", "bob@example.test"]);
+}
+
+/// What a refused rollback must leave as it was: the versions, the roles,
+/// the test labels, the account history, the seed runs and the audit
+/// lines.
+async fn at_12(db: &PgPool) -> (Vec<i64>, i64, i64, i64, i64, i64) {
+    let count = |sql: &'static str| {
+        let db = db.clone();
+        async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&db).await.unwrap() }
+    };
+    (
+        versions(db).await,
+        count("SELECT count(*) FROM accounts WHERE role IS NOT NULL").await,
+        count("SELECT count(*) FROM accounts WHERE test_account").await,
+        count("SELECT count(*) FROM account_audit").await,
+        count("SELECT count(*) FROM seed_runs").await,
+        count("SELECT count(*) FROM claim_audit").await,
+    )
+}
+
+/// One column of a `rollback_archive` table, sorted.
+async fn archived(db: &PgPool, table: &str, column: &str) -> Vec<String> {
+    sqlx::query_scalar(&format!("SELECT {column}::text FROM rollback_archive.{table} ORDER BY 1"))
+        .fetch_all(db)
+        .await
+        .unwrap()
+}
+
+/// 0012's down file makes 0011's checks word for word, so a rollback never
+/// stops between the two.
+#[test]
+fn the_newer_down_file_makes_every_check_of_the_older_one() {
+    let older = include_str!("../migrations/0011_tin_states.down.sql");
+    let start = older.find("-- BEGIN checks of 0011").unwrap();
+    let end = older.find("-- END checks of 0011").unwrap();
+    let checks = &older[start..end];
+    assert!(checks.contains("RAISE EXCEPTION"));
+    assert!(include_str!("../migrations/0012_staff_roles.down.sql").contains(checks));
 }
 
 /// The database reads as at migration 10 plus what the new release added

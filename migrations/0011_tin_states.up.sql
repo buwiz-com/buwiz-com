@@ -64,7 +64,8 @@ CREATE INDEX tin_claims_tin ON tin_claims (tin_root, branch_code);
 ALTER TABLE claim_audit DROP CONSTRAINT claim_audit_action_check;
 ALTER TABLE claim_audit ADD CONSTRAINT claim_audit_action_check
     CHECK (action IN ('deleted', 'removed', 'revoked', 'file_replaced', 'file_removed',
-                      'activated', 'auto_activated', 'auto_confirmed', 'paused', 'resumed'));
+                      'activated', 'auto_activated', 'auto_confirmed', 'paused', 'resumed',
+                      'approved', 'rejected', 'sent_back'));
 -- Every line so far came from the website. From now on each writer says
 -- where its line comes from: there is no default to fall back on.
 ALTER TABLE claim_audit ADD COLUMN source text NOT NULL DEFAULT 'web' CHECK (source IN ('web', 'auto', 'seed'));

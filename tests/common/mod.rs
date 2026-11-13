@@ -250,3 +250,75 @@ pub async fn profiles(site: &Site, token: &str, path: &str) -> Value {
 pub fn content_type(response: &Response) -> &str {
     response.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap()
 }
+
+/// A BIR app signed in for an account, with a registered device key: what
+/// the v2 calls (tickets, sealed returns) need.
+pub struct TestDevice {
+    pub token: String,
+    pub device_id: Uuid,
+    key: ed25519_dalek::SigningKey,
+}
+
+impl TestDevice {
+    pub async fn new(db: &PgPool, account_id: Uuid) -> Self {
+        let token = app_token(db, account_id).await;
+        let grant: Uuid = sqlx::query_scalar(
+            "SELECT g.id FROM oauth_grants g JOIN oauth_access_tokens t ON t.grant_id = g.id WHERE t.token_hash = $1",
+        )
+        .bind(crypto::hash(&token))
+        .fetch_one(db)
+        .await
+        .unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let device_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO devices (account_id, grant_id, public_key, name) VALUES ($1, $2, $3, 'Test Mac') RETURNING id",
+        )
+        .bind(account_id)
+        .bind(grant)
+        .bind(key.verifying_key().as_bytes().as_slice())
+        .fetch_one(db)
+        .await
+        .unwrap();
+        Self { token, device_id, key }
+    }
+
+    /// A request signed with the device key, a fresh nonce and the time now.
+    pub async fn post(&self, site: &Site, path: &str, body: &Value) -> Response {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let body = body.to_string();
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+        let nonce = Uuid::new_v4().simple().to_string();
+        let input = buwiz_cloud::filing::devices::signing_input(
+            "POST",
+            path,
+            &crypto::hex(&crypto::sha256(body.as_bytes())),
+            timestamp,
+            &nonce,
+        );
+        let signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.key.sign(input.as_bytes()).to_bytes());
+        let request = Request::post(path)
+            .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("buwiz-device", self.device_id.to_string())
+            .header("buwiz-timestamp", timestamp.to_string())
+            .header("buwiz-nonce", nonce)
+            .header("buwiz-signature", signature)
+            .body(Body::from(body))
+            .unwrap();
+        site.send(request).await
+    }
+}
+
+/// The status and `{"error":{"code","message"}}` of a JSON refusal.
+pub async fn refusal(response: Response) -> (u16, String, String) {
+    let status = response.status().as_u16();
+    let body: Value = serde_json::from_str(&text(response).await).unwrap_or_default();
+    let error = &body["error"];
+    (
+        status,
+        error["code"].as_str().unwrap_or_default().to_owned(),
+        error["message"].as_str().unwrap_or_default().to_owned(),
+    )
+}

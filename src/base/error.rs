@@ -11,6 +11,10 @@ use serde_json::json;
 pub enum ApiError {
     #[error("{message}")]
     Client { status: StatusCode, code: &'static str, message: &'static str },
+    /// The same shape, with words made for this request (a claim's fix
+    /// reasons, say).
+    #[error("{message}")]
+    Refused { status: StatusCode, code: &'static str, message: String },
     /// Missing, expired or revoked access token. Answers 401 with
     /// `WWW-Authenticate`.
     #[error("sign in again")]
@@ -47,6 +51,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             Self::Client { status, code, message } => {
+                (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+            }
+            Self::Refused { status, code, message } => {
                 (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
             }
             Self::InvalidToken => {

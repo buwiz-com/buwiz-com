@@ -20,6 +20,7 @@ use crate::account::tin::Tin;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
 use crate::filing::devices::Signed;
+use crate::filing::gate;
 use crate::filing::jws;
 use crate::filing::submissions::parse_filename;
 
@@ -125,17 +126,7 @@ pub async fn issue(State(state): State<AppState>, signed: Signed<TicketRequest>)
         return Err(ApiError::bad_request("bad_idempotency_key", "idempotency_key must be 1 to 100 characters"));
     }
 
-    let claim_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status = 'approved'",
-    )
-    .bind(bearer.account.id)
-    .bind(tin.root())
-    .bind(tin.branch())
-    .fetch_optional(&state.db)
-    .await?;
-    let Some(claim_id) = claim_id else {
-        return Err(ApiError::forbidden("tin_not_active", "this TIN is not active on your account"));
-    };
+    let claim_id = gate::own(&state.db, bearer.account.id, &tin).await?.sendable()?;
 
     let previous: Option<Previous> = sqlx::query_as(
         "SELECT t.device_id, t.claim_id, t.form_type, t.period, t.payload_sha256, t.email, t.jws, t.expires_at,

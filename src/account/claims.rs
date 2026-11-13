@@ -35,6 +35,7 @@ use crate::base::crypto;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
 use crate::base::storage::DocumentStore;
+use crate::filing::gate;
 
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SUPPORTING_FILES: usize = 5;
@@ -1076,13 +1077,15 @@ pub async fn tax_profiles(
     Ok(Json(json!({ "profiles": profiles })))
 }
 
-/// The account's active TINs. `full` adds the raw TIN and filing
-/// permissions, for the Buwiz BIR app only.
+/// The account's active TINs that can send: a paused one is left out.
+/// `full` adds the raw TIN and filing permissions, for the Buwiz BIR app
+/// only.
 pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::Result<Vec<Value>> {
-    let rows: Vec<(Uuid, String, String, String, OffsetDateTime)> = sqlx::query_as(
-        "SELECT id, tin_root, branch_code, registered_name, decided_at FROM tin_claims
-         WHERE account_id = $1 AND status = 'approved' ORDER BY decided_at",
-    )
+    let rows: Vec<(Uuid, String, String, String, OffsetDateTime)> = sqlx::query_as(&format!(
+        "SELECT c.id, c.tin_root, c.branch_code, c.registered_name, c.decided_at FROM tin_claims c
+         WHERE c.account_id = $1 AND {} ORDER BY c.decided_at",
+        gate::SENDABLE_SQL
+    ))
     .bind(account_id)
     .fetch_all(db)
     .await?;

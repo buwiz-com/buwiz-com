@@ -410,7 +410,32 @@ impl Bearer {
     }
 }
 
+/// What a banned account's app hears on every call but signing out.
+pub const BANNED_MESSAGE: &str = "This Buwiz account is banned: it can't send returns. Write to support@buwiz.com.";
+
 impl FromRequestParts<AppState> for Bearer {
+    type Rejection = ApiError;
+
+    /// A banned account's token is valid but refused with `403
+    /// account_banned`, so the app can say why. Its refresh keeps working
+    /// (`/oauth/token` is not a bearer call), and so does signing out.
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let SigningOut { bearer, banned } = SigningOut::from_request_parts(parts, state).await?;
+        if banned {
+            return Err(ApiError::forbidden("account_banned", BANNED_MESSAGE));
+        }
+        Ok(bearer)
+    }
+}
+
+/// The bearer of a valid token, banned or not: only for `POST
+/// /api/auth/logout`.
+pub struct SigningOut {
+    pub bearer: Bearer,
+    pub banned: bool,
+}
+
+impl FromRequestParts<AppState> for SigningOut {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
@@ -420,8 +445,8 @@ impl FromRequestParts<AppState> for Bearer {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or(ApiError::InvalidToken)?;
-        let row: Option<(Uuid, String, Uuid, String)> = sqlx::query_as(
-            "SELECT g.id, g.scope, a.id, a.email
+        let row: Option<(Uuid, String, Uuid, String, bool)> = sqlx::query_as(
+            "SELECT g.id, g.scope, a.id, a.email, a.banned_at IS NOT NULL
              FROM oauth_access_tokens t
              JOIN oauth_grants g ON g.id = t.grant_id
              JOIN accounts a ON a.id = g.account_id
@@ -430,8 +455,8 @@ impl FromRequestParts<AppState> for Bearer {
         .bind(crypto::hash(token.trim()))
         .fetch_optional(&state.db)
         .await?;
-        let (grant_id, scope, id, email) = row.ok_or(ApiError::InvalidToken)?;
-        Ok(Self { account: Account { id, email }, grant_id, scope })
+        let (grant_id, scope, id, email, banned) = row.ok_or(ApiError::InvalidToken)?;
+        Ok(Self { bearer: Bearer { account: Account { id, email }, grant_id, scope }, banned })
     }
 }
 
@@ -441,7 +466,10 @@ pub async fn me(bearer: Bearer) -> Json<Value> {
 }
 
 /// `POST /api/auth/logout`: ends this app's sign-in.
-pub async fn logout(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
+pub async fn logout(
+    State(state): State<AppState>,
+    SigningOut { bearer, .. }: SigningOut,
+) -> Result<Json<Value>, ApiError> {
     let mut tx = state.db.begin().await?;
     revoke_grant(&mut tx, bearer.grant_id, "signed_out").await?;
     tx.commit().await?;

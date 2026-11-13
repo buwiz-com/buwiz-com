@@ -5,6 +5,7 @@
 
 pub mod devices;
 pub mod envelope;
+pub mod gate;
 pub mod jws;
 pub mod link;
 pub mod submissions;

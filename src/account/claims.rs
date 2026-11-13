@@ -838,6 +838,9 @@ pub async fn decide(
     if claim.account_id == reviewer.id {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
+    if note.trim().chars().count() > crate::account::admin::MAX_REASON_CHARS {
+        return Err(DecideError::Refused(Notice::ReasonTooLong));
+    }
     let role = roles::recheck(&mut tx, config, reviewer.id).await?;
     if !role.is_some_and(|role| role.can(Power::Review)) {
         return Err(DecideError::Refused(Notice::AdminOnly));
@@ -963,10 +966,8 @@ pub async fn activate_without_papers(
     actor: &Account,
     reason: &str,
 ) -> Result<Notice, DecideError> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err(DecideError::Refused(Notice::ReasonMissing));
-    }
+    let reason = crate::account::admin::required_reason(reason)?;
+    let reason = reason.as_str();
     let mut tx = db.begin().await?;
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
@@ -1091,10 +1092,7 @@ fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>) -> Result<Option<St
         By::Owner if claim.account_id != actor.id => Err(Notice::ClaimMissing),
         By::Owner => Ok(None),
         By::Staff { .. } if claim.account_id == actor.id => Err(Notice::OwnClaim),
-        By::Staff { reason, .. } => {
-            let reason = reason.trim();
-            if reason.is_empty() { Err(Notice::ReasonMissing) } else { Ok(Some(reason.to_owned())) }
-        }
+        By::Staff { reason, .. } => crate::account::admin::reason_text(reason).map(Some),
     }
 }
 
@@ -1225,7 +1223,10 @@ pub async fn pause(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let by = By::Staff { reason, config };
-    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
+        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
+        notice => DecideError::Refused(notice),
+    })?;
     if !by.may(&mut tx, actor, Power::Pause).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1257,7 +1258,10 @@ pub async fn resume(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let by = By::Staff { reason, config };
-    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
+        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
+        notice => DecideError::Refused(notice),
+    })?;
     if !by.may(&mut tx, actor, Power::Pause).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }

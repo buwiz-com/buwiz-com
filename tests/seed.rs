@@ -602,6 +602,16 @@ async fn the_seed_command_needs_admin_emails_or_says_there_is_none(db: PgPool) {
     let out = String::from_utf8_lossy(&listed.stdout);
     assert_eq!(listed.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&listed.stderr));
     assert!(out.contains("ADMIN_EMAILS: root@example.test, ops@example.test"), "{out}");
+    // A list separated by something else than commas is noticed.
+    let semicolons = command(
+        &["seed", &path, "--as", "root@example.test", "--dry-run"],
+        &[("ADMIN_EMAILS", "root@example.test; ops@example.test")],
+    );
+    let stderr = String::from_utf8_lossy(&semicolons.stderr);
+    assert!(
+        stderr.contains("not an email address") && stderr.contains("root@example.test; ops@example.test"),
+        "{stderr}"
+    );
     assert!(out.contains(&format!("--target {target}")), "{out}");
     assert_eq!(counts(&db).await, [0; 5]);
     std::fs::remove_dir_all(&dir).unwrap();

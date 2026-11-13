@@ -1269,7 +1269,16 @@ pub async fn cli(args: &[String]) -> ExitCode {
 fn admin_emails_given(no_admin_emails: bool) -> Result<Option<Vec<String>>, SeedError> {
     let set = std::env::var("ADMIN_EMAILS").is_ok_and(|raw| !raw.trim().is_empty());
     match (set, no_admin_emails) {
-        (true, false) => Ok(Some(crate::base::config::admin_emails())),
+        (true, false) => {
+            let (list, bad) =
+                crate::base::config::parse_admin_emails(&std::env::var("ADMIN_EMAILS").unwrap_or_default());
+            for entry in bad {
+                eprintln!(
+                    "Warning: ADMIN_EMAILS has {entry:?}, which is not an email address; separate addresses with commas"
+                );
+            }
+            Ok(Some(list))
+        }
         (false, true) => Ok(None),
         (false, false) => Err(SeedError::Refused(vec![
             "ADMIN_EMAILS is not set. Run the seed with the server's own settings (docs/deploy.md), or pass \

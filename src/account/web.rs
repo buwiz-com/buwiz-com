@@ -1115,7 +1115,7 @@ async fn sign_out_user(
     staff_outcome(&back_to, admin::sign_out(&state.db, &state.config, &staff, account_id, &form.reason).await)
 }
 
-/// Staff end one app's or agent's sign-in; the reason is optional.
+/// Staff end one app's or agent's sign-in, with a reason.
 async fn sign_out_user_app(
     State(state): State<AppState>,
     headers: HeaderMap,

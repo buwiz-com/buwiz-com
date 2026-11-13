@@ -123,6 +123,10 @@ notices! {
     ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
     AutoConfirmed = "auto_confirmed" => info "Confirmed. The papers were deleted.",
     NotAuto = "not_auto" => error "This TIN was not activated automatically, or it was already confirmed.",
+    ReasonTooLong = "reason_too_long" => error "Keep it to 500 characters.",
+    RoleUnchanged = "role_unchanged" => info "Nothing changed: they already have that role.",
+    OwnTinPause = "own_tin_pause" => error "You can't pause or resume your own TIN. Another admin does it.",
+    AppAlreadySignedOut = "app_already_signed_out" => info "That app was already signed out. Nothing changed.",
     OwnPage = "own_page" => info "This is your own account. Ask another staff member to look at it.",
     AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
 }
@@ -144,6 +148,8 @@ mod tests {
         use crate::account::claims::{MAX_FILE_BYTES, MAX_SUPPORTING_FILES, MAX_UNVERIFIED};
         assert!(Notice::TooManyUnverified.message().contains(&format!(" {MAX_UNVERIFIED} ")));
         assert!(Notice::TooManySupporting.message().contains(&format!(" {MAX_SUPPORTING_FILES} ")));
+        let reason = crate::account::admin::MAX_REASON_CHARS;
+        assert!(Notice::ReasonTooLong.message().contains(&format!(" {reason} ")));
         let file_mb = MAX_FILE_BYTES / 1024 / 1024;
         assert!(Notice::FileTooBig.message().contains(&format!(" {file_mb} MB")));
     }

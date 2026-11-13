@@ -279,7 +279,7 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         // One app: Support and Admins.
         let path = format!("{user}/apps/{}/sign-out", t.grant);
         let done = format!("{user}?notice=app_signed_out");
-        expect_post(&site, (who, &cookie), &path, "", false, &user, &done).await;
+        expect_post(&site, (who, &cookie), &path, "reason=Lost+phone", false, &user, &done).await;
         assert_eq!(grant_revoked(&site.db, t.grant).await, who.may(false), "{who:?}");
 
         // Everywhere: Support and Admins.
@@ -471,7 +471,7 @@ async fn support_cannot_sign_an_admin_out(db: PgPool) {
         let page = text(site.get(&user, &support).await).await;
         assert!(!page.contains(&format!("action=\"{user}/sign-out\"")), "{page}");
     }
-    let response = site.post(&format!("/staff/users/{boss}/apps/{grant}/sign-out"), &support, "").await;
+    let response = site.post(&format!("/staff/users/{boss}/apps/{grant}/sign-out"), &support, "reason=Tidy").await;
     assert_eq!(location(&response), format!("/staff/users/{boss}?notice=admin_only"));
     assert!(!grant_revoked(&site.db, grant).await);
     assert_eq!(live_sessions(&site.db, boss).await, 1);
@@ -634,4 +634,89 @@ async fn staff_cannot_read_the_reasons_about_themselves(db: PgPool) {
     let history = text(site.get(&format!("/staff/users/{helper}"), &staff).await).await;
     assert!(history.contains("Known to the owner from the old office"), "{history}");
     assert!(history.contains("moved to carl@example.test"), "{history}");
+}
+
+/// Signing one app out needs a reason, like every other staff action, and
+/// leaves a line only when it ended a sign-in.
+#[sqlx::test(migrations = "./migrations")]
+async fn signing_one_app_out_needs_a_reason_and_says_when_nothing_changed(db: PgPool) {
+    let site = Site::new(db);
+    let (_, helper) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    app_token(&site.db, ana).await;
+    let grant: Uuid = sqlx::query_scalar("SELECT id FROM oauth_grants WHERE account_id = $1")
+        .bind(ana)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    let user = format!("/staff/users/{ana}");
+    let path = format!("{user}/apps/{grant}/sign-out");
+    for form in ["", "reason=+"] {
+        assert_eq!(location(&site.post(&path, &helper, form).await), format!("{user}?notice=reason_missing"));
+    }
+    assert!(!grant_revoked(&site.db, grant).await);
+    assert_eq!(
+        location(&site.post(&path, &helper, "reason=Lost+phone").await),
+        format!("{user}?notice=app_signed_out")
+    );
+    assert!(grant_revoked(&site.db, grant).await);
+    // Again, or a grant that is not this account's: nothing changed.
+    let again = site.post(&path, &helper, "reason=Lost+phone").await;
+    assert_eq!(location(&again), format!("{user}?notice=app_already_signed_out"));
+    let missing = site.post(&format!("{user}/apps/{}/sign-out", Uuid::new_v4()), &helper, "reason=x").await;
+    assert_eq!(location(&missing), format!("{user}?notice=app_already_signed_out"));
+    let lines = account_audit_lines(&site.db, ana).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!((lines[0].0.as_str(), lines[0].5.as_deref()), ("app_signed_out", Some("Lost phone")));
+}
+
+/// Reasons are 500 characters at most, as on the page; a role change to
+/// the same role says nothing changed; pausing one's own TIN says so.
+#[sqlx::test(migrations = "./migrations")]
+async fn reasons_are_short_and_no_op_or_own_actions_say_so(db: PgPool) {
+    let site = Site::new(db);
+    let (boss, boss_cookie) = site.staff_with_role("boss@example.test", "admin").await;
+    let (ana, _) = site.staff_with_role("ana@example.test", "support").await;
+    let unverified = add_claim(&site.db, ana, "000123451", "unverified").await;
+    let active = add_claim(&site.db, ana, "000123452", "approved").await;
+    let pending = add_claim(&site.db, ana, "000123453", "pending").await;
+    let long = "a".repeat(501);
+    let user = format!("/staff/users/{ana}");
+    for (path, form, back) in [
+        (format!("{user}/ban"), format!("reason={long}"), user.clone()),
+        (format!("{user}/sign-out"), format!("reason={long}"), user.clone()),
+        (format!("{user}/role"), format!("role=none&reason={long}"), user.clone()),
+        (format!("/staff/claims/{active}/pause"), format!("reason={long}"), format!("/staff/claims/{active}")),
+        (format!("/staff/claims/{active}/revoke"), format!("reason={long}"), format!("/staff/claims/{active}")),
+        (
+            format!("/staff/claims/{unverified}/activate"),
+            format!("reason={long}"),
+            format!("/staff/claims/{unverified}"),
+        ),
+        (format!("/staff/claims/{unverified}/delete"), format!("reason={long}"), format!("/staff/claims/{unverified}")),
+        (
+            format!("/staff/claims/{pending}/decision"),
+            format!("decision=reject&note={long}"),
+            format!("/staff/claims/{pending}"),
+        ),
+    ] {
+        let response = site.post(&path, &boss_cookie, &form).await;
+        assert_eq!(location(&response), format!("{back}?notice=reason_too_long"), "{path}");
+    }
+    assert!(account_audit_lines(&site.db, ana).await.is_empty());
+    assert!(claim_audit_lines(&site.db, ana).await.is_empty());
+    // 500 is fine.
+    let response =
+        site.post(&format!("/staff/claims/{active}/pause"), &boss_cookie, &format!("reason={}", "a".repeat(500))).await;
+    assert_eq!(location(&response), format!("/staff/claims/{active}?notice=tin_paused"));
+
+    let response = site.post(&format!("{user}/role"), &boss_cookie, "role=support&reason=Again").await;
+    assert_eq!(location(&response), format!("{user}?notice=role_unchanged"));
+    assert!(account_audit_lines(&site.db, ana).await.is_empty());
+
+    let own = add_claim(&site.db, boss, "000123454", "approved").await;
+    let response = site.post(&format!("/staff/claims/{own}/pause"), &boss_cookie, "reason=Check").await;
+    assert_eq!(location(&response), format!("/staff/claims/{own}?notice=own_tin_pause"));
+    let response = site.post(&format!("/staff/claims/{own}/resume"), &boss_cookie, "reason=Check").await;
+    assert_eq!(location(&response), format!("/staff/claims/{own}?notice=own_tin_pause"));
 }

@@ -38,10 +38,24 @@ async fn lock_account(tx: &mut Transaction<'_, Postgres>, account_id: Uuid) -> R
     Ok(Target { id, email, role, banned })
 }
 
-/// The trimmed reason, or the notice asking for one.
-pub(crate) fn required_reason(reason: &str) -> Result<String, DecideError> {
+/// The longest reason or note staff may write, as the pages' `maxlength`.
+pub const MAX_REASON_CHARS: usize = 500;
+
+/// A staff reason, trimmed: required, and [`MAX_REASON_CHARS`] at most.
+pub(crate) fn reason_text(reason: &str) -> Result<String, Notice> {
     let reason = reason.trim();
-    if reason.is_empty() { Err(DecideError::Refused(Notice::ReasonMissing)) } else { Ok(reason.to_owned()) }
+    if reason.is_empty() {
+        Err(Notice::ReasonMissing)
+    } else if reason.chars().count() > MAX_REASON_CHARS {
+        Err(Notice::ReasonTooLong)
+    } else {
+        Ok(reason.to_owned())
+    }
+}
+
+/// [`reason_text`], as a refusal.
+pub(crate) fn required_reason(reason: &str) -> Result<String, DecideError> {
+    reason_text(reason).map_err(DecideError::Refused)
 }
 
 /// Where an account change came from: the staff pages or the seed tool.
@@ -111,7 +125,7 @@ pub async fn change_role(
     }
     let old = target.role.as_deref().and_then(Role::parse);
     if old == role {
-        return Ok(Notice::RoleChanged);
+        return Ok(Notice::RoleUnchanged);
     }
     // Under the lock, so a demotion running at the same time has committed
     // and is counted.
@@ -175,8 +189,8 @@ pub async fn sign_out(
     Ok(Notice::SignedOutEverywhere)
 }
 
-/// Staff end one app's or agent's sign-in on the account. The reason is
-/// optional.
+/// Staff end one app's or agent's sign-in on the account, saying why. A
+/// line is written only when a sign-in was ended.
 pub async fn sign_out_app(
     db: &PgPool,
     config: &Config,
@@ -185,7 +199,7 @@ pub async fn sign_out_app(
     grant_id: Uuid,
     reason: &str,
 ) -> Result<Notice, DecideError> {
-    let reason = Some(reason.trim()).filter(|reason| !reason.is_empty());
+    let reason = required_reason(reason)?;
     let mut tx = db.begin().await?;
     let target = lock_account(&mut tx, account_id).await?;
     if !may_sign_out(config, actor, &target) {
@@ -200,17 +214,18 @@ pub async fn sign_out_app(
     .bind(target.id)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some(client) = &client {
-        let line = Line {
-            account_id: target.id,
-            action: "app_signed_out",
-            old_value: None,
-            new_value: Some(client),
-            source: Source::Web,
-            reason,
-        };
-        audit(&mut tx, &actor.account, line).await?;
-    }
+    let Some(client) = client else {
+        return Ok(Notice::AppAlreadySignedOut);
+    };
+    let line = Line {
+        account_id: target.id,
+        action: "app_signed_out",
+        old_value: None,
+        new_value: Some(&client),
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
     tx.commit().await?;
     Ok(Notice::AppSignedOut)
 }

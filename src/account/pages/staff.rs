@@ -1259,6 +1259,7 @@ async fn connected_app(account_id: Uuid, app: AppRow, may_sign_out: bool) -> Res
             </span>
             if may_sign_out {
                 <form method="post" action=(action) data-confirm=(format!("Sign {name} out?")) data-confirm-detail="It loses access to this account until the person connects it again." data-confirm-label=(if app.is_agent() { "Remove" } else { "Sign out" }) data-confirm-tone="danger">
+                    reason_field()
                     <button class="btn btn-ghost btn-small" type="submit">(if app.is_agent() { "Remove" } else { "Sign out" })</button>
                 </form>
             }

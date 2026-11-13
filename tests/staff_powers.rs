@@ -516,3 +516,77 @@ async fn staff_pages_show_tins_saved_without_papers(db: PgPool) {
     );
     assert!(!history.contains("a unverified"), "{history}");
 }
+
+/// Every Admin action checks its actor again inside its own transaction:
+/// one whose page check passed just before the actor was demoted does
+/// nothing.
+#[sqlx::test(migrations = "./migrations")]
+async fn every_admin_action_rechecks_its_actor_in_its_transaction(db: PgPool) {
+    use buwiz_cloud::claims::{self, By};
+    let site = Site::with_admins(db, &[]);
+    let (db, config, store) = (&site.db, &site.state.config, &site.state.documents);
+    let (boss, _) = site.staff_with_role("boss@example.test", "admin").await;
+    site.staff_with_role("other@example.test", "admin").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (dan, _) = site.person("dan@example.test").await;
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = $2, ban_reason = 'Fraud' WHERE id = $1")
+        .bind(dan)
+        .bind(boss)
+        .execute(db)
+        .await
+        .unwrap();
+    let unverified = add_claim(db, ana, "000123451", "unverified").await;
+    let deletable = add_claim(db, ana, "000123452", "unverified").await;
+    let active = add_claim(db, ana, "000123453", "approved").await;
+    let revocable = add_claim(db, ana, "000123454", "approved").await;
+    let paused = add_claim(db, ana, "000123455", "approved").await;
+    sqlx::query("UPDATE tin_claims SET paused_at = now(), paused_by = $2, pause_reason = 'Check' WHERE id = $1")
+        .bind(paused)
+        .bind(boss)
+        .execute(db)
+        .await
+        .unwrap();
+    // The page saw an Admin; then another Admin demoted boss.
+    let staff = as_staff(&site, boss).await;
+    assert_eq!(staff.role, Role::Admin);
+    sqlx::query("UPDATE accounts SET role = 'support' WHERE id = $1").bind(boss).execute(db).await.unwrap();
+
+    let admin_only = |outcome: Result<Notice, DecideError>| match outcome {
+        Err(DecideError::Refused(Notice::AdminOnly)) => {}
+        other => panic!("not refused: {other:?}"),
+    };
+    let actor = &staff.account;
+    admin_only(admin::ban(db, config, &staff, ana, "Abuse").await);
+    admin_only(admin::unban(db, config, &staff, dan, "Sorted").await);
+    admin_only(admin::mark_test(db, config, &staff, ana, true, "Trial").await);
+    admin_only(claims::activate_without_papers(db, config, store, unverified, actor, "Known").await);
+    admin_only(claims::pause(db, config, active, actor, "Check").await);
+    admin_only(claims::resume(db, config, paused, actor, "Ok").await);
+    admin_only(claims::delete(db, store, deletable, actor, By::Staff { reason: "Typo", config }).await);
+    admin_only(claims::end_ownership(db, revocable, actor, By::Staff { reason: "Wrong owner", config }).await);
+
+    // Nothing changed, and nothing was written to the history.
+    let state: (bool, bool, bool) = sqlx::query_as(
+        "SELECT (SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1), (SELECT test_account FROM accounts WHERE id = $1),
+                (SELECT banned_at IS NOT NULL FROM accounts WHERE id = $2)",
+    )
+    .bind(ana)
+    .bind(dan)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(state, (false, false, true));
+    for (claim, status) in
+        [(unverified, "unverified"), (deletable, "unverified"), (active, "approved"), (revocable, "approved")]
+    {
+        assert_eq!(site.claim_status(claim).await, status);
+    }
+    let still_paused: bool = sqlx::query_scalar("SELECT paused_at IS NOT NULL FROM tin_claims WHERE id = $1")
+        .bind(paused)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(still_paused);
+    assert!(claim_audit_lines(db, ana).await.is_empty());
+    assert!(account_audit_lines(db, ana).await.is_empty() && account_audit_lines(db, dan).await.is_empty());
+}

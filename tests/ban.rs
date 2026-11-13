@@ -191,3 +191,144 @@ async fn an_admin_cannot_be_banned_nor_oneself(db: PgPool) {
     let page = text(site.get(&format!("/staff/users/{other}"), &boss_cookie).await).await;
     assert!(page.contains("An admin can't be banned. Change the role first."), "{page}");
 }
+
+/// Runs `request` while a ban of `account` is under way (its row changed,
+/// not committed), and commits the ban once the request waits for it (or
+/// after two seconds if it never does).
+async fn during_a_ban<F: std::future::Future<Output = axum::response::Response>>(
+    site: &Site,
+    account: Uuid,
+    by: Uuid,
+    request: F,
+) -> axum::response::Response {
+    let mut ban = site.db.begin().await.unwrap();
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = $2, ban_reason = 'Fraud' WHERE id = $1")
+        .bind(account)
+        .bind(by)
+        .execute(&mut *ban)
+        .await
+        .unwrap();
+    let commit = async {
+        for _ in 0..40 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        ban.commit().await.unwrap();
+    };
+    let (response, ()) = tokio::join!(request, commit);
+    response
+}
+
+async fn lift(db: &PgPool, account: Uuid) {
+    sqlx::query("UPDATE accounts SET banned_at = NULL, banned_by = NULL, ban_reason = NULL WHERE id = $1")
+        .bind(account)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// A ban that commits while a request for the account is under way wins:
+/// activation, approval, an app's sign-in and an agent's consent each lock
+/// the account and look again at the moment they write.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_ban_committed_during_a_request_wins(db: PgPool) {
+    let site = Site::new(db);
+    let (staff_id, staff) = site.person(STAFF).await;
+    let (ana, ana_cookie) = site.person("ana@example.test").await;
+    let unverified = add_claim(&site.db, ana, "000123453", "unverified").await;
+    let pending = add_claim(&site.db, ana, "000123454", "pending").await;
+
+    let path = format!("/staff/claims/{unverified}/activate");
+    let activate = site.post(&path, &staff, "reason=Known");
+    let response = during_a_ban(&site, ana, staff_id, activate).await;
+    assert_eq!(location(&response), format!("/staff/claims/{unverified}?notice=claimant_banned"));
+    assert_eq!(site.claim_status(unverified).await, "unverified");
+    lift(&site.db, ana).await;
+
+    let path = format!("/staff/claims/{pending}/decision");
+    let approve = site.post(&path, &staff, "decision=approve");
+    let response = during_a_ban(&site, ana, staff_id, approve).await;
+    assert_eq!(location(&response), format!("/staff/claims/{pending}?notice=claimant_banned"));
+    assert_eq!(site.claim_status(pending).await, "pending");
+    lift(&site.db, ana).await;
+
+    // An app's sign-in: the ban ends any approved one, and no new one is
+    // approved for the banned account.
+    sqlx::query(
+        "INSERT INTO device_authorizations (client_id, device_code_hash, user_code, interval_seconds, expires_at)
+         VALUES ('buwiz-desktop', $1, 'BCDF-GHJK', 5, now() + interval '10 minutes')",
+    )
+    .bind(buwiz_cloud::crypto::hash("bwd_test-device-code"))
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let device = site.post("/device/decision", &ana_cookie, "user_code=BCDF-GHJK&decision=approve");
+    let response = during_a_ban(&site, ana, staff_id, device).await;
+    assert_eq!(location(&response), "/device?notice=account_banned");
+    let approved: i64 = sqlx::query_scalar("SELECT count(*) FROM device_authorizations WHERE decision IS NOT NULL")
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(approved, 0);
+    lift(&site.db, ana).await;
+
+    // An agent's consent.
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+         VALUES ('agent_test', 'Test agent', ARRAY['https://agent.example.test/cb'])",
+    )
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let ana_cookie = site.person_session(ana).await;
+    let form = format!(
+        "client_id=agent_test&response_type=code&code_challenge={}&code_challenge_method=S256&decision=approve",
+        "a".repeat(43)
+    );
+    let consent = site.post("/oauth/authorize/decision", &ana_cookie, &form);
+    let response = during_a_ban(&site, ana, staff_id, consent).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{}", location(&response));
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_codes").fetch_one(&site.db).await.unwrap();
+    assert_eq!(codes, 0);
+}
+
+/// Should a sign-in for a banned account be approved anyway, no token is
+/// issued for it.
+#[sqlx::test(migrations = "./migrations")]
+async fn no_token_is_issued_to_a_banned_account(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person("ana@example.test").await;
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Fraud' WHERE id = $1")
+        .bind(ana)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_authorizations
+             (client_id, device_code_hash, user_code, interval_seconds, expires_at, account_id, decision)
+         VALUES ('buwiz-desktop', $1, 'BCDF-GHJK', 5, now() + interval '10 minutes', $2, 'approved')",
+    )
+    .bind(buwiz_cloud::crypto::hash("bwd_test-device-code"))
+    .bind(ana)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let request = Request::post("/auth/device/poll")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"client_id":"buwiz-desktop","device_code":"bwd_test-device-code"}"#))
+        .unwrap();
+    let response = site.send(request).await;
+    let status = response.status();
+    let body = text(response).await;
+    assert!(status.is_client_error() && body.contains("access_denied"), "{status} {body}");
+    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_grants").fetch_one(&site.db).await.unwrap();
+    assert_eq!(grants, 0);
+}

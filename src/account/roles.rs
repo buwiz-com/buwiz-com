@@ -169,6 +169,17 @@ pub async fn recheck(
     Ok(row.and_then(|(email, role, banned)| of(config, &email, role.as_deref(), banned)).map(|(role, _)| role))
 }
 
+/// Whether `account_id` may use `power` as the database stands now
+/// ([`recheck`]).
+pub async fn may(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &Config,
+    account_id: uuid::Uuid,
+    power: Power,
+) -> sqlx::Result<bool> {
+    Ok(recheck(tx, config, account_id).await?.is_some_and(|role| role.can(power)))
+}
+
 /// Serialises every change to roles and bans (the staff pages and the seed
 /// tool) for the rest of the transaction, so two Admins demoting each other
 /// at once cannot both pass the "someone stays Admin" check.

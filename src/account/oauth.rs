@@ -166,6 +166,11 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
+            // No new sign-in for a banned account, whatever was approved.
+            if banned_now(&mut tx, account_id).await? {
+                tx.commit().await?;
+                return Err(OAuthError::new("access_denied", "this account is banned").into());
+            }
             let tokens = issue_grant(&mut tx, account_id, client_id, client_scope(client_id)).await?;
             tx.commit().await?;
             return Ok(tokens);
@@ -193,8 +198,29 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
     Err(OAuthError::new("authorization_pending", "waiting for the person to approve").into())
 }
 
-/// The person on the account site approves or declines a code.
-pub async fn decide_device(db: &PgPool, user_code: &str, account_id: Uuid, approve: bool) -> sqlx::Result<bool> {
+/// What deciding an app's sign-in came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeviceDecided {
+    Done,
+    /// The code is wrong, expired or already decided.
+    Gone,
+    /// The account was banned meanwhile.
+    Banned,
+}
+
+/// The person on the account site approves or declines a code. The account
+/// is locked and checked at the moment of writing, so a ban that commits
+/// meanwhile wins (and a ban after this ends the sign-in it approved).
+pub async fn decide_device(
+    db: &PgPool,
+    user_code: &str,
+    account_id: Uuid,
+    approve: bool,
+) -> sqlx::Result<DeviceDecided> {
+    let mut tx = db.begin().await?;
+    if banned_now(&mut tx, account_id).await? {
+        return Ok(DeviceDecided::Banned);
+    }
     let decision = if approve { "approved" } else { "denied" };
     let updated = sqlx::query(
         "UPDATE device_authorizations SET decision = $1, account_id = $2
@@ -203,9 +229,20 @@ pub async fn decide_device(db: &PgPool, user_code: &str, account_id: Uuid, appro
     .bind(decision)
     .bind(account_id)
     .bind(user_code)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
-    Ok(updated.rows_affected() == 1)
+    tx.commit().await?;
+    Ok(if updated.rows_affected() == 1 { DeviceDecided::Done } else { DeviceDecided::Gone })
+}
+
+/// Whether the account is banned, read with a share lock so a ban under
+/// way is waited for and seen.
+pub(crate) async fn banned_now(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    let banned: Option<bool> = sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR SHARE")
+        .bind(account_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(banned.unwrap_or(true))
 }
 
 /// The app asking to sign in, if `user_code` is still open.

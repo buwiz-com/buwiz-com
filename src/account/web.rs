@@ -569,11 +569,12 @@ async fn device_decision(
     };
     let approve = form.decision == "approve";
     match oauth::decide_device(&state.db, &user_code, account.id, approve).await {
-        Ok(true) => {
+        Ok(oauth::DeviceDecided::Done) => {
             let notice = if approve { Notice::DeviceApproved } else { Notice::DeviceDenied };
             see_other(link("/device", Some(notice), &[]))
         }
-        Ok(false) => see_other(link("/device", Some(Notice::DeviceInvalid), &[])),
+        Ok(oauth::DeviceDecided::Gone) => see_other(link("/device", Some(Notice::DeviceInvalid), &[])),
+        Ok(oauth::DeviceDecided::Banned) => see_other(link("/device", Some(Notice::AccountBanned), &[])),
         Err(error) => internal(error),
     }
 }
@@ -966,7 +967,7 @@ async fn staff_delete_claim(
         Ok(staff) => staff.account,
         Err(response) => return response,
     };
-    let by = By::Staff { reason: &form.reason };
+    let by = By::Staff { reason: &form.reason, config: &state.config };
     match claims::delete(&state.db, &state.documents, claim_id, &staff, by).await {
         Ok(notice) => see_other(link("/staff", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
@@ -989,7 +990,8 @@ async fn revoke_claim(
         Ok(staff) => staff.account,
         Err(response) => return response,
     };
-    match claims::end_ownership(&state.db, claim_id, &staff, By::Staff { reason: &form.reason }).await {
+    let by = By::Staff { reason: &form.reason, config: &state.config };
+    match claims::end_ownership(&state.db, claim_id, &staff, by).await {
         Ok(notice) | Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }
@@ -1010,8 +1012,15 @@ async fn activate_claim(
         Ok(staff) => staff,
         Err(response) => return response,
     };
-    let outcome =
-        claims::activate_without_papers(&state.db, &state.documents, claim_id, &staff.account, &form.reason).await;
+    let outcome = claims::activate_without_papers(
+        &state.db,
+        &state.config,
+        &state.documents,
+        claim_id,
+        &staff.account,
+        &form.reason,
+    )
+    .await;
     staff_outcome(&back_to, outcome)
 }
 
@@ -1030,7 +1039,7 @@ async fn pause_claim(
         Ok(staff) => staff,
         Err(response) => return response,
     };
-    staff_outcome(&back_to, claims::pause(&state.db, claim_id, &staff.account, &form.reason).await)
+    staff_outcome(&back_to, claims::pause(&state.db, &state.config, claim_id, &staff.account, &form.reason).await)
 }
 
 /// An Admin resumes a paused TIN, with a reason.
@@ -1048,7 +1057,7 @@ async fn resume_claim(
         Ok(staff) => staff,
         Err(response) => return response,
     };
-    staff_outcome(&back_to, claims::resume(&state.db, claim_id, &staff.account, &form.reason).await)
+    staff_outcome(&back_to, claims::resume(&state.db, &state.config, claim_id, &staff.account, &form.reason).await)
 }
 
 /// Support or an Admin confirms an automatic activation after checking its
@@ -1158,7 +1167,7 @@ async fn unban_user(
         Ok(staff) => staff,
         Err(response) => return response,
     };
-    staff_outcome(&back_to, admin::unban(&state.db, &staff, account_id, &form.reason).await)
+    staff_outcome(&back_to, admin::unban(&state.db, &state.config, &staff, account_id, &form.reason).await)
 }
 
 #[derive(Deserialize)]
@@ -1189,7 +1198,7 @@ async fn mark_test(
         "off" => false,
         _ => return (StatusCode::BAD_REQUEST, "test must be on or off").into_response(),
     };
-    staff_outcome(&back_to, admin::mark_test(&state.db, &staff, account_id, test, &form.reason).await)
+    staff_outcome(&back_to, admin::mark_test(&state.db, &state.config, &staff, account_id, test, &form.reason).await)
 }
 
 #[derive(Deserialize)]

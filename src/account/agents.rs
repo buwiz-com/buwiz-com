@@ -22,6 +22,7 @@ use time::{Duration, OffsetDateTime};
 use url::Url;
 use uuid::Uuid;
 
+use crate::account::notice::Notice;
 use crate::account::oauth::{self, SCOPE_MCP, TokenResponse};
 use crate::base::config::Config;
 use crate::base::crypto;
@@ -276,8 +277,19 @@ pub fn problem_redirect(problem: &AuthorizeProblem, issuer: &str) -> Option<Stri
     Some(redirect_with(redirect_uri, &params))
 }
 
-/// The person approved: store a one-time code and send them back.
-async fn approve(db: &PgPool, request: &AuthorizeRequest, account_id: Uuid, issuer: &str) -> sqlx::Result<String> {
+/// The person approved: store a one-time code and send them back. `None`
+/// when the account was banned meanwhile: it is locked and checked at the
+/// moment of writing.
+async fn approve(
+    db: &PgPool,
+    request: &AuthorizeRequest,
+    account_id: Uuid,
+    issuer: &str,
+) -> sqlx::Result<Option<String>> {
+    let mut tx = db.begin().await?;
+    if oauth::banned_now(&mut tx, account_id).await? {
+        return Ok(None);
+    }
     let code = crypto::new_token("bwc_");
     sqlx::query(
         "INSERT INTO oauth_codes (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at)
@@ -290,13 +302,14 @@ async fn approve(db: &PgPool, request: &AuthorizeRequest, account_id: Uuid, issu
     .bind(&request.code_challenge)
     .bind(SCOPE_MCP)
     .bind(OffsetDateTime::now_utc() + CODE_TTL)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     let mut params = vec![("code", code.as_str()), ("iss", issuer)];
     if let Some(state) = &request.state {
         params.push(("state", state));
     }
-    Ok(redirect_with(&request.redirect_uri, &params))
+    Ok(Some(redirect_with(&request.redirect_uri, &params)))
 }
 
 /// `POST /oauth/authorize/decision`: the consent form.
@@ -334,7 +347,8 @@ pub async fn decide(
         return Redirect::to(&redirect_with(&request.redirect_uri, &params)).into_response();
     }
     match approve(&state.db, &request, account.id, issuer).await {
-        Ok(location) => {
+        Ok(None) => (StatusCode::FORBIDDEN, Notice::AccountBanned.message()).into_response(),
+        Ok(Some(location)) => {
             tracing::info!(client_id = %request.client_id, account = %account.id, "agent approved");
             Redirect::to(&location).into_response()
         }
@@ -380,6 +394,11 @@ pub async fn redeem_code(
     if !valid {
         tx.commit().await?;
         return Err(invalid());
+    }
+    // No new sign-in for a banned account, whatever was approved.
+    if oauth::banned_now(&mut tx, account_id).await? {
+        tx.commit().await?;
+        return Err(OAuthFailure::from(OAuthError::new("access_denied", "this account is banned")));
     }
     let tokens = oauth::issue_grant(&mut tx, account_id, client_id, SCOPE_MCP).await?;
     tx.commit().await?;

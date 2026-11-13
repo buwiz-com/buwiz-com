@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::account::accounts::{self, Account};
 use crate::account::claims::DecideError;
 use crate::account::notice::Notice;
-use crate::account::roles::{self, Role, Staff};
+use crate::account::roles::{self, Power, Role, Staff};
 use crate::base::config::Config;
 
 /// An account locked for a change.
@@ -121,7 +121,7 @@ pub async fn change_role(
     }
     // The page checked the actor's own role before this; it may have been
     // taken away since.
-    if !still_admin(&mut tx, config, &actor.account).await? {
+    if !roles::may(&mut tx, config, actor.account.id, Power::ChangeRole).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
     let new = role.map(Role::as_str);
@@ -138,18 +138,6 @@ pub async fn change_role(
     tx.commit().await?;
     tracing::info!(account_id = %target.id, actor = %actor.account.id, role = new, "role changed");
     Ok(Notice::RoleChanged)
-}
-
-/// Whether `account` is an Admin as the database stands now.
-async fn still_admin(tx: &mut Transaction<'_, Postgres>, config: &Config, account: &Account) -> sqlx::Result<bool> {
-    let row: Option<(String, Option<String>, bool)> =
-        sqlx::query_as("SELECT email, role, banned_at IS NOT NULL FROM accounts WHERE id = $1")
-            .bind(account.id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    Ok(row
-        .and_then(|(email, role, banned)| roles::of(config, &email, role.as_deref(), banned))
-        .is_some_and(|(role, _)| role == Role::Admin))
 }
 
 /// Support may sign anyone out but an Admin; an Admin anyone.
@@ -244,6 +232,9 @@ pub async fn ban(
     }
     let mut tx = db.begin().await?;
     roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::Ban).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     let target = lock_account(&mut tx, account_id).await?;
     if roles::in_server_setting(config, &target.email) {
         return Err(DecideError::Refused(Notice::RoleFromServer));
@@ -276,10 +267,19 @@ pub async fn ban(
 }
 
 /// An Admin lifts a ban. The account's app sign-ins work again at once.
-pub async fn unban(db: &PgPool, actor: &Staff, account_id: Uuid, reason: &str) -> Result<Notice, DecideError> {
+pub async fn unban(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    account_id: Uuid,
+    reason: &str,
+) -> Result<Notice, DecideError> {
     let reason = required_reason(reason)?;
     let mut tx = db.begin().await?;
     roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::Ban).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     let target = lock_account(&mut tx, account_id).await?;
     if !target.banned {
         return Ok(Notice::BanLifted);
@@ -306,6 +306,7 @@ pub async fn unban(db: &PgPool, actor: &Staff, account_id: Uuid, reason: &str) -
 /// Only staff see it; sends work as usual.
 pub async fn mark_test(
     db: &PgPool,
+    config: &Config,
     actor: &Staff,
     account_id: Uuid,
     test: bool,
@@ -314,6 +315,9 @@ pub async fn mark_test(
     let reason = required_reason(reason)?;
     let notice = if test { Notice::TestMarked } else { Notice::TestUnmarked };
     let mut tx = db.begin().await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::MarkTest).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     let target = lock_account(&mut tx, account_id).await?;
     let labelled: bool = sqlx::query_scalar("SELECT test_account FROM accounts WHERE id = $1")
         .bind(target.id)

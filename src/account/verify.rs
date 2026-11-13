@@ -403,7 +403,7 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
              c.branch_code, c.registered_name, a.banned_at IS NOT NULL AS banned
          FROM claim_documents d JOIN tin_claims c ON c.id = d.claim_id JOIN accounts a ON a.id = c.account_id
          WHERE d.id = $1
-         FOR UPDATE OF c",
+         FOR UPDATE OF c FOR SHARE OF a",
     )
     .bind(document_id)
     .fetch_optional(&mut *tx)

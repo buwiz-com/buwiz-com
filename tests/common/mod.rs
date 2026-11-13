@@ -126,6 +126,12 @@ impl Site {
         (id, format!("buwiz_session={token}"))
     }
 
+    /// A new website session for an existing account: its cookie.
+    pub async fn person_session(&self, id: Uuid) -> String {
+        let token = accounts::start_session(&self.db, id).await.unwrap();
+        format!("buwiz_session={token}")
+    }
+
     /// A signed-in account with the stored staff role `role` (`admin`,
     /// `support`).
     pub async fn staff_with_role(&self, email: &str, role: &str) -> (Uuid, String) {

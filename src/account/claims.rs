@@ -931,9 +931,11 @@ pub async fn was_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, tin: &Ti
     .await
 }
 
-/// Whether the account is banned. A banned account gets no active TIN.
+/// Whether the account is banned, read with a share lock: a ban under way
+/// commits first and is seen, or waits until this transaction ends. A
+/// banned account gets no active TIN.
 async fn is_banned(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
-    sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1")
+    sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR SHARE")
         .bind(account_id)
         .fetch_one(&mut **tx)
         .await
@@ -948,6 +950,7 @@ async fn is_banned(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: U
 /// power ([`crate::account::roles::Power::ActivateWithoutPapers`]).
 pub async fn activate_without_papers(
     db: &PgPool,
+    config: &Config,
     store: &DocumentStore,
     claim_id: Uuid,
     actor: &Account,
@@ -961,6 +964,9 @@ pub async fn activate_without_papers(
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
+    if !roles::may(&mut tx, config, actor.id, Power::ActivateWithoutPapers).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if !matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix") {
         return Err(DecideError::Refused(Notice::AlreadyDecided));
     }
@@ -1022,10 +1028,26 @@ async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_i
     Ok(keys.into_iter().flatten().collect())
 }
 
-/// Who ends a claim: its owner, or staff, who must say why.
+/// Who ends a claim: its owner, or staff, who must say why (and whose
+/// power is checked again inside the transaction, against `config`).
 pub enum By<'a> {
     Owner,
-    Staff { reason: &'a str },
+    Staff { reason: &'a str, config: &'a Config },
+}
+
+impl By<'_> {
+    /// For staff, whether the actor still has `power` now.
+    async fn may(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        actor: &Account,
+        power: Power,
+    ) -> sqlx::Result<bool> {
+        match self {
+            Self::Owner => Ok(true),
+            Self::Staff { config, .. } => roles::may(tx, config, actor.id, power).await,
+        }
+    }
 }
 
 /// Statuses of a claim that never became an active TIN, so nothing refers
@@ -1062,7 +1084,7 @@ fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>) -> Result<Option<St
         By::Owner if claim.account_id != actor.id => Err(Notice::ClaimMissing),
         By::Owner => Ok(None),
         By::Staff { .. } if claim.account_id == actor.id => Err(Notice::OwnClaim),
-        By::Staff { reason } => {
+        By::Staff { reason, .. } => {
             let reason = reason.trim();
             if reason.is_empty() { Err(Notice::ReasonMissing) } else { Ok(Some(reason.to_owned())) }
         }
@@ -1110,6 +1132,9 @@ pub async fn delete(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !by.may(&mut tx, actor, Power::DeleteClaim).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if !DELETABLE.contains(&claim.status.as_str()) {
         return Err(DecideError::Refused(Notice::ClaimNotDeletable));
     }
@@ -1139,6 +1164,9 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !by.may(&mut tx, actor, Power::EndOwnership).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if claim.status != "approved" {
         return Err(DecideError::Refused(Notice::TinNotActive));
     }
@@ -1178,12 +1206,22 @@ async fn is_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uui
 /// An Admin pauses an active TIN: it stays owned (nobody else can be
 /// approved for it) but nothing sends until it is resumed. The owner reads
 /// the reason on My TINs. Not on one's own TIN, like ending an ownership.
-pub async fn pause(db: &PgPool, claim_id: Uuid, actor: &Account, reason: &str) -> Result<Notice, DecideError> {
+pub async fn pause(
+    db: &PgPool,
+    config: &Config,
+    claim_id: Uuid,
+    actor: &Account,
+    reason: &str,
+) -> Result<Notice, DecideError> {
     let mut tx = db.begin().await?;
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    let reason = check_actor(&claim, actor, &By::Staff { reason }).map_err(DecideError::Refused)?;
+    let by = By::Staff { reason, config };
+    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !by.may(&mut tx, actor, Power::Pause).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if claim.status != "approved" || is_paused(&mut tx, claim_id).await? {
         return Err(DecideError::Refused(Notice::NotPausable));
     }
@@ -1200,12 +1238,22 @@ pub async fn pause(db: &PgPool, claim_id: Uuid, actor: &Account, reason: &str) -
 }
 
 /// An Admin resumes a paused TIN: it is exactly as before the pause.
-pub async fn resume(db: &PgPool, claim_id: Uuid, actor: &Account, reason: &str) -> Result<Notice, DecideError> {
+pub async fn resume(
+    db: &PgPool,
+    config: &Config,
+    claim_id: Uuid,
+    actor: &Account,
+    reason: &str,
+) -> Result<Notice, DecideError> {
     let mut tx = db.begin().await?;
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    let reason = check_actor(&claim, actor, &By::Staff { reason }).map_err(DecideError::Refused)?;
+    let by = By::Staff { reason, config };
+    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !by.may(&mut tx, actor, Power::Pause).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if claim.status != "approved" || !is_paused(&mut tx, claim_id).await? {
         return Err(DecideError::Refused(Notice::NotPaused));
     }

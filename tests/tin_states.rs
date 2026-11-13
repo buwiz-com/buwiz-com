@@ -607,9 +607,12 @@ async fn an_agent_hears_of_papers_sent_only_once_they_were(db: PgPool) {
     let papers = [("registered_name", Text("SYNTHETIC TAXPAYER")), ("tin_id", File("id.png", PNG))];
     let sent = site.upload(&format!("/tins/claims/{claim}/papers"), &cookie, &papers).await;
     assert_eq!(location(&sent), "/tins?notice=claim_submitted");
-    let submitted: i64 =
-        scalar_i64(&site.db, "SELECT extract(epoch FROM submitted_at)::bigint FROM tin_claims WHERE id = $1", claim)
-            .await;
+    let submitted: i64 = scalar_i64(
+        &site.db,
+        "SELECT floor(extract(epoch FROM submitted_at))::bigint FROM tin_claims WHERE id = $1",
+        claim,
+    )
+    .await;
     let listed = claims().await;
     assert_eq!(listed[0]["status"], "pending");
     assert_eq!(listed[0]["sent_at"], submitted, "{listed}");

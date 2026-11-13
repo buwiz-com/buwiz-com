@@ -461,7 +461,9 @@ async fn an_activation_nobody_confirms_in_30_days_is_paused_with_its_papers(db: 
     assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=auto_confirmed"));
     assert!(gate::own(&site.db, ana, &tin).await.unwrap().can_send());
     assert_eq!(papers(&site.db, claim).await, (0, 0));
-    let actions: Vec<String> = claim_audit_lines(&site.db, ana).await.into_iter().map(|line| line.0).collect();
+    let mut actions: Vec<String> = claim_audit_lines(&site.db, ana).await.into_iter().map(|line| line.0).collect();
+    // Confirming writes its two lines in one transaction, at one time.
+    actions[2..].sort();
     assert_eq!(actions, ["auto_activated", "paused", "auto_confirmed", "resumed"]);
 
     // A staff pause is the staff's: confirming leaves it.

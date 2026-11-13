@@ -370,6 +370,17 @@ pub async fn redeem_code(
 ) -> Result<TokenResponse, OAuthFailure> {
     let invalid = || OAuthFailure::from(OAuthError::new("invalid_grant", "the code is not valid"));
     let mut tx = db.begin().await?;
+    // The account before the code row, in the order a ban takes them (it
+    // locks the account, then ends the code rows). A code's account never
+    // changes, so the unlocked read names the same one.
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM oauth_codes WHERE code_hash = $1")
+        .bind(crypto::hash(code))
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(owner) = owner else {
+        return Err(invalid());
+    };
+    let banned = oauth::banned_now(&mut tx, owner).await?;
     let row: Option<(String, Uuid, String, String, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
         "SELECT client_id, account_id, redirect_uri, code_challenge, expires_at, used_at
          FROM oauth_codes WHERE code_hash = $1 FOR UPDATE",
@@ -387,6 +398,7 @@ pub async fn redeem_code(
     let verifier_ok = (43..=128).contains(&verifier.len())
         && URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == challenge;
     let valid = used_at.is_none()
+        && account_id == owner
         && expires_at > OffsetDateTime::now_utc()
         && code_client == client_id
         && code_redirect == redirect_uri
@@ -396,7 +408,7 @@ pub async fn redeem_code(
         return Err(invalid());
     }
     // No new sign-in for a banned account, whatever was approved.
-    if oauth::banned_now(&mut tx, account_id).await? {
+    if banned {
         tx.commit().await?;
         return Err(OAuthFailure::from(OAuthError::new("access_denied", "this account is banned")));
     }

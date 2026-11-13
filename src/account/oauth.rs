@@ -137,6 +137,19 @@ struct DeviceRow {
 async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> Result<TokenResponse, OAuthFailure> {
     known_client(client_id)?;
     let mut tx = db.begin().await?;
+    // The account before the code row, in the order a ban takes them (it
+    // locks the account, then ends the code rows): read who approved it
+    // without a lock, lock that account, then the row.
+    let approved_by: Option<Uuid> =
+        sqlx::query_scalar("SELECT account_id FROM device_authorizations WHERE device_code_hash = $1")
+            .bind(crypto::hash(device_code))
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+    let banned = match approved_by {
+        Some(account_id) => Some(banned_now(&mut tx, account_id).await?),
+        None => None,
+    };
     let row: Option<DeviceRow> = sqlx::query_as(
         "SELECT id, client_id, interval_seconds, expires_at, last_polled_at, account_id, decision, consumed_at
          FROM device_authorizations WHERE device_code_hash = $1 FOR UPDATE",
@@ -162,12 +175,18 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
             return Err(OAuthError::new("access_denied", "the sign-in was declined").into());
         }
         (Some("approved"), Some(account_id)) => {
+            // Approved after the first read: that account is not locked.
+            // Nothing was written; the app asks again at its next poll.
+            let Some(banned) = banned.filter(|_| approved_by == Some(account_id)) else {
+                tx.rollback().await?;
+                return Err(OAuthError::new("authorization_pending", "waiting for the person to approve").into());
+            };
             sqlx::query("UPDATE device_authorizations SET consumed_at = now() WHERE id = $1")
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
             // No new sign-in for a banned account, whatever was approved.
-            if banned_now(&mut tx, account_id).await? {
+            if banned {
                 tx.commit().await?;
                 return Err(OAuthError::new("access_denied", "this account is banned").into());
             }

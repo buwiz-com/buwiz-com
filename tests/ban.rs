@@ -332,3 +332,117 @@ async fn no_token_is_issued_to_a_banned_account(db: PgPool) {
     let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_grants").fetch_one(&site.db).await.unwrap();
     assert_eq!(grants, 0);
 }
+
+/// Waits until `n` backends of this test's database wait for a lock (at
+/// most five seconds).
+async fn until_waiting(db: &PgPool, n: i64) {
+    for _ in 0..100 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap();
+        if waiting >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{n} backends never waited for a lock");
+}
+
+/// A real ban and a sign-in completing at once: the ban has the account
+/// locked and is about to end the sign-ins not yet picked up, while the
+/// app (or agent) redeems its code. Both lock the account before the code,
+/// so neither deadlocks: the ban goes through and no token is issued.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_ban_and_a_sign_in_completing_at_once_do_not_deadlock(db: PgPool) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let site = Site::new(db);
+    let (staff_id, _) = site.person(STAFF).await;
+    let staff_account = buwiz_cloud::accounts::Account { id: staff_id, email: STAFF.into() };
+    let staff =
+        buwiz_cloud::account::roles::staff(&site.db, &site.state.config, &staff_account).await.unwrap().unwrap();
+    let (ana, _) = site.person("ana@example.test").await;
+    sqlx::query(
+        "INSERT INTO device_authorizations
+             (client_id, device_code_hash, user_code, interval_seconds, expires_at, account_id, decision)
+         VALUES ('buwiz-desktop', $1, 'BCDF-GHJK', 5, now() + interval '10 minutes', $2, 'approved')",
+    )
+    .bind(buwiz_cloud::crypto::hash("bwd_test-device-code"))
+    .bind(ana)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let verifier = "v".repeat(43);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+         VALUES ('agent_test', 'Test agent', ARRAY['https://agent.example.test/cb']);
+         ",
+    )
+    .execute(&site.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO oauth_codes (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at)
+         VALUES ($1, 'agent_test', $2, 'https://agent.example.test/cb', $3, 'mcp', now() + interval '10 minutes')",
+    )
+    .bind(buwiz_cloud::crypto::hash("code_test"))
+    .bind(ana)
+    .bind(&challenge)
+    .execute(&site.db)
+    .await
+    .unwrap();
+
+    // Something holds ana's website session a moment, so the ban stops
+    // there with ana's account locked, before it ends the sign-ins.
+    let mut holder = site.db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM web_sessions WHERE account_id = $1 FOR UPDATE")
+        .bind(ana)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let ban = {
+        let (db, config, staff) = (site.db.clone(), site.state.config.clone(), staff.clone());
+        tokio::spawn(async move { buwiz_cloud::account::admin::ban(&db, &config, &staff, ana, "Fraud").await })
+    };
+    until_waiting(&site.db, 1).await;
+    let poll = Request::post("/auth/device/poll")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"client_id":"buwiz-desktop","device_code":"bwd_test-device-code"}"#))
+        .unwrap();
+    let device = site.send(poll);
+    let agent = buwiz_cloud::account::agents::redeem_code(
+        &site.db,
+        "agent_test",
+        "code_test",
+        "https://agent.example.test/cb",
+        &verifier,
+    );
+    let release = async {
+        until_waiting(&site.db, 3).await;
+        holder.rollback().await.unwrap();
+    };
+    let (device, agent, ()) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(device, agent, release) })
+            .await
+            .expect("a deadlock that never resolved");
+    let banned = ban.await.unwrap();
+    assert!(matches!(banned, Ok(buwiz_cloud::notice::Notice::AccountBannedStaff)), "{banned:?}");
+    let status = device.status();
+    let body = text(device).await;
+    assert!(status.is_client_error() && !body.contains("internal"), "{status} {body}");
+    match agent {
+        Err(buwiz_cloud::error::OAuthFailure::OAuth(_)) => {}
+        Err(buwiz_cloud::error::OAuthFailure::Internal(error)) => panic!("the agent's sign-in failed: {error:#}"),
+        Ok(_) => panic!("tokens issued to a banned account"),
+    }
+    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_grants WHERE account_id = $1")
+        .bind(ana)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0);
+}

@@ -79,6 +79,8 @@ pub enum Power {
     Ban,
     MarkTest,
     ChangeRole,
+    /// Make a login on the staff pages.
+    CreateLogin,
 }
 
 /// A signed-in staff member.
@@ -220,6 +222,7 @@ mod tests {
             Ban,
             MarkTest,
             ChangeRole,
+            CreateLogin,
         ];
         for power in all {
             assert!(Role::Admin.can(power), "{power:?}");

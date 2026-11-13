@@ -29,6 +29,7 @@ reads the list.
 | Sign an account out everywhere, or out of one app (never an Admin) | ✓ | ✓ |
 | Revoke an ownership, activate without papers, pause and resume (one's own TINs too) | – | ✓ |
 | Delete a claim (one's own: as its owner, on My TINs), ban and lift a ban, the test label, change a role (never on one's own account) | – | ✓ |
+| Make a login ("New user" on `/staff/users`) | – | ✓ |
 
 Staff without a power are sent back with "Only an admin can do this";
 everyone who is not staff gets a 404. Each action checks its actor's role
@@ -43,6 +44,12 @@ pause Buwiz put on it). Rejecting a claim needs a note to the
 person, and sending it back needs a fix reason or a note. Nobody bans
 themselves, changes their own role or labels their own account a test
 account; their own page says so instead of showing those forms.
+
+"New user" makes a login the way the seed tool does: the account, its
+role and test label if asked, and a `created` line (and one per role or
+label) with the reason. It refuses an address that already has an
+account, and mails nothing: the person signs in with a code sent to the
+address when they ask, so it must be able to receive mail.
 
 Staff open their own page under `/staff/users` and read it in full,
 History and every reason included, and their own claims' pages too. An

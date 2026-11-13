@@ -126,6 +126,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/claims/{claim_id}/resume", post(resume_claim))
         .route("/staff/claims/{claim_id}/confirm", post(confirm_auto))
         .route("/staff/documents/{document_id}", get(staff_document))
+        .route("/staff/users/new", post(create_login))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
         .route("/staff/users/{account_id}/role", post(change_role))
@@ -1213,6 +1214,45 @@ async fn mark_test(
         _ => return (StatusCode::BAD_REQUEST, "test must be on or off").into_response(),
     };
     staff_outcome(&back_to, admin::mark_test(&state.db, &state.config, &staff, account_id, test, &form.reason).await)
+}
+
+#[derive(Deserialize)]
+struct NewLoginForm {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    role: String,
+    /// `on` when the box is ticked.
+    #[serde(default)]
+    test: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// An Admin makes a login: an email, a role (`none`, `support`, `admin`),
+/// maybe the test label, and a reason. It opens the new account's page.
+async fn create_login(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<NewLoginForm>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = "/staff/users";
+    let staff = match require_staff(&state, &headers, back_to, Power::CreateLogin).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let role = match form.role.as_str() {
+        "" | "none" => None,
+        raw => match Role::parse(raw) {
+            Some(role) => Some(role),
+            None => return see_other(link(back_to, Some(Notice::RoleUnknown), &[])),
+        },
+    };
+    let login = admin::NewLogin { email: &form.email, role, test: form.test == "on", reason: &form.reason };
+    match admin::create_login(&state.db, &state.config, &staff, &login).await {
+        Ok((id, notice)) => see_other(link(&format!("/staff/users/{id}"), Some(notice), &[])),
+        Err(DecideError::Refused(notice)) => see_other(link(back_to, Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
+    }
 }
 
 #[derive(Deserialize)]

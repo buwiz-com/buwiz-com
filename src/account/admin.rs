@@ -1,6 +1,6 @@
-//! What staff do to accounts: change a role, ban and lift a ban, label a
-//! test account, and sign
-//! an account out everywhere or out of one app. Each runs in one transaction (lock, check,
+//! What staff do to accounts: make a login, change a role, ban and lift a
+//! ban, label a test account, and sign an account out everywhere or out of
+//! one app. Each runs in one transaction (lock, check,
 //! change, a line in `account_audit` with who, when and why). The routes
 //! check the power first ([`crate::account::roles`]); the checks here are
 //! the ones that depend on the account acted on.
@@ -100,6 +100,84 @@ pub(crate) async fn audit(tx: &mut Transaction<'_, Postgres>, actor: &Account, l
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// The account for `email`, made if there is none: (id, made now). The
+/// staff pages and the seed tool make logins this way; each writes its own
+/// `created` line.
+pub(crate) async fn create_account(tx: &mut Transaction<'_, Postgres>, email: &str) -> sqlx::Result<(Uuid, bool)> {
+    let made: Option<Uuid> =
+        sqlx::query_scalar("INSERT INTO accounts (email) VALUES ($1) ON CONFLICT (email) DO NOTHING RETURNING id")
+            .bind(email)
+            .fetch_optional(&mut **tx)
+            .await?;
+    match made {
+        Some(id) => Ok((id, true)),
+        None => {
+            let id =
+                sqlx::query_scalar("SELECT id FROM accounts WHERE email = $1").bind(email).fetch_one(&mut **tx).await?;
+            Ok((id, false))
+        }
+    }
+}
+
+/// A login an Admin makes on the staff pages.
+pub struct NewLogin<'a> {
+    pub email: &'a str,
+    pub role: Option<Role>,
+    pub test: bool,
+    pub reason: &'a str,
+}
+
+/// An Admin makes a login: the account, with its role and test label, and
+/// a line for each in `account_audit`, all with the one reason. Refused for
+/// an address that already has an account. No mail goes out: the person
+/// signs in with a code sent to the address when they ask for one. Locks
+/// as a role change does: the roles lock, then the actor.
+pub async fn create_login(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    login: &NewLogin<'_>,
+) -> Result<(Uuid, Notice), DecideError> {
+    let reason = required_reason(login.reason)?;
+    let email = accounts::normalize_email(login.email).map_err(DecideError::Refused)?;
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::CreateLogin).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if login.role.is_some() && roles::in_server_setting(config, &email) {
+        return Err(DecideError::Refused(Notice::RoleFromServer));
+    }
+    let (id, made) = create_account(&mut tx, &email).await?;
+    if !made {
+        return Err(DecideError::Refused(Notice::AccountExists));
+    }
+    let line = |action, new_value| Line {
+        account_id: id,
+        action,
+        old_value: None,
+        new_value,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line("created", None)).await?;
+    if let Some(role) = login.role {
+        sqlx::query("UPDATE accounts SET role = $2 WHERE id = $1")
+            .bind(id)
+            .bind(role.as_str())
+            .execute(&mut *tx)
+            .await?;
+        audit(&mut tx, &actor.account, line("role_changed", Some(role.as_str()))).await?;
+    }
+    if login.test {
+        sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1").bind(id).execute(&mut *tx).await?;
+        audit(&mut tx, &actor.account, line("test_marked", None)).await?;
+    }
+    tx.commit().await?;
+    tracing::info!(account_id = %id, actor = %actor.account.id, role = login.role.map(Role::as_str), "login created");
+    Ok((id, Notice::LoginCreated))
 }
 
 /// An Admin gives an account a role, or takes it away (`None`). Refused for

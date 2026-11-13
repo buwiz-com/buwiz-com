@@ -840,7 +840,8 @@ async fn document_viewer(documents: Vec<(usize, DocumentRow)>, empty: String) ->
 
 #[page("/staff/users")]
 pub async fn users_page(cx: &Cx) -> Result<impl View> {
-    staff_member(cx, Power::SeeUsers).await?;
+    let viewer = staff_member(cx, Power::SeeUsers).await?;
+    let can_create = viewer.can(Power::CreateLogin);
     let filter = UserFilter::parse(query(cx, "filter").as_deref());
     let search = query(cx, "q").unwrap_or_default();
     let config = &state(cx).config;
@@ -889,6 +890,9 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                     search_box(action: "/staff/users", label: "Search users", placeholder: "Search email, TIN or registered name", value: search.clone(), keep: vec![("filter", filter.code())])
                 </div>
                 page_notice(notice: notice(cx))
+                if can_create {
+                    new_login_form()
+                }
                 <nav class="filters" aria-label="Filter users">
                     for (chip, href) in chips {
                         <a href=(href) class=(if chip == filter { "on" } else { "" }) aria-current=(if chip == filter { "page" } else { "false" })>
@@ -915,6 +919,37 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 <p class="fine left">"Active is the newest website sign-in or app token. Up to " (queries::LIST_LIMIT.to_string()) " accounts show; search to narrow."</p>
             </div>
         </main>
+    })
+}
+
+/// "New user": an Admin makes a login. Nothing is mailed.
+#[component]
+async fn new_login_form() -> Result<impl View> {
+    Ok(view! {
+        <details class="panel side-card">
+            <summary>"New user"</summary>
+            <form class="end-form" method="post" action="/staff/users/new">
+                <label class="decision-label">
+                    "Email"
+                    <input type="email" name="email" required=(true) maxlength="254" autocomplete="off">
+                </label>
+                <p class="side-text">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now."</p>
+                <label class="decision-label">
+                    "Role"
+                    <select name="role">
+                        <option value="none" selected=(true)>"No staff role"</option>
+                        <option value="support">"Support"</option>
+                        <option value="admin">"Admin"</option>
+                    </select>
+                </label>
+                <label class="reason">
+                    <input type="checkbox" name="test" value="on">
+                    <span>"Test account"</span>
+                </label>
+                reason_field()
+                <button class="btn btn-ghost" type="submit">"Make the login"</button>
+            </form>
+        </details>
     })
 }
 

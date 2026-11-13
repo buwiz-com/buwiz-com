@@ -183,6 +183,7 @@ const MATRIX: &[&str] = &[
     "/staff/users/{account_id}/ban",
     "/staff/users/{account_id}/unban",
     "/staff/users/{account_id}/test",
+    "/staff/users/new",
 ];
 
 /// `path` with its ids put back as the route's placeholders.
@@ -373,6 +374,26 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             .await
             .unwrap();
         assert_eq!(labelled, who.may(true), "{who:?}");
+
+        // A new login: Admins only.
+        let email = format!("new-{}@example.test", format!("{who:?}").to_lowercase());
+        site.hit("/staff/users/new");
+        let response =
+            site.post("/staff/users/new", &cookie, &format!("email={}&reason=Joins", email.replace('@', "%40"))).await;
+        let made: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE email = $1")
+            .bind(&email)
+            .fetch_optional(&site.db)
+            .await
+            .unwrap();
+        match (who, made) {
+            (Who::SignedOut, None) => assert!(location(&response).starts_with("/login?"), "{who:?}"),
+            (Who::User, None) => assert_eq!(response.status(), StatusCode::NOT_FOUND, "{who:?}"),
+            (Who::Support, None) => assert_eq!(location(&response), "/staff/users?notice=admin_only"),
+            (Who::Admin | Who::ServerAdmin, Some(id)) => {
+                assert_eq!(location(&response), format!("/staff/users/{id}?notice=login_created"));
+            }
+            other => panic!("{other:?}"),
+        }
 
         // Ban and lift: Admins only.
         let banned = || async {
@@ -993,6 +1014,7 @@ fn staff_posts(t: &Target, user: &str) -> Vec<(String, String)> {
         (format!("{user}/ban"), "reason=Abuse".into()),
         (format!("{user}/unban"), "reason=Sorted".into()),
         (format!("{user}/test"), "test=on&reason=Trial".into()),
+        ("/staff/users/new".into(), "email=new%40example.test&role=support&reason=Joins".into()),
     ]
 }
 

@@ -745,23 +745,10 @@ impl Seed<'_> {
         Ok(actor)
     }
 
-    /// The account for `email`, made if missing: (id, made now).
+    /// The account for `email`, made if missing: (id, made now), as the
+    /// staff pages make one.
     async fn create_account(&mut self, email: &str) -> sqlx::Result<(Uuid, bool)> {
-        let made: Option<Uuid> =
-            sqlx::query_scalar("INSERT INTO accounts (email) VALUES ($1) ON CONFLICT (email) DO NOTHING RETURNING id")
-                .bind(email)
-                .fetch_optional(&mut *self.tx)
-                .await?;
-        match made {
-            Some(id) => Ok((id, true)),
-            None => {
-                let id = sqlx::query_scalar("SELECT id FROM accounts WHERE email = $1")
-                    .bind(email)
-                    .fetch_one(&mut *self.tx)
-                    .await?;
-                Ok((id, false))
-            }
-        }
+        admin::create_account(&mut self.tx, email).await
     }
 
     async fn account_line(&mut self, actor: &Account, line: Line<'_>) -> sqlx::Result<()> {

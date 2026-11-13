@@ -376,3 +376,38 @@ async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
     assert_eq!(command(&["seed", path]).status.code(), Some(2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A database at the same number but with other migration files (another
+/// build's 0011 or 0012) is refused too.
+#[sqlx::test(migrations = "./migrations")]
+async fn seed_refuses_a_database_whose_migrations_differ_from_this_release(db: PgPool) {
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = decode('00', 'hex') WHERE version = 12")
+        .execute(&db)
+        .await
+        .unwrap();
+    let problem = refused(seed(&db, EXAMPLE, &options("admin@example.test", false)).await);
+    assert!(problem.contains("migration 12"), "{problem}");
+    assert_eq!(counts(&db).await, [0; 5]);
+}
+
+/// The seed waits a few seconds at most for a lock another change holds
+/// (a role change, a ban), then gives up having written nothing, so it
+/// never holds those changes up for long.
+#[sqlx::test(migrations = "./migrations")]
+async fn seed_gives_up_on_a_lock_held_by_a_concurrent_role_change(db: PgPool) {
+    // A role change on the website, under way: it holds the roles lock.
+    let mut change = db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7095465005590572908)").execute(&mut *change).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        seed(&db, EXAMPLE, &options("admin@example.test", false)),
+    )
+    .await
+    .expect("the seed waited for the lock without end");
+    let error = outcome.expect_err("the seed ran while the roles were locked").to_string();
+    assert!(error.contains("lock"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    change.rollback().await.unwrap();
+    assert_eq!(counts(&db).await, [0; 5]);
+}

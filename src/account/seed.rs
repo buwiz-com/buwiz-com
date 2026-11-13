@@ -6,8 +6,9 @@
 //!
 //! It changes only what differs from the file, so a second run with the
 //! same file changes nothing. It never runs migrations and starts no
-//! server: it refuses a database that is not at this release's newest
-//! migration.
+//! server: it refuses a database whose applied migrations are not exactly
+//! this release's (by number and checksum). It waits at most
+//! [`LOCK_TIMEOUT`] for a lock another change holds.
 //!
 //! What it refuses, before anything is written (the whole file):
 //! - a file that does not parse, or has a key it does not know;
@@ -157,15 +158,26 @@ pub enum SeedError {
     /// The file is refused; nothing was written.
     #[error("the seed file is refused:\n{}", .0.join("\n"))]
     Refused(Vec<String>),
-    #[error("this database is at migration {database}, this release at {release}: deploy this release first")]
+    #[error(
+        "this database is at migration {database}, this release at {release}: run the seed of the release the \
+         database runs"
+    )]
     Behind { database: i64, release: i64 },
+    #[error(
+        "another change (a role change, a ban, a claim being decided) held a lock for more than {LOCK_TIMEOUT}: run it again"
+    )]
+    Busy,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
 
 impl From<sqlx::Error> for SeedError {
     fn from(error: sqlx::Error) -> Self {
-        Self::Internal(error.into())
+        match &error {
+            // lock_timeout: another change held a lock too long.
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03") => Self::Busy,
+            _ => Self::Internal(error.into()),
+        }
     }
 }
 
@@ -192,6 +204,17 @@ fn plan(file: &[u8]) -> Result<(Vec<PlannedLogin>, Vec<String>), SeedError> {
         let mut planned = Vec::new();
         for entry in login.tin {
             let tin = match Tin::parse_fields(&entry.tin, entry.branch.as_deref().unwrap_or("")) {
+                // A `tin` that carries its branch and a `branch` key that
+                // names another one: which is meant is not for us to guess.
+                Ok(tin) if branch_conflict(&tin, entry.branch.as_deref()) => {
+                    problems.push(format!(
+                        "TIN {} for {email}: its branch {} differs from branch = {:?}; keep one of them",
+                        tin.masked(),
+                        tin.branch(),
+                        entry.branch.as_deref().unwrap_or_default()
+                    ));
+                    continue;
+                }
                 Ok(tin) => tin,
                 Err(notice) => {
                     refused_tins.push(format!("refused TIN {} for {email}: {}", entry.tin, notice.message()));
@@ -240,19 +263,59 @@ fn plan(file: &[u8]) -> Result<(Vec<PlannedLogin>, Vec<String>), SeedError> {
     if problems.is_empty() { Ok((logins, refused_tins)) } else { Err(SeedError::Refused(problems)) }
 }
 
+/// Whether a `branch` key names another branch than the one `tin` was read
+/// with (from the `tin` itself, as printed on Form 2303).
+fn branch_conflict(tin: &Tin, branch: Option<&str>) -> bool {
+    let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) else {
+        return false;
+    };
+    Tin::parse(tin.root(), branch).map_or(true, |keyed| keyed.branch() != tin.branch())
+}
+
+/// How long the seed waits for a lock another change holds (a role change,
+/// a ban, a claim being decided) before it gives up, having written nothing.
+/// It holds the roles lock meanwhile, so it must not wait for long.
+pub const LOCK_TIMEOUT: &str = "5s";
+
+/// Refuses a database whose applied migrations are not exactly this
+/// release's: a missing one, one this release does not know, or one with
+/// the same number but other contents (another build's file).
+async fn check_migrations(db: &PgPool) -> Result<(), SeedError> {
+    let applied: Vec<(i64, Vec<u8>, bool)> =
+        sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(db)
+            .await?;
+    let release: Vec<&sqlx::migrate::Migration> =
+        crate::MIGRATOR.iter().filter(|migration| !migration.migration_type.is_down_migration()).collect();
+    let database = applied.iter().filter(|(_, _, success)| *success).map(|(version, ..)| *version).max();
+    let newest = release.iter().map(|migration| migration.version).max().unwrap_or_default();
+    if database != Some(newest) {
+        return Err(SeedError::Behind { database: database.unwrap_or_default(), release: newest });
+    }
+    for (version, checksum, success) in &applied {
+        match release.iter().find(|migration| migration.version == *version) {
+            Some(migration) if *success && migration.checksum.as_ref() == checksum.as_slice() => {}
+            _ => {
+                return Err(SeedError::Refused(vec![format!(
+                    "this database's migration {version} is not this release's (another build's file, or one \
+                     that failed): run the seed of the release the database runs"
+                )]));
+            }
+        }
+    }
+    if let Some(missing) = release.iter().find(|migration| !applied.iter().any(|(v, ..)| *v == migration.version)) {
+        return Err(SeedError::Behind { database: missing.version - 1, release: newest });
+    }
+    Ok(())
+}
+
 /// Runs the file against `db` as `options` say. A dry run does everything,
 /// then rolls back.
 pub async fn run(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Options) -> Result<Report, SeedError> {
     let (logins, refused_tins) = plan(file)?;
     let actor_email = accounts::normalize_email(&options.actor)
         .map_err(|_| SeedError::Refused(vec![format!("--as {:?} is not a valid email", options.actor)]))?;
-    let database: i64 = sqlx::query_scalar("SELECT coalesce(max(version), 0) FROM _sqlx_migrations WHERE success")
-        .fetch_one(db)
-        .await?;
-    let release = crate::MIGRATOR.iter().map(|migration| migration.version).max().unwrap_or_default();
-    if database != release {
-        return Err(SeedError::Behind { database, release });
-    }
+    check_migrations(db).await?;
     let (accounts_before, claims_before): (i64, i64) =
         sqlx::query_as("SELECT (SELECT count(*) FROM accounts), (SELECT count(*) FROM tin_claims)")
             .fetch_one(db)
@@ -260,6 +323,7 @@ pub async fn run(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Opti
 
     let run_id = Uuid::new_v4();
     let mut tx = db.begin().await?;
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")).execute(&mut *tx).await?;
     roles::lock(&mut tx).await?;
     let mut seed = Seed {
         tx,
@@ -886,5 +950,25 @@ mod tests {
             tin("state = \"not_verified\"\n")
         );
         assert!(refused(&twice).contains("TIN 000-123-453-00000: in the file twice"));
+    }
+
+    #[test]
+    fn a_tin_whose_branch_differs_from_its_branch_key_is_refused() {
+        let file = |tin: &str, branch: &str| {
+            format!(
+                "[[login]]\nemail = \"a@example.test\"\n[[login.tin]]\ntin = \"{tin}\"\nbranch = \"{branch}\"\nkind = \"business\"\nname = \"A\"\nstate = \"not_verified\"\n"
+            )
+        };
+        match plan(file("000-123-453-00002", "00000").as_bytes()) {
+            Err(SeedError::Refused(problems)) => {
+                assert!(problems.join("\n").contains("branch"), "{problems:?}");
+            }
+            other => panic!("not refused: {:?}", other.map(|(logins, _)| logins.len())),
+        }
+        // The same branch twice, or in one place only, is fine.
+        for (tin, branch) in [("000-123-453-00002", "00002"), ("000-123-453-002", "00002"), ("000-123-453", "00002")] {
+            let (logins, _) = plan(file(tin, branch).as_bytes()).unwrap();
+            assert_eq!(logins[0].tins[0].tin.branch(), "00002", "{tin} {branch}");
+        }
     }
 }

@@ -46,6 +46,14 @@ echo "15. reject without note -> $(curl -s -o /dev/null -w '%{redirect_url}' -b 
 echo "16. approve -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J2 -H "$O" -d decision=approve $B$CID/decision)"
 echo "16b. document after decision -> $(curl -s -o /dev/null -w '%{http_code}' -b $J2 $B$DOC)"
 echo "17. tax-profiles after approval: $(curl -s -H "Authorization: Bearer $AT" $B/api/tax-profiles)"
+# TINs without papers: Skip for now, the full TIN list, and the refusal a
+# send for such a TIN gets (the return inside matches its file name).
+echo "17b. skip for now -> $(curl -s -o /dev/null -w '%{redirect_url}' -b $J1 -H "$O" -F kind=personal -F tin=123-456-788 -F 'registered_name=Juan Dela Cruz' -F tin_id=@id.png -F skip=1 "$B/tins/claims?skip=1")"
+echo "17c. include=all: $(curl -s -H "Authorization: Bearer $AT" "$B/api/tax-profiles?include=all" | python3 -c 'import sys,json;b=json.load(sys.stdin);print(b.get("include"),[(p["status"],p["can_send"]) for p in b["profiles"]])')"
+line() { printf '<div>frm1701q:%s=%sfrm1701q:%s=</div>' "$1" "$2" "$1"; }
+XML="$(line txtYear 2026)$(line txtTIN1 123)$(line txtTIN2 456)$(line txtTIN3 788)$(line txtBranchCode 00000)"
+BODY=$(python3 -c 'import json,sys;print(json.dumps({"filename":"12345678800000-1701Qv2018-2026Q1#user@example.test#.xml","xml":sys.argv[1]}))' "$XML")
+echo "17d. send for it -> $(curl -s -H "Authorization: Bearer $AT" -H 'content-type: application/json' -d "$BODY" $B/api/submissions)"
 R2=$(curl -s -d "grant_type=refresh_token&refresh_token=$RT&client_id=buwiz-desktop" $B/oauth/token); echo "18. refresh: $(echo $R2 | cut -c1-60)..."
 AT2=$(echo $R2 | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 echo "18b. new token /me: $(curl -s -H "Authorization: Bearer $AT2" $B/me | cut -c1-40)..."

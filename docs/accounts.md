@@ -6,13 +6,48 @@ call).
 ## Accounts
 
 You sign in with a 6-digit code sent by email. There are no passwords, no
-organizations and no workspaces. One account can hold several TINs. People
-in `ADMIN_EMAILS` see the staff pages. Code: `src/account/accounts.rs`,
-`src/account/pages.rs` (the Topcoat pages) and `src/account/web.rs` (the form posts).
+organizations and no workspaces. One account can hold several TINs. Code:
+`src/account/accounts.rs`, `src/account/pages.rs` (the Topcoat pages) and
+`src/account/web.rs` (the form posts).
+
+### Staff roles
+
+A staff role is kept on the account (`accounts.role`,
+`src/account/roles.rs`): **Support** or **Admin**. `ADMIN_EMAILS` is a
+break-glass list: anyone in it is always an Admin, whatever the account
+says, and the staff pages cannot change their role or ban them. The setting
+never writes a role. A banned account has no role.
+
+| | Support | Admin |
+|---|---|---|
+| See the queue, claims, their files, and every account | ✓ | ✓ |
+| Approve, reject, send back (never one's own claim) | ✓ | ✓ |
+| Confirm a TIN activated automatically (never one's own) | ✓ | ✓ |
+| Sign an account out everywhere, or out of one app (never an Admin) | ✓ | ✓ |
+| Delete a claim, revoke an ownership, activate without papers (one's own too), pause and resume, ban and lift a ban, the test label, change a role | – | ✓ |
+
+Staff without a power are sent back with "Only an admin can do this";
+everyone who is not staff gets a 404. Role changes refuse one's own account,
+an `ADMIN_EMAILS` person, and a change that would leave no Admin.
+
+### Bans and test accounts
+
+A **ban** (Admin, with a reason) ends the account's website sessions and
+any sign-in not yet picked up. The person cannot sign in ("This account
+can't be used on Buwiz…"). App sign-ins stay but every API call answers
+`403 account_banned`; the token refresh and signing out still work, so the
+app can say why. Lifting the ban restores everything. An Admin can't be
+banned. The **test label** is for staff only: they see and filter it, and
+sends work as usual.
+
+Every staff action on an account goes to `account_audit` with who, when and
+why; actions on claims go to `claim_audit`. Both are on the user's page
+under History.
 
 ## TIN activation
 
-The person says whose TIN it is, and uploads its papers (`src/account/claims.rs`):
+The person says whose TIN it is, and uploads its papers
+(`src/account/claims.rs`), or presses **Skip for now**:
 
 - **Personal:** a TIN ID, either the card or the ORUS digital TIN ID. A selfie
   and a photo of the National ID are optional, and they make the check
@@ -20,6 +55,17 @@ The person says whose TIN it is, and uploads its papers (`src/account/claims.rs`
 - **Business:** BIR Form 2303 and a government ID. When the 2303 is in a
   company's name, add proof of authority: a secretary's certificate, a board
   resolution or an SPA.
+
+**Not verified.** Skip saves the TIN without papers (`unverified`); any
+files chosen are not even read. It can prepare and save returns in the
+apps but cannot send, test-send or be shared. Its card on My TINs has
+"Verify to send", which opens `/tins/claims/{id}/verify`: sending the papers
+there makes the same claim wait for review, so the app's profile keeps its
+id. Any number of accounts may save the same TIN this way, and saving looks
+exactly the same whether or not someone else has it. At most 20 TINs per
+account wait to be verified. `/tins/new?tin=<9 digits>&branch=<5>` (the
+apps' "Add it" link) fills in the TIN, or goes to that TIN's own page when
+the person already has it.
 
 ### Staff review
 
@@ -30,6 +76,49 @@ Staff review each claim by hand at `/staff` (`src/account/staff.rs`). They can:
 
 An approved claim makes the TIN active. A TIN has at most one owner. People
 can prepare returns right away, but sending them waits for approval.
+
+The queue's tabs: Waiting, Sent back, Not verified, **Activated
+automatically** (with a count), Approved, Paused, Rejected, Removed.
+
+An Admin can also:
+- **activate without papers**, with a reason, a TIN not verified, waiting
+  or sent back, their own too (refused while another account owns it, or
+  for a banned account). The reason stays in the audit only;
+- **pause** an active TIN, with a reason the owner reads: it stays owned
+  but nothing sends (`tin_paused`) until resumed. The owner cannot remove a
+  paused TIN. A "Paused before" card shows every pause of the TIN, on any
+  account, to whoever reviews it next.
+
+### Automatic activation (`AUTO_VERIFY`)
+
+**Off unless `AUTO_VERIFY=on`** (`src/account/verify.rs`). While off,
+nothing is checked or written. When on, after OCR reads a claim's TIN ID,
+the claim becomes active by itself only if all of these hold: a personal
+head-office TIN waiting for its first review (never sent back); exactly one
+TIN ID, a photo read by OCR (never a PDF); TIN and name a full match with
+what is typed, each at least 90% sure, and a name of two words or more; the
+account not banned; no other account ever had a row for the TIN; this
+account never had it rejected or revoked, or removed it after an automatic
+activation; no other automatic activation of the account waiting for a
+person; fewer than 20 automatic activations in the last 24 hours. The
+limits are counted under one lock.
+
+- When it activates: `verified_by = 'auto'`, what it rests on in
+  `auto_check`, and an audit line from source `auto`. **The papers are
+  kept** until a person confirms.
+- Otherwise the claim waits for staff as usual, and its page lists, in
+  plain words, every reason it was not activated.
+- The "Activated automatically" tab lists every automatic activation no
+  person has confirmed, whatever happened since (removed by its owner or
+  revoked included, with their papers). Support or an Admin checks the
+  papers and presses **Looks right: confirm**: the papers are deleted.
+- One still unconfirmed after 30 days is **paused by Buwiz** (no staff
+  name, a fixed reason, an audit line), papers kept. Confirming lifts that
+  pause; a staff pause stays.
+
+What it proves is weak: the person types the TIN and name and uploads the
+picture, and a card drawn in a few lines of code passes (`tests/ocr.rs`).
+See [deploy.md](deploy.md#automatic-activation) before turning it on.
 
 ### Changing and removing claims
 
@@ -52,7 +141,8 @@ stored. In production they go to an S3-compatible store (Cloudflare R2, via
 - the claim is withdrawn;
 - or the file is replaced.
 
-The file's hash stays.
+For a TIN activated automatically, the files stay until staff confirm it
+(above). The file's hash stays.
 
 ### OCR
 
@@ -64,7 +154,8 @@ Runtime. For a digital PDF, it reads the text layer first.
   or RDO code, with a mark per row.
 - The queue flags "TIN matches the ID" or "Name differs".
 - Only those fields are kept, and they are deleted with the file.
-- Nothing is sent to anyone else, and staff still decide.
+- Nothing is sent to anyone else. Staff decide, unless automatic
+  activation is on (above).
 
 ## App sign-in
 
@@ -82,16 +173,28 @@ The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 
 ## Licence gate
 
-`GET /api/tax-profiles` lists the account's active TINs. The apps unlock
-their BIR tools when any profile has permissions. With `?include=pending`,
-it also lists TINs that are still being checked or were sent back. Each of
-those has a `status` and no `filing.submit` permission.
+`GET /api/tax-profiles` lists the account's active TINs that can send (a
+paused one is left out). The apps unlock their BIR tools when any profile
+has permissions. With `?include=pending`, it also lists TINs that are still
+being checked or were sent back. Each of those has a `status` and no
+`filing.submit` permission.
+
+With `?include=all` (also in a comma list) the answer is
+`{"include":"all","profiles":[…]}`: every TIN on the account that has not
+ended, with `status` (`approved`, `paused`, `unverified`, `pending`,
+`needs_fix`), `can_send`, `message` and `action` (the id-based Verify or Fix
+link). `approved` means it can send. Sent-back rows add `reasons`,
+`reason_codes` and the staff `note`. Only the BIR app's token gets the full
+TIN, filing permissions, links and the note. The golden example is
+`tests/fixtures/tax_profiles_all.json`; the refusal codes the same rule gives
+are in [relay-protocol.md](relay-protocol.md#refusals).
 
 ## MCP for AI agents
 
 `POST /mcp` has four read-only tools (`src/account/mcp.rs`):
 - active TINs;
-- TIN claims;
+- TIN claims (with `sent_at`, when the papers were sent: null for a TIN
+  saved or activated without them; the staff note only for a rejection);
 - sent returns;
 - one return.
 

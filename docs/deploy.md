@@ -77,6 +77,197 @@ The rest of `deploy/ec2/` sets up a new instance:
 - `sender-keys.sh`: creates the Sender's keys in Parameter Store. It prints
   only names and versions, and refuses to replace a key that exists.
 
+## Deploying the TIN release (migrations 11 and 12)
+
+The release that adds TINs without papers, roles, bans, pauses, the seed
+tool and automatic activation runs migrations 11 and 12 when it starts.
+`install.sh` overwrites the previous binaries, and with `Restart=always` a
+failed migration means a crash loop. The release before it refuses to start
+on a database at 11 or 12 (sqlx finds versions it does not know). So check
+first, keep the old binaries, and know the way back.
+
+### Before you deploy
+
+Run these against production (read only), from a machine with the Neon
+connection string, in this order:
+
+1. **Every active TIN says since when.** Must return no rows, or migration
+   11 fails on its `decided_at` check:
+   ```sql
+   SELECT id FROM tin_claims WHERE status = 'approved' AND decided_at IS NULL;
+   ```
+2. **No account holds two live rows for one TIN.** Must return no rows, or
+   the new one-live-row index fails:
+   ```sql
+   SELECT account_id, tin_root, branch_code, count(*) FROM tin_claims
+    WHERE status IN ('pending', 'needs_fix', 'approved') GROUP BY 1, 2, 3 HAVING count(*) > 1;
+   ```
+3. **How the active TINs will be labelled.** Rows that name no reviewer
+   become `verified_by = 'unknown'` (not `staff`); expect none:
+   ```sql
+   SELECT id, status FROM tin_claims WHERE status IN ('approved', 'removed', 'revoked') AND decided_by IS NULL;
+   ```
+4. **`ADMIN_EMAILS`.** Read `/buwiz/ADMIN_EMAILS` in Parameter Store.
+   Everyone in it becomes an Admin with every new power at once (ban,
+   activate without papers, pause, change roles), and the staff pages
+   cannot demote them. It should name the owner's admin login only; a
+   Support login does not belong in it.
+5. **`AUTO_VERIFY`.** Make sure `/buwiz/AUTO_VERIFY` does not exist (or is
+   not `on`): this release ships with automatic activation off
+   ([below](#automatic-activation)).
+6. **Nothing is being sent.** Right before the restart, must be `0` (a
+   restart in the middle of a send ends it as `unknown`):
+   ```sql
+   SELECT count(*) FROM submissions WHERE status = 'sending';
+   ```
+
+Better still, restore the latest backup into the local Docker Postgres and
+start the new binary on that copy first (with `DATABASE_URL` pointing at
+`127.0.0.1`, never at Neon). Take a Neon branch right before the deploy as
+the last resort; restoring it loses every return filed since (see the
+rollback instead).
+
+Private test fixtures (the BIR relay files) that insert active claims must
+set `decided_at` and `verified_by`.
+
+### Deploy
+
+1. On the instance (SSM session), keep the running binaries:
+   ```sh
+   sudo cp -p /opt/buwiz/buwiz-cloud /opt/buwiz/buwiz-cloud.prev
+   sudo cp -p /opt/buwiz/buwiz-sender /opt/buwiz/buwiz-sender.prev
+   cat /opt/buwiz/RELEASE        # note the release you are leaving
+   ```
+2. Re-run check 6, then `deploy/ec2/deploy.sh <sha>` as usual.
+3. Watch `journalctl -u buwiz.service` for `migrations failed`. If it
+   crash-loops on a migration, stop it, put the `.prev` binary back and
+   start it: a failed migration ran in one transaction and left the
+   database at 10, so the old binary starts.
+4. Smoke-test as below, then sign in as the admin login and open `/staff`.
+
+### Rolling back
+
+Use this when the new release runs (the database is at 12) and you need
+the one before. It keeps every account, TIN, ticket, return and receipt.
+
+**What it destroys:** TINs saved without papers (`unverified`) and their
+rows; every stored role (only `ADMIN_EMAILS` makes admins again); the test
+labels; how each TIN became active (`verified_by`), when papers were sent,
+and what the automatic check saw; each audit line's `source`. Migrating up
+again later labels each TIN ever active `staff` when it names a reviewer
+and `unknown` when it does not.
+
+**What it keeps elsewhere:** the audit lines the old release cannot hold
+(activated without papers, paused, resumed, the automatic ones, the review
+decisions), the whole `account_audit` (bans, roles, labels, sign-outs) and
+`seed_runs` move, whole, to tables in the `rollback_archive` schema, which
+the old release does not read. They are the only record of why a TIN that
+stays active was activated without papers. Rolling back twice adds to them.
+
+**What makes it refuse** (it then changes nothing and the database stays at
+12; the newer down file makes every check of the older one first):
+- an account is banned (the old release would let it sign in and send):
+  lift each ban first;
+- a TIN is paused (the old release would send for it): resume or revoke;
+- a TIN saved without papers has files: decide those claims first;
+- a TIN activated automatically waits for a person: confirm or revoke it;
+- any account has a stored role: make sure `ADMIN_EMAILS` names your
+  admins, then set `buwiz.rollback_drop_roles = 'yes'` in the same
+  transaction (below).
+
+The order:
+1. Run check 6 above and wait for `0`, then stop the app:
+   `sudo systemctl stop buwiz.service`.
+2. Resolve each refusal above (on a stopped app, with SQL; or before
+   stopping it, on the staff pages).
+3. From the release's checkout, run the newer down file, then the older,
+   each in one transaction:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET LOCAL buwiz.rollback_drop_roles = 'yes'" -f migrations/0012_staff_roles.down.sql
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 10
+   ```
+   Leave out the `SET LOCAL` line unless you mean to drop the roles. If the
+   first file refuses, nothing changed; if the second refuses, the
+   database is at 11 and nothing of 11 changed: fix what it names and run
+   the second again.
+4. Put the previous binaries back and start:
+   ```sh
+   sudo cp -p /opt/buwiz/buwiz-cloud.prev /opt/buwiz/buwiz-cloud
+   sudo cp -p /opt/buwiz/buwiz-sender.prev /opt/buwiz/buwiz-sender
+   sudo systemctl restart buwiz-sender.service buwiz.service
+   ```
+   (Or `deploy/ec2/deploy.sh <previous sha>` once the database is at 10.)
+
+`tests/migrations.rs` runs this whole rollback, by sqlx and by hand, on a
+database with a row in every state.
+
+### The seed tool
+
+`buwiz-cloud seed <FILE> --as <admin email> [--dry-run]` makes logins,
+roles, test labels and TINs from one TOML file, in one transaction
+(`docs/seed.example.toml`; `src/account/seed.rs`). It reads
+`DATABASE_URL`, `ADMIN_EMAILS` and the `S3_*` settings. It needs `S3_*` to
+delete from R2 the files of a waiting claim that a `move_from` deletes;
+without them it uses the database store and those objects stay behind, so
+always run it with the service's settings. It runs no migration and refuses
+a database not at this release's newest migration.
+
+What it prints: the target database (host and name, no password), the
+account and claim counts before, the file's SHA-256, one line per change
+(`created login …`, `role … none → support`, `TIN … active on … (new)`,
+`unchanged …`), and the number of changes. A dry run shows full TINs:
+check every digit. Exit codes: 0 done or dry run, 2 refused (with every
+reason; nothing written), 1 an error (nothing written). Each run is one
+`seed_runs` row and one audit line per change.
+
+1. Write the file on the Mac, outside the repository. Make a Neon branch.
+2. Deploy this release. In an SSM session, put the file at
+   `/tmp/seed.toml`, owned by `buwiz`, mode 600.
+3. Dry run, with the service's settings:
+   ```sh
+   sudo systemd-run --uid=buwiz --pty --wait -p EnvironmentFile=/etc/buwiz/env \
+     /opt/buwiz/buwiz-cloud seed /tmp/seed.toml --as <admin login> --dry-run
+   ```
+   Read every line: the database, the counts, each TIN.
+4. Run it again without `--dry-run`, then delete `/tmp/seed.toml`.
+5. Each address must be able to receive mail before anyone can sign in as
+   it.
+
+To be completed by the seed hardening pass: which `ADMIN_EMAILS` the tool
+uses when it is run outside the service, and how it confirms the target
+database before writing. Until then, run it only as above.
+
+### Automatic activation
+
+`AUTO_VERIFY` (Parameter Store `/buwiz/AUTO_VERIFY`) turns on automatic
+activation of a personal TIN from its TIN ID photo
+([accounts.md](accounts.md#automatic-activation-auto_verify)). It is off
+unless the value is exactly `on`, and this release ships with it unset. To
+turn it on, set `/buwiz/AUTO_VERIFY=on` and `sudo systemctl restart
+buwiz.service`; to turn it off, delete the parameter (or set `off`) and
+restart. Turning it off does not undo activations already made: confirm or
+revoke them in the "Activated automatically" tab.
+
+**The risk, plainly.** It checks that the TIN and name the person typed
+match a photo the same person uploaded. Anyone who knows a taxpayer's TIN
+and registered name (on payslips, BIR 2316s, contracts) can draw a TIN ID
+that passes in minutes; the repository's own test does it in about 30
+lines. The card itself is not checked: no photo, hologram, QR code or BIR
+lookup. Once it passes, that person owns the TIN on Buwiz and **can file
+real returns to the BIR under it at once**, before any person has looked,
+with Buwiz vouching for the receipt; the real owner is locked out until
+staff revoke it. The limits (one unconfirmed per account, 20 a day, a clean
+history for the TIN, papers kept, a pause after 30 days unconfirmed) bound
+the damage; they do not prevent it. And whether a claim is activated or
+left for staff tells the claimant whether any other account ever had that
+TIN.
+
+Before turning it on, decide whether an automatically activated TIN may
+send before a person confirms it (as built, it may), and keep someone
+checking the tab daily.
+
 ## OCR of claim documents
 
 The image is built with `--features ocr`: the TIN ID or 2303 of each claim
@@ -249,5 +440,6 @@ them.
 BUWIZ_SERVER_URL=https://api.buwiz.com BUWIZ_ACCOUNT_URL=https://account.buwiz.com
 ```
 
-Sign in from the app, add your TIN at `/tins/new`, approve it as
-`ADMIN_EMAILS` at `/staff/claims`, and the licence gate opens.
+Sign in from the app, add your TIN at `/tins/new`, approve it as staff
+(Support, an Admin, or someone in `ADMIN_EMAILS`) at `/staff`, and the
+licence gate opens.

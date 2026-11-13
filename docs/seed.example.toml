@@ -2,7 +2,10 @@
 # Synthetic data only. Write the real file outside the repository.
 #
 # One [[login]] per Buwiz login. A key left out keeps what the database
-# has; nothing is ever removed or downgraded. Running the same file again
+# has. A key given wins, so a role can be lowered (`none` takes it away).
+# A TIN is never made "not verified" again once active, but `move_from`
+# ends the old account's ownership, and deletes a claim still waiting for
+# review on the old account, files and all. Running the same file again
 # changes nothing.
 
 [[login]]

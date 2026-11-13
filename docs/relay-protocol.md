@@ -47,10 +47,18 @@ Content-Type: application/json
 - `filename` follows eBIRForms: `{TIN}-{form}-{period}#{email}#.xml`. The
   TIN is 12 or 14 digits: the 9-digit root, then a 3- or 5-digit branch.
   The email is where BIR sends its confirmation.
-- The TIN must be active (an approved claim) on the signed-in account.
-  Otherwise the answer is `403 {"error":{"code":"tin_not_active"}}`.
 - `xml` is the plaintext IAF file, at most 2 MB. The server does the IAF
   encryption.
+- The return inside must be the one the file name names: its TIN and
+  branch fields, its form (the field prefix, `frm1601c` for `1601Cv2018`)
+  and its year (and ticked quarter) must be the name's. Otherwise
+  `400 {"error":{"code":"return_mismatch","message":"The return does not
+  match its file name: …"}}`, and nothing is stored. This is the same check
+  the Sender makes on a sealed return against its ticket (section 5), and
+  the Sender makes it again on every v1 return before it sends.
+- The TIN must be able to send on the signed-in account (an active claim,
+  not paused). Otherwise `403` with one of the codes in
+  [Refusals](#refusals).
 - Sending the same `idempotency_key` again returns the existing submission
   without creating another.
 
@@ -61,6 +69,42 @@ Answer `201`:
 ```
 
 The server keeps the XML, encrypted, until it is sent or 24 hours pass.
+
+### Refusals
+
+Tickets (`POST /api/tickets`), both submission calls and the relay refuse
+a TIN that cannot send with `403 {"error":{"code","message"}}`. The code
+says where the caller's **own** row for that TIN stands; another account's
+row is never looked at, so "someone else owns it", "never added" and "it
+ended" all read `tin_not_active`, word for word alike.
+
+| `code` | When | `message` |
+|---|---|---|
+| `tin_unverified` | Added without its papers | This TIN is not verified yet. Verify it with its papers on My TINs at account.buwiz.com to send returns. |
+| `tin_pending` | Papers waiting for review | This TIN's papers are still being checked, usually within one business day. You can send once it is active. |
+| `tin_needs_fix` | Sent back for a fix | `Sent back for a fix: ` and the fixed reason sentences (never the staff's own note), or `Sent back for a fix. See what to change on My TINs at account.buwiz.com.` |
+| `tin_paused` | Active, but sending is paused | Sending is paused for this TIN. Write to support@buwiz.com. |
+| `tin_not_active` | Anything else | this TIN is not active on your account |
+| `account_banned` | The account is banned (every bearer call but `POST /api/auth/logout`; the token refresh still works) | This Buwiz account is banned: it can't send returns. Write to support@buwiz.com. |
+
+None of these is worth retrying: the return goes back to a draft with the
+words shown. Retry only `429 quota_exceeded`, network errors and a relay
+`failed` without a code in brackets (section 3).
+
+### The TIN list
+
+`GET /api/tax-profiles?include=all` (Bearer, any scope; `all` may come in a
+comma list, `include=all,pending`) answers
+`{"include":"all","profiles":[…]}`: every TIN on the account that has not
+ended, each with `status` (`approved`, `paused`, `unverified`, `pending`,
+`needs_fix`), `can_send`, a `message`, and an `action` link to Verify or
+Fix. `status` is `approved` exactly when `can_send` is true; both come from
+the same rule as the refusals above. A `needs_fix` row also carries
+`reasons`, `reason_codes` and the staff `note` (at most 200 characters, BIR
+app only). Only the BIR app (`app` scope) gets `tin`, filing permissions,
+the link and the note. Without `all`, the list means what it always did,
+except that a paused TIN is left out. `tests/fixtures/tax_profiles_all.json`
+is the golden example; [accounts.md](accounts.md#licence-gate) has more.
 
 ## 2. Open the pipe
 
@@ -105,8 +149,20 @@ What the server does over the pipe:
 |---|---|---|
 | `sent` | BIR's server accepted the file. `receipt` is a signed receipt. | Mark the return **Sent** and store the receipt. |
 | `dry_run` | The server is in dry-run mode. Nothing reached BIR. | Treat as a test. |
-| `failed` | Nothing reached BIR. `error` says why (`relay not built in` from a server built without the `bir` feature). | Retry later by opening the relay again (same submission, within 24 h). |
+| `failed` | Nothing reached BIR. `error` says why (`relay not built in` from a server built without the `bir` feature). | Retry later by opening the relay again (same submission, within 24 h), unless `error` ends with a refusal code in brackets (below). |
 | `unknown` | The connection broke during the upload. BIR may have the file. | Do **not** resend automatically. Ask the person to check for BIR's confirmation email. |
+
+The server checks the account and the TIN again when the socket opens,
+after the token check. If the account was banned, or the TIN stopped being
+able to send (paused, removed, revoked), since the return was stored, the
+return is not sent: the answer is `failed` with `error` set to the
+refusal's message and its code in brackets, for example
+`"Sending is paused for this TIN. Write to support@buwiz.com. (tin_paused)"`
+or `"… (account_banned)"`. Nothing reached BIR. Treat it as the same refusal
+as a `403` with that code (section 1, Refusals): back to a draft, no retry.
+A v2 return's envelope is dropped with its ticket; a v1 return may be sent
+again once the TIN can send. A send already under way on another
+connection keeps its own outcome.
 
 Opening the relay again for a submission that is already `sent` returns
 the same receipt and does not send again. `GET /api/submissions/{id}` and
@@ -192,8 +248,9 @@ POST /api/tickets            (signed)
 
 `form`, `period` and `email` are the parts of the eBIRForms file name
 `{TIN}-{form}-{period}#{email}#.xml`; the email is where BIR sends its
-confirmation (the person's choice). Checks: the TIN is active on the
-account (`403 tin_not_active`), the device is live, quotas (30 tickets an
+confirmation (the person's choice). Checks: the TIN can send on the
+account (`403` with a code from section 1's Refusals), the device is live,
+quotas (30 tickets an
 hour per account and per device, 50 a day per TIN: `429 quota_exceeded`),
 and idempotency:
 
@@ -240,7 +297,9 @@ POST /api/v2/submissions     (signed)
 The Gatekeeper checks the ticket's signature and expiry, that it was
 issued to this account and device, and spends it: a second use is
 `409 ticket_used`, an expired one `403 ticket_expired`, a forged one
-`403 ticket_invalid`, another device's `403 ticket_mismatch`. It stores the
+`403 ticket_invalid`, another device's `403 ticket_mismatch`. If the TIN
+stopped being able to send since the ticket (paused, ended), it answers
+with that refusal (section 1) and the ticket is not spent. It stores the
 envelope as it came and answers `201` with the submission (`relay_path`
 included).
 

@@ -335,11 +335,13 @@ async fn the_first_admin_comes_from_the_file_only_on_a_database_with_none(db: Pg
     // The server's own ADMIN_EMAILS is an Admin, even before signing in.
     let root = listing("root@example.test", false, &["root@example.test"]);
     seed(&db, make_mallory, &root).await.unwrap();
-    // And the file cannot leave nobody in charge.
+    // And the file cannot leave nobody in charge: whoever runs it stays an
+    // Admin, since it cannot change its own role.
     let demote = "[[login]]\nemail = \"eve@example.test\"\nrole = \"none\"\n[[login]]\nemail = \"mallory@example.test\"\nrole = \"none\"\n";
     let problem = refused(seed(&db, demote, &options("eve@example.test", false)).await);
-    assert!(problem.contains("no Admin"), "{problem}");
+    assert!(problem.contains("--as eve@example.test cannot change its own role"), "{problem}");
     assert_eq!(account(&db, "eve@example.test").await.1.as_deref(), Some("admin"));
+    assert_eq!(account(&db, "mallory@example.test").await.1.as_deref(), Some("admin"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -603,4 +605,151 @@ async fn the_seed_command_needs_admin_emails_or_says_there_is_none(db: PgPool) {
     assert!(out.contains(&format!("--target {target}")), "{out}");
     assert_eq!(counts(&db).await, [0; 5]);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Moving a paused TIN would lift its pause without a word: refused, and
+/// a TIN that was ever paused moves only when its entry says so.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_move_from_a_paused_owner_is_refused(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (_, staff) = site.person(STAFF).await;
+    let opts = listing(STAFF, false, &[STAFF]);
+    let (old, _) = site.person("old@example.test").await;
+    let claim = add_claim(db, old, "000123456", "approved").await;
+    let response = site.post(&format!("/staff/claims/{claim}/pause"), &staff, "reason=Fraud+complaint").await;
+    assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=tin_paused"));
+    let file = |extra: &str| {
+        format!(
+            "[[login]]\nemail = \"new@example.test\"\n[[login.tin]]\ntin = \"000-123-456\"\nkind = \"business\"\nname = \"N\"\nstate = \"active\"\nreason = \"Moves\"\nmove_from = \"old@example.test\"\n{extra}"
+        )
+    };
+    let before = counts(db).await;
+    for extra in ["", "reapply = true\n"] {
+        let problem = refused(seed(db, &file(extra), &opts).await);
+        assert!(
+            problem.contains("TIN ***-***-456-00000 for new@example.test: it is paused on old@example.test"),
+            "{problem}"
+        );
+        assert!(problem.contains("resume it or revoke it on the staff pages first"), "{problem}");
+    }
+    assert_eq!(counts(db).await, before);
+    assert_eq!(site.claim_status(claim).await, "approved");
+
+    // Resumed, it was still paused once: the entry must say to go ahead.
+    let response = site.post(&format!("/staff/claims/{claim}/resume"), &staff, "reason=Cleared").await;
+    assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=tin_resumed"));
+    let problem = refused(seed(db, &file(""), &opts).await);
+    assert!(problem.contains("it was paused before") && problem.contains("reapply = true"), "{problem}");
+    let report = seed(db, &file("reapply = true\n"), &opts).await.unwrap();
+    assert_eq!(report.changes, 2, "{:?}", report.lines);
+    assert_eq!(site.claim_status(claim).await, "revoked");
+}
+
+/// Running an old file again keeps what staff decided on the website
+/// since: a role and a test label set there stay, and each is reported.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_rerun_keeps_a_role_and_a_label_staff_changed_on_the_website(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (_, staff) = site.person(STAFF).await;
+    let opts = listing(STAFF, false, &[STAFF]);
+    let file = "[[login]]\nemail = \"bob@example.test\"\nrole = \"admin\"\ntest = true\n";
+    seed(db, file, &opts).await.unwrap();
+    let (bob, role, test) = account(db, "bob@example.test").await;
+    assert_eq!((role.as_deref(), test), (Some("admin"), true));
+    // An Admin demotes bob for cause and takes the label off.
+    let user = format!("/staff/users/{bob}");
+    let response = site.post(&format!("{user}/role"), &staff, "role=none&reason=For+cause").await;
+    assert_eq!(location(&response), format!("{user}?notice=role_changed"));
+    let response = site.post(&format!("{user}/test"), &staff, "test=off&reason=Real+customer").await;
+    assert_eq!(location(&response), format!("{user}?notice=test_unmarked"));
+
+    let before = counts(db).await;
+    let again = seed(db, file, &opts).await.unwrap();
+    assert_eq!(again.changes, 0, "{:?}", again.lines);
+    let (_, role, test) = account(db, "bob@example.test").await;
+    assert_eq!((role, test), (None, false));
+    let lines = again.lines.join("\n");
+    assert!(
+        lines.contains(
+            "kept role bob@example.test No staff role (the file says Admin): staff changed it on the website after the last seed run"
+        ),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("kept test label bob@example.test off (the file says on): staff changed it on the website"),
+        "{lines}"
+    );
+    assert_eq!(counts(db).await[..4], before[..4]);
+}
+
+/// A TIN that staff revoked, or a TIN saved without papers that staff
+/// deleted, is not put back by running the file again, unless its entry
+/// says `reapply = true`.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_rerun_does_not_bring_back_a_tin_ended_on_the_website(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (_, staff) = site.person(STAFF).await;
+    let opts = listing(STAFF, false, &[STAFF]);
+    seed(db, EXAMPLE, &opts).await.unwrap();
+    let (jane, ..) = account(db, "jane@example.test").await;
+    let (shop, ..) = account(db, "shop@example.test").await;
+    let active = site.newest_claim(jane).await;
+    let unverified = site.newest_claim(shop).await;
+    let response = site.post(&format!("/staff/claims/{active}/revoke"), &staff, "reason=Not+hers").await;
+    assert_eq!(location(&response), format!("/staff/claims/{active}?notice=ownership_revoked"));
+    let response = site.post(&format!("/staff/claims/{unverified}/delete"), &staff, "reason=Typo").await;
+    assert_eq!(location(&response), "/staff?notice=claim_deleted");
+
+    let before = counts(db).await;
+    let problem = refused(seed(db, EXAMPLE, &opts).await);
+    assert!(
+        problem.contains("TIN ***-***-453-00000 on jane@example.test: it was revoked on this login on the website"),
+        "{problem}"
+    );
+    assert!(
+        problem.contains("TIN ***-***-454-00000 on shop@example.test: it was deleted from this login on the website"),
+        "{problem}"
+    );
+    assert!(problem.contains("set reapply = true on its entry"), "{problem}");
+    assert_eq!(counts(db).await, before);
+    assert_eq!(site.claim_status(active).await, "revoked");
+
+    // An owner who removed it is heard the same way.
+    let (ana, ana_cookie) = site.person("ana@example.test").await;
+    let removed = add_claim(db, ana, "000123460", "approved").await;
+    let response = site.post(&format!("/tins/claims/{removed}/remove"), &ana_cookie, "").await;
+    assert_eq!(location(&response), "/tins?notice=tin_removed");
+    let ana_file = "[[login]]\nemail = \"ana@example.test\"\n[[login.tin]]\ntin = \"000123460\"\nkind = \"business\"\nname = \"A\"\nstate = \"active\"\nreason = \"x\"\n";
+    let problem = refused(seed(db, ana_file, &opts).await);
+    assert!(problem.contains("it was removed on this login on the website"), "{problem}");
+
+    // Said explicitly, the file wins.
+    let reapplied = EXAMPLE
+        .replace("reason = \"Owner's test login\"", "reason = \"Owner's test login\"\n  reapply = true")
+        .replace(
+            "state = \"not_verified\"    # saved without papers; it can prepare, not send",
+            "state = \"not_verified\"\n  reapply = true",
+        );
+    let report = seed(db, &reapplied, &opts).await.unwrap();
+    assert_eq!(report.changes, 2, "{:?}", report.lines);
+    assert_eq!(claim_of(db, jane, "000123453").await.0, "approved");
+    assert_eq!(claim_of(db, shop, "000123454").await.0, "unverified");
+}
+
+/// Like the website, the seed never changes the role of the one running
+/// it, except to make the first Admin on a server with none.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_seed_never_changes_the_role_of_whoever_runs_it(db: PgPool) {
+    seed(&db, "[[login]]\nemail = \"eve@example.test\"\nrole = \"admin\"\n", &options("eve@example.test", false))
+        .await
+        .unwrap();
+    for role in ["support", "none"] {
+        let file = format!("[[login]]\nemail = \"eve@example.test\"\nrole = \"{role}\"\n");
+        let problem = refused(seed(&db, &file, &options("eve@example.test", false)).await);
+        assert!(problem.contains("--as eve@example.test cannot change its own role"), "{problem}");
+    }
+    assert_eq!(account(&db, "eve@example.test").await.1.as_deref(), Some("admin"));
 }

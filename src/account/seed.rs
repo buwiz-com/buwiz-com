@@ -1,25 +1,34 @@
-//! `buwiz-cloud seed <FILE> --as <admin email> [--dry-run]`: creates
-//! logins, their staff roles and test labels, and their TINs from one TOML
-//! file, in one transaction, with a record of what it did (`seed_runs`, and
-//! a line in `account_audit` or `claim_audit` for each change, from source
-//! `seed`). See `docs/seed.example.toml` for the file.
+//! `buwiz-cloud seed`: creates logins, their staff roles and test labels,
+//! and their TINs from one TOML file, in one transaction, with a record of
+//! what it did (`seed_runs`, and a line in `account_audit` or `claim_audit`
+//! for each change, from source `seed`). See [`USAGE`],
+//! `docs/seed.example.toml` for the file and `docs/deploy.md` for the run.
 //!
-//! It changes only what differs from the file, so a second run with the
-//! same file changes nothing. It never runs migrations and starts no
-//! server: it refuses a database whose applied migrations are not exactly
-//! this release's (by number and checksum). It waits at most
-//! [`LOCK_TIMEOUT`] for a lock another change holds.
+//! It changes only what differs from the file, and never undoes what staff
+//! decided on the website since: a role or test label staff last changed
+//! there is kept (and reported), and a TIN this login ended there, or a
+//! TIN ever paused, comes back only with `reapply = true`. It never runs
+//! migrations and starts no server: it refuses a database whose applied
+//! migrations are not exactly this release's (by number and checksum). It
+//! waits at most [`LOCK_TIMEOUT`] for a lock another change holds. A real
+//! run writes only to the database `--target` names, and with `--expect`
+//! only the plan the dry run showed.
 //!
 //! What it refuses, before anything is written (the whole file):
 //! - a file that does not parse, or has a key it does not know;
-//! - a bad email, the same login or the same TIN twice;
+//! - a bad email, the same login or the same TIN twice; a TIN whose own
+//!   branch differs from its `branch` key;
 //! - an active TIN without a reason, or on a banned account;
 //! - an active TIN another account owns, unless `move_from` names that
-//!   account; and `move_from` naming an account with nothing to move;
+//!   account; `move_from` naming an account with nothing to move, or one
+//!   whose row is paused (resume or revoke it on /staff first);
 //! - a TIN whose papers are waiting for review on the login (decide it on
 //!   /staff);
-//! - `--as` that is not an Admin (on a database with no Admin at all, the
-//!   file may make `--as` the first one);
+//! - a TIN this login ended on the website, or an active one ever paused,
+//!   without `reapply = true`;
+//! - `--as` that is not an Admin (on a server without `ADMIN_EMAILS` and a
+//!   database with no Admin at all, the file may make `--as` the first
+//!   one), and a change of `--as`'s own role;
 //! - a change of roles that leaves no Admin.
 //!
 //! A TIN that is not valid (000-000-000, or not 9 digits) is refused on its
@@ -94,6 +103,11 @@ struct TinEntry {
     state: StateEntry,
     reason: Option<String>,
     move_from: Option<String>,
+    /// Applies the entry even though this login ended the TIN on the
+    /// website (revoked, removed, rejected or deleted), or the TIN was ever
+    /// paused.
+    #[serde(default)]
+    reapply: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -126,6 +140,7 @@ struct PlannedTin {
     active: bool,
     reason: String,
     move_from: Option<String>,
+    reapply: bool,
 }
 
 /// How the tool was asked to run.
@@ -298,7 +313,7 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
                 KindEntry::Personal => ClaimKind::Personal,
                 KindEntry::Business => ClaimKind::Business,
             };
-            planned.push(PlannedTin { tin, kind, name, active, reason, move_from });
+            planned.push(PlannedTin { tin, kind, name, active, reason, move_from, reapply: entry.reapply });
         }
         logins.push(PlannedLogin { email, role: login.role.map(RoleEntry::role), test: login.test, tins: planned });
     }
@@ -451,6 +466,7 @@ pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &
         problems: Vec::new(),
         objects: Vec::new(),
         bootstrapped: None,
+        bootstrap: false,
     };
     let actor = seed.actor(&actor_email, &logins).await?;
     let mut ids = Vec::with_capacity(logins.len());
@@ -565,6 +581,8 @@ struct Seed<'a> {
     objects: Vec<String>,
     /// The account of `--as`, when this run made it.
     bootstrapped: Option<Uuid>,
+    /// This run makes `--as` the first Admin (a database with none).
+    bootstrap: bool,
 }
 
 /// A line of `claim_audit` from the seed tool.
@@ -646,6 +664,7 @@ impl Seed<'_> {
             };
             return Err(SeedError::Refused(vec![why]));
         }
+        self.bootstrap = bootstrap;
         let (id, made) = self.create_account(email).await?;
         if made {
             self.bootstrapped = Some(id);
@@ -702,7 +721,27 @@ impl Seed<'_> {
                 .await?;
         if let Some(role) = login.role {
             let old = stored_role.as_deref().and_then(Role::parse);
-            if old != role {
+            let label = |role: Option<Role>| roles::role_label(role.map(Role::as_str));
+            let by_website = self.last_change(id, &["role_changed"]).await?;
+            if old != role && email == actor.email && !(self.bootstrap && role == Some(Role::Admin)) {
+                self.problems.push(format!(
+                    "--as {email} cannot change its own role ({} in the file, {} now), as on the website: another \
+                     Admin runs that",
+                    label(role),
+                    label(old)
+                ));
+            } else if old != role
+                && let Some(at) = by_website
+            {
+                let line = format!(
+                    "kept role {email} {} (the file says {}): staff changed it on the website after the last seed \
+                     run, on {at}; change it there if the file is right",
+                    label(old),
+                    label(role)
+                );
+                self.unchanged(line.clone(), line);
+                changed = true;
+            } else if old != role {
                 let new = role.map(Role::as_str);
                 sqlx::query("UPDATE accounts SET role = $2 WHERE id = $1")
                     .bind(id)
@@ -728,7 +767,20 @@ impl Seed<'_> {
                 changed = true;
             }
         }
+        let on_off = |test: bool| if test { "on" } else { "off" };
         if let Some(test) = login.test
+            && test != stored_test
+            && let Some(at) = self.last_change(id, &["test_marked", "test_unmarked"]).await?
+        {
+            let line = format!(
+                "kept test label {email} {} (the file says {}): staff changed it on the website after the last seed \
+                 run, on {at}; change it there if the file is right",
+                on_off(stored_test),
+                on_off(test)
+            );
+            self.unchanged(line.clone(), line);
+            changed = true;
+        } else if let Some(test) = login.test
             && test != stored_test
         {
             sqlx::query("UPDATE accounts SET test_account = $2 WHERE id = $1")
@@ -756,6 +808,63 @@ impl Seed<'_> {
             self.unchanged(line.clone(), line);
         }
         Ok(id)
+    }
+
+    /// When staff last changed one of `actions` on the account on the
+    /// website, if that is its newest change of them (newer than any seed
+    /// run's): the file must not silently undo it.
+    async fn last_change(&mut self, account_id: Uuid, actions: &[&str]) -> sqlx::Result<Option<String>> {
+        let newest: Option<(String, time::OffsetDateTime)> = sqlx::query_as(
+            "SELECT source, created_at FROM account_audit WHERE account_id = $1 AND action = ANY($2)
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(actions)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        Ok(newest.filter(|(source, _)| source == "web").map(|(_, at)| at.date().to_string()))
+    }
+
+    /// Why this login must not get `tin` again without `reapply = true`:
+    /// the login had it and it was ended on the website (revoked, removed,
+    /// rejected, or a claim deleted), or (for an active TIN) the TIN was
+    /// ever paused, on any login.
+    async fn ended_before(&mut self, account_id: Uuid, tin: &Tin, active: bool) -> sqlx::Result<Option<String>> {
+        let ended: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM tin_claims
+             WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status IN ('revoked', 'removed', 'rejected')
+             ORDER BY coalesce(removed_at, decided_at, created_at) DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(tin.root())
+        .bind(tin.branch())
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        if let Some(status) = ended {
+            return Ok(Some(format!("it was {status} on this login on the website")));
+        }
+        // A deleted claim leaves only its audit line, which keeps the TIN
+        // masked.
+        let deleted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $1 AND tin_masked = $2 AND action = 'deleted')",
+        )
+        .bind(account_id)
+        .bind(tin.masked())
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if deleted {
+            return Ok(Some("it was deleted from this login on the website".to_owned()));
+        }
+        let paused: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id
+                            WHERE c.tin_root = $1 AND c.branch_code = $2 AND a.action = 'paused')
+                 OR EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND paused_at IS NOT NULL)",
+        )
+        .bind(tin.root())
+        .bind(tin.branch())
+        .fetch_one(&mut *self.tx)
+        .await?;
+        Ok((active && paused).then(|| "it was paused before".to_owned()))
     }
 
     async fn claim_line(&mut self, actor: &Account, tin: &Tin, line: ClaimLine<'_>) -> sqlx::Result<()> {
@@ -819,6 +928,14 @@ impl Seed<'_> {
                     self.unchanged(line, masked);
                 }
                 None => {
+                    if !entry.reapply
+                        && let Some(why) = self.ended_before(account_id, tin, false).await?
+                    {
+                        self.problems.push(format!(
+                            "TIN {shown} on {email}: {why}; to add it again, set reapply = true on its entry"
+                        ));
+                        return Ok(());
+                    }
                     sqlx::query(
                         "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status)
                          VALUES ($1, $2, $3, $4, $5, 'unverified')",
@@ -872,6 +989,24 @@ impl Seed<'_> {
         }
         let move_reason = |seed: &Self| seed.reason(&format!("moved to {email} by the seed file: {}", entry.reason));
         let owner = live.iter().find(|claim| claim.account_id != account_id && claim.status == "approved");
+        // Moving it would lift the pause with no record of it.
+        if let (Some(owner), Some(from)) = (owner, &entry.move_from)
+            && owner.email == *from
+            && owner.paused
+        {
+            self.problems.push(format!(
+                "TIN {shown} for {email}: it is paused on {from}; resume it or revoke it on the staff pages first"
+            ));
+            return Ok(());
+        }
+        if !entry.reapply
+            && let Some(why) = self.ended_before(account_id, tin, true).await?
+        {
+            self.problems.push(format!(
+                "TIN {shown} on {email}: {why}; to make it active anyway, set reapply = true on its entry"
+            ));
+            return Ok(());
+        }
         let mut how = "new".to_owned();
         match (owner, &entry.move_from) {
             (Some(owner), Some(from)) if owner.email == *from => {

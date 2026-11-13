@@ -269,6 +269,7 @@
 .status-waiting { background: var(--wait-bg); color: var(--wait-ink); }
 .status-fix, .status-rejected { background: var(--err-bg); color: var(--danger); }
 .status-withdrawn { background: var(--chip); color: var(--muted); }
+.status-unverified { background: var(--chip); color: var(--muted); }
 .flag {
   display: inline-flex;
   align-items: center;
@@ -289,6 +290,7 @@
 .dot.active { background: var(--brand); }
 .dot.waiting { background: var(--hot); }
 .dot.fix, .dot.rejected { background: var(--danger); }
+.dot.unverified { background: var(--muted); }
 .tag {
   display: inline-flex;
   align-items: center;
@@ -363,6 +365,7 @@
 .tin-note.active { background: var(--brand-tint); color: var(--text); }
 .tin-note.waiting { background: var(--wait-bg); color: var(--wait-ink); }
 .tin-note.fix { background: var(--err-bg); color: var(--danger); }
+.tin-note.unverified { background: var(--chip); color: var(--text); }
 .tin-note ul { margin: 6px 0; padding-left: 18px; }
 .tin-note p + p { margin-top: 6px; }
 .tin-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: auto; }

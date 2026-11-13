@@ -7,9 +7,12 @@
 //!
 //! Lifecycle: `pending` → `approved` | `rejected` | `needs_fix` (staff) |
 //! `withdrawn` (claimant). A claim sent back (`needs_fix`) is resent with
-//! new files and is `pending` again. One TIN has at most one approved
-//! owner. Document bytes are dropped when a claim ends; the hash and
-//! metadata stay.
+//! new files and is `pending` again. A TIN added without its papers
+//! ("Skip for now") is `unverified`: it can prepare returns but not send
+//! them, and becomes `pending` when its papers are sent. Any number of
+//! accounts may hold an unverified row for one TIN; one TIN has at most
+//! one approved owner. Document bytes are dropped when a claim ends; the
+//! hash and metadata stay.
 //!
 //! Ending: a claim that never became active can be deleted, rows, files
 //! and all (by the claimant, or by staff with a reason). An approved claim
@@ -39,6 +42,8 @@ use crate::filing::gate;
 
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SUPPORTING_FILES: usize = 5;
+/// TINs an account may have waiting to be verified at once.
+pub const MAX_UNVERIFIED: i64 = 20;
 /// Permissions an approved TIN grants in the Buwiz BIR app.
 pub const PROFILE_PERMISSIONS: &[&str] = &["profile.view", "filing.prepare", "filing.submit"];
 /// What a TIN still being checked allows in the BIR app: preparing
@@ -225,6 +230,9 @@ pub struct NewClaim {
     pub registered_name: String,
     pub trade_name: String,
     pub uploads: Vec<Upload>,
+    /// "Skip for now": saved as not verified, without papers. Any uploads
+    /// are dropped.
+    pub papers_later: bool,
 }
 
 /// Trimmed registered and trade names, or why they cannot be used.
@@ -266,7 +274,18 @@ fn missing_notice(document: DocumentKind) -> Notice {
     }
 }
 
-/// Opens a claim with its files. Errors are messages for the person.
+/// The documents of `kind` missing from `uploads`, as the notice to show.
+fn check_required(kind: ClaimKind, uploads: &[Upload]) -> Result<(), Notice> {
+    match kind.required().iter().find(|required| !uploads.iter().any(|upload| upload.kind == **required)) {
+        Some(missing) => Err(missing_notice(*missing)),
+        None => Ok(()),
+    }
+}
+
+/// Opens a claim with its files, or saves the TIN as not verified without
+/// any ([`NewClaim::papers_later`]). Errors are messages for the person.
+/// Nothing here looks at other accounts' rows: adding a TIN reads the same
+/// whoever else has it.
 pub async fn submit(
     db: &PgPool,
     store: &DocumentStore,
@@ -274,19 +293,19 @@ pub async fn submit(
     account_id: Uuid,
     claim: NewClaim,
 ) -> Result<Uuid, SubmitError> {
-    let NewClaim { kind, tin, registered_name, trade_name, uploads } = claim;
+    let NewClaim { kind, tin, registered_name, trade_name, uploads, papers_later } = claim;
     let (registered_name, trade_name) = check_names(&registered_name, &trade_name).map_err(SubmitError::Invalid)?;
-    for required in kind.required() {
-        if !uploads.iter().any(|upload| upload.kind == *required) {
-            return Err(SubmitError::Invalid(missing_notice(*required)));
-        }
+    let uploads = if papers_later { Vec::new() } else { uploads };
+    if !papers_later {
+        check_required(kind, &uploads).map_err(SubmitError::Invalid)?;
     }
     let checked = check_uploads(kind, uploads).map_err(SubmitError::Invalid)?;
 
     let mut tx = db.begin().await?;
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT status FROM tin_claims
-         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status IN ('pending', 'needs_fix', 'approved')",
+         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
+           AND status IN ('unverified', 'pending', 'needs_fix', 'approved')",
     )
     .bind(account_id)
     .bind(tin.root())
@@ -295,12 +314,25 @@ pub async fn submit(
     .await?;
     match existing.as_deref() {
         Some("approved") => return Err(SubmitError::Invalid(Notice::TinAlreadyActive)),
+        Some("unverified") => return Err(SubmitError::Invalid(Notice::TinAlreadyAdded)),
         Some(_) => return Err(SubmitError::Invalid(Notice::ClaimAlreadyPending)),
         None => {}
     }
+    if papers_later {
+        let waiting: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1 AND status = 'unverified'")
+                .bind(account_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if waiting >= MAX_UNVERIFIED {
+            return Err(SubmitError::Invalid(Notice::TooManyUnverified));
+        }
+    }
     let inserted = sqlx::query_scalar(
         "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, trade_name, status, submitted_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', now()) RETURNING id",
+         VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $7 THEN 'unverified' ELSE 'pending' END,
+                 CASE WHEN $7 THEN NULL ELSE now() END)
+         RETURNING id",
     )
     .bind(account_id)
     .bind(kind.as_str())
@@ -308,12 +340,14 @@ pub async fn submit(
     .bind(tin.branch())
     .bind(&registered_name)
     .bind(&trade_name)
+    .bind(papers_later)
     .fetch_one(&mut *tx)
     .await;
     let claim_id: Uuid = match inserted {
-        // The same claim sent twice at once: the second one loses the race.
+        // The same TIN sent twice at once: the second one loses the race.
         Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_live") => {
-            return Err(SubmitError::Invalid(Notice::ClaimAlreadyPending));
+            let notice = if papers_later { Notice::TinAlreadyAdded } else { Notice::ClaimAlreadyPending };
+            return Err(SubmitError::Invalid(notice));
         }
         other => other?,
     };
@@ -328,8 +362,66 @@ pub async fn submit(
         store.delete_all(&uploaded).await;
         return Err(error);
     }
-    tracing::info!(%claim_id, %account_id, kind = kind.as_str(), "tin claim submitted");
+    tracing::info!(%claim_id, %account_id, kind = kind.as_str(), papers_later, "tin claim submitted");
     Ok(claim_id)
+}
+
+/// The papers for a TIN saved without them, and the names as they read now.
+pub struct Papers {
+    pub registered_name: String,
+    pub trade_name: String,
+    pub uploads: Vec<Upload>,
+}
+
+/// The person sends the papers for their own TIN saved as not verified. It
+/// is the same claim, now waiting for review from this moment.
+pub async fn send_papers(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    account_id: Uuid,
+    claim_id: Uuid,
+    papers: Papers,
+) -> Result<(), SubmitError> {
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT status, kind FROM tin_claims WHERE id = $1 AND account_id = $2 FOR UPDATE")
+            .bind(claim_id)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status, kind)) = row else {
+        return Err(SubmitError::Invalid(Notice::ClaimMissing));
+    };
+    if status != "unverified" {
+        return Err(SubmitError::Invalid(Notice::NotUnverified));
+    }
+    let kind = ClaimKind::parse(&kind).expect("stored kinds are valid");
+    let (registered_name, trade_name) =
+        check_names(&papers.registered_name, &papers.trade_name).map_err(SubmitError::Invalid)?;
+    check_required(kind, &papers.uploads).map_err(SubmitError::Invalid)?;
+    let checked = check_uploads(kind, papers.uploads).map_err(SubmitError::Invalid)?;
+    sqlx::query(
+        "UPDATE tin_claims SET status = 'pending', submitted_at = now(), registered_name = $2, trade_name = $3
+         WHERE id = $1",
+    )
+    .bind(claim_id)
+    .bind(&registered_name)
+    .bind(&trade_name)
+    .execute(&mut *tx)
+    .await?;
+    let mut uploaded = Vec::new();
+    let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
+    let committed = match stored {
+        Ok(_) => tx.commit().await.map_err(SubmitError::from),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = committed {
+        store.delete_all(&uploaded).await;
+        return Err(error);
+    }
+    tracing::info!(%claim_id, %account_id, "papers sent for a tin saved without them");
+    Ok(())
 }
 
 /// What the claimant changes on a claim sent back to them.
@@ -521,9 +613,9 @@ impl ClaimRow {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
-    /// When it last went into the review queue.
+    /// When it last went into the review queue: resent, or its papers sent.
     pub fn waiting_since(&self) -> OffsetDateTime {
-        self.resent_at.unwrap_or(self.created_at)
+        self.resent_at.or(self.submitted_at).unwrap_or(self.created_at)
     }
 
     /// When the claimant changed files on a claim already waiting for
@@ -807,7 +899,7 @@ pub enum By<'a> {
 
 /// Statuses of a claim that never became an active TIN, so nothing refers
 /// to it and it can be deleted outright.
-pub const DELETABLE: &[&str] = &["pending", "needs_fix", "rejected", "withdrawn"];
+pub const DELETABLE: &[&str] = &["unverified", "pending", "needs_fix", "rejected", "withdrawn"];
 
 /// A claim locked for a change, with what its audit line needs.
 struct Locked {

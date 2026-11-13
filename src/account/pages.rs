@@ -18,6 +18,7 @@ use crate::account::agents::{self, AuthorizeProblem};
 use crate::account::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::account::notice::Notice;
 use crate::account::oauth;
+use crate::account::tin::Tin;
 use crate::account::web::{link, safe_next, session_account};
 use crate::base::state::AppState;
 use crate::filing::devices;
@@ -42,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .page(tins::new_tin_page)
         .page(tins::claim_id::fix_page)
         .page(tins::claim_id::files_page)
+        .page(tins::claim_id::verify_page)
         .page(staff::claims_page)
         .page(staff::claim_id::claim_page)
         .page(staff::users_page)
@@ -190,6 +192,8 @@ fn head_for(path: &str) -> Head {
         "/oauth/authorize" => "Connect an AI app · Buwiz",
         "/tins" => "My TINs · Buwiz",
         "/tins/new" => "Add a TIN · Buwiz",
+        _ if path.starts_with("/tins/") && path.ends_with("/verify") => "Verify a TIN · Buwiz",
+        _ if path.starts_with("/tins/") && path.ends_with("/files") => "Your files · Buwiz",
         _ if path.starts_with("/tins/") => "Fix and send again · Buwiz",
         "/staff" => "Staff · Buwiz",
         _ if path.starts_with("/staff/") => "Staff · Buwiz",
@@ -728,6 +732,7 @@ fn ago(at: Option<OffsetDateTime>) -> String {
 /// A claim's status as people read it: (label, icon, CSS tone).
 fn status_look(status: &str) -> (&'static str, &'static str, &'static str) {
     match status {
+        "unverified" => ("Not verified", "help", "unverified"),
         "pending" => ("Being checked", "schedule", "waiting"),
         "needs_fix" => ("Needs a fix", "error", "fix"),
         "approved" => ("Active", "check_circle", "active"),
@@ -821,6 +826,8 @@ mod tests {
             ("/login", "Sign in · Buwiz"),
             ("/tins", "My TINs · Buwiz"),
             ("/tins/claims/0b6e/fix", "Fix and send again · Buwiz"),
+            ("/tins/claims/0b6e/verify", "Verify a TIN · Buwiz"),
+            ("/tins/claims/0b6e/files", "Your files · Buwiz"),
             ("/staff", "Staff · Buwiz"),
             ("/staff/users", "Staff · Buwiz"),
             ("/nowhere", "Buwiz"),

@@ -93,6 +93,10 @@ notices! {
     FileRemoved = "file_removed" => info "File removed and deleted.",
     SignedOutEverywhere = "signed_out_everywhere" => info "Signed out of every browser, app and AI agent.",
     AppSignedOut = "app_signed_out" => info "That app was signed out.",
+    TinSaved = "tin_saved" => info "Saved as Not verified. You can prepare returns for this TIN now; verify it with its papers to send them.",
+    TinAlreadyAdded = "tin_already_added" => error "This TIN is already on My TINs. Verify it there to send returns.",
+    NotUnverified = "not_unverified" => error "This TIN already has its papers. See where it stands on My TINs.",
+    TooManyUnverified = "too_many_unverified" => error "You have 20 TINs waiting to be verified. Verify or remove some first.",
 }
 
 #[cfg(test)]

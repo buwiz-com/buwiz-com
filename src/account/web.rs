@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::account::accounts::{self, Account, CodeError};
 use crate::account::agents;
 use crate::account::claims::{
-    self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Resend, SubmitError, Upload,
+    self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Papers, Resend, SubmitError, Upload,
 };
 use crate::account::mcp;
 use crate::account::notice::Notice;
@@ -100,6 +100,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/tins/claims", post(submit_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
         .route("/tins/claims/{claim_id}/withdraw", post(withdraw_claim))
         .route("/tins/claims/{claim_id}/resend", post(resend_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
+        .route("/tins/claims/{claim_id}/papers", post(send_papers).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
         .route("/tins/claims/{claim_id}/delete", post(delete_claim))
         .route("/tins/claims/{claim_id}/remove", post(remove_tin))
         .route(
@@ -574,14 +575,17 @@ async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipa
         Ok(tin) => tin,
         Err(notice) => return back(notice),
     };
+    let papers_later = form.skip;
     let claim = NewClaim {
         kind,
         tin,
         registered_name: form.registered_name,
         trade_name: form.trade_name,
         uploads: form.uploads,
+        papers_later,
     };
     match claims::submit(&state.db, &state.documents, &state.config.document_key, account.id, claim).await {
+        Ok(_) if papers_later => see_other(link("/tins", Some(Notice::TinSaved), &[])),
         Ok(claim_id) => {
             ocr::queue_claim(&state, claim_id).await;
             see_other(link("/tins", Some(Notice::ClaimSubmitted), &[]))
@@ -624,8 +628,45 @@ async fn resend_claim(
     }
 }
 
-/// The fields of the add-a-TIN and fix forms. Files arrive in fields named
-/// after their [`DocumentKind`].
+/// The person sends the papers for a TIN saved without them, from its
+/// verify page.
+async fn send_papers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    multipart: Multipart,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let verify_page = format!("/tins/claims/{claim_id}/verify");
+    let account = match require_session(&state, &headers, &verify_page).await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    let back = |notice: Notice| see_other(link(&verify_page, Some(notice), &[]));
+    let form = match read_claim_form(multipart).await {
+        Ok(form) => form,
+        Err(notice) => return back(notice),
+    };
+    let papers = Papers { registered_name: form.registered_name, trade_name: form.trade_name, uploads: form.uploads };
+    let key = &state.config.document_key;
+    match claims::send_papers(&state.db, &state.documents, key, account.id, claim_id, papers).await {
+        Ok(()) => {
+            ocr::queue_claim(&state, claim_id).await;
+            see_other(link("/tins", Some(Notice::ClaimSubmitted), &[]))
+        }
+        Err(SubmitError::Invalid(notice @ (Notice::ClaimMissing | Notice::NotUnverified))) => {
+            see_other(link("/tins", Some(notice), &[]))
+        }
+        Err(SubmitError::Invalid(notice)) => back(notice),
+        Err(SubmitError::Internal(error)) => internal(error),
+    }
+}
+
+/// The fields of the add-a-TIN, verify and fix forms. Files arrive in
+/// fields named after their [`DocumentKind`]; `skip` is step 3's "Skip for
+/// now".
 #[derive(Default)]
 struct ClaimForm {
     kind: String,
@@ -634,6 +675,7 @@ struct ClaimForm {
     registered_name: String,
     trade_name: String,
     uploads: Vec<Upload>,
+    skip: bool,
 }
 
 async fn read_claim_form(mut multipart: Multipart) -> Result<ClaimForm, Notice> {
@@ -651,6 +693,10 @@ async fn read_claim_form(mut multipart: Multipart) -> Result<ClaimForm, Notice> 
         };
         if let Some(text) = text {
             *text = field.text().await.map_err(|_| Notice::BadUpload)?;
+            continue;
+        }
+        if name == "skip" {
+            form.skip = field.text().await.map_err(|_| Notice::BadUpload)? == "1";
             continue;
         }
         let Some(kind) = DocumentKind::parse(&name) else {

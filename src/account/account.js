@@ -314,9 +314,12 @@ document.documentElement.classList.add("js");
       }
     });
 
-    // Papers of the other kind stay out of the upload.
-    form.addEventListener("submit", () => {
-      for (const input of form.querySelectorAll(`${other()} input[type="file"]`)) input.disabled = true;
+    // Papers of the other kind stay out of the upload, and "Skip for now"
+    // sends none at all. It is never held back by missing files.
+    form.addEventListener("submit", (event) => {
+      const skip = event.submitter && event.submitter.hasAttribute("data-skip");
+      const left = skip ? 'input[type="file"]' : `${other()} input[type="file"]`;
+      for (const input of form.querySelectorAll(left)) input.disabled = true;
     });
     window.addEventListener("pageshow", () => {
       for (const input of form.querySelectorAll('input[type="file"]')) input.disabled = false;

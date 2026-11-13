@@ -101,6 +101,7 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
         _ => ("Checked", ""),
     };
     let papers = if claim.kind == "personal" { "your TIN ID" } else { "your papers" };
+    let verify_with = if claim.kind == "personal" { "your TIN ID" } else { "your Form 2303 and a government ID" };
     let reasons: Vec<&str> =
         claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(_, message)| message).collect();
     let withdraw = format!("/tins/claims/{}/withdraw", claim.id);
@@ -108,6 +109,7 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
     let files = format!("/tins/claims/{}/files", claim.id);
     let delete = format!("/tins/claims/{}/delete", claim.id);
     let remove = format!("/tins/claims/{}/remove", claim.id);
+    let verify = format!("/tins/claims/{}/verify", claim.id);
     let tin = claim.tin().to_string();
     Ok(view! {
         <article class="tin-card">
@@ -122,12 +124,21 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
                     <span class="tin-trade">(trade)</span>
                 }
             </div>
-            <ol class="track" aria-label="Review progress">
-                <li class="done">"Sent"</li>
-                <li class=(checked.1)>(checked.0)</li>
-                <li class=(match status.as_str() { "approved" => "done", "revoked" => "warn", _ => "" })>"Active"</li>
-            </ol>
+            if status == "unverified" {
+                <ol class="track" aria-label="Review progress">
+                    <li class="done">"Saved"</li>
+                    <li class="">"Papers"</li>
+                    <li class="">"Active"</li>
+                </ol>
+            } else {
+                <ol class="track" aria-label="Review progress">
+                    <li class="done">"Sent"</li>
+                    <li class=(checked.1)>(checked.0)</li>
+                    <li class=(match status.as_str() { "approved" => "done", "revoked" => "warn", _ => "" })>"Active"</li>
+                </ol>
+            }
             match status.as_str() {
+                "unverified" => <p class="tin-note unverified">"Not verified yet. You can prepare and save returns for this TIN in the app. To send them to the BIR, verify it with " (verify_with) "."</p>,
                 "approved" => <p class="tin-note active">"Active since " (claim.decided_at.map(date).unwrap_or_default()) ". File from the Buwiz app on your computer."</p>,
                 "pending" => <p class="tin-note waiting">"A person is checking " (papers) ", usually within one business day. You can already prepare returns in the app."</p>,
                 "needs_fix" => {
@@ -159,6 +170,18 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
                 },
             }
             match status.as_str() {
+                "unverified" => {
+                    <div class="tin-actions">
+                        <a class="btn btn-solid btn-small" href=(verify)>icon(name: "verified_user") "Verify to send"</a>
+                        confirm_form(
+                            label: "Delete",
+                            action: delete,
+                            question: "Remove this TIN from My TINs?".to_owned(),
+                            detail: "It has no papers yet, so nothing else is kept. Returns you prepared stay in the app.".to_owned(),
+                            confirm: "Remove"
+                        )
+                    </div>
+                },
                 "pending" | "needs_fix" => {
                     <div class="tin-actions">
                         if status == "needs_fix" {
@@ -273,9 +296,43 @@ async fn file_slot(
     })
 }
 
+/// Add a TIN. `?tin=<9 digits>&branch=<3 or 5 digits>` (the apps' "Add
+/// it" link) fills in the TIN; for a TIN already on the account it goes to
+/// that TIN's own page instead. Only the person's own rows are looked at,
+/// and a value that is not a TIN is ignored, never shown.
 #[page("/tins/new")]
 pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
-    signed_in(cx).await?;
+    let account = signed_in(cx).await?;
+    let wanted =
+        query(cx, "tin").and_then(|tin| Tin::parse_fields(&tin, &query(cx, "branch").unwrap_or_default()).ok());
+    if let Some(tin) = &wanted {
+        let own: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, status FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
+               AND status IN ('unverified', 'pending', 'needs_fix', 'approved')",
+        )
+        .bind(account.id)
+        .bind(tin.root())
+        .bind(tin.branch())
+        .fetch_optional(&state(cx).db)
+        .await?;
+        let elsewhere = match own {
+            Some((id, status)) if status == "unverified" => Some(format!("/tins/claims/{id}/verify")),
+            Some((id, status)) if status == "needs_fix" => Some(format!("/tins/claims/{id}/fix")),
+            Some((_, status)) if status == "pending" => Some(link("/tins", Some(Notice::ClaimAlreadyPending), &[])),
+            Some(_) => Some(link("/tins", Some(Notice::TinAlreadyActive), &[])),
+            None => None,
+        };
+        if let Some(location) = elsewhere {
+            return Err(redirect(location).into());
+        }
+    }
+    let (tin_value, branch_value) = match &wanted {
+        Some(tin) => {
+            let root = tin.root();
+            (format!("{}-{}-{}", &root[..3], &root[3..6], &root[6..]), tin.branch().to_owned())
+        }
+        None => (String::new(), "00000".to_owned()),
+    };
     Ok(view! {
         <main class="home page">
             <div class="page-in narrow">
@@ -332,12 +389,12 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                                 <div class="field-row">
                                     <div class="field field-tin">
                                         <label for="tin">"TIN"</label>
-                                        <input id="tin" class="mono" type="text" name="tin" inputmode="numeric" autocomplete="off" placeholder="000-000-000" maxlength="20" required=(true) aria-describedby="tin-help" data-tin="">
+                                        <input id="tin" class="mono" type="text" name="tin" value=(tin_value) inputmode="numeric" autocomplete="off" placeholder="000-000-000" maxlength="20" required=(true) aria-describedby="tin-help" data-tin="">
                                         <span id="tin-help" class="field-help" data-tin-help="">"Nine digits. Dashes are added for you."</span>
                                     </div>
                                     <div class="field field-branch">
                                         <label for="branch">"Branch code " <span class="tag">"DEFAULT"</span></label>
-                                        <input id="branch" class="mono" type="text" name="branch" inputmode="numeric" autocomplete="off" value="00000" maxlength="5" aria-describedby="branch-help">
+                                        <input id="branch" class="mono" type="text" name="branch" inputmode="numeric" autocomplete="off" value=(branch_value) maxlength="5" aria-describedby="branch-help">
                                         <span id="branch-help" class="field-help">"00000 is the head office. Change it only for a branch."</span>
                                     </div>
                                 </div>
@@ -444,12 +501,14 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                             </span>
                             <span class="send-buttons">
                                 <button class="btn btn-ghost-dark" type="button" data-back="" hidden=(true)>"Back"</button>
+                                <button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formnovalidate=(true) data-skip="">"Skip for now"</button>
                                 <button class="btn btn-send" type="submit" data-send="">
                                     <span data-send-label="">"Send for review"</span>
                                     icon(name: "send")
                                 </button>
                             </span>
                         </div>
+                        <p class="fine">icon(name: "schedule") "No papers at hand? Skip for now: the TIN is saved as Not verified. You can prepare returns for it, and verify it later to send them."</p>
                         <p class="fine">icon(name: "bolt") "You can start preparing returns in the app right away. Sending to the BIR waits for the check."</p>
                     </section>
                     <p class="fine">icon(name: "lock") "Files are encrypted and deleted after review."</p>
@@ -685,6 +744,77 @@ pub mod claim_id {
                         </ul>
                     }
                     <p class="fine">icon(name: "lock") "Files are encrypted. A replaced or removed file is deleted at once."</p>
+                </div>
+            </main>
+        })
+    }
+
+    /// A TIN saved without its papers: send them now, and it goes to the
+    /// review queue as the same claim.
+    #[page("/tins/claims/{claim_id}/verify")]
+    pub async fn verify_page(cx: &Cx) -> Result<impl View> {
+        let account = signed_in(cx).await?;
+        let claim_id = path_id(cx, 1)?;
+        let claim = match claims::find(&state(cx).db, claim_id).await? {
+            Some(claim) if claim.account_id == account.id => claim,
+            _ => return Err(topcoat::router::error::not_found().into()),
+        };
+        if claim.status != "unverified" {
+            return Err(redirect(link("/tins", Some(Notice::NotUnverified), &[])).into());
+        }
+        let personal = claim.kind == "personal";
+        let action = format!("/tins/claims/{claim_id}/papers");
+        Ok(view! {
+            <main class="home page">
+                <div class="page-in narrow">
+                    <a class="back" href="/tins">icon(name: "arrow_back") "My TINs"</a>
+                    page_notice(notice: notice(cx))
+                    <div class="step-head">
+                        kind_pill(kind: claim.kind.clone())
+                        <h1>"Verify this TIN"</h1>
+                        <p class="page-lead">tin_text(tin: claim.tin().to_string()) " · " (claim.registered_name.clone())</p>
+                    </div>
+                    <p class="hint-box">icon(name: "info") <span>"Send the papers to start sending returns for this TIN. A person checks them, usually within one business day."</span></p>
+                    <form class="addtin fix-form" method="post" action=(action) enctype="multipart/form-data">
+                        <div class="panel details-card">
+                            <h2 class="step-title">"Names"</h2>
+                            <div class="field">
+                                <label for="registered_name">"Registered name"</label>
+                                <input id="registered_name" type="text" name="registered_name" maxlength="200" value=(claim.registered_name.clone()) required=(true)>
+                            </div>
+                            if !personal {
+                                <div class="field">
+                                    <label for="trade_name">"Trade name " <span class="optional">"(optional)"</span></label>
+                                    <input id="trade_name" type="text" name="trade_name" maxlength="200" value=(claim.trade_name.clone().unwrap_or_default())>
+                                </div>
+                            }
+                        </div>
+                        <div class="panel details-card">
+                            <h2 class="step-title">"Papers"</h2>
+                            <div class="slots">
+                                if personal {
+                                    file_slot(field: "tin_id", title: "TIN ID", hint: "The card, or the digital TIN ID file from ORUS.", icon_name: "badge", required: true)
+                                    file_slot(field: "selfie", title: "Selfie", hint: "Face the camera in good light.", icon_name: "face", selfie: true)
+                                    file_slot(field: "national_id", title: "National ID photo", hint: "With its QR code readable.", icon_name: "id_card")
+                                } else {
+                                    file_slot(field: "form_2303", title: "Form 2303", hint: "Your BIR Certificate of Registration.", icon_name: "description", required: true)
+                                    file_slot(field: "government_id", title: "Government ID", hint: "An ID with your photo.", icon_name: "badge", required: true)
+                                    file_slot(field: "authority", title: "Proof you can act for it", hint: "Secretary's certificate, board resolution or SPA naming you.", icon_name: "gavel")
+                                    file_slot(field: "supporting", title: "Other papers", hint: "SEC registration, DTI papers or anything else that helps.", icon_name: "attach_file", multiple: true)
+                                }
+                            </div>
+                        </div>
+                        <div class="send-bar">
+                            <span class="send-what">
+                                tin_text(tin: claim.tin().to_string())
+                                <span class="send-sub">"It goes to the review queue."</span>
+                            </span>
+                            <span class="send-buttons">
+                                <button class="btn btn-send" type="submit">"Send for review" icon(name: "send")</button>
+                            </span>
+                        </div>
+                        <p class="fine">icon(name: "lock") "Files are encrypted and deleted after review."</p>
+                    </form>
                 </div>
             </main>
         })

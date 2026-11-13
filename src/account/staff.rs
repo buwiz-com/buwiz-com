@@ -81,7 +81,7 @@ impl QueueFilter {
     /// newest first.
     fn order(self) -> &'static str {
         match self {
-            Self::Waiting => "coalesce(c.resent_at, c.created_at), c.id",
+            Self::Waiting => "coalesce(c.resent_at, c.submitted_at, c.created_at), c.id",
             Self::SentBack => "c.sent_back_at, c.id",
             Self::Approved | Self::Rejected => "c.decided_at DESC, c.id",
             Self::Ended => "c.removed_at DESC, c.id",
@@ -150,16 +150,18 @@ pub async fn open_counts(db: &PgPool) -> sqlx::Result<(i64, i64)> {
 pub async fn neighbours(db: &PgPool, claim: &ClaimRow) -> sqlx::Result<(Option<Uuid>, Option<Uuid>)> {
     let at = claim.waiting_since();
     let previous = sqlx::query_scalar(
-        "SELECT id FROM tin_claims WHERE status = 'pending' AND (coalesce(resent_at, created_at), id) < ($1, $2)
-         ORDER BY coalesce(resent_at, created_at) DESC, id DESC LIMIT 1",
+        "SELECT id FROM tin_claims
+         WHERE status = 'pending' AND (coalesce(resent_at, submitted_at, created_at), id) < ($1, $2)
+         ORDER BY coalesce(resent_at, submitted_at, created_at) DESC, id DESC LIMIT 1",
     )
     .bind(at)
     .bind(claim.id)
     .fetch_optional(db)
     .await?;
     let next = sqlx::query_scalar(
-        "SELECT id FROM tin_claims WHERE status = 'pending' AND (coalesce(resent_at, created_at), id) > ($1, $2)
-         ORDER BY coalesce(resent_at, created_at), id LIMIT 1",
+        "SELECT id FROM tin_claims
+         WHERE status = 'pending' AND (coalesce(resent_at, submitted_at, created_at), id) > ($1, $2)
+         ORDER BY coalesce(resent_at, submitted_at, created_at), id LIMIT 1",
     )
     .bind(at)
     .bind(claim.id)

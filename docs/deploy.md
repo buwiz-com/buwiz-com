@@ -373,13 +373,17 @@ only its own `seed_runs` row.
 
 When staff or owners changed something on the website in between, a
 re-run still never undoes it:
-- a role or test label whose newest change was made on the website is
-  kept, and printed as `kept role …` or `kept test label …` (not counted
-  as a change);
+- a role or test label whose newest change was made on the website (by
+  when it was written, so a change that committed after a seed run is
+  newer than it) is kept, and printed as `kept role …` or `kept test label
+  …` (not counted as a change);
 - a TIN this login had and that was revoked, removed by its owner,
-  rejected or deleted on the website, and an active TIN that was ever
-  paused on any login, refuse the whole file until the entry says
-  `reapply = true` (or is taken out of the file);
+  rejected or deleted on the website, or that an earlier seed run moved to
+  another login, and an active TIN that was ever paused on any login,
+  refuse the whole file until the entry says `reapply = true` (or is taken
+  out of the file). A deleted claim is matched by its masked TIN (the last
+  three digits and the branch), so another such TIN on the login asks for
+  `reapply` too;
 - a TIN already active is never made "not verified", and a paused one
   stays paused;
 - the `--as` Admin's own role never changes.

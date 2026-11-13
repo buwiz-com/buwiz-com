@@ -30,7 +30,10 @@ CREATE TABLE account_audit (
     -- Set by every writer; no default.
     source      text NOT NULL CHECK (source IN ('web', 'seed')),
     reason      text,
-    created_at  timestamptz NOT NULL DEFAULT now()
+    -- When the line was written, not when its transaction began: a change
+    -- that began before a seed run and committed after it is the newer
+    -- one, and the seed's next run keeps it.
+    created_at  timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX account_audit_account ON account_audit (account_id, created_at DESC);
 

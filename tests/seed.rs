@@ -749,12 +749,14 @@ async fn a_rerun_keeps_a_role_and_a_label_staff_changed_on_the_website(db: PgPoo
     let lines = again.lines.join("\n");
     assert!(
         lines.contains(
-            "kept role bob@example.test No staff role (the file says Admin): staff changed it on the website after the last seed run"
+            "kept role bob@example.test No staff role (the file says Admin): its newest change was made by staff on the website"
         ),
         "{lines}"
     );
     assert!(
-        lines.contains("kept test label bob@example.test off (the file says on): staff changed it on the website"),
+        lines.contains(
+            "kept test label bob@example.test off (the file says on): its newest change was made by staff on the website"
+        ),
         "{lines}"
     );
     assert_eq!(counts(db).await[..4], before[..4]);
@@ -971,4 +973,102 @@ async fn activating_a_tin_others_wait_on_says_so_in_the_plan(db: PgPool) {
     assert!(lines.contains("another account has a claim on it saved as not verified"), "{lines}");
     assert!(!lines.contains("carl@example.test") && !lines.contains("dora@example.test"), "{lines}");
     assert_eq!(real.digest, dry.digest);
+}
+
+/// A website change that began before a seed run but committed after it
+/// is newer than the seed's: the next run keeps it. The history is ordered
+/// by when each line was written, not by when its transaction began.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_website_change_committed_after_a_seed_run_is_kept_by_the_next(db: PgPool) {
+    let opts = options("admin@example.test", false);
+    let file = "[[login]]\nemail = \"admin@example.test\"\nrole = \"admin\"\n[[login]]\nemail = \"bob@example.test\"\nrole = \"support\"\n";
+    seed(&db, file, &opts).await.unwrap();
+    let (admin, ..) = account(&db, "admin@example.test").await;
+    let (bob, ..) = account(&db, "bob@example.test").await;
+    // An Admin's change of bob's role starts on the website...
+    let mut website = db.begin().await.unwrap();
+    sqlx::query("SELECT 1").execute(&mut *website).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // ...a seed run goes through meanwhile, setting bob to Admin...
+    let promote = file.replace("role = \"support\"", "role = \"admin\"");
+    seed(&db, &promote, &opts).await.unwrap();
+    assert_eq!(account(&db, "bob@example.test").await.1.as_deref(), Some("admin"));
+    // ...and the website's change writes and commits after it.
+    sqlx::query("UPDATE accounts SET role = NULL WHERE id = $1;").bind(bob).execute(&mut *website).await.unwrap();
+    sqlx::query(
+        "INSERT INTO account_audit (account_id, action, old_value, new_value, actor_id, actor_email, source, reason)
+         VALUES ($1, 'role_changed', 'admin', NULL, $2, 'admin@example.test', 'web', 'For cause')",
+    )
+    .bind(bob)
+    .bind(admin)
+    .execute(&mut *website)
+    .await
+    .unwrap();
+    website.commit().await.unwrap();
+
+    let again = seed(&db, &promote, &opts).await.unwrap();
+    assert_eq!(again.changes, 0, "{:?}", again.lines);
+    assert!(
+        again.lines.iter().any(|line| line.starts_with("kept role bob@example.test No staff role")),
+        "{:?}",
+        again.lines
+    );
+    assert_eq!(account(&db, "bob@example.test").await.1, None);
+}
+
+/// What the seed itself ended on a login (a TIN it moved to another) is
+/// said to be the seed's doing, not the website's; it still needs
+/// `reapply = true` to come back.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_ending_made_by_an_earlier_seed_run_is_named_as_such(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let opts = options("admin@example.test", false);
+    seed(db, "[[login]]\nemail = \"admin@example.test\"\nrole = \"admin\"\n", &opts).await.unwrap();
+    let (old, _) = site.person("old@example.test").await;
+    add_claim(db, old, "000123456", "approved").await;
+    let (waiting, waiting_cookie) = site.person("waiting@example.test").await;
+    let parts = [
+        ("kind", Text("personal")),
+        ("tin", Text("000123457")),
+        ("registered_name", Text("W")),
+        ("tin_id", File("tin.png", PNG)),
+    ];
+    site.upload("/tins/claims", &waiting_cookie, &parts).await;
+    let _ = waiting;
+    let entry = |email: &str, tin: &str, from: &str, extra: &str| {
+        format!(
+            "[[login]]\nemail = \"{email}\"\n[[login.tin]]\ntin = \"{tin}\"\nkind = \"business\"\nname = \"N\"\nstate = \"active\"\nreason = \"Moves\"\nmove_from = \"{from}\"\n{extra}"
+        )
+    };
+    let away = format!(
+        "{}{}",
+        entry("new@example.test", "000-123-456", "old@example.test", ""),
+        entry("other@example.test", "000-123-457", "waiting@example.test", "")
+    );
+    seed(db, &away, &opts).await.unwrap();
+    // Moving them back: refused, and the seed is named as what ended them.
+    let back = format!(
+        "{}{}",
+        entry("old@example.test", "000-123-456", "new@example.test", ""),
+        entry("waiting@example.test", "000-123-457", "other@example.test", "")
+    );
+    let problem = refused(seed(db, &back, &opts).await);
+    assert!(
+        problem.contains("TIN ***-***-456-00000 on old@example.test: an earlier seed run moved it from this login"),
+        "{problem}"
+    );
+    assert!(
+        problem.contains(
+            "TIN ***-***-457-00000 on waiting@example.test: an earlier seed run deleted its claim on this login"
+        ),
+        "{problem}"
+    );
+    assert!(!problem.contains("on the website"), "{problem}");
+    let back = format!(
+        "{}{}",
+        entry("old@example.test", "000-123-456", "new@example.test", "reapply = true\n"),
+        entry("waiting@example.test", "000-123-457", "other@example.test", "reapply = true\n")
+    );
+    assert_eq!(seed(db, &back, &opts).await.unwrap().changes, 2);
 }

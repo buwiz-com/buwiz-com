@@ -6,8 +6,9 @@
 //!
 //! It changes only what differs from the file, and never undoes what staff
 //! decided on the website since: a role or test label staff last changed
-//! there is kept (and reported), and a TIN this login ended there, or a
-//! TIN ever paused, comes back only with `reapply = true`. It never runs
+//! there is kept (and reported), and a TIN this login ended there (or an
+//! earlier seed run moved away), or a TIN ever paused, comes back only with
+//! `reapply = true`. It never runs
 //! migrations and starts no server: it refuses a database whose applied
 //! migrations are not exactly this release's (by number and checksum). It
 //! waits at most [`LOCK_TIMEOUT`] for a lock another change holds. A real
@@ -25,8 +26,8 @@
 //!   whose row is paused (resume or revoke it on /staff first);
 //! - a TIN whose papers are waiting for review on the login (decide it on
 //!   /staff);
-//! - a TIN this login ended on the website, or an active one ever paused,
-//!   without `reapply = true`;
+//! - a TIN this login ended on the website or an earlier run moved away,
+//!   or an active one ever paused, without `reapply = true`;
 //! - `--as` that is not an Admin (on a server without `ADMIN_EMAILS` and a
 //!   database with no Admin at all, the file may make `--as` the first
 //!   one), and a change of `--as`'s own role;
@@ -797,8 +798,8 @@ impl Seed<'_> {
                 && let Some(at) = by_website
             {
                 let line = format!(
-                    "kept role {email} {} (the file says {}): staff changed it on the website after the last seed \
-                     run, on {at}; change it there if the file is right",
+                    "kept role {email} {} (the file says {}): its newest change was made by staff on the website, \
+                     on {at}; change it there if the file is right",
                     label(old),
                     label(role)
                 );
@@ -836,8 +837,8 @@ impl Seed<'_> {
             && let Some(at) = self.last_change(id, &["test_marked", "test_unmarked"]).await?
         {
             let line = format!(
-                "kept test label {email} {} (the file says {}): staff changed it on the website after the last seed \
-                 run, on {at}; change it there if the file is right",
+                "kept test label {email} {} (the file says {}): its newest change was made by staff on the website, \
+                 on {at}; change it there if the file is right",
                 on_off(stored_test),
                 on_off(test)
             );
@@ -875,7 +876,9 @@ impl Seed<'_> {
 
     /// When staff last changed one of `actions` on the account on the
     /// website, if that is its newest change of them (newer than any seed
-    /// run's): the file must not silently undo it.
+    /// run's): the file must not silently undo it. `created_at` is when
+    /// each line was written (`clock_timestamp()`), so a website change
+    /// that began before a seed run and committed after it is the newer.
     async fn last_change(&mut self, account_id: Uuid, actions: &[&str]) -> sqlx::Result<Option<String>> {
         let newest: Option<(String, time::OffsetDateTime)> = sqlx::query_as(
             "SELECT source, created_at FROM account_audit WHERE account_id = $1 AND action = ANY($2)
@@ -889,34 +892,53 @@ impl Seed<'_> {
     }
 
     /// Why this login must not get `tin` again without `reapply = true`:
-    /// the login had it and it was ended on the website (revoked, removed,
-    /// rejected, or a claim deleted), or (for an active TIN) the TIN was
-    /// ever paused, on any login.
+    /// the login had it and it was ended (revoked, removed, rejected, or a
+    /// claim deleted) on the website or by an earlier seed run moving it
+    /// away, or (for an active TIN) the TIN was ever paused, on any login.
     async fn ended_before(&mut self, account_id: Uuid, tin: &Tin, active: bool) -> sqlx::Result<Option<String>> {
-        let ended: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM tin_claims
-             WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status IN ('revoked', 'removed', 'rejected')
-             ORDER BY coalesce(removed_at, decided_at, created_at) DESC LIMIT 1",
+        // The ending's own audit line says who ended it; none (a line from
+        // before this release) is the website's.
+        let ended: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT c.status,
+                    (SELECT a.source FROM claim_audit a WHERE a.claim_id = c.id AND a.action = c.status
+                      ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
+             FROM tin_claims c
+             WHERE c.account_id = $1 AND c.tin_root = $2 AND c.branch_code = $3
+               AND c.status IN ('revoked', 'removed', 'rejected')
+             ORDER BY coalesce(c.removed_at, c.decided_at, c.created_at) DESC LIMIT 1",
         )
         .bind(account_id)
         .bind(tin.root())
         .bind(tin.branch())
         .fetch_optional(&mut *self.tx)
         .await?;
-        if let Some(status) = ended {
-            return Ok(Some(format!("it was {status} on this login on the website")));
+        match ended {
+            Some((_, Some(source))) if source == "seed" => {
+                return Ok(Some("an earlier seed run moved it from this login to another".to_owned()));
+            }
+            Some((status, _)) => return Ok(Some(format!("it was {status} on this login on the website"))),
+            None => {}
         }
         // A deleted claim leaves only its audit line, which keeps the TIN
-        // masked.
-        let deleted: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $1 AND tin_masked = $2 AND action = 'deleted')",
+        // masked. So another TIN with the same last three digits and branch
+        // on this login matches too: that only refuses (until the entry
+        // says `reapply = true`), so it fails safe.
+        let deleted: Option<String> = sqlx::query_scalar(
+            "SELECT source FROM claim_audit WHERE account_id = $1 AND tin_masked = $2 AND action = 'deleted'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(account_id)
         .bind(tin.masked())
-        .fetch_one(&mut *self.tx)
+        .fetch_optional(&mut *self.tx)
         .await?;
-        if deleted {
-            return Ok(Some("it was deleted from this login on the website".to_owned()));
+        match deleted.as_deref() {
+            Some("seed") => {
+                return Ok(Some(
+                    "an earlier seed run deleted its claim on this login, moving it to another".to_owned(),
+                ));
+            }
+            Some(_) => return Ok(Some("it was deleted from this login on the website".to_owned())),
+            None => {}
         }
         let paused: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id

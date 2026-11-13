@@ -104,6 +104,8 @@ notices! {
     LastAdmin = "last_admin" => error "Buwiz needs at least one admin. Make someone else an admin first.",
     RoleFromServer = "role_from_server" => error "This person is an admin through the server setting ADMIN_EMAILS. Change it there.",
     AccountMissing = "account_missing" => error "That account does not exist.",
+    TinActivated = "tin_activated" => info "Activated without papers. The reason is in the account's history.",
+    ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
 }
 
 #[cfg(test)]

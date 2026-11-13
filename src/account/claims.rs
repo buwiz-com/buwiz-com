@@ -800,6 +800,9 @@ pub async fn decide(
     if claimant == reviewer_id {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
+    if *decision == Decision::Approve && is_banned(&mut tx, claimant).await? {
+        return Err(DecideError::Refused(Notice::ClaimantBanned));
+    }
     let note = note.trim();
     if let Decision::SendBack(reasons) = decision {
         if status != "pending" {
@@ -858,6 +861,66 @@ pub async fn decide(
     store.delete_all(&objects).await;
     tracing::info!(%claim_id, %reviewer_id, status, "tin claim decided");
     Ok(Notice::ClaimDecided)
+}
+
+/// Whether the account is banned. A banned account gets no active TIN.
+async fn is_banned(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+/// An Admin makes a TIN active without its papers: one saved without them,
+/// or one still waiting for review or a fix (its papers are deleted as on
+/// any decision). Unlike [`decide`], it works on the Admin's own TIN. The
+/// reason goes only into the claim's audit line, never into anything the
+/// owner or an app reads. Refused for a banned account, and while another
+/// account owns the TIN: end that ownership first. The route checks the
+/// power ([`crate::account::roles::Power::ActivateWithoutPapers`]).
+pub async fn activate_without_papers(
+    db: &PgPool,
+    store: &DocumentStore,
+    claim_id: Uuid,
+    actor: &Account,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(DecideError::Refused(Notice::ReasonMissing));
+    }
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    if !matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix") {
+        return Err(DecideError::Refused(Notice::AlreadyDecided));
+    }
+    if is_banned(&mut tx, claim.account_id).await? {
+        return Err(DecideError::Refused(Notice::ClaimantBanned));
+    }
+    let updated = sqlx::query(
+        "UPDATE tin_claims SET status = 'approved', decided_at = now(), decided_by = $2, verified_by = 'admin'
+         WHERE id = $1",
+    )
+    .bind(claim_id)
+    .bind(actor.id)
+    .execute(&mut *tx)
+    .await;
+    match updated {
+        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_owner") => {
+            return Err(DecideError::Refused(Notice::TinOwnedElsewhere));
+        }
+        other => {
+            other?;
+        }
+    }
+    let objects = purge_documents(&mut tx, claim_id).await?;
+    audit(&mut tx, &claim, actor, "activated", None, Some(reason)).await?;
+    tx.commit().await?;
+    store.delete_all(&objects).await;
+    tracing::info!(%claim_id, actor = %actor.id, "tin activated without papers");
+    Ok(Notice::TinActivated)
 }
 
 /// The claimant gives up a claim that is still open.

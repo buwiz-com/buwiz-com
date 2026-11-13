@@ -46,6 +46,8 @@ struct Target {
     open: Uuid,
     /// Saved without papers (deletable).
     unverified: Uuid,
+    /// Saved without papers too, to activate.
+    spare: Uuid,
     /// Active.
     active: Uuid,
     document: Uuid,
@@ -71,13 +73,14 @@ async fn target(site: &Site, n: u32) -> Target {
         .unwrap();
     let unverified = add_claim(&site.db, account, &format!("2{n:08}"), "unverified").await;
     let active = add_claim(&site.db, account, &format!("3{n:08}"), "approved").await;
+    let spare = add_claim(&site.db, account, &format!("4{n:08}"), "unverified").await;
     app_token(&site.db, account).await;
     let grant = sqlx::query_scalar("SELECT id FROM oauth_grants WHERE account_id = $1")
         .bind(account)
         .fetch_one(&site.db)
         .await
         .unwrap();
-    Target { account, open, unverified, active, document, grant }
+    Target { account, open, unverified, spare, active, document, grant }
 }
 
 /// The actors of the matrix, each signed in (but the first).
@@ -196,6 +199,13 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         let done = format!("{claim_page}?notice=ownership_revoked");
         expect_post(&site, (who, &cookie), &path, "reason=Wrong+owner", true, &claim_page, &done).await;
         assert_eq!(site.claim_status(t.active).await == "revoked", who.may(true), "{who:?}");
+
+        // Activate without papers: Admins only.
+        let claim_page = format!("/staff/claims/{}", t.spare);
+        let path = format!("{claim_page}/activate");
+        let done = format!("{claim_page}?notice=tin_activated");
+        expect_post(&site, (who, &cookie), &path, "reason=Known+owner", true, &claim_page, &done).await;
+        assert_eq!(site.claim_status(t.spare).await == "approved", who.may(true), "{who:?}");
 
         // Change a role: Admins only.
         let path = format!("{user}/role");

@@ -413,8 +413,20 @@ pub mod claim_id {
         let decide = format!("/staff/claims/{claim_id}/decision");
         let delete = format!("/staff/claims/{claim_id}/delete");
         let revoke = format!("/staff/claims/{claim_id}/revoke");
-        let deletable = claims::DELETABLE.contains(&claim.status.as_str());
+        let show_delete = claims::DELETABLE.contains(&claim.status.as_str()) && reviewer.can(Power::DeleteClaim);
+        let show_revoke = claim.status == "approved" && reviewer.can(Power::EndOwnership);
         let ended = matches!(claim.status.as_str(), "removed" | "revoked");
+        let unverified = claim.status == "unverified";
+        let claimant_banned = claimant.as_ref().is_some_and(|user| user.banned_at.is_some());
+        let can_activate = reviewer.can(Power::ActivateWithoutPapers)
+            && matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix");
+        let activate = format!("/staff/claims/{claim_id}/activate");
+        let tin = claim.tin().to_string();
+        let empty_viewer = if unverified {
+            format!("No papers yet. Added without the upload on {}.", date(claim.created_at))
+        } else {
+            "No files on this claim.".to_owned()
+        };
         let tabs: Vec<(usize, DocumentRow)> = documents.into_iter().enumerate().collect();
         Ok(view! {
             <main class="home page staff">
@@ -459,7 +471,7 @@ pub mod claim_id {
                         </div>
                     }
                     <div class="review">
-                        document_viewer(documents: tabs)
+                        document_viewer(documents: tabs, empty: empty_viewer)
                         <aside class="review-side">
                             <section class="panel side-card who">
                                 <span class="avatar big">(initials(&claim.email))</span>
@@ -472,7 +484,9 @@ pub mod claim_id {
                                 </span>
                                 <a href=(format!("/staff/users/{}", claim.account_id))>"View user"</a>
                             </section>
-                            typed_vs_document(comparison: compare)
+                            if !unverified {
+                                typed_vs_document(comparison: compare)
+                            }
                             if !checks.is_empty() {
                                 <section class="panel side-card">
                                     <h2>"Checks"</h2>
@@ -502,7 +516,9 @@ pub mod claim_id {
                                     }
                                 </section>
                             }
-                            if own_claim && claim.is_open() {
+                            if own_claim && claim.is_open() && can_activate {
+                                <p class="panel side-card side-text">"This is your own claim. Another staff member reviews its papers, or you can activate it without papers; the reason goes in your history."</p>
+                            } else if own_claim && claim.is_open() {
                                 <p class="panel side-card side-text">"This is your own claim. Another staff member decides it."</p>
                             } else if claim.is_open() {
                                 <form class="panel side-card decision" method="post" action=(decide)>
@@ -531,6 +547,11 @@ pub mod claim_id {
                                         <button class="btn btn-danger" type="submit" name="decision" value="reject">"Reject"</button>
                                     </div>
                                 </form>
+                            } else if unverified {
+                                <section class="panel side-card">
+                                    <h2>"Not verified"</h2>
+                                    <p class="side-text">"The person can prepare returns but not send them."</p>
+                                </section>
                             } else if ended {
                                 <section class="panel side-card">
                                     <h2>"Ended"</h2>
@@ -552,9 +573,27 @@ pub mod claim_id {
                                     }
                                 </section>
                             }
-                            if !own_claim && (deletable || claim.status == "approved") {
+                            if can_activate {
                                 <section class="panel side-card end-claim">
-                                    if claim.status == "approved" {
+                                    <h2>(if unverified { "Activate without papers" } else { "Or activate without papers" })</h2>
+                                    if claimant_banned {
+                                        <p class="side-text">(Notice::ClaimantBanned.message())</p>
+                                    } else {
+                                        <p class="side-text">"Makes " (claim.email.clone()) " the owner of " (tin.clone()) " now, without papers. Use it for accounts you know. The reason goes in the account's history."</p>
+                                        confirm_form(
+                                            label: "Activate without papers",
+                                            action: activate,
+                                            question: format!("Activate {tin} for {} without papers?", claim.email),
+                                            detail: "The TIN becomes active at once and can send returns to the BIR. Your reason is kept in the account's history.".to_owned(),
+                                            confirm: "Activate",
+                                            reason: true
+                                        )
+                                    }
+                                </section>
+                            }
+                            if !own_claim && (show_delete || show_revoke) {
+                                <section class="panel side-card end-claim">
+                                    if show_revoke {
                                         <p class="side-text">"Ends this account's ownership. The TIN stops being active at once, its sent returns stay, and it can be claimed again."</p>
                                         confirm_form(
                                             label: "Revoke ownership",
@@ -588,7 +627,7 @@ pub mod claim_id {
 /// The claim's files as tabs. The tabs are radio buttons, so they switch
 /// without JavaScript; `account.js` adds zoom and rotate for photos.
 #[component]
-async fn document_viewer(documents: Vec<(usize, DocumentRow)>) -> Result<impl View> {
+async fn document_viewer(documents: Vec<(usize, DocumentRow)>, empty: String) -> Result<impl View> {
     let tabs: Vec<(usize, String, &'static str)> = documents
         .iter()
         .map(|(index, row)| (*index, DocumentKind::label(&row.kind).to_owned(), DocumentKind::icon(&row.kind)))
@@ -597,7 +636,7 @@ async fn document_viewer(documents: Vec<(usize, DocumentRow)>) -> Result<impl Vi
     Ok(view! {
         <section class="viewer" aria-label="Documents">
             if documents.is_empty() {
-                <p class="viewer-empty">"No files on this claim."</p>
+                <p class="viewer-empty">(empty)</p>
             }
             for index in radios {
                 <input class="viewer-radio" type="radio" name="document" id=(format!("document-{index}")) checked=(index == 0)>

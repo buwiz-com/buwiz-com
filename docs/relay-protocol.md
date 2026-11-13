@@ -51,7 +51,11 @@ Content-Type: application/json
   encryption.
 - The return inside must be the one the file name names: its TIN and
   branch fields, its form (the field prefix, `frm1601c` for `1601Cv2018`)
-  and its year (and ticked quarter) must be the name's. Otherwise
+  and its year (and ticked quarter) must be the name's. None of those
+  fields may come twice with different values, and the markup must read
+  the same to an XML reader as to a split on `<div>`: no comments, no
+  CDATA, no processing instruction after the prolog, no `<div` with
+  attributes or in other case. Otherwise
   `400 {"error":{"code":"return_mismatch","message":"The return does not
   match its file name: …"}}`, and nothing is stored. This is the same check
   the Sender makes on a sealed return against its ticket (section 5), and
@@ -88,7 +92,9 @@ ended" all read `tin_not_active`, word for word alike.
 | `account_banned` | The account is banned (every bearer call but `POST /api/auth/logout`; the token refresh still works) | This Buwiz account is banned: it can't send returns. Write to support@buwiz.com. |
 
 None of these is worth retrying: the return goes back to a draft with the
-words shown. Retry only `429 quota_exceeded`, network errors and a relay
+words shown. Nor is `return_mismatch` (a `400` from `POST /api/submissions`,
+or in brackets on a relay `failed`, section 3): the return is not the one
+its file name or ticket names. Retry only `429 quota_exceeded`, network errors and a relay
 `failed` without a code in brackets (section 3).
 
 ### The TIN list
@@ -161,7 +167,15 @@ refusal's message and its code in brackets, for example
 or `"… (account_banned)"`. Nothing reached BIR. Treat it as the same refusal
 as a `403` with that code (section 1, Refusals): back to a draft, no retry.
 A v2 return's envelope is dropped with its ticket; a v1 return may be sent
-again once the TIN can send. A send already under way on another
+again once the TIN can send.
+
+The Sender checks the return itself again, against its file name (v1) or
+its ticket (v2), before it opens anything, with the same rules as
+`POST /api/submissions`. A return that does not match ends `failed` with
+`"The return does not match its ticket: … (return_mismatch)"` (or "its
+file name"). Nothing reached BIR, and it is final: back to a draft, no
+retry. What the message repeats from the return is cut at 40
+characters. A send already under way on another
 connection keeps its own outcome.
 
 Opening the relay again for a submission that is already `sent` returns

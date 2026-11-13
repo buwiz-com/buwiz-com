@@ -9,7 +9,17 @@
 //!   ticket's TIN;
 //! - the first year field's year is in the ticket's period, and when the
 //!   return ticks a quarter (`…Quarter_N` / `…QuarterN`) and the period
-//!   names one (`…Q3`), they agree.
+//!   names one (`…Q3`), they agree;
+//! - none of those fields comes twice with different values, and nothing
+//!   in the markup reads otherwise to an XML reader than to the split on
+//!   `<div>` (comments, CDATA, processing instructions after the prolog,
+//!   `<div` with attributes or in other case).
+//!
+//! What it still assumes: BIR's reader takes the identity fields this
+//! check takes (the first whose name ends in `TIN1`, …). A decoy field
+//! with another name (`xTIN1`) placed first is read by this check and may
+//! not be by BIR's; telling them apart needs each form's exact field names
+//! as BIR reads them, which are not public.
 
 use super::super::submissions::IafName;
 use super::super::tickets::TicketClaims;
@@ -35,6 +45,84 @@ fn fields(xml: &str) -> Vec<Field<'_>> {
 
 fn first<'a>(fields: &'a [Field<'a>], test: impl Fn(&str) -> bool) -> Option<&'a str> {
     fields.iter().find(|field| test(&field.name.to_ascii_lowercase())).map(|field| field.value.trim())
+}
+
+/// A field this check reads to name the return: a TIN part, the branch, a
+/// year or a quarter tick (`name` lowercased).
+fn names_the_return(name: &str) -> bool {
+    ["tin1", "tin2", "tin3", "branchcode"].iter().any(|suffix| name.ends_with(suffix))
+        || (name.contains("year") && !name.contains("birth"))
+        || name.starts_with("datequarter_")
+        || name.starts_with("optquarter")
+}
+
+/// At most 40 characters of something taken from the return, for a
+/// refusal's words (they go into the answer and into `submissions.error`).
+fn quoted(text: &str) -> String {
+    let mut shown: String = text.chars().take(40).map(|c| if c.is_control() { '?' } else { c }).collect();
+    if text.chars().count() > 40 {
+        shown.push('…');
+    }
+    shown
+}
+
+/// Refuses markup that an XML reader and this check's split on `<div>`
+/// would read differently: a comment or CDATA section (one of them sees
+/// what it hides, the other does not), a processing instruction other
+/// than the leading prolog, and a `<div`/`</div` tag that is not exactly
+/// `<div>`/`</div>` (attributes, spaces or other case: the split does not
+/// see it, a reader does). Other markup, and `&`, are left alone.
+fn plain_markup(xml: &str) -> Result<(), String> {
+    let lower = xml.to_ascii_lowercase();
+    if lower.contains("<!--") {
+        return Err("the return has an XML comment".into());
+    }
+    if lower.contains("<![cdata[") {
+        return Err("the return has a CDATA section".into());
+    }
+    let body = xml.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+    let prolog = if body.starts_with("<?xml") { body.find("?>").map(|end| end + 2).unwrap_or(0) } else { 0 };
+    if body[prolog..].contains("<?") {
+        return Err("the return has a processing instruction after its prolog".into());
+    }
+    for (at, _) in lower.match_indices('<') {
+        let tag = &lower[at + 1..];
+        let name = tag.strip_prefix('/').unwrap_or(tag);
+        let Some(after) = name.strip_prefix("div") else { continue };
+        // `<divider>` and the like are other elements, not a div.
+        if after.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')) {
+            continue;
+        }
+        let exact = if tag.starts_with('/') { "</div>" } else { "<div>" };
+        if !xml[at..].starts_with(exact) {
+            return Err(
+                "the return has a div tag with attributes or in other case, which this check does not read".into()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a field that names the return given twice with different
+/// values: a reader that keeps the last copy, or matches names in another
+/// case, would read another TIN, branch or period than this check's first.
+fn one_value_each(fields: &[Field<'_>]) -> Result<(), String> {
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for field in fields {
+        let name = field.name.to_ascii_lowercase();
+        if !names_the_return(&name) {
+            continue;
+        }
+        let value = field.value.trim();
+        match seen.iter().find(|(known, _)| *known == name) {
+            Some((_, first)) if *first != value => {
+                return Err(format!("the return names {} twice, with different values", quoted(field.name)));
+            }
+            Some(_) => {}
+            None => seen.push((name, value)),
+        }
+    }
+    Ok(())
 }
 
 /// What a return must name: the 14-digit TIN (root and branch), the form
@@ -63,6 +151,7 @@ pub fn check_named(xml: &[u8], name: &IafName) -> Result<(), String> {
 pub fn check_against(xml: &[u8], expected: &Expected<'_>) -> Result<(), String> {
     let by = expected.named_by;
     let xml = std::str::from_utf8(xml).map_err(|_| "the return is not UTF-8 text".to_owned())?;
+    plain_markup(xml)?;
     let fields = fields(xml);
     let Some(prefix) = fields.first().map(|field| field.prefix.to_ascii_lowercase()) else {
         return Err("the return has no form fields".into());
@@ -76,8 +165,9 @@ pub fn check_against(xml: &[u8], expected: &Expected<'_>) -> Result<(), String> 
         _ => form.as_str(),
     };
     if prefix != format!("frm{form}") && prefix != format!("frm{base}") {
-        return Err(format!("the return is a {prefix} form, not the {by}'s {}", expected.form));
+        return Err(format!("the return is a {} form, not the {by}'s {}", quoted(&prefix), expected.form));
     }
+    one_value_each(&fields)?;
 
     let part = |suffix: &str| first(&fields, |name| name.ends_with(suffix)).unwrap_or_default();
     let tin = format!("{}{}{}", part("tin1"), part("tin2"), part("tin3"));
@@ -205,6 +295,89 @@ mod tests {
             assert!(refused.contains(words), "{filename}: {refused}");
         }
         assert!(check_named(b"<return/>", &name("00012345300000-1701Qv2018-2026Q1#a@example.test#.xml")).is_err());
+    }
+
+    /// `xml_1701q` for the head office of 000-123-453 in 2026 Q1, with
+    /// `extra` put in right after the prolog.
+    fn with(extra: &str) -> Vec<u8> {
+        let xml = String::from_utf8(xml_1701q(["000", "123", "453", "00000"], "2026", 1)).unwrap();
+        xml.replacen("?>", &format!("?>{extra}"), 1).into_bytes()
+    }
+
+    fn refused(xml: &[u8]) -> String {
+        check(xml, &ticket("00012345300000", "1701Qv2018", "2026Q1")).unwrap_err()
+    }
+
+    /// The same identity field twice with different values: a reader that
+    /// keeps the last one would read another TIN, branch or period than
+    /// this check's first. Equal copies, and repeated other fields, are
+    /// fine.
+    #[test]
+    fn an_identity_field_given_twice_with_different_values_is_refused() {
+        for (field, value) in [
+            ("txtTIN1", "999"),
+            ("txtTIN3", "454"),
+            ("TXTTIN1", "999"),
+            ("txtBranchCode", "00001"),
+            ("txtYear", "2025"),
+            ("DateQuarter_2", "true"),
+        ] {
+            let xml = format!("{}{}", String::from_utf8(with("")).unwrap(), line(&format!("frm1701q:{field}"), value));
+            let refused = refused(xml.as_bytes());
+            assert!(refused.contains("twice") && refused.contains("different values"), "{field}: {refused}");
+        }
+        let same = format!("{}{}", String::from_utf8(with("")).unwrap(), line("frm1701q:txtTIN1", "000"));
+        assert_eq!(check(same.as_bytes(), &ticket("00012345300000", "1701Qv2018", "2026Q1")), Ok(()));
+        let other = format!("{0}{1}{1}", String::from_utf8(with("")).unwrap(), line("frm1701q:txtRemarks", "x"));
+        assert_eq!(check(other.as_bytes(), &ticket("00012345300000", "1701Qv2018", "2026Q1")), Ok(()));
+    }
+
+    /// Markup an XML reader treats otherwise than this check's split: a
+    /// comment or CDATA hiding a field from one of them, a processing
+    /// instruction after the prolog, a `<div` with attributes or in other
+    /// case that the split does not see.
+    #[test]
+    fn markup_the_split_reads_otherwise_is_refused() {
+        let decoy = "<div>frm1701q:txtTIN1=999frm1701q:txtTIN1=</div>";
+        for extra in [
+            format!("<!-- {decoy} -->"),
+            format!("<![CDATA[{decoy}]]>"),
+            format!("<![cdata[{decoy}]]>"),
+            "<?php echo 1; ?>".to_owned(),
+            "<div class=\"x\">frm1701q:txtTIN1=999frm1701q:txtTIN1=</div>".to_owned(),
+            "<DIV>frm1701q:txtTIN1=999frm1701q:txtTIN1=</DIV>".to_owned(),
+            "<div >frm1701q:txtTIN1=999frm1701q:txtTIN1=</div>".to_owned(),
+            "<div>frm1701q:txtRemarks=xfrm1701q:txtRemarks=</div >".to_owned(),
+        ] {
+            let refused = refused(&with(&extra));
+            assert!(refused.contains("the return has"), "{extra}: {refused}");
+        }
+        // The prolog itself, after a byte-order mark or whitespace, is fine.
+        let plain = String::from_utf8(with("")).unwrap();
+        for xml in [format!("\u{feff}{plain}"), format!("  \r\n{plain}")] {
+            assert_eq!(check(xml.as_bytes(), &ticket("00012345300000", "1701Qv2018", "2026Q1")), Ok(()), "{xml:?}");
+        }
+    }
+
+    /// What a refusal repeats from the return is cut short.
+    #[test]
+    fn a_refusal_repeats_little_of_the_return() {
+        let long = "x".repeat(5000);
+        let xml = format!("<div>frm{long}:txtYear=2026frm{long}:txtYear=</div>");
+        let refused = refused(xml.as_bytes());
+        assert!(refused.chars().count() < 200, "{refused}");
+        let field = format!("{long}TIN1");
+        let xml = format!(
+            "{}{}{}",
+            String::from_utf8(with("")).unwrap(),
+            line(&format!("frm1701q:{field}"), "1"),
+            line(&format!("frm1701q:{field}"), "2")
+        );
+        assert!(refused_len(&xml) < 200);
+    }
+
+    fn refused_len(xml: &str) -> usize {
+        refused(xml.as_bytes()).chars().count()
     }
 
     /// The fixtures (`tests/fixtures/iaf/`) belong to the BIR relay files.

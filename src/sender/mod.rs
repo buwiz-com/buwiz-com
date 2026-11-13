@@ -209,7 +209,7 @@ impl Sender {
                 let expected =
                     identity::Expected { tin: &named, form: &form_type, period: &period, named_by: "file name" };
                 if let Err(reason) = identity::check_against(&xml, &expected) {
-                    return failed(reason);
+                    return mismatch("file name", &reason);
                 }
                 let send = Send { submission_id, account_id, tin, form_type, period, filename, xml, jti: None };
                 self.send(pipe, send).await
@@ -234,7 +234,7 @@ impl Sender {
                     return failed("the sealed return is not the one the ticket names".into());
                 }
                 if let Err(reason) = identity::check(&xml, &claims) {
-                    return failed(reason);
+                    return mismatch("ticket", &reason);
                 }
                 let Ok(tin) = Tin::parse(&claims.tin[..9], &claims.tin[9..]) else {
                     return failed("the ticket's TIN is not valid".into());
@@ -327,6 +327,12 @@ struct Send {
 
 fn failed(reason: String) -> Control {
     Control::Result { status: "failed".to_owned(), error: Some(reason), receipt: None }
+}
+
+/// A return that is not the one its file name or ticket names: final, so
+/// it carries its code in brackets and the app does not retry it.
+fn mismatch(named_by: &str, reason: &str) -> Control {
+    failed(format!("The return does not match its {named_by}: {reason}. (return_mismatch)"))
 }
 
 /// The Sender's routes: `/healthz`, `/internal/public`, `/internal/relay`.
@@ -454,7 +460,9 @@ mod tests {
             ("<return/>".to_owned(), "the return has no form fields"),
         ] {
             let (result, opened) = answer(v1_job(&xml)).await;
-            assert_eq!(result, Control::Result { status: "failed".into(), error: Some(words.into()), receipt: None });
+            // Final, as the relay protocol says: a code in brackets.
+            let error = format!("The return does not match its file name: {words}. (return_mismatch)");
+            assert_eq!(result, Control::Result { status: "failed".into(), error: Some(error), receipt: None });
             assert!(!opened);
         }
     }

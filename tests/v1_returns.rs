@@ -89,3 +89,25 @@ async fn a_v1_return_must_be_the_one_its_file_name_names(db: PgPool) {
     assert_eq!((status, code.as_str()), (403, "tin_not_active"));
     assert_eq!(stored(&site.db).await, 1);
 }
+
+/// The older path refuses a return that names its TIN twice, or hides a
+/// field in a comment, the same way: nothing is stored.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_v1_return_with_two_tins_or_hidden_fields_is_refused(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person("ana@example.test").await;
+    add_claim(&site.db, ana, "000123453", "approved").await;
+    let token = app_token(&site.db, ana).await;
+    let name = "00012345300000-1701Qv2018-2026Q1#ana@example.test#.xml";
+    let matching = iaf_return("frm1701q", "00012345300000", "2026");
+    let other_tin = "<div>frm1701q:txtTIN3=455frm1701q:txtTIN3=</div>\r\n";
+    for xml in [
+        format!("{matching}{other_tin}"),
+        matching.replacen("?>", &format!("?><!-- {other_tin} -->"), 1),
+        matching.replacen("?>", "?><div class=\"x\">frm1701q:txtTIN3=455frm1701q:txtTIN3=</div>", 1),
+    ] {
+        let (status, code, message) = refusal(post_v1(&site, &token, name, &xml).await).await;
+        assert_eq!((status, code.as_str()), (400, "return_mismatch"), "{message}");
+    }
+    assert_eq!(stored(&site.db).await, 0);
+}

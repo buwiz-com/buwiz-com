@@ -374,7 +374,8 @@ async fn command_in(
 ) -> (std::path::PathBuf, String, impl Fn(&[&str], &[(&str, &str)]) -> std::process::Output + use<>) {
     let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(db).await.unwrap();
     let mut url = url::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
-    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    // Only ever a database on this machine (CI names it localhost).
+    assert!(matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "{:?}", url.host_str());
     url.set_path(&name);
     let dir = std::env::temp_dir().join(format!("seed-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
@@ -402,7 +403,6 @@ async fn command_in(
 async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
     let (dir, path, command) = command_in(&db).await;
     let target = target_of(&db).await;
-    let name = target.rsplit('/').next().unwrap().to_owned();
     let path = path.as_str();
     let none = ("ADMIN_EMAILS", "");
     let command = |args: &[&str]| command(args, &[none]);
@@ -410,7 +410,7 @@ async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
     let dry = command(&["seed", path, "--as", "admin@example.test", "--dry-run", "--no-admin-emails"]);
     let out = String::from_utf8_lossy(&dry.stdout);
     assert_eq!(dry.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&dry.stderr));
-    assert!(out.contains(&format!("Database: 127.0.0.1:54330/{name}")), "{out}");
+    assert!(out.contains(&format!("Database: {target}")), "{out}");
     assert!(out.contains("Before: 0 accounts, 0 TIN claims"), "{out}");
     assert!(out.contains("ADMIN_EMAILS: none (--no-admin-emails)"), "{out}");
     assert!(out.contains("Dry run: nothing is written."), "{out}");
@@ -536,7 +536,13 @@ async fn a_real_run_must_name_the_database_it_is_connected_to(db: PgPool) {
     // pastes the dry run's line, after reading that dry run.
     assert!(problem.contains("--target") && problem.contains("dry run"), "{problem}");
     assert!(!problem.contains(&target), "{problem}");
-    for wrong in ["127.0.0.1:54330/buwiz_cloud".to_owned(), target.replace(":54330/", ":5432/"), format!("{target}x")] {
+    // Another database on the same server, the same database on another
+    // port, and a near miss of the name.
+    let (address, _) = target.rsplit_once('/').unwrap();
+    let (host, port) = address.rsplit_once(':').unwrap();
+    let other_port = port.parse::<u16>().unwrap().wrapping_add(1);
+    let name = target.rsplit('/').next().unwrap();
+    for wrong in [format!("{address}/not_{name}"), format!("{host}:{other_port}/{name}"), format!("{target}x")] {
         let problem =
             refused(run(Options { target: Some(wrong.clone()), ..options("admin@example.test", false) }).await);
         assert!(problem.contains(&format!("connected to {target}, not {wrong}")), "{problem}");

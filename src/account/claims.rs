@@ -625,6 +625,8 @@ pub struct ClaimRow {
     /// What the automatic check saw, and when staff confirmed its activation.
     pub auto_check: Option<Value>,
     pub auto_confirmed_at: Option<OffsetDateTime>,
+    /// Who decided it: the reviewer, or the Admin who activated it.
+    pub decided_by: Option<Uuid>,
 }
 
 impl ClaimRow {
@@ -643,6 +645,11 @@ impl ClaimRow {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
+    /// An Admin activated their own TIN without papers.
+    pub fn self_activated(&self) -> bool {
+        self.verified_by.as_deref() == Some("admin") && self.decided_by == Some(self.account_id)
+    }
+
     /// When it last went into the review queue: resent, or its papers sent.
     pub fn waiting_since(&self) -> OffsetDateTime {
         self.resent_at.or(self.submitted_at).unwrap_or(self.created_at)
@@ -658,7 +665,7 @@ impl ClaimRow {
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
      c.decided_at, c.removed_at, c.removal_note, c.files_changed_at, c.submitted_at, c.verified_by, c.paused_at, \
-     c.pause_reason, c.auto_check, c.auto_confirmed_at";
+     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(

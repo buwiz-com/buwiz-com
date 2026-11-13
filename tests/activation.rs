@@ -100,8 +100,24 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     let agent = token_for(&site, boss, "mcp").await;
     let claims = mcp_claims(&site, &agent).await;
     assert!(claims.contains("\"approved\"") && !claims.contains(REASON), "{claims}");
-    let history = text(site.get(&format!("/staff/users/{boss}"), &boss_cookie).await).await;
-    assert!(history.contains(&format!("The person activated ***-***-453-00000 without papers: {REASON}")), "{history}");
+    // Another staff member reads it as a staff member activating their own
+    // TIN, flagged in the queue and on the claim; boss cannot open their
+    // own history.
+    let (_, staff) = site.person(STAFF).await;
+    let history = text(site.get(&format!("/staff/users/{boss}"), &staff).await).await;
+    assert!(
+        history.contains(&format!(
+            "Staff boss@example.test activated their own TIN ***-***-453-00000 without papers: {REASON}"
+        )),
+        "{history}"
+    );
+    assert!(!history.contains("The person activated"), "{history}");
+    let queue = text(site.get("/staff?status=approved", &staff).await).await;
+    assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+    let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
+    assert!(review.contains("Activated by its owner, an admin"), "{review}");
+    let own = site.get(&format!("/staff/users/{boss}"), &boss_cookie).await;
+    assert_eq!(location(&own), "/staff/users?notice=own_page");
 
     // Approving one's own papers stays refused.
     let parts = [

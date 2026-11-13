@@ -21,6 +21,9 @@ async fn flag(item: Flag) -> Result<impl View> {
     Ok(view! { <span class=(format!("flag {tone}"))>icon(name: icon_name) (text)</span> })
 }
 
+/// The flag on a TIN an Admin activated for themselves.
+const SELF_ACTIVATED: &str = "Activated by its owner, an admin";
+
 /// What a reviewer should notice first about a claim. These are plain
 /// checks on the claim's rows; they help look, staff still decide.
 fn queue_flags(row: &QueueRow) -> Vec<Flag> {
@@ -40,6 +43,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     }
     if claim.paused_at.is_some() {
         flags.push(("warn", "pause_circle", "Paused".to_owned()));
+    }
+    if claim.self_activated() {
+        flags.push(("warn", "how_to_reg", SELF_ACTIVATED.to_owned()));
     }
     if claim.status == "pending" && claim.resent_at.is_some() {
         flags.push(("warn", "replay", "Resent after a fix".to_owned()));
@@ -379,6 +385,9 @@ pub mod claim_id {
             checks.push(("good", "person_check", "No other account claims this TIN".to_owned()));
         } else {
             checks.push(("bad", "group", format!("{} other account(s) claim this TIN", other_accounts.len())));
+        }
+        if claim.self_activated() {
+            checks.push(("warn", "how_to_reg", SELF_ACTIVATED.to_owned()));
         }
         if claim.is_open() {
             for required in kind.required() {
@@ -958,6 +967,11 @@ pub mod account_id {
     pub async fn user_page(cx: &Cx) -> Result<impl View> {
         let viewer = staff_member(cx, Power::SeeUsers).await?;
         let account_id = path_id(cx, 0)?;
+        // An account's page carries what staff wrote about it (why a TIN
+        // was activated, where one went): never for its own eyes.
+        if viewer.account.id == account_id {
+            return Err(redirect(link("/staff/users", Some(Notice::OwnPage), &[])).into());
+        }
         let config = &state(cx).config;
         let db = &state(cx).db;
         let Some(user) = queries::user(db, account_id).await? else {
@@ -978,7 +992,6 @@ pub mod account_id {
         // Support may sign anyone out but an Admin.
         let may_sign_out = viewer.role == Role::Admin || !is_admin;
         let admin_viewer = viewer.can(Power::ChangeRole);
-        let own_account = viewer.account.id == account_id;
         let stored_role = user.role.clone().unwrap_or_else(|| "none".to_owned());
         let role_choices: Vec<(&'static str, &'static str, bool)> = [
             ("none", "No staff role"),
@@ -1101,8 +1114,6 @@ pub mod account_id {
                                     <p class="side-text">"Only an admin can change roles, bans and test labels."</p>
                                 } else if from_server {
                                     <p class="side-text">"Admin through the server setting ADMIN_EMAILS. Change it there."</p>
-                                } else if own_account {
-                                    <p class="side-text">"This is you. Another admin can change your role."</p>
                                 } else {
                                     if user.test_account {
                                         <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Remove the test label from {}?", user.email)) data-confirm-detail="Staff no longer see it as a test account." data-confirm-label="Remove">
@@ -1391,7 +1402,12 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "resumed" => format!("resumed {tin}"),
         _ => format!("removed the {file} from {tin}"),
     };
-    let who = actor_text(line.actor_id, &line.actor_email, &line.source, Some(account_id));
+    // An Admin activating their own TIN acts as staff, not as its owner.
+    let (who, what) = if line.action == "activated" && line.source == "web" && line.actor_id == account_id {
+        (format!("Staff {}", line.actor_email), format!("activated their own TIN {tin} without papers"))
+    } else {
+        (actor_text(line.actor_id, &line.actor_email, &line.source, Some(account_id)), what)
+    };
     match &line.reason {
         Some(reason) => format!("{who} {what}: {reason}"),
         None => format!("{who} {what}"),

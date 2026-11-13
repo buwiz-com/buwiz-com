@@ -400,8 +400,11 @@ async fn roles_cannot_lock_everyone_out(db: PgPool) {
         location(&site.post(&path(carl), &ana_cookie, "role=support&reason=+").await),
         back(carl, "reason_missing")
     );
-    let page = text(site.get(&format!("/staff/users/{ana}"), &ana_cookie).await).await;
-    assert!(page.contains("This is you. Another admin can change your role."), "{page}");
+    // Staff never open their own page (it carries reasons about them).
+    let own = site.get(&format!("/staff/users/{ana}"), &ana_cookie).await;
+    assert_eq!(location(&own), "/staff/users?notice=own_page");
+    let list = text(site.get("/staff/users?notice=own_page", &ana_cookie).await).await;
+    assert!(list.contains("This is your own account. Ask another staff member to look at it."), "{list}");
     assert_eq!(stored_role(&site.db, carl).await, None);
     assert!(account_audit_lines(&site.db, carl).await.is_empty());
 
@@ -589,4 +592,46 @@ async fn every_admin_action_rechecks_its_actor_in_its_transaction(db: PgPool) {
     assert!(still_paused);
     assert!(claim_audit_lines(db, ana).await.is_empty());
     assert!(account_audit_lines(db, ana).await.is_empty() && account_audit_lines(db, dan).await.is_empty());
+}
+
+/// A staff member who is also a claimant never reads the reasons staff
+/// wrote about them: why an Admin activated their TIN, where a TIN of theirs
+/// went.
+#[sqlx::test(migrations = "./migrations")]
+async fn staff_cannot_read_the_reasons_about_themselves(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (helper, helper_cookie) = site.staff_with_role("helper@example.test", "support").await;
+    let claim = add_claim(&site.db, helper, "000123453", "unverified").await;
+    let reason = "Known+to+the+owner+from+the+old+office";
+    let response = site.post(&format!("/staff/claims/{claim}/activate"), &staff, &format!("reason={reason}")).await;
+    assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=tin_activated"));
+    // The seed moved another of helper's TINs: only the audit line says where.
+    let moved = add_claim(&site.db, helper, "000123454", "revoked").await;
+    sqlx::query(
+        "INSERT INTO claim_audit (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
+         VALUES ($1, $2, '***-***-454-00000', 'revoked', 'approved', $2, 'boss@example.test',
+                 'seed 1: moved to carl@example.test by the seed file: Moves', 'seed')",
+    )
+    .bind(moved)
+    .bind(helper)
+    .execute(&site.db)
+    .await
+    .unwrap();
+
+    let own = site.get(&format!("/staff/users/{helper}"), &helper_cookie).await;
+    assert_eq!(location(&own), "/staff/users?notice=own_page");
+    for page in [
+        "/staff/users".to_owned(),
+        format!("/staff/claims/{claim}"),
+        format!("/staff/claims/{moved}"),
+        "/staff?status=approved".to_owned(),
+    ] {
+        let body = text(site.get(&page, &helper_cookie).await).await;
+        assert!(!body.contains("Known to the owner") && !body.contains("carl@example.test"), "{page}: {body}");
+    }
+    // Another staff member reads it all.
+    let history = text(site.get(&format!("/staff/users/{helper}"), &staff).await).await;
+    assert!(history.contains("Known to the owner from the old office"), "{history}");
+    assert!(history.contains("moved to carl@example.test"), "{history}");
 }

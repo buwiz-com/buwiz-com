@@ -370,7 +370,7 @@ async fn removing_an_active_tin_keeps_its_returns_and_frees_it(db: PgPool) {
     let send = || {
         let body = serde_json::json!({
             "filename": "111111111000-1601Cv2018-062025#juan@example.test#.xml",
-            "xml": "<return/>",
+            "xml": common::iaf_return("frm1601c", "11111111100000", "2025"),
         });
         Request::post("/api/submissions")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))

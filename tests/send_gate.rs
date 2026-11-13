@@ -130,7 +130,10 @@ fn ticket_body(root: &str, key: &str) -> Value {
 }
 
 fn v1_body(root: &str) -> Value {
-    json!({ "filename": format!("{root}00000-1701Qv2018-2026Q1#ana@example.test#.xml"), "xml": "<return/>" })
+    json!({
+        "filename": format!("{root}00000-1701Qv2018-2026Q1#ana@example.test#.xml"),
+        "xml": common::iaf_return("frm1701q", &format!("{root}00000"), "2026"),
+    })
 }
 
 async fn post_v1(site: &Site, token: &str, body: &Value) -> axum::response::Response {

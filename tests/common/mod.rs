@@ -334,6 +334,24 @@ impl TestDevice {
     }
 }
 
+/// A plaintext eBIRForms return as its file name describes it: the form's
+/// field prefix (`frm1701q` for `1701Qv2018`), the 14-digit TIN (root and
+/// branch) and the year. Synthetic, with only the fields the checks read.
+pub fn iaf_return(form_prefix: &str, tin: &str, year: &str) -> String {
+    let line = |key: &str, value: &str| format!("<div>{form_prefix}:{key}={value}{form_prefix}:{key}=</div>\r\n");
+    let mut xml = String::from("<?xml version='1.0'?>\r\n");
+    for (key, value) in [
+        ("txtYear", year),
+        ("txtTIN1", &tin[0..3]),
+        ("txtTIN2", &tin[3..6]),
+        ("txtTIN3", &tin[6..9]),
+        ("txtBranchCode", &tin[9..]),
+    ] {
+        xml += &line(key, value);
+    }
+    xml
+}
+
 /// The status and `{"error":{"code","message"}}` of a JSON refusal.
 pub async fn refusal(response: Response) -> (u16, String, String) {
     let status = response.status().as_u16();

@@ -1,5 +1,5 @@
 //! Does a plaintext eBIRForms return name the TIN, form and period its
-//! ticket names?
+//! ticket (v2) or its file name (v1) names?
 //!
 //! The XML is a list of `<div>{form}:{field}={value}{form}:{field}=</div>`
 //! lines. The checks:
@@ -11,6 +11,7 @@
 //!   return ticks a quarter (`…Quarter_N` / `…QuarterN`) and the period
 //!   names one (`…Q3`), they agree.
 
+use super::super::submissions::IafName;
 use super::super::tickets::TicketClaims;
 
 struct Field<'a> {
@@ -36,7 +37,31 @@ fn first<'a>(fields: &'a [Field<'a>], test: impl Fn(&str) -> bool) -> Option<&'a
     fields.iter().find(|field| test(&field.name.to_ascii_lowercase())).map(|field| field.value.trim())
 }
 
+/// What a return must name: the 14-digit TIN (root and branch), the form
+/// and the period, and what named them, for the refusal's words.
+pub struct Expected<'a> {
+    pub tin: &'a str,
+    pub form: &'a str,
+    pub period: &'a str,
+    /// `ticket` or `file name`.
+    pub named_by: &'a str,
+}
+
+/// A sealed return against its ticket.
 pub fn check(xml: &[u8], ticket: &TicketClaims) -> Result<(), String> {
+    check_against(xml, &Expected { tin: &ticket.tin, form: &ticket.form, period: &ticket.period, named_by: "ticket" })
+}
+
+/// A v1 return against its file name (`{TIN}-{form}-{period}#…#.xml`).
+pub fn check_named(xml: &[u8], name: &IafName) -> Result<(), String> {
+    let tin = format!("{}{}", name.tin.root(), name.tin.branch());
+    check_against(xml, &Expected { tin: &tin, form: &name.form_type, period: &name.period, named_by: "file name" })
+}
+
+/// The return names `expected`'s TIN, form and period. Errors say which
+/// does not, in words for the person sending.
+pub fn check_against(xml: &[u8], expected: &Expected<'_>) -> Result<(), String> {
+    let by = expected.named_by;
     let xml = std::str::from_utf8(xml).map_err(|_| "the return is not UTF-8 text".to_owned())?;
     let fields = fields(xml);
     let Some(prefix) = fields.first().map(|field| field.prefix.to_ascii_lowercase()) else {
@@ -45,13 +70,13 @@ pub fn check(xml: &[u8], ticket: &TicketClaims) -> Result<(), String> {
     if fields.iter().any(|field| !field.prefix.eq_ignore_ascii_case(&prefix)) {
         return Err("the return mixes fields of several forms".into());
     }
-    let form = ticket.form.to_ascii_lowercase();
+    let form = expected.form.to_ascii_lowercase();
     let base = match form.rfind('v') {
         Some(at) if form.len() - at == 5 && form[at + 1..].bytes().all(|byte| byte.is_ascii_digit()) => &form[..at],
         _ => form.as_str(),
     };
     if prefix != format!("frm{form}") && prefix != format!("frm{base}") {
-        return Err(format!("the return is a {prefix} form, not the ticket's {}", ticket.form));
+        return Err(format!("the return is a {prefix} form, not the {by}'s {}", expected.form));
     }
 
     let part = |suffix: &str| first(&fields, |name| name.ends_with(suffix)).unwrap_or_default();
@@ -61,26 +86,26 @@ pub fn check(xml: &[u8], ticket: &TicketClaims) -> Result<(), String> {
         3 => format!("00{branch}"),
         _ => branch.to_owned(),
     };
-    if format!("{tin}{branch}") != ticket.tin {
-        return Err("the TIN in the return is not the ticket's TIN".into());
+    if format!("{tin}{branch}") != expected.tin {
+        return Err(format!("the TIN in the return is not the {by}'s TIN"));
     }
 
     let year = first(&fields, |name| name.contains("year") && !name.contains("birth"))
         .filter(|year| year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()))
         .ok_or("the return has no year")?;
-    if !ticket.period.contains(year) {
-        return Err(format!("the return is for {year}, not the ticket's period {}", ticket.period));
+    if !expected.period.contains(year) {
+        return Err(format!("the return is for {year}, not the {by}'s period {}", expected.period));
     }
     let ticked_quarter = fields.iter().find_map(|field| {
         let name = field.name.to_ascii_lowercase();
         let digit = name.strip_prefix("datequarter_").or_else(|| name.strip_prefix("optquarter"))?;
         (field.value == "true" && digit.len() == 1).then(|| digit.to_owned())
     });
-    let period_quarter = ticket.period.rsplit_once('Q').map(|(_, quarter)| quarter.to_owned());
+    let period_quarter = expected.period.rsplit_once('Q').map(|(_, quarter)| quarter.to_owned());
     if let (Some(ticked), Some(named)) = (ticked_quarter, period_quarter)
         && ticked != named
     {
-        return Err(format!("the return is for quarter {ticked}, not the ticket's period {}", ticket.period));
+        return Err(format!("the return is for quarter {ticked}, not the {by}'s period {}", expected.period));
     }
     Ok(())
 }
@@ -141,6 +166,45 @@ mod tests {
         assert!(check(&xml, &ticket("00012345300000", "1701Qv2018", "2025Q1")).unwrap_err().contains("2026"));
         assert!(check(&xml, &ticket("00012345300000", "1701Qv2018", "2026Q2")).unwrap_err().contains("quarter"));
         assert!(check(b"not xml", &ticket("00012345300000", "1701Qv2018", "2026Q1")).is_err());
+    }
+
+    #[test]
+    fn the_ticket_refusals_read_as_before() {
+        let xml = xml_1701q(["000", "123", "453", "00000"], "2026", 1);
+        assert_eq!(
+            check(&xml, &ticket("00012345400000", "1701Qv2018", "2026Q1")).unwrap_err(),
+            "the TIN in the return is not the ticket's TIN"
+        );
+        assert_eq!(
+            check(&xml, &ticket("00012345300000", "1601Cv2018", "012026")).unwrap_err(),
+            "the return is a frm1701q form, not the ticket's 1601Cv2018"
+        );
+    }
+
+    #[test]
+    fn a_v1_return_matches_its_file_name() {
+        let name = |filename: &str| crate::filing::submissions::parse_filename(filename).unwrap();
+        let xml = xml_1701q(["000", "123", "453", "00000"], "2026", 1);
+        assert_eq!(check_named(&xml, &name("00012345300000-1701Qv2018-2026Q1#a@example.test#.xml")), Ok(()));
+        // A 12-digit name with a 3-digit branch is the same head office.
+        assert_eq!(check_named(&xml, &name("000123453000-1701Qv2018-2026Q1#a@example.test#.xml")), Ok(()));
+        for (filename, words) in [
+            (
+                "00012345400000-1701Qv2018-2026Q1#a@example.test#.xml",
+                "the TIN in the return is not the file name's TIN",
+            ),
+            (
+                "00012345300001-1701Qv2018-2026Q1#a@example.test#.xml",
+                "the TIN in the return is not the file name's TIN",
+            ),
+            ("00012345300000-1601Cv2018-012026#a@example.test#.xml", "not the file name's 1601Cv2018"),
+            ("00012345300000-1701Qv2018-2025Q1#a@example.test#.xml", "not the file name's period 2025Q1"),
+            ("00012345300000-1701Qv2018-2026Q2#a@example.test#.xml", "quarter 1, not the file name's period 2026Q2"),
+        ] {
+            let refused = check_named(&xml, &name(filename)).unwrap_err();
+            assert!(refused.contains(words), "{filename}: {refused}");
+        }
+        assert!(check_named(b"<return/>", &name("00012345300000-1701Qv2018-2026Q1#a@example.test#.xml")).is_err());
     }
 
     /// The fixtures (`tests/fixtures/iaf/`) belong to the BIR relay files.

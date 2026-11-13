@@ -16,7 +16,9 @@
 //! A v2 job carries the app's ticket and sealed envelope. The Sender checks
 //! the ticket (signature, expiry, single use), opens the envelope, and
 //! sends only when the XML's SHA-256, TIN, form and period are the
-//! ticket's. The file name comes from the ticket.
+//! ticket's. The file name comes from the ticket. A v1 job's XML must name
+//! the job's TIN, form and period too (the Gatekeeper checked it against
+//! the file name when the return came; this covers one stored before).
 
 pub mod identity;
 mod outcome;
@@ -203,6 +205,12 @@ impl Sender {
                 let Ok(tin) = Tin::parse(&tin_root, &branch_code) else {
                     return failed("the job's TIN is not valid".into());
                 };
+                let named = format!("{}{}", tin.root(), tin.branch());
+                let expected =
+                    identity::Expected { tin: &named, form: &form_type, period: &period, named_by: "file name" };
+                if let Err(reason) = identity::check_against(&xml, &expected) {
+                    return failed(reason);
+                }
                 let send = Send { submission_id, account_id, tin, form_type, period, filename, xml, jti: None };
                 self.send(pipe, send).await
             }
@@ -382,20 +390,28 @@ pub async fn serve(listener: tokio::net::TcpListener, sender: Arc<Sender>) -> an
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn without_the_bir_feature_every_send_fails_unsent() {
-        let config = SenderConfig {
+    fn config() -> SenderConfig {
+        SenderConfig {
             relay: RelaySettings { mode: Mode::Live },
             sealing_key: SealingKey::from_bytes(&[7; 32]).unwrap(),
             receipt_key: SigningKey::from_bytes(&[8; 32]),
             ticket_keys: vec![SigningKey::from_bytes(&[9; 32]).verifying_key()],
             secret: Zeroizing::new("x".repeat(32)),
             issuer: "http://localhost:3008".into(),
-        };
-        let (to_app, mut from_server) = mpsc::channel(8);
-        let (_to_server, from_app) = mpsc::channel(8);
-        let pipe = Pipe::new(to_app, from_app);
-        let job = Job::V1 {
+        }
+    }
+
+    /// A 1601C return for `tin` (root, branch) in 2025.
+    fn return_1601c(tin: [&str; 4]) -> String {
+        let line = |key: &str, value: &str| format!("<div>frm1601c:{key}={value}frm1601c:{key}=</div>");
+        [("txtYear", "2025"), ("txtTIN1", tin[0]), ("txtTIN2", tin[1]), ("txtTIN3", tin[2]), ("txtBranchCode", tin[3])]
+            .into_iter()
+            .map(|(key, value)| line(key, value))
+            .collect()
+    }
+
+    fn v1_job(xml: &str) -> Job {
+        Job::V1 {
             submission_id: Uuid::nil(),
             account_id: Uuid::nil(),
             tin_root: "123456789".into(),
@@ -403,15 +419,43 @@ mod tests {
             form_type: "1601Cv2018".into(),
             period: "062025".into(),
             filename: "12345678900000-1601Cv2018-062025#juan@example.com#.xml".into(),
-            xml: STANDARD.encode("<return/>"),
-        };
-        let result = Sender::new(config).handle(&pipe, job).await;
+            xml: STANDARD.encode(xml),
+        }
+    }
+
+    /// What the Sender answers `job`, and whether it opened anything
+    /// through the pipe.
+    async fn answer(job: Job) -> (Control, bool) {
+        let (to_app, mut from_server) = mpsc::channel(8);
+        let (_to_server, from_app) = mpsc::channel(8);
+        let pipe = Pipe::new(to_app, from_app);
+        let result = Sender::new(config()).handle(&pipe, job).await;
+        drop(pipe);
+        (result, from_server.try_recv().is_ok())
+    }
+
+    #[tokio::test]
+    async fn without_the_bir_feature_every_send_fails_unsent() {
+        // A v1 return that matches its job (it used to be `<return/>`, which
+        // the Sender now refuses before it gets this far).
+        let (result, opened) = answer(v1_job(&return_1601c(["123", "456", "789", "00000"]))).await;
         assert_eq!(
             result,
             Control::Result { status: "failed".into(), error: Some(NOT_BUILT_IN.into()), receipt: None }
         );
-        // Nothing was opened through the pipe.
-        drop(pipe);
-        assert!(from_server.try_recv().is_err());
+        assert!(!opened, "nothing was opened through the pipe");
+    }
+
+    #[tokio::test]
+    async fn a_v1_return_for_another_tin_is_refused_before_sending() {
+        for (xml, words) in [
+            (return_1601c(["123", "456", "780", "00000"]), "the TIN in the return is not the file name's TIN"),
+            (return_1601c(["123", "456", "789", "00001"]), "the TIN in the return is not the file name's TIN"),
+            ("<return/>".to_owned(), "the return has no form fields"),
+        ] {
+            let (result, opened) = answer(v1_job(&xml)).await;
+            assert_eq!(result, Control::Result { status: "failed".into(), error: Some(words.into()), receipt: None });
+            assert!(!opened);
+        }
     }
 }

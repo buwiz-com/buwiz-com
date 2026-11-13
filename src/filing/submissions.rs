@@ -1,7 +1,8 @@
 //! Returns sent to BIR through the relay.
 //!
 //! 1. `POST /api/submissions` with the plaintext IAF XML and its file name.
-//!    The TIN in the name must be active on the account. The XML is kept,
+//!    The TIN, branch, form and period inside the XML must be the file
+//!    name's, and the TIN must be active on the account. The XML is kept,
 //!    encrypted, until it is sent or 24 hours pass.
 //! 2. `GET /api/submissions/{id}/relay` opens the WebSocket pipe (see
 //!    [`crate::relay`]). The server sends the return through it and answers
@@ -38,7 +39,7 @@ use crate::filing::gate;
 use crate::filing::jws;
 use crate::filing::tickets::{self, TicketError};
 use crate::relay::{Control, Frame};
-use crate::sender::Job;
+use crate::sender::{Job, identity};
 
 const MAX_XML_BYTES: usize = 2 * 1024 * 1024;
 pub const BODY_LIMIT: usize = 3 * MAX_XML_BYTES;
@@ -99,6 +100,16 @@ pub async fn create(
     let xml = request.xml.as_bytes();
     if xml.is_empty() || xml.len() > MAX_XML_BYTES {
         return Err(ApiError::bad_request("bad_xml", "the return must be 1 byte to 2 MB of XML"));
+    }
+    // The account may send for the file name's TIN only if the return
+    // inside is for that TIN too: the same check the Sender makes on a
+    // sealed return against its ticket.
+    if let Err(reason) = identity::check_named(xml, &name) {
+        return Err(ApiError::Refused {
+            status: StatusCode::BAD_REQUEST,
+            code: "return_mismatch",
+            message: format!("The return does not match its file name: {reason}."),
+        });
     }
     if let Some(key) = &request.idempotency_key
         && (key.is_empty() || key.len() > 100)

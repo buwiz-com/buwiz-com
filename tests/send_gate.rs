@@ -76,12 +76,12 @@ async fn sql(db: &PgPool, query: &str, id: Uuid) {
 }
 
 async fn pause(db: &PgPool, claim: Uuid) {
-    sql(db, "UPDATE tin_claims SET paused_at = now(), pause_reason = 'Checking a complaint.' WHERE id = $1", claim)
+    sql(db, "UPDATE tin_claims SET paused_at = now(), paused_by = account_id, pause_reason = 'Checking a complaint.' WHERE id = $1", claim)
         .await;
 }
 
 async fn resume(db: &PgPool, claim: Uuid) {
-    sql(db, "UPDATE tin_claims SET paused_at = NULL, pause_reason = NULL WHERE id = $1", claim).await;
+    sql(db, "UPDATE tin_claims SET paused_at = NULL, paused_by = NULL, pause_reason = NULL WHERE id = $1", claim).await;
 }
 
 /// Ana's TINs in every state of [`MATRIX`], and bob, who owns 000111012
@@ -415,7 +415,7 @@ async fn a_banned_account_is_refused_on_every_bearer_call_but_sign_out(db: PgPoo
     };
     assert_eq!(site.send(get("/me", &device.token)).await.status(), StatusCode::OK);
 
-    sqlx::query("UPDATE accounts SET banned_at = now(), ban_reason = 'Abuse.' WHERE id = $1")
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Abuse.' WHERE id = $1")
         .bind(ana)
         .execute(&site.db)
         .await

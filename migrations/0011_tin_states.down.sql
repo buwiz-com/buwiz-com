@@ -4,16 +4,22 @@
 -- run each file with psql (`psql -v ON_ERROR_STOP=1 -1 -f …`) in that order.
 --
 -- It refuses to run while a TIN is paused (the release before this one
--- would send for it again) or while a TIN saved without papers has files
+-- would send for it again), while a TIN saved without papers has files
 -- (deleting the row would delete them silently, and leave their stored
--- objects behind). Resume or end the pauses, and decide those files, first.
+-- objects behind), or while a TIN the automatic check activated waits for
+-- a person to confirm it (the release before this one has no such list,
+-- and its papers would be kept with nobody to look at them). Resume or end
+-- the pauses, decide those files, and confirm or revoke those TINs first.
 --
 -- What a rollback loses:
 -- - TINs added without papers (`unverified`). They never have tickets,
 --   returns or files, so nothing refers to them; deleting one fails loudly
 --   if a ticket or return does.
 -- - How each TIN became active (`verified_by`), when papers were sent, and
---   what the automatic check saw.
+--   what the automatic check saw. Migrating up again labels each TIN that
+--   was ever active `staff` when it names a reviewer (`decided_by`: staff
+--   approval, an admin, the seed tool) and `unknown` when it does not (the
+--   automatic check).
 -- - Audit lines of the new actions (activated, paused, …) and every line's
 --   source.
 
@@ -25,6 +31,10 @@ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM claim_documents d JOIN tin_claims c ON c.id = d.claim_id WHERE c.status = 'unverified') THEN
         RAISE EXCEPTION 'refusing to roll back: TINs saved without papers have files, which deleting them would delete silently. Deal with those claims first.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) THEN
+        RAISE EXCEPTION 'refusing to roll back: % TIN(s) activated automatically wait for a person to confirm them. Confirm or revoke each first.',
+            (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL);
     END IF;
 END $$;
 

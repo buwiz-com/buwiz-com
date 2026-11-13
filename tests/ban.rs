@@ -118,7 +118,7 @@ async fn a_ban_closes_every_website_session_door(db: PgPool) {
     let (ana, cookie) = site.person("ana@example.test").await;
     let (server_admin, staff_cookie) = site.person(STAFF).await;
     for id in [ana, server_admin] {
-        sqlx::query("UPDATE accounts SET banned_at = now(), ban_reason = 'Test' WHERE id = $1")
+        sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Test' WHERE id = $1")
             .bind(id)
             .execute(&site.db)
             .await
@@ -150,7 +150,7 @@ async fn a_banned_app_can_still_remove_its_own_device(db: PgPool) {
     let site = Site::new(db);
     let (ana, _) = site.person("ana@example.test").await;
     let device = TestDevice::new(&site.db, ana).await;
-    sqlx::query("UPDATE accounts SET banned_at = now(), ban_reason = 'Test' WHERE id = $1")
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Test' WHERE id = $1")
         .bind(ana)
         .execute(&site.db)
         .await

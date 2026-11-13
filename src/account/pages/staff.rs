@@ -1254,6 +1254,7 @@ fn history(
                 "approved" | "removed" | "revoked" => match claim.verified_by.as_deref() {
                     Some("admin") => ("verified", format!("{tin} activated without papers")),
                     Some("seed") => ("verified", format!("{tin} activated by the seed tool")),
+                    Some("unknown") => ("verified", format!("{tin} became active; how is not on record")),
                     _ => ("verified", format!("{tin} approved")),
                 },
                 "rejected" => ("cancel", format!("{tin} not approved")),

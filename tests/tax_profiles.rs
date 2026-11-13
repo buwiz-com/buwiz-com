@@ -73,7 +73,7 @@ async fn golden_account(site: &Site) -> Uuid {
         insert(&site.db, juan, Some(id), &root, name, status, 10 - age as i32).await;
     }
     sqlx::query(
-        "UPDATE tin_claims SET paused_at = now(), pause_reason = 'Checking a complaint.'
+        "UPDATE tin_claims SET paused_at = now(), paused_by = account_id, pause_reason = 'Checking a complaint.'
          WHERE id = '22222222-2222-4222-8222-222222222222'",
     )
     .execute(&site.db)

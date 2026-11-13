@@ -295,6 +295,14 @@ async fn versions(db: &PgPool) -> Vec<i64> {
     sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version").fetch_all(db).await.unwrap()
 }
 
+/// `sql` breaks a NOT NULL column: a writer must name the value itself.
+async fn fails_not_null(db: &PgPool, sql: &str) {
+    match sqlx::raw_sql(sql).execute(db).await {
+        Err(sqlx::Error::Database(error)) => assert_eq!(error.code().as_deref(), Some("23502"), "{sql}: {error}"),
+        other => panic!("{sql} should break a NOT NULL column: {other:?}"),
+    }
+}
+
 async fn fails_with(db: &PgPool, sql: &str, constraint: &str) {
     match sqlx::raw_sql(sql).execute(db).await {
         Err(sqlx::Error::Database(error)) => assert_eq!(error.constraint(), Some(constraint), "{sql}"),
@@ -382,6 +390,49 @@ async fn rows_from_migration_10_survive(db: PgPool) {
         "tin_claims_auto_confirmed_check",
     )
     .await;
+    // A pause names who paused it and why: a staff member, or Buwiz itself
+    // for an automatic activation nobody confirmed. A blank reason is none.
+    fails_with(
+        &db,
+        &format!(
+            "UPDATE tin_claims SET paused_at = now(), pause_reason = 'Checking.' WHERE id = '{}'",
+            seeded.approved
+        ),
+        "tin_claims_paused_check",
+    )
+    .await;
+    fails_with(
+        &db,
+        &format!(
+            "UPDATE tin_claims SET paused_at = now(), paused_by = '{bob}', pause_reason = '  ' WHERE id = '{}'",
+            seeded.approved
+        ),
+        "tin_claims_paused_check",
+    )
+    .await;
+    fails_with(
+        &db,
+        &format!("UPDATE tin_claims SET pause_reason = 'Checking.' WHERE id = '{}'", seeded.approved),
+        "tin_claims_paused_check",
+    )
+    .await;
+    let auto = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by,
+                 paused_at, pause_reason)
+             VALUES ('{bob}', 'personal', '000123463', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'auto',
+                 now(), 'Not confirmed by a person within 30 days.') RETURNING id"
+        ),
+    )
+    .await;
+    fails_with(
+        &db,
+        &format!("UPDATE tin_claims SET auto_confirmed_at = now(), auto_confirmed_by = '{ana}' WHERE id = '{auto}'"),
+        "tin_claims_paused_check",
+    )
+    .await;
+    exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{auto}'")).await;
     fails_with(&db, &insert(bob, "000123460", "paused", "", ""), "tin_claims_status_check").await;
     // Ana's open claim on a TIN is her one live row for it, as is her
     // active one.
@@ -423,13 +474,43 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     )
     .await;
     fails_with(&db, &format!("UPDATE accounts SET banned_at = now() WHERE id = '{bob}'"), "accounts_ban_check").await;
+    fails_with(
+        &db,
+        &format!("UPDATE accounts SET banned_at = now(), ban_reason = 'Abuse.' WHERE id = '{bob}'"),
+        "accounts_ban_check",
+    )
+    .await;
+    fails_with(
+        &db,
+        &format!("UPDATE accounts SET banned_at = now(), banned_by = '{ana}', ban_reason = ' ' WHERE id = '{bob}'"),
+        "accounts_ban_check",
+    )
+    .await;
+    // Every audit writer says where its line came from.
+    fails_not_null(
+        &db,
+        &format!(
+            "INSERT INTO claim_audit (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email)
+             VALUES ('{}', '{ana}', '***-***-453-00000', 'paused', 'approved', '{bob}', 'bob@example.test')",
+            seeded.approved
+        ),
+    )
+    .await;
+    fails_not_null(
+        &db,
+        &format!(
+            "INSERT INTO account_audit (account_id, action, actor_id, actor_email)
+             VALUES ('{bob}', 'banned', '{ana}', 'ana@example.test')"
+        ),
+    )
+    .await;
     fails_with(&db, &format!("UPDATE accounts SET role = 'owner' WHERE id = '{bob}'"), "accounts_role_check").await;
     exec(
         &db,
         &format!(
             "UPDATE accounts SET role = 'support', test_account = true WHERE id = '{bob}';
-             INSERT INTO account_audit (account_id, action, old_value, new_value, actor_id, actor_email, reason)
-             VALUES ('{bob}', 'role_changed', NULL, 'support', '{ana}', 'ana@example.test', 'Helps with the queue.');
+             INSERT INTO account_audit (account_id, action, old_value, new_value, actor_id, actor_email, source, reason)
+             VALUES ('{bob}', 'role_changed', NULL, 'support', '{ana}', 'ana@example.test', 'web', 'Helps with the queue.');
              INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary)
              VALUES (gen_random_uuid(), '{ana}', 'ana@example.test', decode('00', 'hex'), '{{}}')"
         ),
@@ -464,8 +545,8 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
              VALUES ('{approved}', '{ana}', '***-***-453-00000', 'paused', 'approved', '{bob}', 'bob@example.test', 'Checking.', 'web');
              UPDATE accounts SET role = 'admin', test_account = true WHERE id = '{bob}';
              UPDATE accounts SET banned_at = now(), banned_by = '{bob}', ban_reason = 'Abuse.' WHERE id = '{ana}';
-             INSERT INTO account_audit (account_id, action, actor_id, actor_email, reason)
-             VALUES ('{ana}', 'banned', '{bob}', 'bob@example.test', 'Abuse.');
+             INSERT INTO account_audit (account_id, action, actor_id, actor_email, source, reason)
+             VALUES ('{ana}', 'banned', '{bob}', 'bob@example.test', 'web', 'Abuse.');
              INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary)
              VALUES (gen_random_uuid(), '{bob}', 'bob@example.test', decode('00', 'hex'), '{{}}')",
             approved = seeded.approved
@@ -477,6 +558,17 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         &format!(
             "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
              VALUES ('{bob}', 'personal', '000123462', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'admin') RETURNING id"
+        ),
+    )
+    .await;
+    // The seed tool names who ran it as the reviewer.
+    let seeded_tin = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, decided_by,
+                 verified_by)
+             VALUES ('{bob}', 'personal', '000123464', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), '{bob}', 'seed')
+             RETURNING id"
         ),
     )
     .await;
@@ -518,22 +610,43 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     assert!(refused.contains("TINs saved without papers have files"), "{refused}");
     assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
     exec(&db, &format!("DELETE FROM claim_documents WHERE claim_id = '{unverified}'")).await;
+    let auto = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+             VALUES ('{bob}', 'personal', '000123465', '00000', 'SYNTHETIC TAXPAYER', 'removed', now(), 'auto') RETURNING id"
+        ),
+    )
+    .await;
+    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
+    assert!(refused.contains("activated automatically wait for a person"), "{refused}");
+    assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
+    exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{auto}'")).await;
 
     // Back to 10 the way sqlx reverts, then the release before this one
     // starts on it.
     MIGRATOR.undo(&db, 10).await.unwrap();
-    assert_rolled_back(&db, &old, &schema_10, &rows_10, activated, sent_meanwhile, &seeded).await;
+    assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
 
     // The new release can come back on it, and the down files also work run
     // by hand (as psql runs them), newest first.
     MIGRATOR.run(&db).await.unwrap();
-    let verified_by: Option<String> = sqlx::query_scalar("SELECT verified_by FROM tin_claims WHERE id = $1")
-        .bind(activated)
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    // How it became active was lost with the rollback; it counts as staff's.
-    assert_eq!(verified_by.as_deref(), Some("staff"));
+    let verified_by = |claim: Uuid| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT verified_by FROM tin_claims WHERE id = $1")
+                .bind(claim)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    // How each became active was lost with the rollback. A TIN that names
+    // a reviewer counts as staff's; one that does not is not on record.
+    assert_eq!(verified_by(activated).await.as_deref(), Some("unknown"));
+    assert_eq!(verified_by(seeded_tin).await.as_deref(), Some("staff"));
+    assert_eq!(verified_by(seeded.approved).await.as_deref(), Some("staff"));
+    assert_eq!(verified_by(seeded.revoked).await.as_deref(), Some("staff"));
     for down in [
         include_str!("../migrations/0012_staff_roles.down.sql"),
         include_str!("../migrations/0011_tin_states.down.sql"),
@@ -542,7 +655,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
     }
-    assert_rolled_back(&db, &old, &schema_10, &rows_10, activated, sent_meanwhile, &seeded).await;
+    assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
 }
 
 /// The database reads as at migration 10 plus what the new release added
@@ -552,7 +665,7 @@ async fn assert_rolled_back(
     old: &Migrator,
     schema_10: &BTreeSet<String>,
     rows_10: &BTreeMap<String, BTreeMap<String, Value>>,
-    activated: Uuid,
+    activated: [Uuid; 2],
     sent_meanwhile: Uuid,
     seeded: &Seeded,
 ) {
@@ -569,10 +682,12 @@ async fn assert_rolled_back(
     let mut rows = rows(db).await;
     // The TIN an admin activated and the return sent for it stay; nothing
     // the new release added can be told apart from what the old one writes.
-    let activated_row = rows.get_mut("tin_claims").unwrap().remove(&activated.to_string()).unwrap();
-    assert_eq!(activated_row["status"], "approved");
+    for claim in activated {
+        let activated_row = rows.get_mut("tin_claims").unwrap().remove(&claim.to_string()).unwrap();
+        assert_eq!(activated_row["status"], "approved");
+    }
     let sent = rows.get_mut("submissions").unwrap().remove(&sent_meanwhile.to_string()).unwrap();
-    assert_eq!((sent["status"].as_str(), sent["claim_id"].as_str()), (Some("sent"), Some(&*activated.to_string())));
+    assert_eq!((sent["status"].as_str(), sent["claim_id"].as_str()), (Some("sent"), Some(&*activated[0].to_string())));
     // Everything from migration 10 is there as it was: the TIN that was
     // paused (and resumed before the rollback) is active, the unverified
     // rows and the pause's audit line are gone, the role with its column.

@@ -483,11 +483,13 @@ async fn the_add_link_prefills_or_goes_to_the_tins_own_page(db: PgPool) {
     add_claim(&site.db, ana, "000123494", "pending").await;
     add_claim(&site.db, ana, "000123495", "approved").await;
     let paused = add_claim(&site.db, ana, "000123496", "approved").await;
-    sqlx::query("UPDATE tin_claims SET paused_at = now(), pause_reason = 'Checking.' WHERE id = $1")
-        .bind(paused)
-        .execute(&site.db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE tin_claims SET paused_at = now(), paused_by = account_id, pause_reason = 'Checking.' WHERE id = $1",
+    )
+    .bind(paused)
+    .execute(&site.db)
+    .await
+    .unwrap();
     for (query, to) in [
         ("tin=000123492", format!("/tins/claims/{unverified}/verify")),
         ("tin=000-123-492&branch=00000", format!("/tins/claims/{unverified}/verify")),

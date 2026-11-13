@@ -7,7 +7,10 @@ ALTER TABLE accounts ADD COLUMN test_account boolean NOT NULL DEFAULT false;
 ALTER TABLE accounts ADD COLUMN banned_at timestamptz;
 ALTER TABLE accounts ADD COLUMN banned_by uuid REFERENCES accounts (id);
 ALTER TABLE accounts ADD COLUMN ban_reason text;
-ALTER TABLE accounts ADD CONSTRAINT accounts_ban_check CHECK ((banned_at IS NULL) = (ban_reason IS NULL));
+-- A ban always says who banned the account and why.
+ALTER TABLE accounts ADD CONSTRAINT accounts_ban_check CHECK (
+    (banned_at IS NULL AND banned_by IS NULL AND ban_reason IS NULL)
+    OR (banned_at IS NOT NULL AND banned_by IS NOT NULL AND coalesce(btrim(ban_reason), '') <> ''));
 
 -- Like claim_audit: no foreign keys, so lines outlive what they describe.
 CREATE TABLE account_audit (
@@ -19,7 +22,8 @@ CREATE TABLE account_audit (
     new_value   text,
     actor_id    uuid NOT NULL,
     actor_email text NOT NULL,
-    source      text NOT NULL DEFAULT 'web' CHECK (source IN ('web', 'seed')),
+    -- Set by every writer; no default.
+    source      text NOT NULL CHECK (source IN ('web', 'seed')),
     reason      text,
     created_at  timestamptz NOT NULL DEFAULT now()
 );

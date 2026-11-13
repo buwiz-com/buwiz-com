@@ -595,7 +595,8 @@ pub struct ClaimRow {
     pub files_changed_at: Option<OffsetDateTime>,
     /// When the papers were sent; `None` while not verified.
     pub submitted_at: Option<OffsetDateTime>,
-    /// `staff`, `auto`, `admin` or `seed`, once the TIN was ever active.
+    /// `staff`, `auto`, `admin` or `seed`, once the TIN was ever active;
+    /// `unknown` for one active before a rollback that named no reviewer.
     pub verified_by: Option<String>,
     /// An active TIN staff paused: still owned, but nothing sends.
     pub paused_at: Option<OffsetDateTime>,

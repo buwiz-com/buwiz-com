@@ -190,7 +190,7 @@ async fn activation_is_refused_for_a_tin_owned_elsewhere_and_for_a_banned_accoun
     ];
     site.upload("/tins/claims", &dan_cookie, &parts).await;
     let pending = site.newest_claim(dan).await;
-    sqlx::query("UPDATE accounts SET banned_at = now(), ban_reason = 'Fraud' WHERE id = $1")
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Fraud' WHERE id = $1")
         .bind(dan)
         .execute(&site.db)
         .await

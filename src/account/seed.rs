@@ -303,6 +303,12 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
             if active && reason.is_empty() {
                 problems.push(format!("TIN {shown} for {email}: an active TIN needs a reason"));
             }
+            if reason.chars().count() > admin::MAX_REASON_CHARS {
+                problems.push(format!(
+                    "TIN {shown} for {email}: the reason is too long ({} characters at most, as on the website)",
+                    admin::MAX_REASON_CHARS
+                ));
+            }
             let move_from = match entry.move_from.as_deref().map(accounts::normalize_email) {
                 None => None,
                 Some(Err(_)) => {
@@ -1575,6 +1581,24 @@ mod tests {
                 other => panic!("{broken}: not refused: {:?}", other.map(|(logins, _)| logins.len())),
             };
             assert!(dry.contains("123"), "{broken}: {dry}");
+        }
+    }
+
+    /// Reasons stop where the website's do.
+    #[test]
+    fn a_reason_longer_than_the_websites_is_refused() {
+        let file = |reason: &str| {
+            format!(
+                "[[login]]\nemail = \"a@example.test\"\n[[login.tin]]\ntin = \"000-123-453\"\nkind = \"personal\"\nname = \"A\"\nstate = \"active\"\nreason = \"{reason}\"\n"
+            )
+        };
+        let longest = "é".repeat(crate::account::admin::MAX_REASON_CHARS);
+        assert!(plan(file(&longest).as_bytes(), false).is_ok());
+        match plan(file(&format!("{longest}x")).as_bytes(), false) {
+            Err(SeedError::Refused(problems)) => {
+                assert!(problems.join("\n").contains("reason is too long (500 characters at most"), "{problems:?}")
+            }
+            other => panic!("not refused: {:?}", other.map(|(logins, _)| logins.len())),
         }
     }
 

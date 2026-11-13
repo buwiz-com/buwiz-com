@@ -1072,3 +1072,26 @@ async fn an_ending_made_by_an_earlier_seed_run_is_named_as_such(db: PgPool) {
     );
     assert_eq!(seed(db, &back, &opts).await.unwrap().changes, 2);
 }
+
+/// The seed activating the `--as` Admin's own TIN is flagged on the staff
+/// pages like an Admin activating their own on the website.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_seed_activating_its_own_admins_tin_is_flagged(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (_, other_admin) = site.staff_with_role("boss@example.test", "admin").await;
+    let file = format!(
+        "[[login]]\nemail = \"{STAFF}\"\n[[login.tin]]\ntin = \"000-123-453\"\nkind = \"personal\"\nname = \"S T A F F\"\nstate = \"active\"\nreason = \"Mine\"\n[[login]]\nemail = \"jo@example.test\"\n[[login.tin]]\ntin = \"000-123-454\"\nkind = \"personal\"\nname = \"J O\"\nstate = \"active\"\nreason = \"Hers\"\n"
+    );
+    seed(db, &file, &listing(STAFF, false, &[STAFF])).await.unwrap();
+    let (own, ..) = account(db, STAFF).await;
+    let (jo, ..) = account(db, "jo@example.test").await;
+    let own_claim = site.newest_claim(own).await;
+    let jos = site.newest_claim(jo).await;
+    let page = text(site.get(&format!("/staff/claims/{own_claim}"), &other_admin).await).await;
+    assert!(page.contains("Activated by its owner, an admin"), "{page}");
+    let page = text(site.get(&format!("/staff/claims/{jos}"), &other_admin).await).await;
+    assert!(!page.contains("Activated by its owner, an admin"), "{page}");
+    let queue = text(site.get("/staff?status=approved", &other_admin).await).await;
+    assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+}

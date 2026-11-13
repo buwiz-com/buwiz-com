@@ -322,6 +322,19 @@ files left in R2. Each real run is one `seed_runs` row (who ran it as
 file's SHA-256, the plan digest, and what changed) and one audit line per
 account or claim it changes or makes, the `--as` account included.
 
+**Who ran it** is not in that row. Session Manager runs every person as
+`ssm-user`, so run as below the OS user is always `buwiz (sudo from
+ssm-user)` and the host is always the instance: it says where it ran, not
+who. `--as` is whatever was typed. The record of who ran it is CloudTrail:
+the Session Manager `StartSession` event names the IAM identity and the
+time. Note the seed run id beside the session id when you run it.
+
+**The dry run's full TINs go to the session.** If Session Manager logs
+sessions (to S3 or CloudWatch), that log keeps them: check the account's
+Session Manager preferences, and treat that log as holding taxpayer TINs.
+
+Reasons in the file stop at 500 characters, as on the website.
+
 #### Running it
 
 1. Write the file on the Mac, outside the repository. Make a Neon branch.

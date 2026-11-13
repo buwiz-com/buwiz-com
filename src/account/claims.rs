@@ -645,9 +645,10 @@ impl ClaimRow {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
-    /// An Admin activated their own TIN without papers.
+    /// An Admin activated their own TIN without papers, on the staff pages
+    /// or as the `--as` of a seed run.
     pub fn self_activated(&self) -> bool {
-        self.verified_by.as_deref() == Some("admin") && self.decided_by == Some(self.account_id)
+        matches!(self.verified_by.as_deref(), Some("admin" | "seed")) && self.decided_by == Some(self.account_id)
     }
 
     /// When it last went into the review queue: resent, or its papers sent.

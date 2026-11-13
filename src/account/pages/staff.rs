@@ -35,6 +35,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     } else if claim.is_open() {
         flags.push(("good", "person_check", "First claim on this TIN".to_owned()));
     }
+    if claim.verified_by.as_deref() == Some("auto") && claim.auto_confirmed_at.is_none() {
+        flags.push(("warn", "bolt", "Activated automatically · check".to_owned()));
+    }
     if claim.paused_at.is_some() {
         flags.push(("warn", "pause_circle", "Paused".to_owned()));
     }
@@ -78,6 +81,7 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
     let db = &state(cx).db;
     let rows = queries::queue(db, filter, &search).await?;
     let (waiting, sent_back) = queries::open_counts(db).await?;
+    let unconfirmed_auto = queries::unconfirmed_auto(db).await?;
     let oldest_first = matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack);
     let tabs: Vec<(QueueFilter, String, Option<i64>)> = QueueFilter::ALL
         .into_iter()
@@ -85,6 +89,7 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
             let count = match tab {
                 QueueFilter::Waiting => Some(waiting),
                 QueueFilter::SentBack => Some(sent_back),
+                QueueFilter::Auto => Some(unconfirmed_auto),
                 _ => None,
             };
             (tab, link("/staff", None, &[("status", tab.code()), ("q", &search)]), count)
@@ -419,9 +424,18 @@ pub mod claim_id {
             .bind(claim.id)
             .fetch_optional(db)
             .await?
-            .unwrap_or_default(),
+            // No one named: Buwiz paused it itself.
+            .unwrap_or_else(|| "Buwiz".to_owned()),
             None => String::new(),
         };
+        let auto_waiting = claim.verified_by.as_deref() == Some("auto") && claim.auto_confirmed_at.is_none();
+        let can_confirm = auto_waiting && reviewer.can(Power::ConfirmAuto) && !own_claim_of(&claim, &reviewer);
+        let confirm = format!("/staff/claims/{claim_id}/confirm");
+        let auto_sure = claim.auto_check.as_ref().map(|check| {
+            let percent = |field: &str| format!("{:.0}%", check["confidence"][field].as_f64().unwrap_or(0.0) * 100.0);
+            (percent("tin"), percent("name"))
+        });
+        let auto_doubts = crate::account::verify::doubt_words(claim.auto_check.as_ref());
         let can_pause = reviewer.can(Power::Pause) && claim.status == "approved" && !own_claim_of(&claim, &reviewer);
         let pause = format!("/staff/claims/{claim_id}/pause");
         let resume = format!("/staff/claims/{claim_id}/resume");
@@ -521,6 +535,44 @@ pub mod claim_id {
                                     </div>
                                 </section>
                             }
+                            if !auto_doubts.is_empty() {
+                                <section class="panel side-card">
+                                    <h2>"Not activated automatically"</h2>
+                                    <ul class="side-text">
+                                        for words in auto_doubts {
+                                            <li>(words)</li>
+                                        }
+                                    </ul>
+                                </section>
+                            }
+                            if claim.verified_by.as_deref() == Some("auto") {
+                                <section class="panel side-card">
+                                    <h2>"Activated automatically"</h2>
+                                    <p class="side-text">
+                                        (claim.decided_at.map(date_time).unwrap_or_default()) ". TIN and name matched the TIN ID read on our server"
+                                        if let Some((tin_sure, name_sure)) = auto_sure.clone() {
+                                            " (" (tin_sure) " and " (name_sure) " sure)"
+                                        }
+                                        "."
+                                    </p>
+                                    if let Some(at) = claim.auto_confirmed_at {
+                                        <p class="side-text">"Confirmed by staff " (date_time(at)) "; its papers were deleted."</p>
+                                    } else {
+                                        <p class="side-text">"No person has confirmed it yet. Check the papers, then confirm. They are deleted when you confirm; until then they are kept, even if the TIN is removed or revoked."</p>
+                                        if can_confirm {
+                                            confirm_form(
+                                                label: "Looks right: confirm",
+                                                action: confirm.clone(),
+                                                question: format!("Confirm {tin} for {}?", claim.email),
+                                                detail: "You checked the papers and they match. They are deleted now.".to_owned(),
+                                                confirm: "Confirm"
+                                            )
+                                        } else if own_claim_of(&claim, &reviewer) {
+                                            <p class="side-text">"This is your own TIN. Another staff member confirms it."</p>
+                                        }
+                                    }
+                                </section>
+                            }
                             if claim.sent_back_at.is_some() {
                                 <section class="panel side-card">
                                     <h2>"Sent back before"</h2>
@@ -603,7 +655,7 @@ pub mod claim_id {
                                     for line in pauses {
                                         <p class="side-text">
                                             (if line.action == "paused" { "Paused by " } else { "Resumed by " })
-                                            (line.actor_email.clone()) " on " (date(line.created_at))
+                                            (if line.source == "auto" { "Buwiz".to_owned() } else { line.actor_email.clone() }) " on " (date(line.created_at))
                                             if let Some(reason) = line.reason.clone() {
                                                 ": " (reason)
                                             }
@@ -1253,6 +1305,7 @@ fn history(
                 "approved" | "removed" | "revoked" => match claim.verified_by.as_deref() {
                     Some("admin") => ("verified", format!("{tin} activated without papers")),
                     Some("seed") => ("verified", format!("{tin} activated by the seed tool")),
+                    Some("auto") => ("bolt", format!("{tin} activated automatically from its TIN ID")),
                     Some("unknown") => ("verified", format!("{tin} became active; how is not on record")),
                     _ => ("verified", format!("{tin} approved")),
                 },
@@ -1279,7 +1332,7 @@ fn audit_icon(action: &str) -> &'static str {
         "removed" => "remove_circle",
         "revoked" => "block",
         "file_replaced" => "swap_horiz",
-        "activated" => "verified",
+        "activated" | "auto_activated" | "auto_confirmed" => "verified",
         "paused" => "pause_circle",
         "resumed" => "play_circle",
         _ => "draft",
@@ -1291,6 +1344,8 @@ fn audit_icon(action: &str) -> &'static str {
 fn actor_text(actor_id: Uuid, actor_email: &str, source: &str, account_id: Option<Uuid>) -> String {
     if source == "seed" {
         format!("The seed tool, run by {actor_email},")
+    } else if source == "auto" {
+        "Buwiz".to_owned()
     } else if Some(actor_id) == account_id {
         "The person".to_owned()
     } else {
@@ -1317,6 +1372,8 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "revoked" => format!("revoked the ownership of {tin}"),
         "file_replaced" => format!("replaced the {file} on {tin}"),
         "activated" => format!("activated {tin} without papers"),
+        "auto_activated" => format!("activated {tin} automatically"),
+        "auto_confirmed" => format!("confirmed the automatic activation of {tin}"),
         "paused" => format!("paused {tin}"),
         "resumed" => format!("resumed {tin}"),
         _ => format!("removed the {file} from {tin}"),

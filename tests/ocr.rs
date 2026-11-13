@@ -130,12 +130,8 @@ fn reads_a_phone_sized_photo() {
 
 /// A claim sent with the card is read in the background, and the reading
 /// compares with what was typed.
-#[sqlx::test(migrations = "./migrations")]
-async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
-    // The reader finds the models the same way: OCR_MODEL_DIR, or
-    // `ocr-models/` here.
-    models();
-    let config = Config {
+fn config() -> Config {
+    Config {
         host: "127.0.0.1".into(),
         port: 0,
         database_url: String::new(),
@@ -150,10 +146,21 @@ async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
         forms_origin: "https://buwiz.com".into(),
         // Nothing listens there: the star count is unknown.
         github_api_url: "http://127.0.0.1:9".into(),
-    };
+    }
+}
+
+fn state(db: &PgPool) -> AppState {
     let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
     let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
-    let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender);
+    AppState::new(config(), db.clone(), DocumentStore::Database, key, sender)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
+    // The reader finds the models the same way: OCR_MODEL_DIR, or
+    // `ocr-models/` here.
+    models();
+    let state = state(&db);
     let account: uuid::Uuid =
         sqlx::query_scalar("INSERT INTO accounts (email) VALUES ('juan@example.test') RETURNING id")
             .fetch_one(&db)
@@ -165,6 +172,7 @@ async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
         registered_name: "Juan Santos Dela Cruz".into(),
         trade_name: String::new(),
         uploads: vec![Upload { kind: DocumentKind::TinId, filename: "id.png".into(), bytes: tin_card() }],
+        papers_later: false,
     };
     let claim_id = claims::submit(&db, &state.documents, &state.config.document_key, account, claim).await.unwrap();
     ocr::queue_claim(&state, claim_id).await;
@@ -194,4 +202,53 @@ async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
     claims::decide(&db, &state.documents, claim_id, reviewer, &claims::Decision::Approve, "").await.unwrap();
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM document_readings").fetch_one(&db).await.unwrap();
     assert_eq!(left, 0);
+}
+
+/// On purpose: the card drawn above, about 30 lines of code, is a "clear
+/// TIN ID photo" to the automatic check. With `AUTO_VERIFY=on` it passes
+/// every rule the drawing controls; only OCR's own sureness can still hold
+/// it back. This is why automatic activation ships off (docs/deploy.md).
+#[sqlx::test(migrations = "./migrations")]
+async fn the_drawn_card_activates_when_auto_verify_is_on(db: PgPool) {
+    use buwiz_cloud::account::verify::{Doubt, Verification};
+    models();
+    let state = state(&db).with_verification(Verification::On);
+    let account: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO accounts (email) VALUES ('juan@example.test') RETURNING id")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let claim = NewClaim {
+        kind: ClaimKind::Personal,
+        tin: Tin::parse("123-456-789", "").unwrap(),
+        registered_name: "Juan Santos Dela Cruz".into(),
+        trade_name: String::new(),
+        uploads: vec![Upload { kind: DocumentKind::TinId, filename: "id.png".into(), bytes: tin_card() }],
+        papers_later: false,
+    };
+    let claim_id = claims::submit(&db, &state.documents, &state.config.document_key, account, claim).await.unwrap();
+    ocr::queue_claim(&state, claim_id).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let check: serde_json::Value = loop {
+        let check: Option<serde_json::Value> = sqlx::query_scalar("SELECT auto_check FROM tin_claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        if let Some(check) = check {
+            break check;
+        }
+        assert!(Instant::now() < deadline, "the check did not run");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    eprintln!("automatic check of a drawn card: {check}");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM tin_claims WHERE id = $1").bind(claim_id).fetch_one(&db).await.unwrap();
+    if status == "approved" {
+        assert_eq!(check["outcome"], "activated");
+    } else {
+        // Only the engine's sureness held it back.
+        assert_eq!(check["doubts"][0]["code"], Doubt::LowConfidence.code(), "{check}");
+        assert_eq!(check["doubts"].as_array().unwrap().len(), 1, "{check}");
+    }
 }

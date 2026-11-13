@@ -226,6 +226,23 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             .await;
         assert!(!paused().await, "{who:?}");
 
+        // Confirm an automatic activation: Support and Admins.
+        let auto = add_claim(&site.db, t.account, &format!("6{n:08}"), "approved").await;
+        sqlx::query("UPDATE tin_claims SET verified_by = 'auto', decided_by = NULL WHERE id = $1")
+            .bind(auto)
+            .execute(&site.db)
+            .await
+            .unwrap();
+        let claim_page = format!("/staff/claims/{auto}");
+        let done = format!("{claim_page}?notice=auto_confirmed");
+        expect_post(&site, (who, &cookie), &format!("{claim_page}/confirm"), "", false, &claim_page, &done).await;
+        let confirmed: bool = sqlx::query_scalar("SELECT auto_confirmed_at IS NOT NULL FROM tin_claims WHERE id = $1")
+            .bind(auto)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+        assert_eq!(confirmed, who.may(false), "{who:?}");
+
         // Change a role: Admins only.
         let path = format!("{user}/role");
         let done = format!("{user}?notice=role_changed");

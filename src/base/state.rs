@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
 use crate::account::mail::Mailer;
+use crate::account::verify::Verification;
 use crate::base::config::Config;
 use crate::base::storage::DocumentStore;
 use crate::filing::link::SenderLink;
@@ -29,6 +30,9 @@ pub struct Inner {
     pub sender: SenderLink,
     /// Reads claim documents on this server, one at a time.
     pub ocr: Reader,
+    /// `AUTO_VERIFY`: whether a clear TIN ID photo activates its TIN
+    /// automatically ([`crate::account::verify`]). Off unless `on`.
+    pub verification: Verification,
     /// The released version of the app (eBIRForms), if any.
     pub downloads: Downloads,
     /// The released version of Buwiz Bot, if any, for buwiz.com's download
@@ -58,10 +62,20 @@ impl AppState {
             ticket_key,
             sender,
             ocr: Reader::from_env(),
+            verification: Verification::from_env(),
             downloads,
             bot_downloads,
             stars,
         }))
+    }
+}
+
+impl AppState {
+    /// The same state with automatic activation set to `verification`, for
+    /// tests. Only before the state is shared (cloned).
+    pub fn with_verification(mut self, verification: Verification) -> Self {
+        Arc::get_mut(&mut self.0).expect("set before the state is shared").verification = verification;
+        self
     }
 }
 

@@ -15,4 +15,5 @@ pub mod roles;
 pub mod seed;
 pub mod staff;
 pub mod tin;
+pub mod verify;
 pub mod web;

@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, header};
 use axum::response::Response;
 use buwiz_cloud::account::accounts;
+use buwiz_cloud::account::verify::Verification;
 use buwiz_cloud::base::config::{Config, MailConfig};
 use buwiz_cloud::base::crypto;
 use buwiz_cloud::base::state::AppState;
@@ -67,7 +68,24 @@ impl Site {
         Self::configured(db, store, downloads_url, vec![STAFF.into()])
     }
 
+    /// A site with automatic activation on (`AUTO_VERIFY=on`).
+    pub fn with_auto(db: PgPool) -> Self {
+        Self::configured_with(db, DocumentStore::Database, NO_DOWNLOADS, vec![STAFF.into()], Verification::On)
+    }
+
     fn configured(db: PgPool, store: DocumentStore, downloads_url: &str, admin_emails: Vec<String>) -> Self {
+        // As in production: from `AUTO_VERIFY`, which the test runner never
+        // sets, so off.
+        Self::configured_with(db, store, downloads_url, admin_emails, Verification::from_env())
+    }
+
+    fn configured_with(
+        db: PgPool,
+        store: DocumentStore,
+        downloads_url: &str,
+        admin_emails: Vec<String>,
+        verification: Verification,
+    ) -> Self {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
@@ -87,7 +105,7 @@ impl Site {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         // The account site never reaches the Sender in these tests.
         let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
-        let state = AppState::new(config, db.clone(), store, key, sender);
+        let state = AppState::new(config, db.clone(), store, key, sender).with_verification(verification);
         Self { db, router: buwiz_cloud::app(state.clone()), state }
     }
 

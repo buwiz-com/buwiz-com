@@ -15,7 +15,8 @@ use crate::base::config::Config;
 /// A staff role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// Reviews claims, sees users, signs people out.
+    /// Reviews claims, confirms automatic activations, sees users, signs
+    /// people out.
     Support,
     /// Everything.
     Admin,
@@ -48,7 +49,7 @@ impl Role {
     pub fn can(self, power: Power) -> bool {
         match self {
             Self::Admin => true,
-            Self::Support => matches!(power, Power::Review | Power::SeeUsers | Power::SignOut),
+            Self::Support => matches!(power, Power::Review | Power::SeeUsers | Power::SignOut | Power::ConfirmAuto),
         }
     }
 }
@@ -68,6 +69,9 @@ pub enum Power {
     /// Sign an account out everywhere, or out of one app (never an
     /// Admin's, unless the one signing out is an Admin).
     SignOut,
+    /// Confirm a TIN activated automatically, once its papers look right
+    /// (never one's own).
+    ConfirmAuto,
     DeleteClaim,
     EndOwnership,
     ActivateWithoutPapers,
@@ -166,6 +170,7 @@ mod tests {
             Review,
             SeeUsers,
             SignOut,
+            ConfirmAuto,
             DeleteClaim,
             EndOwnership,
             ActivateWithoutPapers,
@@ -176,7 +181,11 @@ mod tests {
         ];
         for power in all {
             assert!(Role::Admin.can(power), "{power:?}");
-            assert_eq!(Role::Support.can(power), matches!(power, Review | SeeUsers | SignOut), "{power:?}");
+            assert_eq!(
+                Role::Support.can(power),
+                matches!(power, Review | SeeUsers | SignOut | ConfirmAuto),
+                "{power:?}"
+            );
         }
     }
 

@@ -1186,6 +1186,8 @@ pub async fn resume(db: &PgPool, claim_id: Uuid, actor: &Account, reason: &str) 
 pub struct PauseLine {
     pub action: String,
     pub actor_email: String,
+    /// `auto` for a pause Buwiz made itself.
+    pub source: String,
     pub reason: Option<String>,
     pub created_at: OffsetDateTime,
 }
@@ -1194,7 +1196,7 @@ pub struct PauseLine {
 /// first: what a reviewer should know before making it active again.
 pub async fn pauses(db: &PgPool, tin: &Tin) -> sqlx::Result<Vec<PauseLine>> {
     sqlx::query_as(
-        "SELECT a.action, a.actor_email, a.reason, a.created_at
+        "SELECT a.action, a.actor_email, a.source, a.reason, a.created_at
          FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id
          WHERE c.tin_root = $1 AND c.branch_code = $2 AND a.action IN ('paused', 'resumed')
          ORDER BY a.created_at, a.id",

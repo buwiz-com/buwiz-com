@@ -121,6 +121,8 @@ notices! {
     NotPaused = "not_paused" => error "This TIN is not paused.",
     TinActivated = "tin_activated" => info "Activated without papers. The reason is in the account's history.",
     ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
+    AutoConfirmed = "auto_confirmed" => info "Confirmed. The papers were deleted.",
+    NotAuto = "not_auto" => error "This TIN was not activated automatically, or it was already confirmed.",
 }
 
 #[cfg(test)]

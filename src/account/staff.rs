@@ -37,6 +37,9 @@ pub enum QueueFilter {
     SentBack,
     /// Saved without papers: nothing to review yet.
     Unverified,
+    /// Activated automatically and not yet confirmed by a person, in any
+    /// status: removed by the owner, revoked or paused too.
+    Auto,
     /// Active and not paused.
     Approved,
     Paused,
@@ -46,8 +49,16 @@ pub enum QueueFilter {
 }
 
 impl QueueFilter {
-    pub const ALL: [Self; 7] =
-        [Self::Waiting, Self::SentBack, Self::Unverified, Self::Approved, Self::Paused, Self::Rejected, Self::Ended];
+    pub const ALL: [Self; 8] = [
+        Self::Waiting,
+        Self::SentBack,
+        Self::Unverified,
+        Self::Auto,
+        Self::Approved,
+        Self::Paused,
+        Self::Rejected,
+        Self::Ended,
+    ];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Waiting)
@@ -58,6 +69,7 @@ impl QueueFilter {
             Self::Waiting => "waiting",
             Self::SentBack => "sent_back",
             Self::Unverified => "unverified",
+            Self::Auto => "auto",
             Self::Approved => "approved",
             Self::Paused => "paused",
             Self::Rejected => "rejected",
@@ -70,6 +82,7 @@ impl QueueFilter {
             Self::Waiting => "Waiting",
             Self::SentBack => "Sent back",
             Self::Unverified => "Not verified",
+            Self::Auto => "Activated automatically",
             Self::Approved => "Approved",
             Self::Paused => "Paused",
             Self::Rejected => "Rejected",
@@ -82,6 +95,9 @@ impl QueueFilter {
             Self::Waiting => &["pending"],
             Self::SentBack => &["needs_fix"],
             Self::Unverified => &["unverified"],
+            Self::Auto => {
+                &["unverified", "pending", "needs_fix", "approved", "rejected", "withdrawn", "removed", "revoked"]
+            }
             Self::Approved | Self::Paused => &["approved"],
             Self::Rejected => &["rejected"],
             Self::Ended => &["removed", "revoked"],
@@ -99,8 +115,14 @@ impl QueueFilter {
         }
     }
 
+    /// Whether the tab holds only automatic activations nobody confirmed.
+    fn unconfirmed_auto(self) -> Option<bool> {
+        (self == Self::Auto).then_some(true)
+    }
+
     fn order(self) -> &'static str {
         match self {
+            Self::Auto => "c.decided_at, c.id",
             Self::Waiting => "coalesce(c.resent_at, c.submitted_at, c.created_at), c.id",
             Self::SentBack => "c.sent_back_at, c.id",
             Self::Unverified => "c.created_at DESC, c.id",
@@ -146,6 +168,7 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
              ORDER BY d.created_at DESC LIMIT 1
          ) reading ON true
          WHERE c.status = ANY($1) AND ($5::bool IS NULL OR (c.paused_at IS NOT NULL) = $5)
+           AND ($6::bool IS NULL OR (c.verified_by = 'auto' AND c.auto_confirmed_at IS NULL))
            AND ($2::text IS NULL OR a.email ILIKE $2 OR c.registered_name ILIKE $2 OR c.trade_name ILIKE $2
                 OR ($3::text IS NOT NULL AND c.tin_root || c.branch_code LIKE $3))
          ORDER BY {}
@@ -157,8 +180,17 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
     .bind(tin_digits(search))
     .bind(LIST_LIMIT)
     .bind(filter.paused())
+    .bind(filter.unconfirmed_auto())
     .fetch_all(db)
     .await
+}
+
+/// TINs activated automatically that no person has confirmed yet, for the
+/// tab's count.
+pub async fn unconfirmed_auto(db: &PgPool) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL")
+        .fetch_one(db)
+        .await
 }
 
 /// Claims waiting for review and claims sent back, for the tab counts.

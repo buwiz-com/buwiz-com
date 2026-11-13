@@ -124,6 +124,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/claims/{claim_id}/activate", post(activate_claim))
         .route("/staff/claims/{claim_id}/pause", post(pause_claim))
         .route("/staff/claims/{claim_id}/resume", post(resume_claim))
+        .route("/staff/claims/{claim_id}/confirm", post(confirm_auto))
         .route("/staff/documents/{document_id}", get(staff_document))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
@@ -1048,6 +1049,21 @@ async fn resume_claim(
         Err(response) => return response,
     };
     staff_outcome(&back_to, claims::resume(&state.db, claim_id, &staff.account, &form.reason).await)
+}
+
+/// Support or an Admin confirms an automatic activation after checking its
+/// papers, which are then deleted.
+async fn confirm_auto(State(state): State<AppState>, headers: HeaderMap, Path(claim_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/claims/{claim_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::ConfirmAuto).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let outcome = crate::account::verify::confirm(&state.db, &state.documents, claim_id, &staff.account).await;
+    staff_outcome(&back_to, outcome)
 }
 
 /// A claim document, shown inline to staff only.

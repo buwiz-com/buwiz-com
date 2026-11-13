@@ -59,6 +59,9 @@ pub async fn run() -> anyhow::Result<()> {
                 if let Err(error) = submissions::upkeep(&db).await {
                     tracing::error!(error = ?error, "submission upkeep failed");
                 }
+                if let Err(error) = account::verify::upkeep(&db).await {
+                    tracing::error!(error = ?error, "automatic activation upkeep failed");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         }

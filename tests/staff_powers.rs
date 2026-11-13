@@ -825,6 +825,31 @@ async fn staff_cannot_read_the_reasons_about_themselves(db: PgPool) {
     assert!(history.contains("moved to carl@example.test"), "{history}");
 }
 
+/// On the page of their own claim, staff read neither the note of the
+/// staff member who approved it nor the reasons it was paused and resumed.
+#[sqlx::test(migrations = "./migrations")]
+async fn staff_do_not_read_the_decision_note_or_pause_reasons_of_their_own_claim(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (helper, helper_cookie) = site.staff_with_role("helper@example.test", "support").await;
+    let claim = add_claim(&site.db, helper, "000123453", "pending").await;
+    let page = format!("/staff/claims/{claim}");
+    let response = site.post(&format!("{page}/decision"), &staff, "decision=approve&note=Vouched+for+by+Ana").await;
+    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    site.post(&format!("{page}/pause"), &staff, "reason=Complaint+from+a+client").await;
+    site.post(&format!("{page}/resume"), &staff, "reason=Client+withdrew+it").await;
+
+    let own = text(site.get(&page, &helper_cookie).await).await;
+    for secret in ["Vouched for by Ana", "Complaint from a client", "Client withdrew it"] {
+        assert!(!own.contains(secret), "{secret}: {own}");
+    }
+    // Another staff member reads them.
+    let other = text(site.get(&page, &staff).await).await;
+    for secret in ["Vouched for by Ana", "Complaint from a client", "Client withdrew it"] {
+        assert!(other.contains(secret), "{secret}: {other}");
+    }
+}
+
 /// Signing one app out needs a reason, like every other staff action, and
 /// leaves a line only when it ended a sign-in.
 #[sqlx::test(migrations = "./migrations")]

@@ -677,12 +677,15 @@ pub mod claim_id {
                                 <section class="panel side-card">
                                     <h2>"Decided"</h2>
                                     <p class="side-text">(status_label) " · " (claim.decided_at.map(date_time).unwrap_or_default())</p>
-                                    if let Some(note) = claim.decision_note.clone() {
+                                    // The reviewer's note is for staff, not for the claimant.
+                                    if let Some(note) = claim.decision_note.clone().filter(|_| !own_claim) {
                                         <p class="side-text quote">(note)</p>
                                     }
                                 </section>
                             }
-                            if !pauses.is_empty() {
+                            // Why staff paused and resumed it is theirs to read, not
+                            // the claimant's, staff or not.
+                            if !pauses.is_empty() && !own_claim {
                                 <section class="panel side-card">
                                     <h2>"Paused before"</h2>
                                     for line in pauses {

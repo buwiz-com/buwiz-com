@@ -356,8 +356,8 @@ impl Harness {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at)
-             VALUES ($1, 'personal', $2, '00000', 'Juana Santos', 'approved', now())",
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+             VALUES ($1, 'personal', $2, '00000', 'Juana Santos', 'approved', now(), 'staff')",
         )
         .bind(account_id)
         .bind(TIN_ROOT)

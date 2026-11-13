@@ -298,8 +298,8 @@ pub async fn submit(
         None => {}
     }
     let inserted = sqlx::query_scalar(
-        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, trade_name, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id",
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, trade_name, status, submitted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', now()) RETURNING id",
     )
     .bind(account_id)
     .bind(kind.as_str())
@@ -311,7 +311,7 @@ pub async fn submit(
     .await;
     let claim_id: Uuid = match inserted {
         // The same claim sent twice at once: the second one loses the race.
-        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_open") => {
+        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_live") => {
             return Err(SubmitError::Invalid(Notice::ClaimAlreadyPending));
         }
         other => other?,
@@ -498,6 +498,16 @@ pub struct ClaimRow {
     pub removed_at: Option<OffsetDateTime>,
     pub removal_note: Option<String>,
     pub files_changed_at: Option<OffsetDateTime>,
+    /// When the papers were sent; `None` while not verified.
+    pub submitted_at: Option<OffsetDateTime>,
+    /// `staff`, `auto`, `admin` or `seed`, once the TIN was ever active.
+    pub verified_by: Option<String>,
+    /// An active TIN staff paused: still owned, but nothing sends.
+    pub paused_at: Option<OffsetDateTime>,
+    pub pause_reason: Option<String>,
+    /// What the automatic check saw, and when staff confirmed its activation.
+    pub auto_check: Option<Value>,
+    pub auto_confirmed_at: Option<OffsetDateTime>,
 }
 
 impl ClaimRow {
@@ -524,7 +534,8 @@ impl ClaimRow {
 
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
-     c.decided_at, c.removed_at, c.removal_note, c.files_changed_at";
+     c.decided_at, c.removed_at, c.removal_note, c.files_changed_at, c.submitted_at, c.verified_by, c.paused_at, \
+     c.pause_reason, c.auto_check, c.auto_confirmed_at";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -731,7 +742,8 @@ pub async fn decide(
     }
     let status = if approve { "approved" } else { "rejected" };
     let updated = sqlx::query(
-        "UPDATE tin_claims SET status = $2, decided_at = now(), decided_by = $3, decision_note = NULLIF($4, '')
+        "UPDATE tin_claims SET status = $2, decided_at = now(), decided_by = $3, decision_note = NULLIF($4, ''),
+             verified_by = CASE WHEN $2 = 'approved' THEN 'staff' END
          WHERE id = $1",
     )
     .bind(claim_id)
@@ -913,7 +925,9 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
         By::Staff { .. } => ("revoked", Notice::OwnershipRevoked),
     };
     sqlx::query(
-        "UPDATE tin_claims SET status = $2, removed_at = now(), removed_by = $3, removal_note = $4 WHERE id = $1",
+        "UPDATE tin_claims SET status = $2, removed_at = now(), removed_by = $3, removal_note = $4,
+             paused_at = NULL, paused_by = NULL, pause_reason = NULL
+         WHERE id = $1",
     )
     .bind(claim_id)
     .bind(status)

@@ -1,0 +1,37 @@
+-- Staff roles, bans and the test label on accounts; a history of what staff
+-- did to accounts; and a record of each seed run. No account has a role or
+-- a ban yet: ADMIN_EMAILS still makes its people admins.
+
+ALTER TABLE accounts ADD COLUMN role text CHECK (role IN ('admin', 'support'));
+ALTER TABLE accounts ADD COLUMN test_account boolean NOT NULL DEFAULT false;
+ALTER TABLE accounts ADD COLUMN banned_at timestamptz;
+ALTER TABLE accounts ADD COLUMN banned_by uuid REFERENCES accounts (id);
+ALTER TABLE accounts ADD COLUMN ban_reason text;
+ALTER TABLE accounts ADD CONSTRAINT accounts_ban_check CHECK ((banned_at IS NULL) = (ban_reason IS NULL));
+
+-- Like claim_audit: no foreign keys, so lines outlive what they describe.
+CREATE TABLE account_audit (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id  uuid NOT NULL,
+    action      text NOT NULL CHECK (action IN ('banned', 'unbanned', 'role_changed', 'test_marked',
+                                                'test_unmarked', 'signed_out', 'app_signed_out', 'created')),
+    old_value   text,
+    new_value   text,
+    actor_id    uuid NOT NULL,
+    actor_email text NOT NULL,
+    source      text NOT NULL DEFAULT 'web' CHECK (source IN ('web', 'seed')),
+    reason      text,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX account_audit_account ON account_audit (account_id, created_at DESC);
+
+-- One row per run of `buwiz-cloud seed`: who ran it, the file's hash and
+-- what it changed.
+CREATE TABLE seed_runs (
+    id          uuid PRIMARY KEY,
+    actor_id    uuid NOT NULL,
+    actor_email text NOT NULL,
+    file_sha256 bytea NOT NULL,
+    summary     jsonb NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);

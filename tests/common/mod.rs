@@ -227,8 +227,10 @@ pub async fn token(db: &PgPool, account_id: Uuid, client_id: &str, scope: &str) 
 
 pub async fn add_claim(db: &PgPool, account_id: Uuid, root: &str, status: &str) -> Uuid {
     sqlx::query_scalar(
-        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at)
-         VALUES ($1, 'business', $2, '00000', 'Juan', $3, CASE WHEN $3 IN ('approved', 'rejected') THEN now() END)
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'business', $2, '00000', 'Juan', $3,
+                 CASE WHEN $3 IN ('approved', 'rejected', 'removed', 'revoked') THEN now() END,
+                 CASE WHEN $3 IN ('approved', 'removed', 'revoked') THEN 'staff' END)
          RETURNING id",
     )
     .bind(account_id)

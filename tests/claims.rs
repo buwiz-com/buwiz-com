@@ -177,6 +177,14 @@ async fn a_claim_sent_back_is_fixed_and_resent(db: PgPool) {
     assert!(review.contains("Read by OCR on our server") && review.contains(&format!("read: {expected}")), "{review}");
     assert_eq!(location(&site.post(&decide, &staff, "decision=approve").await), "/staff?notice=claim_decided");
     assert_eq!(site.claim_status(claim).await, "approved");
+    // Staff made it active with its papers, and it says since when.
+    let (verified_by, decided): (Option<String>, bool) =
+        sqlx::query_as("SELECT verified_by, decided_at IS NOT NULL FROM tin_claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+    assert_eq!((verified_by.as_deref(), decided), (Some("staff"), true));
     assert_eq!(site.readings(claim).await, []);
 }
 

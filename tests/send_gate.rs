@@ -456,3 +456,108 @@ async fn a_banned_account_is_refused_on_every_bearer_call_but_sign_out(db: PgPoo
     assert_eq!(site.send(logout).await.status(), StatusCode::OK);
     assert_eq!(site.send(get("/api/tax-profiles", &fresh)).await.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// The relay checks again once its socket is open: a ban after the
+/// request's token check, or a return whose claim is not the caller's, is
+/// not sent. Only a return still waiting is failed.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_relay_checks_the_account_again_when_it_starts(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (bob, _) = site.person("bob@example.test").await;
+    let anas = claim(db, ana, "000333011", "approved").await;
+    let bobs = claim(db, bob, "000333012", "approved").await;
+
+    // A return of ana's tied to bob's active TIN (nothing writes that; it
+    // stands for any slip): never sent, and read as not active.
+    let crossed = submission(db, ana, bobs, "ready", false).await;
+    let (status, error) = answered(submissions::claim_for_relay(db, ana, crossed).await.unwrap());
+    let failed_not_active = format!("{NOT_ACTIVE} (tin_not_active)");
+    assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(failed_not_active.as_str())));
+    assert_eq!(stored(db, crossed).await.0, "failed");
+
+    // Banned between the ticket and the relay: the v1 return and the
+    // sealed one are failed with the ban's words, and the v2 envelope goes.
+    let v1 = submission(db, ana, anas, "ready", false).await;
+    let v2 = submission(db, ana, anas, "ready", true).await;
+    let busy = submission(db, ana, anas, "sending", false).await;
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = $2, ban_reason = 'Abuse.' WHERE id = $1")
+        .bind(ana)
+        .bind(bob)
+        .execute(db)
+        .await
+        .unwrap();
+    let failed_banned = format!("{BANNED} (account_banned)");
+    for (id, kept) in [(v1, true), (v2, false)] {
+        let (status, error) = answered(submissions::claim_for_relay(db, ana, id).await.unwrap());
+        assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(failed_banned.as_str())));
+        assert_eq!(stored(db, id).await, ("failed".to_owned(), Some(failed_banned.clone()), kept));
+    }
+    // A send already under way keeps its own outcome.
+    let (status, _) = answered(submissions::claim_for_relay(db, ana, busy).await.unwrap());
+    assert_eq!(status, "sending");
+
+    // Ban lifted: the v1 return may go again.
+    sqlx::query("UPDATE accounts SET banned_at = NULL, banned_by = NULL, ban_reason = NULL WHERE id = $1")
+        .bind(ana)
+        .execute(db)
+        .await
+        .unwrap();
+    assert!(matches!(submissions::claim_for_relay(db, ana, v1).await.unwrap(), RelayStart::Send(_)));
+}
+
+/// The two forms of each rule agree on every status, paused and not: the
+/// SQL the relay and the licence list use, and the Rust the gate and the
+/// TIN list use. The one-live-row index holds exactly the live statuses.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_sql_and_the_rust_forms_of_the_gate_agree(db: PgPool) {
+    use buwiz_cloud::filing::gate;
+    let site = Site::new(db);
+    let db = &site.db;
+    let (ana, _) = site.person("ana@example.test").await;
+    let statuses: Vec<String> = {
+        let check: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'tin_claims_status_check'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap();
+        check.split('\'').skip(1).step_by(2).map(str::to_owned).collect()
+    };
+    assert_eq!(statuses.len(), 8, "{statuses:?}");
+    let mut root = 333100;
+    for status in &statuses {
+        for paused in [false, true] {
+            if paused && status != "approved" {
+                continue;
+            }
+            root += 1;
+            let id = claim(db, ana, &format!("000{root}"), status).await;
+            if paused {
+                pause(db, id).await;
+            }
+            let (sendable, live): (bool, bool) = sqlx::query_as(&format!(
+                "SELECT {}, c.{} FROM tin_claims c WHERE c.id = $1",
+                gate::SENDABLE_SQL,
+                gate::LIVE_SQL
+            ))
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+            let standing = gate::classify(id, status, paused, &[]);
+            assert_eq!(sendable, standing.can_send(), "{status} paused={paused}");
+            assert_eq!(live, gate::is_live(status), "{status}");
+            assert_eq!(live, standing != gate::Standing::NotActive, "{status}");
+            // The gate's own read agrees with both.
+            let tin = buwiz_cloud::tin::Tin::parse(&format!("000{root}"), "").unwrap();
+            let own = gate::own(db, ana, &tin).await.unwrap();
+            assert_eq!(own, if live { standing.clone() } else { gate::Standing::NotActive }, "{status}");
+        }
+    }
+    let index: String =
+        sqlx::query_scalar("SELECT pg_get_indexdef('tin_claims_one_live'::regclass)").fetch_one(db).await.unwrap();
+    let indexed: Vec<&str> = index.split('\'').skip(1).step_by(2).collect();
+    assert_eq!(indexed, gate::LIVE_STATUSES, "{index}");
+}

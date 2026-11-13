@@ -572,3 +572,45 @@ async fn the_limit_of_unverified_tins_holds_under_parallel_requests(db: PgPool) 
             .await;
     assert_eq!(total, 20);
 }
+
+/// What an AI agent reads about the account's claims (`list_tin_claims`):
+/// a "sent" time only once the papers were sent, never for a TIN saved
+/// without them.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_agent_hears_of_papers_sent_only_once_they_were(db: PgPool) {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    let site = Site::new(db);
+    let (ana, cookie) = site.person("ana@example.test").await;
+    let agent = token(&site.db, ana, "some-agent", "mcp").await;
+    let claims = || async {
+        let request = Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {agent}"))
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tin_claims"}}"#))
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+        answer["result"]["structuredContent"]["claims"].clone()
+    };
+    site.upload("/tins/claims", &cookie, &skipped("000123481")).await;
+    let claim = site.newest_claim(ana).await;
+    let listed = claims().await;
+    assert_eq!(listed[0]["status"], "unverified");
+    assert!(listed[0]["sent_at"].is_null(), "{listed}");
+
+    // Its papers come two days later: that is when they were sent.
+    sqlx::query("UPDATE tin_claims SET created_at = now() - interval '2 days' WHERE id = $1")
+        .bind(claim)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let papers = [("registered_name", Text("SYNTHETIC TAXPAYER")), ("tin_id", File("id.png", PNG))];
+    let sent = site.upload(&format!("/tins/claims/{claim}/papers"), &cookie, &papers).await;
+    assert_eq!(location(&sent), "/tins?notice=claim_submitted");
+    let submitted: i64 =
+        scalar_i64(&site.db, "SELECT extract(epoch FROM submitted_at)::bigint FROM tin_claims WHERE id = $1", claim)
+            .await;
+    let listed = claims().await;
+    assert_eq!(listed[0]["status"], "pending");
+    assert_eq!(listed[0]["sent_at"], submitted, "{listed}");
+}

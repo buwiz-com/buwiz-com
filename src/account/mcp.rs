@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::account::agents::request_origin;
@@ -178,7 +179,9 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                         "registered_name": claim.registered_name,
                         "status": status,
                         "note": if claim.status == "rejected" { claim.decision_note.clone() } else { None },
-                        "sent_at": claim.created_at.unix_timestamp(),
+                        // When its papers were sent: none for a TIN saved
+                        // without them (or activated without them).
+                        "sent_at": claim.submitted_at.map(OffsetDateTime::unix_timestamp),
                     });
                     if claim.status == "needs_fix" {
                         let reasons: Vec<&str> = claim

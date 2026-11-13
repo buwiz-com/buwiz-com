@@ -315,11 +315,11 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
     let wanted =
         query(cx, "tin").and_then(|tin| Tin::parse_fields(&tin, &query(cx, "branch").unwrap_or_default()).ok());
     if let Some(tin) = &wanted {
-        let own: Option<(Uuid, String)> = sqlx::query_as(
+        let own: Option<(Uuid, String)> = sqlx::query_as(&format!(
             "SELECT id, CASE WHEN paused_at IS NOT NULL THEN 'paused' ELSE status END FROM tin_claims
-             WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
-               AND status IN ('unverified', 'pending', 'needs_fix', 'approved')",
-        )
+             WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND {}",
+            crate::filing::gate::LIVE_SQL
+        ))
         .bind(account.id)
         .bind(tin.root())
         .bind(tin.branch())

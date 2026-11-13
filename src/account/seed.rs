@@ -538,13 +538,14 @@ impl Seed<'_> {
     ) -> Result<(), SeedError> {
         let tin = &entry.tin;
         let shown = self.shown(tin);
-        let live: Vec<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(
+        let live: Vec<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(&format!(
             "SELECT c.id, c.account_id, a.email, c.status, c.paused_at IS NOT NULL
              FROM tin_claims c JOIN accounts a ON a.id = c.account_id
-             WHERE c.tin_root = $1 AND c.branch_code = $2 AND c.status IN ('unverified', 'pending', 'needs_fix', 'approved')
+             WHERE c.tin_root = $1 AND c.branch_code = $2 AND c.{}
              ORDER BY c.created_at
              FOR UPDATE OF c",
-        )
+            crate::filing::gate::LIVE_SQL
+        ))
         .bind(tin.root())
         .bind(tin.branch())
         .fetch_all(&mut *self.tx)

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::account::claims::{CLAIM_COLUMNS, ClaimRow};
 use crate::account::oauth;
+use crate::filing::gate::LIVE_SQL;
 
 /// Rows a list shows at most; a search narrows the rest.
 pub const LIST_LIMIT: i64 = 200;
@@ -284,7 +285,7 @@ pub async fn users(
                WHEN 'verified' THEN EXISTS (SELECT 1 FROM tin_claims c
                                             WHERE c.account_id = a.id AND c.status = 'approved')
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
-                                              AND c.status IN ('unverified', 'pending', 'needs_fix', 'approved'))
+                                              AND c.{LIVE_SQL})
                WHEN 'staff' THEN a.banned_at IS NULL AND (a.role IS NOT NULL OR a.email = ANY($4))
                WHEN 'test' THEN a.test_account
                WHEN 'banned' THEN a.banned_at IS NOT NULL

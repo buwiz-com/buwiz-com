@@ -360,7 +360,7 @@ pub mod claim_id {
         let claimant_tins = claims::for_account(db, claim.account_id)
             .await?
             .iter()
-            .filter(|other| matches!(other.status.as_str(), "unverified" | "pending" | "needs_fix" | "approved"))
+            .filter(|other| crate::filing::gate::is_live(&other.status))
             .count();
         let kind = ClaimKind::parse(&claim.kind).unwrap_or(ClaimKind::Business);
         let stored = |document: DocumentKind| {
@@ -773,9 +773,8 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
             }
             let tins = own
                 .iter()
-                .filter(|claim| {
-                    matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix" | "approved" | "paused")
-                })
+                // `paused` is an approved row as the list shows it.
+                .filter(|claim| claim.status == "paused" || crate::filing::gate::is_live(&claim.status))
                 .map(|claim| {
                     let tin = crate::account::tin::Tin::parse(&claim.tin_root, &claim.branch_code)
                         .expect("stored TINs are valid");

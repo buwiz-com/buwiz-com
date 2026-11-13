@@ -28,7 +28,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::account::oauth::Bearer;
+use crate::account::oauth::{BANNED_MESSAGE, Bearer};
 use crate::account::tin::Tin;
 use crate::base::crypto;
 use crate::base::error::ApiError;
@@ -295,7 +295,7 @@ pub async fn create_v2(State(state): State<AppState>, signed: Signed<NewSubmissi
     };
     // The TIN may have stopped being active since the ticket. Refusing
     // drops the transaction, so the ticket is not spent.
-    gate::of_claim(&mut *tx, spent.claim_id).await?.sendable()?;
+    gate::of_claim(&mut *tx, bearer.account.id, spent.claim_id).await?.sendable()?;
     let id = Uuid::new_v4();
     let filename = claims.filename();
     sqlx::query(
@@ -384,14 +384,18 @@ pub enum RelayStart {
     Answer(Control),
 }
 
-/// Locks a submission for one send, or says why it cannot go now.
+/// Locks a submission for one send, or says why it cannot go now. Runs once
+/// the relay's socket is open, so a ban or a change to the TIN after the
+/// request's token check still stops the send.
 pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow::Result<RelayStart> {
     // Only one send at a time, and never after `sent` or `unknown`. A v2
-    // submission gets one attempt: its ticket works once.
+    // submission gets one attempt: its ticket works once. The claim must be
+    // this account's and sendable, and the account not banned.
     let locked: Option<Locked> = sqlx::query_as(&format!(
         "UPDATE submissions s SET status = 'sending', sending_since = now(), attempts = attempts + 1
-         FROM tin_claims c
-         WHERE s.id = $1 AND s.account_id = $2 AND c.id = s.claim_id AND {}
+         FROM tin_claims c, accounts a
+         WHERE s.id = $1 AND s.account_id = $2 AND c.id = s.claim_id AND c.account_id = s.account_id AND {}
+           AND a.id = s.account_id AND a.banned_at IS NULL
            AND ((s.xml_ciphertext IS NOT NULL AND s.status IN ('ready', 'failed'))
              OR (s.envelope IS NOT NULL AND s.status = 'ready'))
            AND (s.device_id IS NULL OR EXISTS (SELECT 1 FROM devices d WHERE d.id = s.device_id AND d.revoked_at IS NULL))
@@ -407,20 +411,26 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
     if let Some(locked) = locked {
         return Ok(RelayStart::Send(Box::new(locked)));
     }
-    // A return still waiting whose TIN stopped being active since: it is
-    // failed with the reason, so the app takes it back to a draft. Only a
-    // return still waiting: one `sending` on another connection keeps its
-    // own outcome.
-    let claim_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT claim_id FROM submissions WHERE id = $1 AND account_id = $2")
-            .bind(id)
-            .bind(account_id)
-            .fetch_optional(db)
-            .await?;
-    if let Some(claim_id) = claim_id {
-        let standing = gate::of_claim(db, claim_id).await?;
-        if !standing.can_send() {
-            let error = standing.failure();
+    // A return still waiting whose account was banned or whose TIN stopped
+    // being active since: it is failed with the reason, so the app takes it
+    // back to a draft. Only a return still waiting: one `sending` on
+    // another connection keeps its own outcome.
+    let waiting: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT s.claim_id, a.banned_at IS NOT NULL FROM submissions s JOIN accounts a ON a.id = s.account_id
+         WHERE s.id = $1 AND s.account_id = $2",
+    )
+    .bind(id)
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    if let Some((claim_id, banned)) = waiting {
+        let refusal = if banned {
+            Some(("account_banned", format!("{BANNED_MESSAGE} (account_banned)")))
+        } else {
+            let standing = gate::of_claim(db, account_id, claim_id).await?;
+            (!standing.can_send()).then(|| (standing.code(), standing.failure()))
+        };
+        if let Some((code, error)) = refusal {
             let failed = sqlx::query(
                 "UPDATE submissions SET status = 'failed', error = $3, envelope = NULL,
                      purged_at = CASE WHEN envelope IS NOT NULL THEN now() ELSE purged_at END
@@ -433,7 +443,7 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
             .execute(db)
             .await?;
             if failed.rows_affected() == 1 {
-                tracing::warn!(submission = %id, code = standing.code(), "submission not sent: its TIN is not active");
+                tracing::warn!(submission = %id, code, "submission not sent: its account or TIN cannot send");
                 let result = Control::Result { status: "failed".to_owned(), error: Some(error), receipt: None };
                 return Ok(RelayStart::Answer(result));
             }

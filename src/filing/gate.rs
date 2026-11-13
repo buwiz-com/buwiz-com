@@ -22,8 +22,24 @@ use crate::account::tin::Tin;
 use crate::base::error::ApiError;
 
 /// The condition on a claim `c` that may send, for queries that lock or
-/// list sendable claims themselves (the relay, the licence list).
+/// list sendable claims themselves (the relay, the licence list). The same
+/// rule as [`classify`]'s [`Standing::Sendable`]; a test checks the two
+/// agree on every status, paused or not.
 pub const SENDABLE_SQL: &str = "c.status = 'approved' AND c.paused_at IS NULL";
+
+/// The statuses of a live row: the one row an account may hold per TIN
+/// (`tin_claims_one_live`, whose condition a test checks against this
+/// list). Every other status has ended.
+pub const LIVE_STATUSES: [&str; 4] = ["unverified", "pending", "needs_fix", "approved"];
+
+/// [`LIVE_STATUSES`] as SQL on a `status` column. Write `c.{LIVE_SQL}` for
+/// an aliased table.
+pub const LIVE_SQL: &str = "status IN ('unverified', 'pending', 'needs_fix', 'approved')";
+
+/// Whether a claim with this `status` is live ([`LIVE_STATUSES`]).
+pub fn is_live(status: &str) -> bool {
+    LIVE_STATUSES.contains(&status)
+}
 
 pub const UNVERIFIED_MESSAGE: &str =
     "This TIN is not verified yet. Verify it with its papers on My TINs at account.buwiz.com to send returns.";
@@ -70,11 +86,10 @@ type Row = (Uuid, String, bool, Vec<String>);
 
 /// Where `tin` stands on this account: its own live row only.
 pub async fn own(db: impl PgExecutor<'_>, account_id: Uuid, tin: &Tin) -> sqlx::Result<Standing> {
-    let row: Option<Row> = sqlx::query_as(
+    let row: Option<Row> = sqlx::query_as(&format!(
         "SELECT id, status, paused_at IS NOT NULL, fix_reasons FROM tin_claims
-         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
-           AND status IN ('unverified', 'pending', 'needs_fix', 'approved')",
-    )
+         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND {LIVE_SQL}"
+    ))
     .bind(account_id)
     .bind(tin.root())
     .bind(tin.branch())
@@ -83,15 +98,19 @@ pub async fn own(db: impl PgExecutor<'_>, account_id: Uuid, tin: &Tin) -> sqlx::
     Ok(row.map_or(Standing::NotActive, |(id, status, paused, reasons)| classify(id, &status, paused, &reasons)))
 }
 
-/// Where the claim a ticket or a return was made for stands now. A claim
-/// that ended is [`Standing::NotActive`] even when the account added the
-/// TIN again since: the ticket belongs to the old one.
-pub async fn of_claim(db: impl PgExecutor<'_>, claim_id: Uuid) -> sqlx::Result<Standing> {
-    let row: Option<Row> =
-        sqlx::query_as("SELECT id, status, paused_at IS NOT NULL, fix_reasons FROM tin_claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_optional(db)
-            .await?;
+/// Where the claim a ticket or a return was made for stands now, for the
+/// account sending it. A claim that ended is [`Standing::NotActive`] even
+/// when the account added the TIN again since: the ticket belongs to the
+/// old one. So is a claim of another account (a claim never changes
+/// account, but nothing here relies on that).
+pub async fn of_claim(db: impl PgExecutor<'_>, account_id: Uuid, claim_id: Uuid) -> sqlx::Result<Standing> {
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT id, status, paused_at IS NOT NULL, fix_reasons FROM tin_claims WHERE id = $1 AND account_id = $2",
+    )
+    .bind(claim_id)
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
     Ok(row.map_or(Standing::NotActive, |(id, status, paused, reasons)| classify(id, &status, paused, &reasons)))
 }
 
@@ -184,7 +203,13 @@ mod tests {
         assert_eq!(classify(id, "pending", false, &[]), Standing::Pending);
         for ended in ["rejected", "withdrawn", "removed", "revoked", "something new"] {
             assert_eq!(classify(id, ended, false, &[]), Standing::NotActive, "{ended}");
+            assert!(!is_live(ended), "{ended}");
         }
+        for live in LIVE_STATUSES {
+            assert!(LIVE_SQL.contains(&format!("'{live}'")), "{live}");
+            assert_ne!(classify(id, live, false, &[]), Standing::NotActive, "{live}");
+        }
+        assert_eq!(LIVE_SQL.matches('\'').count(), 2 * LIVE_STATUSES.len(), "{LIVE_SQL}");
         assert_eq!(Standing::Sendable { claim_id: id }.sendable().unwrap(), id);
         assert!(Standing::Paused.sendable().is_err());
     }

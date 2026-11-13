@@ -302,11 +302,11 @@ pub async fn submit(
     let checked = check_uploads(kind, uploads).map_err(SubmitError::Invalid)?;
 
     let mut tx = db.begin().await?;
-    let existing: Option<String> = sqlx::query_scalar(
+    let existing: Option<String> = sqlx::query_scalar(&format!(
         "SELECT status FROM tin_claims
-         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
-           AND status IN ('unverified', 'pending', 'needs_fix', 'approved')",
-    )
+         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND {}",
+        gate::LIVE_SQL
+    ))
     .bind(account_id)
     .bind(tin.root())
     .bind(tin.branch())
@@ -1348,13 +1348,14 @@ struct ListedClaim {
 /// active; then the rest, oldest first. Only the BIR app (`full`) gets the
 /// TIN, filing permissions, the links and the staff's note.
 async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -> sqlx::Result<Vec<Value>> {
-    let rows: Vec<ListedClaim> = sqlx::query_as(
+    let rows: Vec<ListedClaim> = sqlx::query_as(&format!(
         "SELECT id, tin_root, branch_code, registered_name, status, paused_at IS NOT NULL AS paused, decided_at,
              fix_reasons, fix_note
          FROM tin_claims
-         WHERE account_id = $1 AND status IN ('unverified', 'pending', 'needs_fix', 'approved')
+         WHERE account_id = $1 AND {}
          ORDER BY created_at, id",
-    )
+        gate::LIVE_SQL
+    ))
     .bind(account_id)
     .fetch_all(db)
     .await?;

@@ -336,6 +336,12 @@ Session Manager preferences, and treat that log as holding taxpayer TINs.
 
 Reasons in the file stop at 500 characters, as on the website.
 
+A test TIN (000-000-000, at any branch) goes in only with `test_tin = true`
+on its entry, active, on a login with the test label
+(`docs/seed.example.toml`); without that key it is refused on its own like
+any TIN that is not valid. A file that takes the label off a login holding
+one is refused.
+
 #### Running it
 
 1. Write the file on the Mac, outside the repository. Make a Neon branch.

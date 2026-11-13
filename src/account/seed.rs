@@ -34,7 +34,11 @@
 //! - a change of roles that leaves no Admin.
 //!
 //! A TIN that is not valid (000-000-000, or not 9 digits) is refused on its
-//! own: it is reported and left out, and its login is still made.
+//! own: it is reported and left out, and its login is still made. A test
+//! TIN (000-000-000, at any branch) goes in only when its entry says
+//! `test_tin = true`, active, on a login with the test label; such an
+//! entry for a real TIN refuses the file, as does taking the label off a
+//! login that holds a test TIN.
 //!
 //! Reasons stay with staff: they go into the audit lines only, never into
 //! `decision_note` or `removal_note`, and the old owner of a TIN that moves
@@ -110,6 +114,9 @@ struct TinEntry {
     /// paused.
     #[serde(default)]
     reapply: bool,
+    /// A made-up test TIN (000-000-000), on purpose: never implied.
+    #[serde(default)]
+    test_tin: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -143,6 +150,8 @@ struct PlannedTin {
     reason: String,
     move_from: Option<String>,
     reapply: bool,
+    /// A test TIN ([`Tin::is_test`]), as its entry said.
+    test: bool,
 }
 
 /// How the tool was asked to run.
@@ -268,7 +277,9 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
         emails.push(email.clone());
         let mut planned = Vec::new();
         for entry in login.tin {
-            let tin = match Tin::parse_fields(&entry.tin, entry.branch.as_deref().unwrap_or("")) {
+            let branch = entry.branch.as_deref().unwrap_or("");
+            let read = if entry.test_tin { Tin::parse_fields_any } else { Tin::parse_fields };
+            let tin = match read(&entry.tin, branch) {
                 // A `tin` that carries its branch and a `branch` key that
                 // names another one: which is meant is not for us to guess.
                 Ok(tin) if branch_conflict(&tin, entry.branch.as_deref()) => {
@@ -289,6 +300,17 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
                 }
             };
             let shown = shown(&tin, full);
+            if entry.test_tin && !tin.is_test() {
+                problems.push(format!(
+                    "TIN {shown} for {email}: test_tin = true is only for a made-up TIN (000-000-000); a real TIN \
+                     is added without it"
+                ));
+                continue;
+            }
+            if entry.test_tin && entry.state != StateEntry::Active {
+                problems.push(format!("TIN {shown} for {email}: a test TIN is only ever active"));
+                continue;
+            }
             if tins.contains(&tin) {
                 problems.push(format!("TIN {shown}: in the file twice"));
                 continue;
@@ -329,7 +351,8 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
                 KindEntry::Personal => ClaimKind::Personal,
                 KindEntry::Business => ClaimKind::Business,
             };
-            planned.push(PlannedTin { tin, kind, name, active, reason, move_from, reapply: entry.reapply });
+            let test = entry.test_tin;
+            planned.push(PlannedTin { tin, kind, name, active, reason, move_from, reapply: entry.reapply, test });
         }
         logins.push(PlannedLogin { email, role: login.role.map(RoleEntry::role), test: login.test, tins: planned });
     }
@@ -364,7 +387,7 @@ fn branch_conflict(tin: &Tin, branch: Option<&str>) -> bool {
     let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) else {
         return false;
     };
-    Tin::parse(tin.root(), branch).map_or(true, |keyed| keyed.branch() != tin.branch())
+    Tin::parse_any(tin.root(), branch).map_or(true, |keyed| keyed.branch() != tin.branch())
 }
 
 /// How long the seed waits for a lock another change holds (a role change,
@@ -842,6 +865,14 @@ impl Seed<'_> {
             changed = true;
         } else if let Some(test) = login.test
             && test != stored_test
+            && !test
+            && admin::holds_test_tins(&mut self.tx, id).await?
+        {
+            self.problems.push(format!(
+                "login {email}: it holds a test TIN, so the test label stays; revoke it on /staff first"
+            ));
+        } else if let Some(test) = login.test
+            && test != stored_test
         {
             sqlx::query("UPDATE accounts SET test_account = $2 WHERE id = $1")
                 .bind(id)
@@ -1079,10 +1110,17 @@ impl Seed<'_> {
                 _ => {}
             }
         }
-        let banned: bool = sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1")
-            .bind(account_id)
-            .fetch_one(&mut *self.tx)
-            .await?;
+        let (banned, labelled): (bool, bool) =
+            sqlx::query_as("SELECT banned_at IS NOT NULL, test_account FROM accounts WHERE id = $1")
+                .bind(account_id)
+                .fetch_one(&mut *self.tx)
+                .await?;
+        if entry.test && !labelled {
+            self.problems.push(format!(
+                "TIN {shown} on {email}: a test TIN goes on a test account only; give the login test = true"
+            ));
+            return Ok(());
+        }
         if banned {
             self.problems.push(format!("TIN {shown} on {email}: the login is banned; lift the ban first"));
             return Ok(());

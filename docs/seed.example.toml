@@ -60,6 +60,18 @@ email = "juan@example.test"
   state = "active"
   reason = "Login only"
 
+# A made-up test TIN (000-000-000, at any branch) for trying the apps goes
+# on a login with the test label, active, and only when its entry says so.
+# It never sends to the BIR. The label stays on while the login holds one.
+#
+#   [[login.tin]]
+#   tin = "000-000-000-00001"
+#   kind = "personal"
+#   name = "JANE TEST"
+#   state = "active"
+#   test_tin = true
+#   reason = "Test TIN for the app"
+
 # To move a TIN that is active (or waiting for review) on another login,
 # name that login. Its active row is ended (its returns stay with it); a
 # claim still waiting for review is deleted, with its files (the run needs

@@ -416,6 +416,27 @@ async fn rows_from_migration_10_survive(db: PgPool) {
         "tin_claims_paused_check",
     )
     .await;
+    // Tabs, newlines and Unicode spaces are blank too, as the code's `trim`
+    // sees them.
+    for blank in [r"E'\t\n'", r"E'\r\u00a0\u3000 '"] {
+        fails_with(
+            &db,
+            &format!(
+                "UPDATE tin_claims SET paused_at = now(), paused_by = '{bob}', pause_reason = {blank} WHERE id = '{}'",
+                seeded.approved
+            ),
+            "tin_claims_paused_check",
+        )
+        .await;
+        fails_with(
+            &db,
+            &format!(
+                "UPDATE accounts SET banned_at = now(), banned_by = '{ana}', ban_reason = {blank} WHERE id = '{bob}'"
+            ),
+            "accounts_ban_check",
+        )
+        .await;
+    }
     let auto = id(
         &db,
         &format!(
@@ -556,8 +577,21 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     let activated = id(
         &db,
         &format!(
-            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
-             VALUES ('{bob}', 'personal', '000123462', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'admin') RETURNING id"
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, decided_by,
+                 verified_by)
+             VALUES ('{bob}', 'personal', '000123462', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), '{bob}', 'admin')
+             RETURNING id"
+        ),
+    )
+    .await;
+    // An automatic activation a person confirmed: no reviewer named.
+    let confirmed_auto = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by,
+                 auto_confirmed_at, auto_confirmed_by)
+             VALUES ('{bob}', 'personal', '000123466', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'auto', now(), '{ana}')
+             RETURNING id"
         ),
     )
     .await;
@@ -637,7 +671,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         ),
     )
     .await;
-    refuses("activated automatically wait for a person").await;
+    refuses("Confirm each on the \"Activated automatically\" tab first, revoked and removed ones too").await;
     exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{auto}'")).await;
     // Bob is an Admin by stored role: the release before this one would
     // not know him.
@@ -661,7 +695,16 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     // starts on it. The audit lines 10 cannot hold, the account history
     // and the seed runs are kept in `rollback_archive`.
     MIGRATOR.undo(&db, 10).await.unwrap();
-    assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
+    assert_rolled_back(
+        &db,
+        &old,
+        &schema_10,
+        &rows_10,
+        &[activated, seeded_tin, confirmed_auto],
+        sent_meanwhile,
+        &seeded,
+    )
+    .await;
     assert_eq!(
         archived(&db, "claim_audit", "action").await,
         ["activated", "approved", "created", "paused", "rejected", "sent_back"]
@@ -689,8 +732,11 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         }
     };
     // How each became active was lost with the rollback. A TIN that names
-    // a reviewer counts as staff's; one that does not is not on record.
-    assert_eq!(verified_by(activated).await.as_deref(), Some("unknown"));
+    // a reviewer (the admin who activated it, the seed's `--as`) counts as
+    // staff's; one that does not (a confirmed automatic one) is not on
+    // record.
+    assert_eq!(verified_by(activated).await.as_deref(), Some("staff"));
+    assert_eq!(verified_by(confirmed_auto).await.as_deref(), Some("unknown"));
     assert_eq!(verified_by(seeded_tin).await.as_deref(), Some("staff"));
     assert_eq!(verified_by(seeded.approved).await.as_deref(), Some("staff"));
     assert_eq!(verified_by(seeded.revoked).await.as_deref(), Some("staff"));
@@ -713,7 +759,16 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
     }
-    assert_rolled_back(&db, &old, &schema_10, &rows_10, [activated, seeded_tin], sent_meanwhile, &seeded).await;
+    assert_rolled_back(
+        &db,
+        &old,
+        &schema_10,
+        &rows_10,
+        &[activated, seeded_tin, confirmed_auto],
+        sent_meanwhile,
+        &seeded,
+    )
+    .await;
     // A second rollback adds to the archive.
     assert_eq!(archived(&db, "seed_runs", "actor_email").await, ["bob@example.test", "bob@example.test"]);
 }
@@ -763,7 +818,7 @@ async fn assert_rolled_back(
     old: &Migrator,
     schema_10: &BTreeSet<String>,
     rows_10: &BTreeMap<String, BTreeMap<String, Value>>,
-    activated: [Uuid; 2],
+    activated: &[Uuid],
     sent_meanwhile: Uuid,
     seeded: &Seeded,
 ) {
@@ -781,6 +836,7 @@ async fn assert_rolled_back(
     // The TIN an admin activated and the return sent for it stay; nothing
     // the new release added can be told apart from what the old one writes.
     for claim in activated {
+        let claim = *claim;
         let activated_row = rows.get_mut("tin_claims").unwrap().remove(&claim.to_string()).unwrap();
         assert_eq!(activated_row["status"], "approved");
     }
@@ -804,4 +860,26 @@ async fn assert_rolled_back(
         assert!(rows["tin_claims"].contains_key(&claim.to_string()));
     }
     assert!(rows["devices"].contains_key(&seeded.device.to_string()));
+}
+
+/// A transaction left open on the claims (a pre-flight `BEGIN` in a psql
+/// session) makes start-up fail within seconds, saying why, instead of
+/// hanging with the site down; once it ends, the migrations go in.
+#[sqlx::test(migrations = false)]
+async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgPool) {
+    release_10().run(&db).await.unwrap();
+    seed_at_10(&db).await;
+    let mut stray = db.begin().await.unwrap();
+    sqlx::query("SELECT count(*) FROM tin_claims").execute(&mut *stray).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), MIGRATOR.run(&db))
+        .await
+        .expect("the migration waited for the lock without end");
+    let error = outcome.expect_err("the migration ran past an open transaction").to_string();
+    assert!(error.contains("lock timeout"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(versions(&db).await, (1..=10).collect::<Vec<_>>());
+    stray.rollback().await.unwrap();
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=12).collect::<Vec<_>>());
 }

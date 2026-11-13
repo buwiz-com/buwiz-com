@@ -10,7 +10,8 @@
 -- objects behind), or while a TIN the automatic check activated waits for
 -- a person to confirm it (the release before this one has no such list,
 -- and its papers would be kept with nobody to look at them). Resume or end
--- the pauses, decide those files, and confirm or revoke those TINs first.
+-- the pauses, decide those files, and confirm those TINs first (on the
+-- "Activated automatically" tab; revoking one does not confirm it).
 -- 0012's down file makes the same checks before it changes anything, so a
 -- rollback either goes all the way to 10 or changes nothing.
 --
@@ -40,7 +41,7 @@ BEGIN
         RAISE EXCEPTION 'refusing to roll back: TINs saved without papers have files, which deleting them would delete silently. Deal with those claims first.';
     END IF;
     IF EXISTS (SELECT 1 FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back: % TIN(s) activated automatically wait for a person to confirm them. Confirm or revoke each first.',
+        RAISE EXCEPTION 'refusing to roll back: % TIN(s) activated automatically wait for a person to confirm them. Confirm each on the "Activated automatically" tab first, revoked and removed ones too: revoking one does not confirm it.',
             (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL);
     END IF;
 END $$;

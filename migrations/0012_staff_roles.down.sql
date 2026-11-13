@@ -7,8 +7,13 @@
 -- release before this one would let it sign in and send again: lift each
 -- ban first) and while any account has a stored role (the release before
 -- this one knows only ADMIN_EMAILS, and if that no longer lists those
--- people it has no staff). To drop the roles anyway, set
--- `buwiz.rollback_drop_roles` to `yes` in the same session or transaction:
+-- people it has no staff). Run it with:
+--
+--   psql -v ON_ERROR_STOP=1 -1 -f 0012_staff_roles.down.sql
+--
+-- Only if it refuses for stored roles, and ADMIN_EMAILS names your admins,
+-- drop the roles on purpose: run it again with `buwiz.rollback_drop_roles`
+-- set to `yes` in the same transaction:
 --
 --   psql -v ON_ERROR_STOP=1 -1 -c "SET LOCAL buwiz.rollback_drop_roles = 'yes'" -f 0012_staff_roles.down.sql
 --
@@ -37,7 +42,7 @@ BEGIN
         RAISE EXCEPTION 'refusing to roll back: TINs saved without papers have files, which deleting them would delete silently. Deal with those claims first.';
     END IF;
     IF EXISTS (SELECT 1 FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back: % TIN(s) activated automatically wait for a person to confirm them. Confirm or revoke each first.',
+        RAISE EXCEPTION 'refusing to roll back: % TIN(s) activated automatically wait for a person to confirm them. Confirm each on the "Activated automatically" tab first, revoked and removed ones too: revoking one does not confirm it.',
             (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL);
     END IF;
 END $$;

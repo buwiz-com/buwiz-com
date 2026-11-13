@@ -3,6 +3,10 @@
 -- per account and TIN. Every row already here came with its papers and was
 -- decided by staff, so nothing about it changes but the new columns.
 
+-- A stray open transaction on these tables (a pre-flight `BEGIN` left
+-- open) makes start-up fail with a lock timeout instead of hanging.
+SET LOCAL lock_timeout = '10s';
+
 ALTER TABLE tin_claims DROP CONSTRAINT tin_claims_status_check;
 ALTER TABLE tin_claims ADD CONSTRAINT tin_claims_status_check
     CHECK (status IN ('unverified', 'pending', 'needs_fix', 'approved', 'rejected', 'withdrawn', 'removed', 'revoked'));
@@ -44,12 +48,14 @@ ALTER TABLE tin_claims ADD CONSTRAINT tin_claims_auto_confirmed_check
 -- Ending the ownership clears the pause. A pause always says why, and who
 -- paused it: a staff member, or (`paused_by` empty) Buwiz itself, which
 -- pauses only an automatic activation nobody confirmed in time.
+-- A reason of nothing but whitespace (any kind, as Rust's `trim` sees it)
+-- is none.
 ALTER TABLE tin_claims ADD COLUMN paused_at timestamptz;
 ALTER TABLE tin_claims ADD COLUMN paused_by uuid REFERENCES accounts (id);
 ALTER TABLE tin_claims ADD COLUMN pause_reason text;
 ALTER TABLE tin_claims ADD CONSTRAINT tin_claims_paused_check CHECK (
     (paused_at IS NULL AND paused_by IS NULL AND pause_reason IS NULL)
-    OR (paused_at IS NOT NULL AND status = 'approved' AND coalesce(btrim(pause_reason), '') <> ''
+    OR (paused_at IS NOT NULL AND status = 'approved' AND coalesce(pause_reason, '') ~ '[^\t\n\v\f\r \u0085   -     　]'
         AND (paused_by IS NOT NULL OR (verified_by = 'auto' AND auto_confirmed_at IS NULL))));
 
 -- One live row per account and TIN. Other accounts' unverified rows do not

@@ -2,15 +2,20 @@
 -- did to accounts; and a record of each seed run. No account has a role or
 -- a ban yet: ADMIN_EMAILS still makes its people admins.
 
+-- A stray open transaction on these tables (a pre-flight `BEGIN` left
+-- open) makes start-up fail with a lock timeout instead of hanging.
+SET LOCAL lock_timeout = '10s';
+
 ALTER TABLE accounts ADD COLUMN role text CHECK (role IN ('admin', 'support'));
 ALTER TABLE accounts ADD COLUMN test_account boolean NOT NULL DEFAULT false;
 ALTER TABLE accounts ADD COLUMN banned_at timestamptz;
 ALTER TABLE accounts ADD COLUMN banned_by uuid REFERENCES accounts (id);
 ALTER TABLE accounts ADD COLUMN ban_reason text;
--- A ban always says who banned the account and why.
+-- A ban always says who banned the account and why (a reason of nothing
+-- but whitespace, of any kind, is none).
 ALTER TABLE accounts ADD CONSTRAINT accounts_ban_check CHECK (
     (banned_at IS NULL AND banned_by IS NULL AND ban_reason IS NULL)
-    OR (banned_at IS NOT NULL AND banned_by IS NOT NULL AND coalesce(btrim(ban_reason), '') <> ''));
+    OR (banned_at IS NOT NULL AND banned_by IS NOT NULL AND coalesce(ban_reason, '') ~ '[^\t\n\v\f\r \u0085   -     　]'));
 
 -- Like claim_audit: no foreign keys, so lines outlive what they describe.
 CREATE TABLE account_audit (

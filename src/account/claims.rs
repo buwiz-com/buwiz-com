@@ -319,6 +319,8 @@ pub async fn submit(
         None => {}
     }
     if papers_later {
+        // Locks the account, so requests at once count one after another.
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
         let waiting: i64 =
             sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1 AND status = 'unverified'")
                 .bind(account_id)

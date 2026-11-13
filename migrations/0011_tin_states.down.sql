@@ -3,15 +3,30 @@
 -- 0012_staff_roles.down.sql. `MIGRATOR.undo(&pool, 10)` runs both; by hand,
 -- run each file with psql (`psql -v ON_ERROR_STOP=1 -1 -f …`) in that order.
 --
+-- It refuses to run while a TIN is paused (the release before this one
+-- would send for it again) or while a TIN saved without papers has files
+-- (deleting the row would delete them silently, and leave their stored
+-- objects behind). Resume or end the pauses, and decide those files, first.
+--
 -- What a rollback loses:
--- - TINs added without papers (`unverified`). They never have tickets or
---   returns, so nothing refers to them; deleting one fails loudly if
---   something does.
--- - Pauses: a paused TIN is active again.
+-- - TINs added without papers (`unverified`). They never have tickets,
+--   returns or files, so nothing refers to them; deleting one fails loudly
+--   if a ticket or return does.
 -- - How each TIN became active (`verified_by`), when papers were sent, and
 --   what the automatic check saw.
 -- - Audit lines of the new actions (activated, paused, …) and every line's
 --   source.
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM tin_claims WHERE paused_at IS NOT NULL) THEN
+        RAISE EXCEPTION 'refusing to roll back: % TIN(s) are paused, and the release before this one would send for them. Resume or end each pause first.',
+            (SELECT count(*) FROM tin_claims WHERE paused_at IS NOT NULL);
+    END IF;
+    IF EXISTS (SELECT 1 FROM claim_documents d JOIN tin_claims c ON c.id = d.claim_id WHERE c.status = 'unverified') THEN
+        RAISE EXCEPTION 'refusing to roll back: TINs saved without papers have files, which deleting them would delete silently. Deal with those claims first.';
+    END IF;
+END $$;
 
 DELETE FROM tin_claims WHERE status = 'unverified';
 DELETE FROM claim_audit

@@ -501,11 +501,12 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                             </span>
                             <span class="send-buttons">
                                 <button class="btn btn-ghost-dark" type="button" data-back="" hidden=(true)>"Back"</button>
-                                <button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formnovalidate=(true) data-skip="">"Skip for now"</button>
+                                // Send comes first, so Enter sends; CSS shows Skip before it.
                                 <button class="btn btn-send" type="submit" data-send="">
                                     <span data-send-label="">"Send for review"</span>
                                     icon(name: "send")
                                 </button>
+                                <button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formnovalidate=(true) data-skip="">"Skip for now"</button>
                             </span>
                         </div>
                         <p class="fine">icon(name: "schedule") "No papers at hand? Skip for now: the TIN is saved as Not verified. You can prepare returns for it, and verify it later to send them."</p>

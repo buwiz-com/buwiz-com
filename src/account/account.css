@@ -816,6 +816,10 @@
 .send-what .mono, .send-what .tin-number { font-size: 15px; font-weight: 600; }
 .send-sub { color: var(--night-muted); font-size: 13px; overflow-wrap: anywhere; }
 .send-buttons { display: flex; flex-wrap: wrap; gap: 8px; flex: 1 1 auto; justify-content: flex-end; }
+/* "Skip for now" follows "Send for review" in the markup (Enter sends) but
+   shows before it, after "Back". */
+.send-buttons [data-back] { order: -2; }
+.send-buttons [data-skip] { order: -1; }
 @media (max-width: 480px) { .send-buttons .btn { flex: 1 1 auto; } }
 .fix-form { gap: 18px; }
 .fix-form .details-card { flex: none; }

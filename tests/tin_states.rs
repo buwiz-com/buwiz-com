@@ -106,6 +106,11 @@ async fn a_tin_added_without_papers_is_not_verified(db: PgPool) {
         "{add}"
     );
     assert!(add.contains("No papers at hand? Skip for now: the TIN is saved as Not verified. You can prepare returns for it, and verify it later to send them."));
+    // Without JavaScript, Enter presses a form's first submit button: it
+    // must be "Send for review", never "Skip for now".
+    let form = &add[add.find("action=\"/tins/claims\"").unwrap()..];
+    let first_submit = &form[form.find(r#"type="submit""#).unwrap()..];
+    assert!(first_submit.starts_with(r#"type="submit" data-send="""#), "{first_submit}");
 
     let response = site.upload("/tins/claims", &cookie, &skipped("000-123-451")).await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -535,4 +540,32 @@ async fn an_unverified_tin_can_be_deleted(db: PgPool) {
     assert_eq!(audit, ("deleted".to_owned(), "unverified".to_owned()));
     // It can be added again.
     assert_eq!(location(&site.upload("/tins/claims", &cookie, &skipped("000123501")).await), "/tins?notice=tin_saved");
+}
+
+/// The limit of 20 holds when many are saved at once.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_limit_of_unverified_tins_holds_under_parallel_requests(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, cookie) = site.person("ana@example.test").await;
+    for n in 0..19 {
+        sqlx::query(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status)
+             VALUES ($1, 'personal', $2, '00000', 'X', 'unverified')",
+        )
+        .bind(ana)
+        .bind(format!("000200{n:03}"))
+        .execute(&site.db)
+        .await
+        .unwrap();
+    }
+    let forms: Vec<Vec<(&'static str, Part)>> =
+        (0..10).map(|n| skipped(Box::leak(format!("000300{n:03}").into_boxed_str()))).collect();
+    let answers =
+        futures_util::future::join_all(forms.iter().map(|form| site.upload("/tins/claims", &cookie, form))).await;
+    let saved = answers.iter().filter(|response| location(response) == "/tins?notice=tin_saved").count();
+    assert_eq!(saved, 1);
+    let total =
+        scalar_i64(&site.db, "SELECT count(*) FROM tin_claims WHERE account_id = $1 AND status = 'unverified'", ana)
+            .await;
+    assert_eq!(total, 20);
 }

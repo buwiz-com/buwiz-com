@@ -490,6 +490,35 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
 
+    // A rollback never lifts a ban or a pause by itself: each down file
+    // refuses while one exists, and so does 0011's while a TIN saved
+    // without papers has files.
+    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
+    assert!(refused.contains("account(s) are banned"), "{refused}");
+    assert_eq!(versions(&db).await, (1..=12).collect::<Vec<_>>());
+    exec(&db, "UPDATE accounts SET banned_at = NULL, banned_by = NULL, ban_reason = NULL").await;
+    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
+    assert!(refused.contains("TIN(s) are paused"), "{refused}");
+    // 0012 went back; 0011 refused and changed nothing.
+    assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
+    let paused: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE paused_at IS NOT NULL").fetch_one(&db).await.unwrap();
+    assert_eq!(paused, 1);
+    exec(&db, "UPDATE tin_claims SET paused_at = NULL, paused_by = NULL, pause_reason = NULL").await;
+    let unverified = id(&db, "SELECT id FROM tin_claims WHERE status = 'unverified' LIMIT 1").await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO claim_documents (claim_id, kind, filename, content_type, size_bytes, sha256, nonce, ciphertext)
+             VALUES ('{unverified}', 'tin_id', 'tin.png', 'image/png', 5, decode('00', 'hex'), decode('01', 'hex'), decode('02', 'hex'))"
+        ),
+    )
+    .await;
+    let refused = MIGRATOR.undo(&db, 10).await.unwrap_err().to_string();
+    assert!(refused.contains("TINs saved without papers have files"), "{refused}");
+    assert_eq!(versions(&db).await, (1..=11).collect::<Vec<_>>());
+    exec(&db, &format!("DELETE FROM claim_documents WHERE claim_id = '{unverified}'")).await;
+
     // Back to 10 the way sqlx reverts, then the release before this one
     // starts on it.
     MIGRATOR.undo(&db, 10).await.unwrap();
@@ -544,9 +573,9 @@ async fn assert_rolled_back(
     assert_eq!(activated_row["status"], "approved");
     let sent = rows.get_mut("submissions").unwrap().remove(&sent_meanwhile.to_string()).unwrap();
     assert_eq!((sent["status"].as_str(), sent["claim_id"].as_str()), (Some("sent"), Some(&*activated.to_string())));
-    // Everything from migration 10 is there as it was: the paused TIN is
-    // active again, the unverified rows and the pause's audit line are
-    // gone, the ban and role with their columns.
+    // Everything from migration 10 is there as it was: the TIN that was
+    // paused (and resumed before the rollback) is active, the unverified
+    // rows and the pause's audit line are gone, the role with its column.
     assert_eq!(&rows, rows_10);
     let approved = &rows["tin_claims"][&seeded.approved.to_string()];
     assert_eq!(approved["status"], "approved");

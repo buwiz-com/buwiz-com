@@ -2,8 +2,11 @@
 //! code (`?notice=tin_digits`), so a crafted link cannot put its own words
 //! on our pages.
 
+use crate::account::claims::{max_file_mb, max_supporting_files, max_unverified};
+use crate::account::web::claim_total_mb;
+
 macro_rules! notices {
-    ($($variant:ident = $code:literal => $tone:ident $message:literal,)*) => {
+    ($($variant:ident = $code:literal => $tone:ident $message:expr,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Notice {
             $($variant,)*
@@ -60,8 +63,8 @@ notices! {
     NeedId = "need_id" => error "Attach a scan or photo of a government ID.",
     NeedTinId = "need_tin_id" => error "Attach a photo of your TIN ID, or the digital TIN ID file from ORUS.",
     WrongDocuments = "wrong_documents" => error "Attach only the papers asked for this kind of TIN.",
-    TooManySupporting = "too_many_supporting" => error "Attach at most 5 supporting documents.",
-    FileTooBig = "file_too_big" => error "Each file must be 10 MB or smaller, and all files together 40 MB or smaller.",
+    TooManySupporting = "too_many_supporting" => error concat!("Attach at most ", max_supporting_files!(), " supporting documents."),
+    FileTooBig = "file_too_big" => error concat!("Each file must be ", max_file_mb!(), " MB or smaller, and all files together ", claim_total_mb!(), " MB or smaller."),
     FileType = "file_type" => error "Files must be PDF, JPEG, PNG, WebP or HEIC.",
     BadUpload = "bad_upload" => error "The upload did not finish. Try again.",
     TinAlreadyActive = "tin_already_active" => error "This TIN is already active on your account.",
@@ -93,6 +96,40 @@ notices! {
     FileRemoved = "file_removed" => info "File removed and deleted.",
     SignedOutEverywhere = "signed_out_everywhere" => info "Signed out of every browser, app and AI agent.",
     AppSignedOut = "app_signed_out" => info "That app was signed out.",
+    TinSaved = "tin_saved" => info "Saved as Not verified. You can prepare returns for this TIN now; verify it with its papers to send them.",
+    TinAlreadyAdded = "tin_already_added" => error "This TIN is already on My TINs. Verify it there to send returns.",
+    NotUnverified = "not_unverified" => error "This TIN already has its papers. See where it stands on My TINs.",
+    TooManyUnverified = "too_many_unverified" => error concat!("You have ", max_unverified!(), " TINs waiting to be verified. Verify or remove some first."),
+    AdminOnly = "admin_only" => error "Only an admin can do this.",
+    OwnAccount = "own_account" => error "You can't do this to your own account.",
+    RoleChanged = "role_changed" => info "Role changed.",
+    RoleUnknown = "role_unknown" => error "Pick Admin, Support or No staff role.",
+    LastAdmin = "last_admin" => error "Buwiz needs at least one admin. Make someone else an admin first.",
+    RoleFromServer = "role_from_server" => error "This person is an admin through the server setting ADMIN_EMAILS. Change it there.",
+    AccountMissing = "account_missing" => error "That account does not exist.",
+    AccountBanned = "account_banned" => error "This account can't be used on Buwiz. If you think this is a mistake, write to support@buwiz.com.",
+    AccountBannedStaff = "account_banned_staff" => info "Account banned. It can't sign in or send until you lift the ban.",
+    BanLifted = "ban_lifted" => info "Ban lifted. The person can sign in again.",
+    BanAdmin = "ban_admin" => error "Change this person's role first; an admin can't be banned.",
+    TestMarked = "test_marked" => info "Marked as a test account.",
+    TestUnmarked = "test_unmarked" => info "No longer marked as a test account.",
+    PausedLocked = "paused_locked" => error "This TIN is paused. Write to support@buwiz.com to remove it.",
+    TinIsPaused = "tin_is_paused" => error "This TIN is on My TINs, and sending for it is paused. Write to support@buwiz.com.",
+    TinPaused = "tin_paused" => info "Sending paused. The owner sees your reason on My TINs.",
+    TinResumed = "tin_resumed" => info "Sending resumed.",
+    NotPausable = "not_pausable" => error "Only an active TIN can be paused.",
+    NotPaused = "not_paused" => error "This TIN is not paused.",
+    TinActivated = "tin_activated" => info "Activated without papers. The reason is in the account's history.",
+    ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
+    AutoConfirmed = "auto_confirmed" => info "Confirmed. The papers were deleted.",
+    NotAuto = "not_auto" => error "This TIN was not activated automatically, or it was already confirmed.",
+    ReasonTooLong = "reason_too_long" => error "Keep it to 500 characters.",
+    RoleUnchanged = "role_unchanged" => info "Nothing changed: they already have that role.",
+    OwnTinPause = "own_tin_pause" => error "You can't pause or resume your own TIN. Another admin does it.",
+    AppAlreadySignedOut = "app_already_signed_out" => info "That app was already signed out. Nothing changed.",
+    OwnPage = "own_page" => info "This is your own account. Ask another staff member to look at it.",
+    AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
+    AdminMustConfirm = "admin_must_confirm" => error "Sending for this TIN is paused: an admin confirms it, and lifting Buwiz's pause takes a reason.",
 }
 
 #[cfg(test)]
@@ -105,5 +142,16 @@ mod tests {
             assert_eq!(Notice::from_code(notice.code()), Some(notice));
         }
         assert_eq!(Notice::from_code("<script>"), None);
+    }
+
+    #[test]
+    fn limits_in_notices_are_the_limits() {
+        use crate::account::claims::{MAX_FILE_BYTES, MAX_SUPPORTING_FILES, MAX_UNVERIFIED};
+        assert!(Notice::TooManyUnverified.message().contains(&format!(" {MAX_UNVERIFIED} ")));
+        assert!(Notice::TooManySupporting.message().contains(&format!(" {MAX_SUPPORTING_FILES} ")));
+        let reason = crate::account::admin::MAX_REASON_CHARS;
+        assert!(Notice::ReasonTooLong.message().contains(&format!(" {reason} ")));
+        let file_mb = MAX_FILE_BYTES / 1024 / 1024;
+        assert!(Notice::FileTooBig.message().contains(&format!(" {file_mb} MB")));
     }
 }

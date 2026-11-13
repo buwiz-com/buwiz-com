@@ -8,7 +8,9 @@
 //! (PaddleOCR PP-OCRv5 mobile, in [`paddle`], with the `ocr` feature).
 //! Only the fields staff compare, their confidence and the comparison are
 //! kept (`document_readings`), and they are deleted with the file. Nothing
-//! leaves the server, and nothing is decided from a reading.
+//! leaves the server. Nothing is decided from a reading unless automatic
+//! activation is on (`AUTO_VERIFY=on`, [`crate::account::verify`]); it is
+//! off by default.
 
 pub mod extract;
 #[cfg(feature = "ocr")]
@@ -215,7 +217,10 @@ async fn read(state: AppState, document_id: Uuid, job: Uuid) {
     let outcome = read_now(&state, document_id).await;
     let failed = outcome.as_ref().err().cloned();
     match save(&state.db, &*state.ocr.engine, document_id, job, outcome).await {
-        Ok(()) => tracing::info!(%document_id, ms = started.elapsed().as_millis(), error = failed, "document read"),
+        Ok(()) => {
+            tracing::info!(%document_id, ms = started.elapsed().as_millis(), error = failed, "document read");
+            crate::account::verify::consider_document(&state, document_id).await;
+        }
         Err(error) => tracing::error!(%document_id, error = ?error, "could not save a document reading"),
     }
 }

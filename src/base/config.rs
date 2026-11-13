@@ -77,7 +77,7 @@ impl Config {
             extra_origins: list("EXTRA_ORIGINS").iter().map(|raw| origin(raw)).collect::<anyhow::Result<_>>()?,
             secure_cookies,
             document_key: document_key(&required("DOCUMENT_KEY")?)?,
-            admin_emails: list("ADMIN_EMAILS").into_iter().map(|email| email.to_lowercase()).collect(),
+            admin_emails: admin_emails(),
             mail,
             trust_list: std::env::var("TRUST_LIST_JWS")
                 .ok()
@@ -94,7 +94,7 @@ impl Config {
     }
 
     pub fn is_admin(&self, email: &str) -> bool {
-        self.admin_emails.iter().any(|admin| admin == email)
+        crate::account::roles::in_list(&self.admin_emails, email)
     }
 
     pub fn is_own_origin(&self, origin: &str) -> bool {
@@ -108,6 +108,34 @@ fn var_or(name: &str, default: &str) -> String {
 
 fn required(name: &str) -> anyhow::Result<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty()).with_context(|| format!("{name} is not set"))
+}
+
+/// `ADMIN_EMAILS`, split on commas, trimmed and lowercased. An entry that
+/// is not an email address (a list separated by spaces or semicolons, a
+/// quoted value) is logged, so nobody is left believing it makes an Admin;
+/// the server still starts.
+pub fn admin_emails() -> Vec<String> {
+    let (list, bad) = parse_admin_emails(&std::env::var("ADMIN_EMAILS").unwrap_or_default());
+    for entry in &bad {
+        tracing::warn!(%entry, "ADMIN_EMAILS has an entry that is not an email address; separate addresses with commas");
+    }
+    list
+}
+
+/// `raw` as `ADMIN_EMAILS` reads it: (every entry, those that are not an
+/// email address).
+pub fn parse_admin_emails(raw: &str) -> (Vec<String>, Vec<String>) {
+    let list: Vec<String> =
+        raw.split(',').map(str::trim).filter(|item| !item.is_empty()).map(str::to_lowercase).collect();
+    // A sign-in address as Buwiz keeps it, in the characters addresses
+    // use: a quote, a space or a semicolon means the list was written in
+    // another way.
+    let address = |entry: &str| {
+        entry.chars().all(|ch| ch.is_ascii_alphanumeric() || "._+-@".contains(ch))
+            && crate::account::accounts::normalize_email(entry).ok().as_deref() == Some(entry)
+    };
+    let bad = list.iter().filter(|entry| !address(entry)).cloned().collect();
+    (list, bad)
 }
 
 fn list(name: &str) -> Vec<String> {
@@ -290,6 +318,17 @@ mod tests {
         assert_eq!((lab.username.as_str(), lab.password.as_str()), ("lab", "pa:ss"));
         assert_eq!((lab.host.as_str(), lab.port), ("127.0.0.1", 2222));
         assert!(lab_server("127.0.0.1:22").is_err());
+    }
+
+    #[test]
+    fn admin_emails_split_on_commas_and_name_what_is_not_an_address() {
+        let (list, bad) = parse_admin_emails(" Root@Example.test ,ops@example.test,, ");
+        assert_eq!((list, bad), (vec!["root@example.test".to_owned(), "ops@example.test".to_owned()], Vec::new()));
+        for raw in ["a@example.test; b@example.test", "a@example.test b@example.test", "\"a@example.test\"", "admin"] {
+            let (list, bad) = parse_admin_emails(raw);
+            assert_eq!(bad, list, "{raw}");
+            assert_eq!(bad.len(), 1, "{raw}");
+        }
     }
 
     #[test]

@@ -269,6 +269,8 @@
 .status-waiting { background: var(--wait-bg); color: var(--wait-ink); }
 .status-fix, .status-rejected { background: var(--err-bg); color: var(--danger); }
 .status-withdrawn { background: var(--chip); color: var(--muted); }
+.status-unverified { background: var(--chip); color: var(--muted); }
+.status-paused { background: var(--wait-bg); color: var(--wait-ink); }
 .flag {
   display: inline-flex;
   align-items: center;
@@ -289,6 +291,8 @@
 .dot.active { background: var(--brand); }
 .dot.waiting { background: var(--hot); }
 .dot.fix, .dot.rejected { background: var(--danger); }
+.dot.unverified { background: var(--muted); }
+.dot.paused { background: var(--wait-ink); }
 .tag {
   display: inline-flex;
   align-items: center;
@@ -363,6 +367,8 @@
 .tin-note.active { background: var(--brand-tint); color: var(--text); }
 .tin-note.waiting { background: var(--wait-bg); color: var(--wait-ink); }
 .tin-note.fix { background: var(--err-bg); color: var(--danger); }
+.tin-note.unverified { background: var(--chip); color: var(--text); }
+.tin-note.paused { background: var(--wait-bg); color: var(--wait-ink); }
 .tin-note ul { margin: 6px 0; padding-left: 18px; }
 .tin-note p + p { margin-top: 6px; }
 .tin-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: auto; }
@@ -813,6 +819,10 @@
 .send-what .mono, .send-what .tin-number { font-size: 15px; font-weight: 600; }
 .send-sub { color: var(--night-muted); font-size: 13px; overflow-wrap: anywhere; }
 .send-buttons { display: flex; flex-wrap: wrap; gap: 8px; flex: 1 1 auto; justify-content: flex-end; }
+/* "Skip for now" follows "Send for review" in the markup (Enter sends) but
+   shows before it, after "Back". */
+.send-buttons [data-back] { order: -2; }
+.send-buttons [data-skip] { order: -1; }
 @media (max-width: 480px) { .send-buttons .btn { flex: 1 1 auto; } }
 .fix-form { gap: 18px; }
 .fix-form .details-card { flex: none; }
@@ -914,6 +924,11 @@
 .id-badge.waiting { background: var(--wait-bg); color: var(--wait-ink); }
 .id-badge.none { background: var(--chip); color: var(--muted); }
 .id-badge.staff { background: var(--text); color: var(--bg); }
+.id-badge.support { background: var(--wait-bg); color: var(--wait-ink); }
+.id-badge.test { background: var(--chip); color: var(--text); }
+.id-badge.banned { background: var(--err-bg); color: var(--danger); }
+.staff-actions .end-form + .end-form, .staff-actions .end-form + p, .staff-actions p + .end-form { margin-top: 14px; }
+.staff-actions select { width: 100%; margin-top: 4px; }
 
 /* Staff: one claim */
 .claim-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
@@ -1089,7 +1104,7 @@
 .user-tin-name { flex: 1 1 160px; min-width: 0; font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
 .user-tin-status { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; font-weight: 800; }
 .user-tin-status .icon { font-size: 16px; }
-.user-tin-status.waiting { color: var(--wait-ink); }
+.user-tin-status.waiting, .user-tin-status.paused { color: var(--wait-ink); }
 .user-tin-status.fix, .user-tin-status.rejected { color: var(--danger); }
 .user-tin-status.active { color: var(--brand); }
 .user-tin-status.withdrawn { color: var(--muted); }

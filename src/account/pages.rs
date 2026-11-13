@@ -18,6 +18,8 @@ use crate::account::agents::{self, AuthorizeProblem};
 use crate::account::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::account::notice::Notice;
 use crate::account::oauth;
+use crate::account::roles::{self, Power, Staff};
+use crate::account::tin::Tin;
 use crate::account::web::{link, safe_next, session_account};
 use crate::base::state::AppState;
 use crate::filing::devices;
@@ -42,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .page(tins::new_tin_page)
         .page(tins::claim_id::fix_page)
         .page(tins::claim_id::files_page)
+        .page(tins::claim_id::verify_page)
         .page(staff::claims_page)
         .page(staff::claim_id::claim_page)
         .page(staff::users_page)
@@ -102,20 +105,27 @@ async fn signed_in(cx: &Cx) -> Result<Account> {
     }
 }
 
-/// Staff only; signed-in people who are not get a 404.
-async fn admin(cx: &Cx) -> Result<Account> {
+/// The signed-in account's staff role, if it has one.
+async fn staff_role(cx: &Cx, account: &Account) -> Result<Option<Staff>> {
+    roles::staff(&state(cx).db, &state(cx).config, account).await.map_err(fail)
+}
+
+/// Staff with `power` only; signed-in people who are not get a 404.
+async fn staff_member(cx: &Cx, power: Power) -> Result<Staff> {
     let account = signed_in(cx).await?;
-    if state(cx).config.is_admin(&account.email) {
-        Ok(account)
-    } else {
-        Err(topcoat::router::error::not_found().into())
+    match staff_role(cx, &account).await? {
+        Some(staff) if staff.can(power) => Ok(staff),
+        _ => Err(topcoat::router::error::not_found().into()),
     }
 }
 
 #[layout("/")]
 async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let account = current(cx).await?;
-    let admin = account.as_ref().is_some_and(|account| state(cx).config.is_admin(&account.email));
+    let admin = match &account {
+        Some(account) => staff_role(cx, account).await?.is_some(),
+        None => false,
+    };
     let path = uri(cx).path().to_owned();
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let waiting = if staff_area { crate::account::staff::open_counts(&state(cx).db).await?.0 } else { 0 };
@@ -190,6 +200,8 @@ fn head_for(path: &str) -> Head {
         "/oauth/authorize" => "Connect an AI app · Buwiz",
         "/tins" => "My TINs · Buwiz",
         "/tins/new" => "Add a TIN · Buwiz",
+        _ if path.starts_with("/tins/") && path.ends_with("/verify") => "Verify a TIN · Buwiz",
+        _ if path.starts_with("/tins/") && path.ends_with("/files") => "Your files · Buwiz",
         _ if path.starts_with("/tins/") => "Fix and send again · Buwiz",
         "/staff" => "Staff · Buwiz",
         _ if path.starts_with("/staff/") => "Staff · Buwiz",
@@ -728,9 +740,11 @@ fn ago(at: Option<OffsetDateTime>) -> String {
 /// A claim's status as people read it: (label, icon, CSS tone).
 fn status_look(status: &str) -> (&'static str, &'static str, &'static str) {
     match status {
+        "unverified" => ("Not verified", "help", "unverified"),
         "pending" => ("Being checked", "schedule", "waiting"),
         "needs_fix" => ("Needs a fix", "error", "fix"),
         "approved" => ("Active", "check_circle", "active"),
+        "paused" => ("Paused", "pause_circle", "paused"),
         "rejected" => ("Not approved", "cancel", "rejected"),
         "removed" => ("Removed", "remove_circle", "withdrawn"),
         "revoked" => ("Revoked", "block", "rejected"),
@@ -821,6 +835,8 @@ mod tests {
             ("/login", "Sign in · Buwiz"),
             ("/tins", "My TINs · Buwiz"),
             ("/tins/claims/0b6e/fix", "Fix and send again · Buwiz"),
+            ("/tins/claims/0b6e/verify", "Verify a TIN · Buwiz"),
+            ("/tins/claims/0b6e/files", "Your files · Buwiz"),
             ("/staff", "Staff · Buwiz"),
             ("/staff/users", "Staff · Buwiz"),
             ("/nowhere", "Buwiz"),

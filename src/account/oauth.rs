@@ -137,6 +137,19 @@ struct DeviceRow {
 async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> Result<TokenResponse, OAuthFailure> {
     known_client(client_id)?;
     let mut tx = db.begin().await?;
+    // The account before the code row, in the order a ban takes them (it
+    // locks the account, then ends the code rows): read who approved it
+    // without a lock, lock that account, then the row.
+    let approved_by: Option<Uuid> =
+        sqlx::query_scalar("SELECT account_id FROM device_authorizations WHERE device_code_hash = $1")
+            .bind(crypto::hash(device_code))
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+    let banned = match approved_by {
+        Some(account_id) => Some(banned_now(&mut tx, account_id).await?),
+        None => None,
+    };
     let row: Option<DeviceRow> = sqlx::query_as(
         "SELECT id, client_id, interval_seconds, expires_at, last_polled_at, account_id, decision, consumed_at
          FROM device_authorizations WHERE device_code_hash = $1 FOR UPDATE",
@@ -162,10 +175,21 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
             return Err(OAuthError::new("access_denied", "the sign-in was declined").into());
         }
         (Some("approved"), Some(account_id)) => {
+            // Approved after the first read: that account is not locked.
+            // Nothing was written; the app asks again at its next poll.
+            let Some(banned) = banned.filter(|_| approved_by == Some(account_id)) else {
+                tx.rollback().await?;
+                return Err(OAuthError::new("authorization_pending", "waiting for the person to approve").into());
+            };
             sqlx::query("UPDATE device_authorizations SET consumed_at = now() WHERE id = $1")
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
+            // No new sign-in for a banned account, whatever was approved.
+            if banned {
+                tx.commit().await?;
+                return Err(OAuthError::new("access_denied", "this account is banned").into());
+            }
             let tokens = issue_grant(&mut tx, account_id, client_id, client_scope(client_id)).await?;
             tx.commit().await?;
             return Ok(tokens);
@@ -193,8 +217,29 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
     Err(OAuthError::new("authorization_pending", "waiting for the person to approve").into())
 }
 
-/// The person on the account site approves or declines a code.
-pub async fn decide_device(db: &PgPool, user_code: &str, account_id: Uuid, approve: bool) -> sqlx::Result<bool> {
+/// What deciding an app's sign-in came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeviceDecided {
+    Done,
+    /// The code is wrong, expired or already decided.
+    Gone,
+    /// The account was banned meanwhile.
+    Banned,
+}
+
+/// The person on the account site approves or declines a code. The account
+/// is locked and checked at the moment of writing, so a ban that commits
+/// meanwhile wins (and a ban after this ends the sign-in it approved).
+pub async fn decide_device(
+    db: &PgPool,
+    user_code: &str,
+    account_id: Uuid,
+    approve: bool,
+) -> sqlx::Result<DeviceDecided> {
+    let mut tx = db.begin().await?;
+    if banned_now(&mut tx, account_id).await? {
+        return Ok(DeviceDecided::Banned);
+    }
     let decision = if approve { "approved" } else { "denied" };
     let updated = sqlx::query(
         "UPDATE device_authorizations SET decision = $1, account_id = $2
@@ -203,9 +248,20 @@ pub async fn decide_device(db: &PgPool, user_code: &str, account_id: Uuid, appro
     .bind(decision)
     .bind(account_id)
     .bind(user_code)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
-    Ok(updated.rows_affected() == 1)
+    tx.commit().await?;
+    Ok(if updated.rows_affected() == 1 { DeviceDecided::Done } else { DeviceDecided::Gone })
+}
+
+/// Whether the account is banned, read with a share lock so a ban under
+/// way is waited for and seen.
+pub(crate) async fn banned_now(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    let banned: Option<bool> = sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR SHARE")
+        .bind(account_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(banned.unwrap_or(true))
 }
 
 /// The app asking to sign in, if `user_code` is still open.
@@ -410,7 +466,32 @@ impl Bearer {
     }
 }
 
+/// What a banned account's app hears on every call but signing out.
+pub const BANNED_MESSAGE: &str = "This Buwiz account is banned: it can't send returns. Write to support@buwiz.com.";
+
 impl FromRequestParts<AppState> for Bearer {
+    type Rejection = ApiError;
+
+    /// A banned account's token is valid but refused with `403
+    /// account_banned`, so the app can say why. Its refresh keeps working
+    /// (`/oauth/token` is not a bearer call), and so does signing out.
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let SigningOut { bearer, banned } = SigningOut::from_request_parts(parts, state).await?;
+        if banned {
+            return Err(ApiError::forbidden("account_banned", BANNED_MESSAGE));
+        }
+        Ok(bearer)
+    }
+}
+
+/// The bearer of a valid token, banned or not: only for `POST
+/// /api/auth/logout`.
+pub struct SigningOut {
+    pub bearer: Bearer,
+    pub banned: bool,
+}
+
+impl FromRequestParts<AppState> for SigningOut {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
@@ -420,8 +501,8 @@ impl FromRequestParts<AppState> for Bearer {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or(ApiError::InvalidToken)?;
-        let row: Option<(Uuid, String, Uuid, String)> = sqlx::query_as(
-            "SELECT g.id, g.scope, a.id, a.email
+        let row: Option<(Uuid, String, Uuid, String, bool)> = sqlx::query_as(
+            "SELECT g.id, g.scope, a.id, a.email, a.banned_at IS NOT NULL
              FROM oauth_access_tokens t
              JOIN oauth_grants g ON g.id = t.grant_id
              JOIN accounts a ON a.id = g.account_id
@@ -430,8 +511,8 @@ impl FromRequestParts<AppState> for Bearer {
         .bind(crypto::hash(token.trim()))
         .fetch_optional(&state.db)
         .await?;
-        let (grant_id, scope, id, email) = row.ok_or(ApiError::InvalidToken)?;
-        Ok(Self { account: Account { id, email }, grant_id, scope })
+        let (grant_id, scope, id, email, banned) = row.ok_or(ApiError::InvalidToken)?;
+        Ok(Self { bearer: Bearer { account: Account { id, email }, grant_id, scope }, banned })
     }
 }
 
@@ -441,7 +522,10 @@ pub async fn me(bearer: Bearer) -> Json<Value> {
 }
 
 /// `POST /api/auth/logout`: ends this app's sign-in.
-pub async fn logout(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
+pub async fn logout(
+    State(state): State<AppState>,
+    SigningOut { bearer, .. }: SigningOut,
+) -> Result<Json<Value>, ApiError> {
     let mut tx = state.db.begin().await?;
     revoke_grant(&mut tx, bearer.grant_id, "signed_out").await?;
     tx.commit().await?;

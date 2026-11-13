@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::account::claims::{CLAIM_COLUMNS, ClaimRow};
 use crate::account::oauth;
+use crate::filing::gate::LIVE_SQL;
 
 /// Rows a list shows at most; a search narrows the rest.
 pub const LIST_LIMIT: i64 = 200;
@@ -34,14 +35,30 @@ fn tin_digits(text: &str) -> Option<String> {
 pub enum QueueFilter {
     Waiting,
     SentBack,
+    /// Saved without papers: nothing to review yet.
+    Unverified,
+    /// Activated automatically and not yet confirmed by a person, in any
+    /// status: removed by the owner, revoked or paused too.
+    Auto,
+    /// Active and not paused.
     Approved,
+    Paused,
     Rejected,
     /// Approved once, then removed by the owner or revoked by staff.
     Ended,
 }
 
 impl QueueFilter {
-    pub const ALL: [Self; 5] = [Self::Waiting, Self::SentBack, Self::Approved, Self::Rejected, Self::Ended];
+    pub const ALL: [Self; 8] = [
+        Self::Waiting,
+        Self::SentBack,
+        Self::Unverified,
+        Self::Auto,
+        Self::Approved,
+        Self::Paused,
+        Self::Rejected,
+        Self::Ended,
+    ];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Waiting)
@@ -51,7 +68,10 @@ impl QueueFilter {
         match self {
             Self::Waiting => "waiting",
             Self::SentBack => "sent_back",
+            Self::Unverified => "unverified",
+            Self::Auto => "auto",
             Self::Approved => "approved",
+            Self::Paused => "paused",
             Self::Rejected => "rejected",
             Self::Ended => "ended",
         }
@@ -61,7 +81,10 @@ impl QueueFilter {
         match self {
             Self::Waiting => "Waiting",
             Self::SentBack => "Sent back",
+            Self::Unverified => "Not verified",
+            Self::Auto => "Activated automatically",
             Self::Approved => "Approved",
+            Self::Paused => "Paused",
             Self::Rejected => "Rejected",
             Self::Ended => "Removed",
         }
@@ -71,7 +94,11 @@ impl QueueFilter {
         match self {
             Self::Waiting => &["pending"],
             Self::SentBack => &["needs_fix"],
-            Self::Approved => &["approved"],
+            Self::Unverified => &["unverified"],
+            Self::Auto => {
+                &["unverified", "pending", "needs_fix", "approved", "rejected", "withdrawn", "removed", "revoked"]
+            }
+            Self::Approved | Self::Paused => &["approved"],
             Self::Rejected => &["rejected"],
             Self::Ended => &["removed", "revoked"],
         }
@@ -79,11 +106,28 @@ impl QueueFilter {
 
     /// Open claims oldest first, so nobody waits longest; decided ones
     /// newest first.
+    /// Whether the tab holds paused TINs, not paused ones, or either.
+    fn paused(self) -> Option<bool> {
+        match self {
+            Self::Approved => Some(false),
+            Self::Paused => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Whether the tab holds only automatic activations nobody confirmed.
+    fn unconfirmed_auto(self) -> Option<bool> {
+        (self == Self::Auto).then_some(true)
+    }
+
     fn order(self) -> &'static str {
         match self {
-            Self::Waiting => "coalesce(c.resent_at, c.created_at), c.id",
+            Self::Auto => "c.decided_at, c.id",
+            Self::Waiting => "coalesce(c.resent_at, c.submitted_at, c.created_at), c.id",
             Self::SentBack => "c.sent_back_at, c.id",
+            Self::Unverified => "c.created_at DESC, c.id",
             Self::Approved | Self::Rejected => "c.decided_at DESC, c.id",
+            Self::Paused => "c.paused_at DESC, c.id",
             Self::Ended => "c.removed_at DESC, c.id",
         }
     }
@@ -103,6 +147,8 @@ pub struct QueueRow {
     pub reading_kind: Option<String>,
     pub tin_match: Option<String>,
     pub name_match: Option<String>,
+    /// The claimant's account is labelled a test account.
+    pub test_account: bool,
 }
 
 pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Result<Vec<QueueRow>> {
@@ -113,7 +159,7 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
                 AND o.status IN ('pending', 'needs_fix', 'approved')) AS rivals,
              ARRAY(SELECT DISTINCT d.kind FROM claim_documents d
                    WHERE d.claim_id = c.id AND d.purged_at IS NULL) AS document_kinds,
-             reading.reading_kind, reading.tin_match, reading.name_match
+             reading.reading_kind, reading.tin_match, reading.name_match, a.test_account
          FROM tin_claims c JOIN accounts a ON a.id = c.account_id
          LEFT JOIN LATERAL (
              SELECT d.kind AS reading_kind, r.tin_match, r.name_match
@@ -121,7 +167,8 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
              WHERE d.claim_id = c.id AND d.purged_at IS NULL AND r.status = 'read'
              ORDER BY d.created_at DESC LIMIT 1
          ) reading ON true
-         WHERE c.status = ANY($1)
+         WHERE c.status = ANY($1) AND ($5::bool IS NULL OR (c.paused_at IS NOT NULL) = $5)
+           AND ($6::bool IS NULL OR (c.verified_by = 'auto' AND c.auto_confirmed_at IS NULL))
            AND ($2::text IS NULL OR a.email ILIKE $2 OR c.registered_name ILIKE $2 OR c.trade_name ILIKE $2
                 OR ($3::text IS NOT NULL AND c.tin_root || c.branch_code LIKE $3))
          ORDER BY {}
@@ -132,8 +179,18 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
     .bind(contains(search))
     .bind(tin_digits(search))
     .bind(LIST_LIMIT)
+    .bind(filter.paused())
+    .bind(filter.unconfirmed_auto())
     .fetch_all(db)
     .await
+}
+
+/// TINs activated automatically that no person has confirmed yet, for the
+/// tab's count.
+pub async fn unconfirmed_auto(db: &PgPool) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL")
+        .fetch_one(db)
+        .await
 }
 
 /// Claims waiting for review and claims sent back, for the tab counts.
@@ -150,16 +207,18 @@ pub async fn open_counts(db: &PgPool) -> sqlx::Result<(i64, i64)> {
 pub async fn neighbours(db: &PgPool, claim: &ClaimRow) -> sqlx::Result<(Option<Uuid>, Option<Uuid>)> {
     let at = claim.waiting_since();
     let previous = sqlx::query_scalar(
-        "SELECT id FROM tin_claims WHERE status = 'pending' AND (coalesce(resent_at, created_at), id) < ($1, $2)
-         ORDER BY coalesce(resent_at, created_at) DESC, id DESC LIMIT 1",
+        "SELECT id FROM tin_claims
+         WHERE status = 'pending' AND (coalesce(resent_at, submitted_at, created_at), id) < ($1, $2)
+         ORDER BY coalesce(resent_at, submitted_at, created_at) DESC, id DESC LIMIT 1",
     )
     .bind(at)
     .bind(claim.id)
     .fetch_optional(db)
     .await?;
     let next = sqlx::query_scalar(
-        "SELECT id FROM tin_claims WHERE status = 'pending' AND (coalesce(resent_at, created_at), id) > ($1, $2)
-         ORDER BY coalesce(resent_at, created_at), id LIMIT 1",
+        "SELECT id FROM tin_claims
+         WHERE status = 'pending' AND (coalesce(resent_at, submitted_at, created_at), id) > ($1, $2)
+         ORDER BY coalesce(resent_at, submitted_at, created_at), id LIMIT 1",
     )
     .bind(at)
     .bind(claim.id)
@@ -176,10 +235,13 @@ pub enum UserFilter {
     Verified,
     NoTin,
     Staff,
+    Test,
+    Banned,
 }
 
 impl UserFilter {
-    pub const ALL: [Self; 5] = [Self::Everyone, Self::Waiting, Self::Verified, Self::NoTin, Self::Staff];
+    pub const ALL: [Self; 7] =
+        [Self::Everyone, Self::Waiting, Self::Verified, Self::NoTin, Self::Staff, Self::Test, Self::Banned];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Everyone)
@@ -192,6 +254,8 @@ impl UserFilter {
             Self::Verified => "verified",
             Self::NoTin => "no_tin",
             Self::Staff => "staff",
+            Self::Test => "test",
+            Self::Banned => "banned",
         }
     }
 
@@ -202,6 +266,8 @@ impl UserFilter {
             Self::Verified => "Verified",
             Self::NoTin => "No TIN yet",
             Self::Staff => "Staff",
+            Self::Test => "Test accounts",
+            Self::Banned => "Banned",
         }
     }
 }
@@ -213,6 +279,13 @@ pub struct UserRow {
     pub created_at: OffsetDateTime,
     /// The newest website sign-in or app token, whichever is later.
     pub last_active: Option<OffsetDateTime>,
+    /// The stored staff role (`admin`, `support`); see [`crate::account::roles`]
+    /// for the role that counts.
+    pub role: Option<String>,
+    pub test_account: bool,
+    pub banned_at: Option<OffsetDateTime>,
+    pub ban_reason: Option<String>,
+    pub banned_by_email: Option<String>,
 }
 
 const USER_COLUMNS: &str = "a.id, a.email, a.created_at,
@@ -220,9 +293,18 @@ const USER_COLUMNS: &str = "a.id, a.email, a.created_at,
          (SELECT max(s.created_at) FROM web_sessions s WHERE s.account_id = a.id),
          (SELECT max(t.created_at) FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id
           WHERE g.account_id = a.id)
-     ) AS last_active";
+     ) AS last_active,
+     a.role, a.test_account, a.banned_at, a.ban_reason,
+     (SELECT b.email FROM accounts b WHERE b.id = a.banned_by) AS banned_by_email";
 
-pub async fn users(db: &PgPool, filter: UserFilter, search: &str, staff: &[String]) -> sqlx::Result<Vec<UserRow>> {
+/// Accounts for the users list. `admin_emails` is `ADMIN_EMAILS`, whose
+/// people are staff whatever their account says.
+pub async fn users(
+    db: &PgPool,
+    filter: UserFilter,
+    search: &str,
+    admin_emails: &[String],
+) -> sqlx::Result<Vec<UserRow>> {
     sqlx::query_as(&format!(
         "SELECT {USER_COLUMNS} FROM accounts a
          WHERE ($1::text IS NULL OR a.email ILIKE $1 OR EXISTS (
@@ -235,17 +317,20 @@ pub async fn users(db: &PgPool, filter: UserFilter, search: &str, staff: &[Strin
                WHEN 'verified' THEN EXISTS (SELECT 1 FROM tin_claims c
                                             WHERE c.account_id = a.id AND c.status = 'approved')
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
-                                              AND c.status IN ('pending', 'needs_fix', 'approved'))
-               WHEN 'staff' THEN a.email = ANY($4)
+                                              AND c.{LIVE_SQL})
+               WHEN 'staff' THEN {staff}
+               WHEN 'test' THEN a.test_account
+               WHEN 'banned' THEN a.banned_at IS NOT NULL
                ELSE true
            END
          ORDER BY last_active DESC NULLS LAST, a.created_at DESC
-         LIMIT $5"
+         LIMIT $5",
+        staff = crate::account::roles::is_staff_sql("a", "$4")
     ))
     .bind(contains(search))
     .bind(tin_digits(search))
     .bind(filter.code())
-    .bind(staff)
+    .bind(admin_emails)
     .bind(LIST_LIMIT)
     .fetch_all(db)
     .await
@@ -265,12 +350,14 @@ pub struct UserClaim {
     pub tin_root: String,
     pub branch_code: String,
     pub registered_name: String,
+    /// As people read it: an active TIN staff paused is `paused`.
     pub status: String,
 }
 
 pub async fn claims_of(db: &PgPool, account_ids: &[Uuid]) -> sqlx::Result<Vec<UserClaim>> {
     sqlx::query_as(
-        "SELECT account_id, tin_root, branch_code, registered_name, status FROM tin_claims
+        "SELECT account_id, tin_root, branch_code, registered_name,
+             CASE WHEN paused_at IS NOT NULL THEN 'paused' ELSE status END AS status FROM tin_claims
          WHERE account_id = ANY($1) AND status <> 'withdrawn' ORDER BY created_at",
     )
     .bind(account_ids)
@@ -279,7 +366,8 @@ pub async fn claims_of(db: &PgPool, account_ids: &[Uuid]) -> sqlx::Result<Vec<Us
 }
 
 /// A line of `claim_audit`: a claim deleted, a TIN removed or revoked, a
-/// file replaced or removed.
+/// file replaced or removed, a TIN activated without papers, paused or
+/// resumed.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct AuditRow {
     pub tin_masked: String,
@@ -289,14 +377,42 @@ pub struct AuditRow {
     pub actor_id: Uuid,
     pub actor_email: String,
     pub reason: Option<String>,
+    /// `web`, `auto` or `seed`.
+    pub source: String,
     pub created_at: OffsetDateTime,
 }
 
 /// The audit lines about an account's claims, newest first.
 pub async fn audit(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<AuditRow>> {
     sqlx::query_as(
-        "SELECT tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, created_at
+        "SELECT tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, source, created_at
          FROM claim_audit WHERE account_id = $1 ORDER BY created_at DESC LIMIT 40",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await
+}
+
+/// A line of `account_audit`: what staff or the seed tool did to the
+/// account itself.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AccountAuditRow {
+    pub action: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub actor_id: Uuid,
+    pub actor_email: String,
+    /// `web` or `seed`.
+    pub source: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// The account's own audit lines, newest first.
+pub async fn account_audit(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<AccountAuditRow>> {
+    sqlx::query_as(
+        "SELECT action, old_value, new_value, actor_id, actor_email, source, reason, created_at
+         FROM account_audit WHERE account_id = $1 ORDER BY created_at DESC LIMIT 40",
     )
     .bind(account_id)
     .fetch_all(db)
@@ -314,7 +430,8 @@ pub enum IdStatus {
 
 impl IdStatus {
     /// Staff first; then a claim waiting for review or a fix; then any
-    /// approved claim.
+    /// approved claim. A TIN saved without papers proves no identity, so it
+    /// counts for neither.
     pub fn of(is_staff: bool, statuses: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         if is_staff {
             return Self::Staff;
@@ -421,6 +538,8 @@ mod tests {
         assert_eq!(IdStatus::of(false, ["approved", "needs_fix"]), IdStatus::Waiting);
         assert_eq!(IdStatus::of(false, ["rejected", "approved"]), IdStatus::Verified);
         assert_eq!(IdStatus::of(false, ["rejected"]), IdStatus::None);
+        assert_eq!(IdStatus::of(false, ["unverified"]), IdStatus::None);
+        assert_eq!(IdStatus::of(false, ["unverified", "approved"]), IdStatus::Verified);
     }
 
     #[test]

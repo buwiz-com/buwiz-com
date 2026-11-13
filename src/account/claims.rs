@@ -7,9 +7,12 @@
 //!
 //! Lifecycle: `pending` → `approved` | `rejected` | `needs_fix` (staff) |
 //! `withdrawn` (claimant). A claim sent back (`needs_fix`) is resent with
-//! new files and is `pending` again. One TIN has at most one approved
-//! owner. Document bytes are dropped when a claim ends; the hash and
-//! metadata stay.
+//! new files and is `pending` again. A TIN added without its papers
+//! ("Skip for now") is `unverified`: it can prepare returns but not send
+//! them, and becomes `pending` when its papers are sent. Any number of
+//! accounts may hold an unverified row for one TIN; one TIN has at most
+//! one approved owner. Document bytes are dropped when a claim ends; the
+//! hash and metadata stay.
 //!
 //! Ending: a claim that never became active can be deleted, rows, files
 //! and all (by the claimant, or by staff with a reason). An approved claim
@@ -30,14 +33,38 @@ use uuid::Uuid;
 use crate::account::accounts::Account;
 use crate::account::notice::Notice;
 use crate::account::oauth::Bearer;
+use crate::account::roles::{self, Power, Role};
 use crate::account::tin::Tin;
+use crate::base::config::Config;
 use crate::base::crypto;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
 use crate::base::storage::DocumentStore;
+use crate::filing::gate;
 
-pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
-pub const MAX_SUPPORTING_FILES: usize = 5;
+// The limits are macros too, so the notices that name them (notice.rs) are
+// written from the same numbers.
+macro_rules! max_file_mb {
+    () => {
+        10
+    };
+}
+macro_rules! max_supporting_files {
+    () => {
+        5
+    };
+}
+macro_rules! max_unverified {
+    () => {
+        20
+    };
+}
+pub(crate) use {max_file_mb, max_supporting_files, max_unverified};
+
+pub const MAX_FILE_BYTES: usize = max_file_mb!() * 1024 * 1024;
+pub const MAX_SUPPORTING_FILES: usize = max_supporting_files!();
+/// TINs an account may have waiting to be verified at once.
+pub const MAX_UNVERIFIED: i64 = max_unverified!();
 /// Permissions an approved TIN grants in the Buwiz BIR app.
 pub const PROFILE_PERMISSIONS: &[&str] = &["profile.view", "filing.prepare", "filing.submit"];
 /// What a TIN still being checked allows in the BIR app: preparing
@@ -224,6 +251,9 @@ pub struct NewClaim {
     pub registered_name: String,
     pub trade_name: String,
     pub uploads: Vec<Upload>,
+    /// "Skip for now": saved as not verified, without papers. Any uploads
+    /// are dropped.
+    pub papers_later: bool,
 }
 
 /// Trimmed registered and trade names, or why they cannot be used.
@@ -265,7 +295,18 @@ fn missing_notice(document: DocumentKind) -> Notice {
     }
 }
 
-/// Opens a claim with its files. Errors are messages for the person.
+/// The documents of `kind` missing from `uploads`, as the notice to show.
+fn check_required(kind: ClaimKind, uploads: &[Upload]) -> Result<(), Notice> {
+    match kind.required().iter().find(|required| !uploads.iter().any(|upload| upload.kind == **required)) {
+        Some(missing) => Err(missing_notice(*missing)),
+        None => Ok(()),
+    }
+}
+
+/// Opens a claim with its files, or saves the TIN as not verified without
+/// any ([`NewClaim::papers_later`]). Errors are messages for the person.
+/// Nothing here looks at other accounts' rows: adding a TIN reads the same
+/// whoever else has it.
 pub async fn submit(
     db: &PgPool,
     store: &DocumentStore,
@@ -273,20 +314,20 @@ pub async fn submit(
     account_id: Uuid,
     claim: NewClaim,
 ) -> Result<Uuid, SubmitError> {
-    let NewClaim { kind, tin, registered_name, trade_name, uploads } = claim;
+    let NewClaim { kind, tin, registered_name, trade_name, uploads, papers_later } = claim;
     let (registered_name, trade_name) = check_names(&registered_name, &trade_name).map_err(SubmitError::Invalid)?;
-    for required in kind.required() {
-        if !uploads.iter().any(|upload| upload.kind == *required) {
-            return Err(SubmitError::Invalid(missing_notice(*required)));
-        }
+    let uploads = if papers_later { Vec::new() } else { uploads };
+    if !papers_later {
+        check_required(kind, &uploads).map_err(SubmitError::Invalid)?;
     }
     let checked = check_uploads(kind, uploads).map_err(SubmitError::Invalid)?;
 
     let mut tx = db.begin().await?;
-    let existing: Option<String> = sqlx::query_scalar(
+    let existing: Option<String> = sqlx::query_scalar(&format!(
         "SELECT status FROM tin_claims
-         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status IN ('pending', 'needs_fix', 'approved')",
-    )
+         WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND {}",
+        gate::LIVE_SQL
+    ))
     .bind(account_id)
     .bind(tin.root())
     .bind(tin.branch())
@@ -294,12 +335,27 @@ pub async fn submit(
     .await?;
     match existing.as_deref() {
         Some("approved") => return Err(SubmitError::Invalid(Notice::TinAlreadyActive)),
+        Some("unverified") => return Err(SubmitError::Invalid(Notice::TinAlreadyAdded)),
         Some(_) => return Err(SubmitError::Invalid(Notice::ClaimAlreadyPending)),
         None => {}
     }
+    if papers_later {
+        // Locks the account, so requests at once count one after another.
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+        let waiting: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1 AND status = 'unverified'")
+                .bind(account_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if waiting >= MAX_UNVERIFIED {
+            return Err(SubmitError::Invalid(Notice::TooManyUnverified));
+        }
+    }
     let inserted = sqlx::query_scalar(
-        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, trade_name, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id",
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, trade_name, status, submitted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $7 THEN 'unverified' ELSE 'pending' END,
+                 CASE WHEN $7 THEN NULL ELSE now() END)
+         RETURNING id",
     )
     .bind(account_id)
     .bind(kind.as_str())
@@ -307,12 +363,14 @@ pub async fn submit(
     .bind(tin.branch())
     .bind(&registered_name)
     .bind(&trade_name)
+    .bind(papers_later)
     .fetch_one(&mut *tx)
     .await;
     let claim_id: Uuid = match inserted {
-        // The same claim sent twice at once: the second one loses the race.
-        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_open") => {
-            return Err(SubmitError::Invalid(Notice::ClaimAlreadyPending));
+        // The same TIN sent twice at once: the second one loses the race.
+        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_live") => {
+            let notice = if papers_later { Notice::TinAlreadyAdded } else { Notice::ClaimAlreadyPending };
+            return Err(SubmitError::Invalid(notice));
         }
         other => other?,
     };
@@ -327,8 +385,66 @@ pub async fn submit(
         store.delete_all(&uploaded).await;
         return Err(error);
     }
-    tracing::info!(%claim_id, %account_id, kind = kind.as_str(), "tin claim submitted");
+    tracing::info!(%claim_id, %account_id, kind = kind.as_str(), papers_later, "tin claim submitted");
     Ok(claim_id)
+}
+
+/// The papers for a TIN saved without them, and the names as they read now.
+pub struct Papers {
+    pub registered_name: String,
+    pub trade_name: String,
+    pub uploads: Vec<Upload>,
+}
+
+/// The person sends the papers for their own TIN saved as not verified. It
+/// is the same claim, now waiting for review from this moment.
+pub async fn send_papers(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    account_id: Uuid,
+    claim_id: Uuid,
+    papers: Papers,
+) -> Result<(), SubmitError> {
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT status, kind FROM tin_claims WHERE id = $1 AND account_id = $2 FOR UPDATE")
+            .bind(claim_id)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status, kind)) = row else {
+        return Err(SubmitError::Invalid(Notice::ClaimMissing));
+    };
+    if status != "unverified" {
+        return Err(SubmitError::Invalid(Notice::NotUnverified));
+    }
+    let kind = ClaimKind::parse(&kind).expect("stored kinds are valid");
+    let (registered_name, trade_name) =
+        check_names(&papers.registered_name, &papers.trade_name).map_err(SubmitError::Invalid)?;
+    check_required(kind, &papers.uploads).map_err(SubmitError::Invalid)?;
+    let checked = check_uploads(kind, papers.uploads).map_err(SubmitError::Invalid)?;
+    sqlx::query(
+        "UPDATE tin_claims SET status = 'pending', submitted_at = now(), registered_name = $2, trade_name = $3
+         WHERE id = $1",
+    )
+    .bind(claim_id)
+    .bind(&registered_name)
+    .bind(&trade_name)
+    .execute(&mut *tx)
+    .await?;
+    let mut uploaded = Vec::new();
+    let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
+    let committed = match stored {
+        Ok(_) => tx.commit().await.map_err(SubmitError::from),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = committed {
+        store.delete_all(&uploaded).await;
+        return Err(error);
+    }
+    tracing::info!(%claim_id, %account_id, "papers sent for a tin saved without them");
+    Ok(())
 }
 
 /// What the claimant changes on a claim sent back to them.
@@ -498,6 +614,19 @@ pub struct ClaimRow {
     pub removed_at: Option<OffsetDateTime>,
     pub removal_note: Option<String>,
     pub files_changed_at: Option<OffsetDateTime>,
+    /// When the papers were sent; `None` while not verified.
+    pub submitted_at: Option<OffsetDateTime>,
+    /// `staff`, `auto`, `admin` or `seed`, once the TIN was ever active;
+    /// `unknown` for one active before a rollback that named no reviewer.
+    pub verified_by: Option<String>,
+    /// An active TIN staff paused: still owned, but nothing sends.
+    pub paused_at: Option<OffsetDateTime>,
+    pub pause_reason: Option<String>,
+    /// What the automatic check saw, and when staff confirmed its activation.
+    pub auto_check: Option<Value>,
+    pub auto_confirmed_at: Option<OffsetDateTime>,
+    /// Who decided it: the reviewer, or the Admin who activated it.
+    pub decided_by: Option<Uuid>,
 }
 
 impl ClaimRow {
@@ -505,14 +634,26 @@ impl ClaimRow {
         Tin::parse(&self.tin_root, &self.branch_code).expect("stored TINs are valid")
     }
 
+    /// The status as people read it: an active TIN staff paused is
+    /// `paused`.
+    pub fn shown_status(&self) -> &str {
+        if self.status == "approved" && self.paused_at.is_some() { "paused" } else { &self.status }
+    }
+
     /// Waiting for staff or for the claimant's fix.
     pub fn is_open(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
-    /// When it last went into the review queue.
+    /// An Admin activated their own TIN without papers, on the staff pages
+    /// or as the `--as` of a seed run.
+    pub fn self_activated(&self) -> bool {
+        matches!(self.verified_by.as_deref(), Some("admin" | "seed")) && self.decided_by == Some(self.account_id)
+    }
+
+    /// When it last went into the review queue: resent, or its papers sent.
     pub fn waiting_since(&self) -> OffsetDateTime {
-        self.resent_at.unwrap_or(self.created_at)
+        self.resent_at.or(self.submitted_at).unwrap_or(self.created_at)
     }
 
     /// When the claimant changed files on a claim already waiting for
@@ -524,7 +665,8 @@ impl ClaimRow {
 
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
-     c.decided_at, c.removed_at, c.removal_note, c.files_changed_at";
+     c.decided_at, c.removed_at, c.removal_note, c.files_changed_at, c.submitted_at, c.verified_by, c.paused_at, \
+     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -675,28 +817,43 @@ pub enum Decision {
 
 /// Staff approve, reject or send back a claim. Approving and rejecting end
 /// it (also a claim waiting for a fix that never came); only a claim
-/// waiting for review can be sent back.
+/// waiting for review can be sent back. Each decision writes a line in
+/// `claim_audit` in the same transaction (who, the decision, the reasons),
+/// so neither a later send-back nor the claimant deleting the claim erases
+/// who decided. Approving a TIN that was ever paused, on any account, is an
+/// Admin's call. The reviewer's role is checked again inside the
+/// transaction.
 pub async fn decide(
     db: &PgPool,
+    config: &Config,
     store: &DocumentStore,
     claim_id: Uuid,
-    reviewer_id: Uuid,
+    reviewer: &Account,
     decision: &Decision,
     note: &str,
 ) -> Result<Notice, DecideError> {
     let mut tx = db.begin().await?;
-    let row: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT account_id, status FROM tin_claims WHERE id = $1 FOR UPDATE")
-            .bind(claim_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((claimant, status)) = row else {
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    if claimant == reviewer_id {
+    if claim.account_id == reviewer.id {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
+    if note.trim().chars().count() > crate::account::admin::MAX_REASON_CHARS {
+        return Err(DecideError::Refused(Notice::ReasonTooLong));
+    }
+    let role = roles::recheck(&mut tx, config, reviewer.id).await?;
+    if !role.is_some_and(|role| role.can(Power::Review)) {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if *decision == Decision::Approve && is_banned(&mut tx, claim.account_id).await? {
+        return Err(DecideError::Refused(Notice::ClaimantBanned));
+    }
+    if *decision == Decision::Approve && role != Some(Role::Admin) && was_paused(&mut tx, &claim.tin).await? {
+        return Err(DecideError::Refused(Notice::AdminMustDecide));
+    }
     let note = note.trim();
+    let status = claim.status.as_str();
     if let Decision::SendBack(reasons) = decision {
         if status != "pending" {
             return Err(DecideError::Refused(Notice::AlreadyDecided));
@@ -715,14 +872,21 @@ pub async fn decide(
         .bind(claim_id)
         .bind(reasons)
         .bind(note)
-        .bind(reviewer_id)
+        .bind(reviewer.id)
         .execute(&mut *tx)
         .await?;
+        let labels: Vec<&str> = reasons.iter().filter_map(|code| fix_reason(code)).map(|(label, _)| label).collect();
+        let why = match (labels.join(", "), note) {
+            (labels, "") => labels,
+            (labels, note) if labels.is_empty() => note.to_owned(),
+            (labels, note) => format!("{labels}: {note}"),
+        };
+        audit(&mut tx, &claim, reviewer, "sent_back", None, Some(&why)).await?;
         tx.commit().await?;
-        tracing::info!(%claim_id, %reviewer_id, "tin claim sent back");
+        tracing::info!(%claim_id, reviewer = %reviewer.id, "tin claim sent back");
         return Ok(Notice::ClaimSentBack);
     }
-    if !matches!(status.as_str(), "pending" | "needs_fix") {
+    if !matches!(status, "pending" | "needs_fix") {
         return Err(DecideError::Refused(Notice::AlreadyDecided));
     }
     let approve = *decision == Decision::Approve;
@@ -731,12 +895,13 @@ pub async fn decide(
     }
     let status = if approve { "approved" } else { "rejected" };
     let updated = sqlx::query(
-        "UPDATE tin_claims SET status = $2, decided_at = now(), decided_by = $3, decision_note = NULLIF($4, '')
+        "UPDATE tin_claims SET status = $2, decided_at = now(), decided_by = $3, decision_note = NULLIF($4, ''),
+             verified_by = CASE WHEN $2 = 'approved' THEN 'staff' END
          WHERE id = $1",
     )
     .bind(claim_id)
     .bind(status)
-    .bind(reviewer_id)
+    .bind(reviewer.id)
     .bind(note)
     .execute(&mut *tx)
     .await;
@@ -749,10 +914,96 @@ pub async fn decide(
         }
     }
     let objects = purge_documents(&mut tx, claim_id).await?;
+    audit(&mut tx, &claim, reviewer, status, None, Some(note).filter(|note| !note.is_empty())).await?;
     tx.commit().await?;
     store.delete_all(&objects).await;
-    tracing::info!(%claim_id, %reviewer_id, status, "tin claim decided");
+    tracing::info!(%claim_id, reviewer = %reviewer.id, status, "tin claim decided");
     Ok(Notice::ClaimDecided)
+}
+
+/// [`was_paused`], outside a transaction (for the pages).
+pub async fn paused_ever(db: &PgPool, tin: &Tin) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let paused = was_paused(&mut tx, tin).await?;
+    tx.rollback().await?;
+    Ok(paused)
+}
+
+/// Whether sending for this TIN was ever paused, on any account's claim.
+pub async fn was_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, tin: &Tin) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id
+                        WHERE c.tin_root = $1 AND c.branch_code = $2 AND a.action = 'paused')
+             OR EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND paused_at IS NOT NULL)",
+    )
+    .bind(tin.root())
+    .bind(tin.branch())
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Whether the account is banned, read with a share lock: a ban under way
+/// commits first and is seen, or waits until this transaction ends. A
+/// banned account gets no active TIN.
+async fn is_banned(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR SHARE")
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+/// An Admin makes a TIN active without its papers: one saved without them,
+/// or one still waiting for review or a fix (its papers are deleted as on
+/// any decision). Unlike [`decide`], it works on the Admin's own TIN. The
+/// reason goes only into the claim's audit line, never into anything the
+/// owner or an app reads. Refused for a banned account, and while another
+/// account owns the TIN: end that ownership first. The route checks the
+/// power ([`crate::account::roles::Power::ActivateWithoutPapers`]).
+pub async fn activate_without_papers(
+    db: &PgPool,
+    config: &Config,
+    store: &DocumentStore,
+    claim_id: Uuid,
+    actor: &Account,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = crate::account::admin::required_reason(reason)?;
+    let reason = reason.as_str();
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    if !roles::may(&mut tx, config, actor.id, Power::ActivateWithoutPapers).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if !matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix") {
+        return Err(DecideError::Refused(Notice::AlreadyDecided));
+    }
+    if is_banned(&mut tx, claim.account_id).await? {
+        return Err(DecideError::Refused(Notice::ClaimantBanned));
+    }
+    let updated = sqlx::query(
+        "UPDATE tin_claims SET status = 'approved', decided_at = now(), decided_by = $2, verified_by = 'admin'
+         WHERE id = $1",
+    )
+    .bind(claim_id)
+    .bind(actor.id)
+    .execute(&mut *tx)
+    .await;
+    match updated {
+        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_owner") => {
+            return Err(DecideError::Refused(Notice::TinOwnedElsewhere));
+        }
+        other => {
+            other?;
+        }
+    }
+    let objects = purge_documents(&mut tx, claim_id).await?;
+    audit(&mut tx, &claim, actor, "activated", None, Some(reason)).await?;
+    tx.commit().await?;
+    store.delete_all(&objects).await;
+    tracing::info!(%claim_id, actor = %actor.id, "tin activated without papers");
+    Ok(Notice::TinActivated)
 }
 
 /// The claimant gives up a claim that is still open.
@@ -786,15 +1037,31 @@ async fn purge_documents(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_i
     Ok(keys.into_iter().flatten().collect())
 }
 
-/// Who ends a claim: its owner, or staff, who must say why.
+/// Who ends a claim: its owner, or staff, who must say why (and whose
+/// power is checked again inside the transaction, against `config`).
 pub enum By<'a> {
     Owner,
-    Staff { reason: &'a str },
+    Staff { reason: &'a str, config: &'a Config },
+}
+
+impl By<'_> {
+    /// For staff, whether the actor still has `power` now.
+    async fn may(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        actor: &Account,
+        power: Power,
+    ) -> sqlx::Result<bool> {
+        match self {
+            Self::Owner => Ok(true),
+            Self::Staff { config, .. } => roles::may(tx, config, actor.id, power).await,
+        }
+    }
 }
 
 /// Statuses of a claim that never became an active TIN, so nothing refers
 /// to it and it can be deleted outright.
-pub const DELETABLE: &[&str] = &["pending", "needs_fix", "rejected", "withdrawn"];
+pub const DELETABLE: &[&str] = &["unverified", "pending", "needs_fix", "rejected", "withdrawn"];
 
 /// A claim locked for a change, with what its audit line needs.
 struct Locked {
@@ -802,6 +1069,7 @@ struct Locked {
     account_id: Uuid,
     kind: String,
     status: String,
+    tin: Tin,
     tin_masked: String,
 }
 
@@ -812,12 +1080,9 @@ async fn lock_claim(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uu
     .bind(claim_id)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(row.map(|(account_id, kind, status, root, branch)| Locked {
-        id: claim_id,
-        account_id,
-        kind,
-        status,
-        tin_masked: Tin::parse(&root, &branch).expect("stored TINs are valid").masked(),
+    Ok(row.map(|(account_id, kind, status, root, branch)| {
+        let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+        Locked { id: claim_id, account_id, kind, status, tin_masked: tin.masked(), tin }
     }))
 }
 
@@ -828,10 +1093,7 @@ fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>) -> Result<Option<St
         By::Owner if claim.account_id != actor.id => Err(Notice::ClaimMissing),
         By::Owner => Ok(None),
         By::Staff { .. } if claim.account_id == actor.id => Err(Notice::OwnClaim),
-        By::Staff { reason } => {
-            let reason = reason.trim();
-            if reason.is_empty() { Err(Notice::ReasonMissing) } else { Ok(Some(reason.to_owned())) }
-        }
+        By::Staff { reason, .. } => crate::account::admin::reason_text(reason).map(Some),
     }
 }
 
@@ -845,8 +1107,9 @@ async fn audit(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO claim_audit
-             (claim_id, account_id, tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             (claim_id, account_id, tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, source,
+              claim_kind)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'web', $10)",
     )
     .bind(claim.id)
     .bind(claim.account_id)
@@ -857,6 +1120,7 @@ async fn audit(
     .bind(actor.id)
     .bind(&actor.email)
     .bind(reason)
+    .bind(&claim.kind)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -876,6 +1140,9 @@ pub async fn delete(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !by.may(&mut tx, actor, Power::DeleteClaim).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if !DELETABLE.contains(&claim.status.as_str()) {
         return Err(DecideError::Refused(Notice::ClaimNotDeletable));
     }
@@ -905,15 +1172,25 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    if !by.may(&mut tx, actor, Power::EndOwnership).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     if claim.status != "approved" {
         return Err(DecideError::Refused(Notice::TinNotActive));
+    }
+    // Removing a paused TIN and adding it again would get round the pause:
+    // only staff end it. (The pause stays on record in claim_audit.)
+    if matches!(by, By::Owner) && is_paused(&mut tx, claim_id).await? {
+        return Err(DecideError::Refused(Notice::PausedLocked));
     }
     let (status, notice) = match by {
         By::Owner => ("removed", Notice::TinRemoved),
         By::Staff { .. } => ("revoked", Notice::OwnershipRevoked),
     };
     sqlx::query(
-        "UPDATE tin_claims SET status = $2, removed_at = now(), removed_by = $3, removal_note = $4 WHERE id = $1",
+        "UPDATE tin_claims SET status = $2, removed_at = now(), removed_by = $3, removal_note = $4,
+             paused_at = NULL, paused_by = NULL, pause_reason = NULL
+         WHERE id = $1",
     )
     .bind(claim_id)
     .bind(status)
@@ -925,6 +1202,109 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
     tx.commit().await?;
     tracing::info!(%claim_id, actor = %actor.id, status, "tin ownership ended");
     Ok(notice)
+}
+
+async fn is_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT paused_at IS NOT NULL FROM tin_claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+/// An Admin pauses an active TIN: it stays owned (nobody else can be
+/// approved for it) but nothing sends until it is resumed. The owner reads
+/// the reason on My TINs. Not on one's own TIN, like ending an ownership.
+pub async fn pause(
+    db: &PgPool,
+    config: &Config,
+    claim_id: Uuid,
+    actor: &Account,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    let by = By::Staff { reason, config };
+    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
+        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
+        notice => DecideError::Refused(notice),
+    })?;
+    if !by.may(&mut tx, actor, Power::Pause).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if claim.status != "approved" || is_paused(&mut tx, claim_id).await? {
+        return Err(DecideError::Refused(Notice::NotPausable));
+    }
+    sqlx::query("UPDATE tin_claims SET paused_at = now(), paused_by = $2, pause_reason = $3 WHERE id = $1")
+        .bind(claim_id)
+        .bind(actor.id)
+        .bind(&reason)
+        .execute(&mut *tx)
+        .await?;
+    audit(&mut tx, &claim, actor, "paused", None, reason.as_deref()).await?;
+    tx.commit().await?;
+    tracing::info!(%claim_id, actor = %actor.id, "tin paused");
+    Ok(Notice::TinPaused)
+}
+
+/// An Admin resumes a paused TIN: it is exactly as before the pause.
+pub async fn resume(
+    db: &PgPool,
+    config: &Config,
+    claim_id: Uuid,
+    actor: &Account,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    let by = By::Staff { reason, config };
+    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
+        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
+        notice => DecideError::Refused(notice),
+    })?;
+    if !by.may(&mut tx, actor, Power::Pause).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if claim.status != "approved" || !is_paused(&mut tx, claim_id).await? {
+        return Err(DecideError::Refused(Notice::NotPaused));
+    }
+    sqlx::query("UPDATE tin_claims SET paused_at = NULL, paused_by = NULL, pause_reason = NULL WHERE id = $1")
+        .bind(claim_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(&mut tx, &claim, actor, "resumed", None, reason.as_deref()).await?;
+    tx.commit().await?;
+    tracing::info!(%claim_id, actor = %actor.id, "tin resumed");
+    Ok(Notice::TinResumed)
+}
+
+/// A line of `claim_audit` about pausing a TIN, on any of its claims.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct PauseLine {
+    pub action: String,
+    pub actor_email: String,
+    /// `auto` for a pause Buwiz made itself.
+    pub source: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Every pause and resume of this TIN, on any account's claim, oldest
+/// first: what a reviewer should know before making it active again.
+pub async fn pauses(db: &PgPool, tin: &Tin) -> sqlx::Result<Vec<PauseLine>> {
+    sqlx::query_as(
+        "SELECT a.action, a.actor_email, a.source, a.reason, a.created_at
+         FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id
+         WHERE c.tin_root = $1 AND c.branch_code = $2 AND a.action IN ('paused', 'resumed')
+         ORDER BY a.created_at, a.id",
+    )
+    .bind(tin.root())
+    .bind(tin.branch())
+    .fetch_all(db)
+    .await
 }
 
 /// One stored file of the claimant's own open claim, locked for a change.
@@ -1052,9 +1432,13 @@ pub async fn tax_profiles(
     bearer: Bearer,
 ) -> Result<Json<Value>, ApiError> {
     let full = bearer.sees_full_tins();
-    let include_open =
-        query.get("include").is_some_and(|include| include.split(',').any(|item| item.trim() == "pending"));
-    let profiles = if include_open {
+    let include: Vec<&str> =
+        query.get("include").map(|include| include.split(',').map(str::trim).collect()).unwrap_or_default();
+    if include.contains(&"all") {
+        let profiles = all_profiles(&state.db, bearer.account.id, full, &state.config.account_origin).await?;
+        return Ok(Json(json!({ "include": "all", "profiles": profiles })));
+    }
+    let profiles = if include.contains(&"pending") {
         profiles_with_open(&state.db, bearer.account.id, full).await?
     } else {
         active_profiles(&state.db, bearer.account.id, full).await?
@@ -1062,13 +1446,103 @@ pub async fn tax_profiles(
     Ok(Json(json!({ "profiles": profiles })))
 }
 
-/// The account's active TINs. `full` adds the raw TIN and filing
-/// permissions, for the Buwiz BIR app only.
+/// The longest staff note the TIN list hands the apps.
+pub const SHOWN_NOTE_CHARS: usize = 200;
+
+#[derive(sqlx::FromRow)]
+struct ListedClaim {
+    id: Uuid,
+    tin_root: String,
+    branch_code: String,
+    registered_name: String,
+    status: String,
+    paused: bool,
+    decided_at: Option<OffsetDateTime>,
+    fix_reasons: Vec<String>,
+    fix_note: Option<String>,
+}
+
+/// `include=all`: every TIN on the account that is not ended, each with
+/// where it stands for sending ([`gate::classify`], so the list and the
+/// gate agree), the words for it and the link to its next step. TINs that
+/// can send come first, then paused ones, both in the order they became
+/// active; then the rest, oldest first. Only the BIR app (`full`) gets the
+/// TIN, filing permissions, the links and the staff's note.
+async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -> sqlx::Result<Vec<Value>> {
+    let rows: Vec<ListedClaim> = sqlx::query_as(&format!(
+        "SELECT id, tin_root, branch_code, registered_name, status, paused_at IS NOT NULL AS paused, decided_at,
+             fix_reasons, fix_note
+         FROM tin_claims
+         WHERE account_id = $1 AND {}
+         ORDER BY created_at, id",
+        gate::LIVE_SQL
+    ))
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    let mut listed: Vec<(gate::Standing, ListedClaim)> =
+        rows.into_iter().map(|row| (gate::classify(row.id, &row.status, row.paused, &row.fix_reasons), row)).collect();
+    // A stable sort keeps the oldest-first order within each group.
+    listed.sort_by_key(|(standing, row)| match standing {
+        gate::Standing::Sendable { .. } => (0, row.decided_at),
+        gate::Standing::Paused => (1, row.decided_at),
+        _ => (2, None),
+    });
+    Ok(listed.into_iter().map(|(standing, row)| listed_json(&standing, &row, full, origin)).collect())
+}
+
+fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin: &str) -> Value {
+    let tin = Tin::parse(&row.tin_root, &row.branch_code).expect("stored TINs are valid");
+    let active = row.status == "approved";
+    let action = match standing {
+        gate::Standing::Unverified => Some(("Verify to send", "verify")),
+        gate::Standing::NeedsFix { .. } => Some(("Fix and send again", "fix")),
+        _ => None,
+    };
+    let mut profile = json!({
+        "id": row.id,
+        "tin_masked": tin.masked(),
+        "registered_name": row.registered_name,
+        "activated_at": row.decided_at.filter(|_| active).map(OffsetDateTime::unix_timestamp),
+        "permissions": match (full, standing.can_send()) {
+            (true, true) => PROFILE_PERMISSIONS,
+            (true, false) => OPEN_PERMISSIONS,
+            (false, _) => VIEW_PERMISSIONS,
+        },
+        "status": standing.api_status(),
+        "can_send": standing.can_send(),
+        "message": standing.list_message(),
+        "action": match action {
+            Some((label, page)) if full => json!({ "label": label, "url": format!("{origin}/tins/claims/{}/{page}", row.id) }),
+            _ => Value::Null,
+        },
+    });
+    if full {
+        profile["tin"] = json!(tin.to_string());
+    }
+    if let gate::Standing::NeedsFix { reasons } = standing {
+        profile["reasons"] = json!(reasons);
+        profile["reason_codes"] = json!(row.fix_reasons);
+        profile["note"] = json!(row.fix_note.as_deref().filter(|_| full).map(shown_note));
+    }
+    profile
+}
+
+/// A staff note as the apps show it: on one line, at most
+/// [`SHOWN_NOTE_CHARS`] characters.
+fn shown_note(note: &str) -> String {
+    note.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(SHOWN_NOTE_CHARS).collect()
+}
+
+/// The account's active TINs that can send: a paused one is left out.
+/// `full` adds the raw TIN and filing permissions, for the Buwiz BIR app
+/// only.
 pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::Result<Vec<Value>> {
-    let rows: Vec<(Uuid, String, String, String, OffsetDateTime)> = sqlx::query_as(
-        "SELECT id, tin_root, branch_code, registered_name, decided_at FROM tin_claims
-         WHERE account_id = $1 AND status = 'approved' ORDER BY decided_at",
-    )
+    let rows: Vec<(Uuid, String, String, String, OffsetDateTime)> = sqlx::query_as(&format!(
+        "SELECT c.id, c.tin_root, c.branch_code, c.registered_name, c.decided_at FROM tin_claims c
+         WHERE c.account_id = $1 AND {} ORDER BY c.decided_at",
+        gate::SENDABLE_SQL
+    ))
     .bind(account_id)
     .fetch_all(db)
     .await?;
@@ -1158,6 +1632,13 @@ mod tests {
         let limited = open_profile_json(Uuid::nil(), &tin, "Juan", "needs_fix", false);
         assert_eq!(limited["permissions"], json!(VIEW_PERMISSIONS));
         assert!(limited.get("tin").is_none());
+    }
+
+    #[test]
+    fn notes_are_shown_on_one_line_and_cut_short() {
+        assert_eq!(shown_note("  Retake it\n in   daylight. "), "Retake it in daylight.");
+        let long = "é".repeat(SHOWN_NOTE_CHARS + 50);
+        assert_eq!(shown_note(&long).chars().count(), SHOWN_NOTE_CHARS);
     }
 
     #[test]

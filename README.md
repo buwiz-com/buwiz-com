@@ -33,7 +33,11 @@ set -a; . ./.env; set +a
 cargo run                                  # http://localhost:3008
 ```
 
-Migrations run at start. Sign-in codes are printed to the log. See
+Migrations run at start. Sign-in codes are printed to the log. Before
+`cargo test` in a checkout whose `.env` (or one above it) names a real
+database, read "Running them safely" in
+[docs/development.md](docs/development.md#running-them-safely): the tests
+load that file. See
 [docs/development.md](docs/development.md) for:
 - the settings;
 - the cargo features (`bir` and `ocr`);

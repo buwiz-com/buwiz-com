@@ -1,7 +1,8 @@
 //! Returns sent to BIR through the relay.
 //!
 //! 1. `POST /api/submissions` with the plaintext IAF XML and its file name.
-//!    The TIN in the name must be active on the account. The XML is kept,
+//!    The TIN, branch, form and period inside the XML must be the file
+//!    name's, and the TIN must be active on the account. The XML is kept,
 //!    encrypted, until it is sent or 24 hours pass.
 //! 2. `GET /api/submissions/{id}/relay` opens the WebSocket pipe (see
 //!    [`crate::relay`]). The server sends the return through it and answers
@@ -27,17 +28,18 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::account::oauth::Bearer;
+use crate::account::oauth::{BANNED_MESSAGE, Bearer};
 use crate::account::tin::Tin;
 use crate::base::crypto;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
 use crate::filing::devices::{self, Signed};
 use crate::filing::envelope::Envelope;
+use crate::filing::gate;
 use crate::filing::jws;
 use crate::filing::tickets::{self, TicketError};
 use crate::relay::{Control, Frame};
-use crate::sender::Job;
+use crate::sender::{Job, identity};
 
 const MAX_XML_BYTES: usize = 2 * 1024 * 1024;
 pub const BODY_LIMIT: usize = 3 * MAX_XML_BYTES;
@@ -99,22 +101,22 @@ pub async fn create(
     if xml.is_empty() || xml.len() > MAX_XML_BYTES {
         return Err(ApiError::bad_request("bad_xml", "the return must be 1 byte to 2 MB of XML"));
     }
+    // The account may send for the file name's TIN only if the return
+    // inside is for that TIN too: the same check the Sender makes on a
+    // sealed return against its ticket.
+    if let Err(reason) = identity::check_named(xml, &name) {
+        return Err(ApiError::Refused {
+            status: StatusCode::BAD_REQUEST,
+            code: "return_mismatch",
+            message: format!("The return does not match its file name: {reason}."),
+        });
+    }
     if let Some(key) = &request.idempotency_key
         && (key.is_empty() || key.len() > 100)
     {
         return Err(ApiError::bad_request("bad_idempotency_key", "idempotency_key must be 1 to 100 characters"));
     }
-    let claim_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND status = 'approved'",
-    )
-    .bind(bearer.account.id)
-    .bind(name.tin.root())
-    .bind(name.tin.branch())
-    .fetch_optional(&state.db)
-    .await?;
-    let Some(claim_id) = claim_id else {
-        return Err(ApiError::forbidden("tin_not_active", "this TIN is not active on your account"));
-    };
+    let claim_id = gate::own(&state.db, bearer.account.id, &name.tin).await?.sendable()?;
     if let Some(key) = &request.idempotency_key {
         let existing: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM submissions WHERE account_id = $1 AND idempotency_key = $2")
@@ -291,14 +293,9 @@ pub async fn create_v2(State(state): State<AppState>, signed: Signed<NewSubmissi
     let Some(spent) = spent else {
         return Err(ApiError::conflict("ticket_used", "this ticket was already used; ask for a new one"));
     };
-    let active: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tin_claims WHERE id = $1 AND status = 'approved')")
-            .bind(spent.claim_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if !active {
-        return Err(ApiError::forbidden("tin_not_active", "this TIN is not active on your account"));
-    }
+    // The TIN may have stopped being active since the ticket. Refusing
+    // drops the transaction, so the ticket is not spent.
+    gate::of_claim(&mut *tx, bearer.account.id, spent.claim_id).await?.sendable()?;
     let id = Uuid::new_v4();
     let filename = claims.filename();
     sqlx::query(
@@ -365,8 +362,9 @@ pub async fn relay(
     }))
 }
 
+/// A submission locked for sending, with what the Sender needs.
 #[derive(sqlx::FromRow)]
-struct Locked {
+pub struct Locked {
     form_type: String,
     period: String,
     filename: String,
@@ -378,40 +376,101 @@ struct Locked {
     branch_code: String,
 }
 
-async fn run_relay(state: AppState, mut socket: WebSocket, account_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+/// What the relay does with a submission when the app connects.
+pub enum RelayStart {
+    /// It was locked (`sending`): hand it to the Sender.
+    Send(Box<Locked>),
+    /// It cannot be sent now: tell the app why and close.
+    Answer(Control),
+}
+
+/// Locks a submission for one send, or says why it cannot go now. Runs once
+/// the relay's socket is open, so a ban or a change to the TIN after the
+/// request's token check still stops the send.
+pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow::Result<RelayStart> {
     // Only one send at a time, and never after `sent` or `unknown`. A v2
-    // submission gets one attempt: its ticket works once.
-    let locked: Option<Locked> = sqlx::query_as(
+    // submission gets one attempt: its ticket works once. The claim must be
+    // this account's and sendable, and the account not banned.
+    let locked: Option<Locked> = sqlx::query_as(&format!(
         "UPDATE submissions s SET status = 'sending', sending_since = now(), attempts = attempts + 1
-         FROM tin_claims c
-         WHERE s.id = $1 AND s.account_id = $2 AND c.id = s.claim_id AND c.status = 'approved'
+         FROM tin_claims c, accounts a
+         WHERE s.id = $1 AND s.account_id = $2 AND c.id = s.claim_id AND c.account_id = s.account_id AND {}
+           AND a.id = s.account_id AND a.banned_at IS NULL
            AND ((s.xml_ciphertext IS NOT NULL AND s.status IN ('ready', 'failed'))
              OR (s.envelope IS NOT NULL AND s.status = 'ready'))
            AND (s.device_id IS NULL OR EXISTS (SELECT 1 FROM devices d WHERE d.id = s.device_id AND d.revoked_at IS NULL))
          RETURNING s.form_type, s.period, s.filename, s.xml_nonce, s.xml_ciphertext, s.envelope,
                    (SELECT t.jws FROM tickets t WHERE t.jti = s.ticket_jti) AS ticket,
                    c.tin_root, c.branch_code",
+        gate::SENDABLE_SQL
+    ))
+    .bind(id)
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    if let Some(locked) = locked {
+        return Ok(RelayStart::Send(Box::new(locked)));
+    }
+    // A return still waiting whose account was banned or whose TIN stopped
+    // being active since: it is failed with the reason, so the app takes it
+    // back to a draft. Only a return still waiting: one `sending` on
+    // another connection keeps its own outcome.
+    let waiting: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT s.claim_id, a.banned_at IS NOT NULL FROM submissions s JOIN accounts a ON a.id = s.account_id
+         WHERE s.id = $1 AND s.account_id = $2",
     )
     .bind(id)
     .bind(account_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await?;
-    let Some(locked) = locked else {
-        let view = find(&state.db, account_id, id).await?;
-        let (status, error, receipt) = match view {
-            Some(view) if matches!(view.status.as_str(), "sent" | "dry_run") => {
-                (view.status, None, view.receipt_jws.map(Value::String))
-            }
-            Some(view) => {
-                let reason = format!("this submission cannot be sent now (status {})", view.status);
-                (view.status, Some(reason), None)
-            }
-            None => ("missing".to_owned(), Some("not found".to_owned()), None),
+    if let Some((claim_id, banned)) = waiting {
+        let refusal = if banned {
+            Some(("account_banned", format!("{BANNED_MESSAGE} (account_banned)")))
+        } else {
+            let standing = gate::of_claim(db, account_id, claim_id).await?;
+            (!standing.can_send()).then(|| (standing.code(), standing.failure()))
         };
-        let result = Control::Result { status, error, receipt };
-        let _ = socket.send(Message::Text(serde_json::to_string(&result)?.into())).await;
-        let _ = socket.send(Message::Close(None)).await;
-        return Ok(());
+        if let Some((code, error)) = refusal {
+            let failed = sqlx::query(
+                "UPDATE submissions SET status = 'failed', error = $3, envelope = NULL,
+                     purged_at = CASE WHEN envelope IS NOT NULL THEN now() ELSE purged_at END
+                 WHERE id = $1 AND account_id = $2 AND status IN ('ready', 'failed')
+                   AND (xml_ciphertext IS NOT NULL OR envelope IS NOT NULL)",
+            )
+            .bind(id)
+            .bind(account_id)
+            .bind(&error)
+            .execute(db)
+            .await?;
+            if failed.rows_affected() == 1 {
+                tracing::warn!(submission = %id, code, "submission not sent: its account or TIN cannot send");
+                let result = Control::Result { status: "failed".to_owned(), error: Some(error), receipt: None };
+                return Ok(RelayStart::Answer(result));
+            }
+        }
+    }
+    let view = find(db, account_id, id).await?;
+    let (status, error, receipt) = match view {
+        Some(view) if matches!(view.status.as_str(), "sent" | "dry_run") => {
+            (view.status, None, view.receipt_jws.map(Value::String))
+        }
+        Some(view) => {
+            let reason = format!("this submission cannot be sent now (status {})", view.status);
+            (view.status, Some(reason), None)
+        }
+        None => ("missing".to_owned(), Some("not found".to_owned()), None),
+    };
+    Ok(RelayStart::Answer(Control::Result { status, error, receipt }))
+}
+
+async fn run_relay(state: AppState, mut socket: WebSocket, account_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+    let locked = match claim_for_relay(&state.db, account_id, id).await? {
+        RelayStart::Send(locked) => locked,
+        RelayStart::Answer(result) => {
+            let _ = socket.send(Message::Text(serde_json::to_string(&result)?.into())).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return Ok(());
+        }
     };
 
     let v2 = locked.envelope.is_some();

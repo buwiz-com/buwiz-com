@@ -126,14 +126,20 @@ pub async fn start_session(db: &PgPool, account_id: Uuid) -> sqlx::Result<String
     Ok(token)
 }
 
+/// The account of a website session. A banned account has none: a ban
+/// ends its sessions, and this refuses any that is left.
 pub async fn session_account(db: &PgPool, token: &str) -> sqlx::Result<Option<Account>> {
     sqlx::query_as(
         "SELECT a.id, a.email FROM web_sessions s JOIN accounts a ON a.id = s.account_id
-         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now()",
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND a.banned_at IS NULL",
     )
     .bind(crypto::hash(token))
     .fetch_optional(db)
     .await
+}
+
+pub async fn is_banned(db: &PgPool, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await
 }
 
 pub async fn end_session(db: &PgPool, token: &str) -> sqlx::Result<()> {
@@ -144,46 +150,38 @@ pub async fn end_session(db: &PgPool, token: &str) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Ends every sign-in of an account: browser sessions, app and agent
-/// grants (which ends their access and refresh tokens), and sign-ins
-/// approved but not yet picked up by the app or agent.
-pub async fn sign_out_everywhere(db: &PgPool, account_id: Uuid) -> sqlx::Result<()> {
-    let mut tx = db.begin().await?;
+/// Ends an account's browser sessions and the sign-ins approved but not yet
+/// picked up by an app or agent; with `grants`, also every app and agent
+/// grant (which ends their access and refresh tokens). Staff sign an account
+/// out everywhere with `grants`; a ban leaves the grants (the API refuses a
+/// banned account's calls anyway).
+pub(crate) async fn end_sign_ins(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    grants: bool,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE web_sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL")
         .bind(account_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    sqlx::query(
-        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_everywhere'
-         WHERE account_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(account_id)
-    .execute(&mut *tx)
-    .await?;
+    if grants {
+        sqlx::query(
+            "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_everywhere'
+             WHERE account_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(account_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     sqlx::query("UPDATE device_authorizations SET consumed_at = now() WHERE account_id = $1 AND consumed_at IS NULL")
         .bind(account_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("UPDATE oauth_codes SET used_at = now() WHERE account_id = $1 AND used_at IS NULL")
         .bind(account_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    tx.commit().await?;
-    tracing::info!(%account_id, "signed out everywhere");
     Ok(())
-}
-
-/// Ends one app's or agent's sign-in on the account.
-pub async fn sign_out_app(db: &PgPool, account_id: Uuid, grant_id: Uuid) -> sqlx::Result<bool> {
-    let updated = sqlx::query(
-        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_by_staff'
-         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
-    )
-    .bind(grant_id)
-    .bind(account_id)
-    .execute(db)
-    .await?;
-    Ok(updated.rows_affected() == 1)
 }
 
 /// The value of cookie `name` in a `Cookie` header map.

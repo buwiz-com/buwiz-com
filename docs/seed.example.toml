@@ -1,12 +1,25 @@
-# An example file for `buwiz-cloud seed <FILE> --as <admin email> [--dry-run]`.
+# An example file for `buwiz-cloud seed` (docs/deploy.md has the run).
 # Synthetic data only. Write the real file outside the repository.
 #
 # One [[login]] per Buwiz login. A key left out keeps what the database
-# has. A key given wins, so a role can be lowered (`none` takes it away).
-# A TIN is never made "not verified" again once active, but `move_from`
-# ends the old account's ownership, and deletes a claim still waiting for
-# review on the old account, files and all. Running the same file again
-# changes nothing.
+# has. A key given wins over the database, with these exceptions, each
+# printed with its reason:
+# - a role or test label whose newest change staff made on the website is
+#   kept ("kept role …"); change it there if the file is right;
+# - the role of the --as Admin running the file never changes (only the
+#   first Admin, on a server without ADMIN_EMAILS, is made this way);
+# - a TIN this login ended on the website (revoked, removed, rejected or
+#   deleted), and an active TIN that was ever paused on any login, refuse
+#   the whole file until its entry says `reapply = true`;
+# - an active TIN is never made "not verified" again, and a paused one is
+#   left paused.
+# A role can be lowered (`none` takes it away). `move_from` ends the old
+# account's ownership, and deletes a claim still waiting for review on the
+# old account, files and all; it refuses an old owner whose TIN is paused.
+#
+# Running the same file again changes nothing when nothing changed in
+# between; when staff changed something on the website in between, it
+# still changes none of that (see "Running it again" in docs/deploy.md).
 
 [[login]]
 email = "admin@example.test"
@@ -26,6 +39,8 @@ test = true                 # a label staff see; sends work as usual
   name = "JANE EXAMPLE"     # the registered name
   state = "active"          # active | not_verified
   reason = "Owner's test login"   # required for active; staff see it only
+  # reapply = true          # only to bring back a TIN ended on the website,
+                            # or to activate one that was ever paused
 
 [[login]]
 email = "shop@example.test"
@@ -47,8 +62,10 @@ email = "juan@example.test"
 
 # To move a TIN that is active (or waiting for review) on another login,
 # name that login. Its active row is ended (its returns stay with it); a
-# claim still waiting for review is deleted. The old login never sees who
-# has the TIN now.
+# claim still waiting for review is deleted, with its files (the run needs
+# the server's S3_* settings for that). The old login never sees who has
+# the TIN now. A TIN paused on the old login does not move: resume or
+# revoke it on /staff first.
 #
 # [[login]]
 # email = "new-owner@example.test"

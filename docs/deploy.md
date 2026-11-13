@@ -205,39 +205,114 @@ database with a row in every state.
 
 ### The seed tool
 
-`buwiz-cloud seed <FILE> --as <admin email> [--dry-run]` makes logins,
-roles, test labels and TINs from one TOML file, in one transaction
-(`docs/seed.example.toml`; `src/account/seed.rs`). It reads
-`DATABASE_URL`, `ADMIN_EMAILS` and the `S3_*` settings. It needs `S3_*` to
-delete from R2 the files of a waiting claim that a `move_from` deletes;
-without them it uses the database store and those objects stay behind, so
-always run it with the service's settings. It runs no migration and refuses
-a database not at this release's newest migration.
+`buwiz-cloud seed` makes logins, roles, test labels and TINs from one TOML
+file, in one transaction (`docs/seed.example.toml`; `src/account/seed.rs`):
 
-What it prints: the target database (host and name, no password), the
-account and claim counts before, the file's SHA-256, one line per change
-(`created login …`, `role … none → support`, `TIN … active on … (new)`,
-`unchanged …`), and the number of changes. A dry run shows full TINs:
-check every digit. Exit codes: 0 done or dry run, 2 refused (with every
-reason; nothing written), 1 an error (nothing written). Each run is one
-`seed_runs` row and one audit line per change.
+```text
+usage: buwiz-cloud seed <FILE> --as <admin email> --dry-run [--no-admin-emails]
+       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> [--expect <digest>] [--no-admin-emails]
+```
+
+It reads `DATABASE_URL`, `ADMIN_EMAILS` and the `S3_*` settings, so it runs
+**on the instance, with the service's own settings file**, like the other
+server-side commands (`deploy/ec2/trust-list.sh`): `systemd-run -p
+EnvironmentFile=/etc/buwiz/env`. Never run it from a shell with settings
+of its own.
+
+- **Who is an Admin** comes from the server's `ADMIN_EMAILS`. The command
+  refuses to run when `ADMIN_EMAILS` is not set, unless `--no-admin-emails`
+  says the server has none (both at once is refused too). It prints the
+  list it used. While the server has a list, `--as` must be an Admin (in
+  that list or by stored role); the file can make `--as` the first Admin
+  only on a server without the list and a database with no Admin. `--as`
+  cannot change its own role.
+- **The database** it writes to must be named: a real run needs `--target
+  host:port/name`, equal to the database it is connected to (the host and
+  port of `DATABASE_URL`, the name the server reports). The dry run prints
+  the exact value, and a plan digest for `--expect`: a real run given it
+  refuses if the plan is no longer the one the dry run showed (the
+  database, `--as`, `ADMIN_EMAILS`, the file, or anything it would change
+  or keep).
+- **Before it writes**, a real run prints the database, the account and
+  claim counts, `ADMIN_EMAILS`, the file's SHA-256, the plan digest and
+  every planned line, then commits.
+- **Files**: a `move_from` that deletes a claim waiting for review deletes
+  its files from R2 after the commit. Without `S3_*` such a move is
+  refused. A file it could not delete is listed on stderr with the seed
+  run's id, and the command exits 1: delete those objects by hand.
+- **TINs** are shown in full only in a dry run. A real run masks them
+  everywhere, refusals included, and `seed_runs` stores them masked.
+- It waits at most 5 seconds for a lock another change holds (a role
+  change, a ban, a claim being decided), then gives up having written
+  nothing: run it again.
+- It runs no migration, and refuses a database whose applied migrations
+  are not exactly this release's (by number and checksum).
+
+Exit codes: 0 done or dry run; 2 refused, with every reason, nothing
+written; 1 an error, nothing written, or (with "The changes were made")
+files left in R2. Each real run is one `seed_runs` row (who ran it as
+`--as`, the OS user and the one behind `sudo`, the host, the target, the
+file's SHA-256, the plan digest, and what changed) and one audit line per
+account or claim it changes or makes, the `--as` account included.
+
+#### Running it
 
 1. Write the file on the Mac, outside the repository. Make a Neon branch.
-2. Deploy this release. In an SSM session, put the file at
-   `/tmp/seed.toml`, owned by `buwiz`, mode 600.
-3. Dry run, with the service's settings:
+2. Deploy this release. In an SSM session, put the file on the instance,
+   readable by `buwiz` only:
    ```sh
-   sudo systemd-run --uid=buwiz --pty --wait -p EnvironmentFile=/etc/buwiz/env \
+   sudo install -o buwiz -g buwiz -m 600 /dev/stdin /tmp/seed.toml   # paste the file, then Ctrl-D
+   ```
+3. Dry run, with the service's settings (`--as` is your Admin login, one
+   of the server's `ADMIN_EMAILS` the first time):
+   ```sh
+   sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
+     -E SUDO_USER -E RUST_LOG=off \
      /opt/buwiz/buwiz-cloud seed /tmp/seed.toml --as <admin login> --dry-run
    ```
-   Read every line: the database, the counts, each TIN.
-4. Run it again without `--dry-run`, then delete `/tmp/seed.toml`.
-5. Each address must be able to receive mail before anyone can sign in as
+   Read every line: `Database:` is the production database; `Before:`
+   has the counts you expect; `ADMIN_EMAILS:` is the server's list; every
+   digit of every TIN; every `kept …` line (staff changed it on the
+   website; the file loses) and every `refused TIN …`. If it refuses, fix
+   the file (or the database, on `/staff`) and dry-run again. Its last
+   line is the rest of the real run's command:
+   `--target <host:port/name> --expect <digest>`.
+4. The real run: the same command, the same `--as`, with that line in
+   place of `--dry-run`:
+   ```sh
+   sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
+     -E SUDO_USER -E RUST_LOG=off \
+     /opt/buwiz/buwiz-cloud seed /tmp/seed.toml --as <admin login> \
+     --target <host:port/name> --expect <digest>
+   echo "exit $?"
+   ```
+   It prints the same plan (TINs masked), then `N change(s) made, recorded
+   as seed run <id>.` Exit 0 is done. If it refuses because the plan
+   changed, someone changed the database in between: go back to step 3.
+5. `sudo rm /tmp/seed.toml`.
+6. Each address must be able to receive mail before anyone can sign in as
    it.
 
-To be completed by the seed hardening pass: which `ADMIN_EMAILS` the tool
-uses when it is run outside the service, and how it confirms the target
-database before writing. Until then, run it only as above.
+#### Running it again
+
+Running the same file again **changes nothing when nothing changed in
+between**: every line reads `unchanged …` (or `refused TIN …` for a TIN
+that is not valid), it makes 0 changes ("Nothing to change."), and adds
+only its own `seed_runs` row.
+
+When staff or owners changed something on the website in between, a
+re-run still never undoes it:
+- a role or test label whose newest change was made on the website is
+  kept, and printed as `kept role …` or `kept test label …` (not counted
+  as a change);
+- a TIN this login had and that was revoked, removed by its owner,
+  rejected or deleted on the website, and an active TIN that was ever
+  paused on any login, refuse the whole file until the entry says
+  `reapply = true` (or is taken out of the file);
+- a TIN already active is never made "not verified", and a paused one
+  stays paused;
+- the `--as` Admin's own role never changes.
+Everything else that differs from the file is changed, and printed.
 
 ### Automatic activation
 

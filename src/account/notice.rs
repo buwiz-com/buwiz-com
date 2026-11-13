@@ -123,6 +123,7 @@ notices! {
     ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
     AutoConfirmed = "auto_confirmed" => info "Confirmed. The papers were deleted.",
     NotAuto = "not_auto" => error "This TIN was not activated automatically, or it was already confirmed.",
+    AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
 }
 
 #[cfg(test)]

@@ -621,3 +621,61 @@ async fn claimants_replace_and_remove_files_while_open(db: PgPool) {
         assert_eq!(location(&response), "/tins?notice=files_locked", "{status}");
     }
 }
+
+/// Each review decision leaves its own audit line (who, when, what, from
+/// where), so a second send-back or the claimant deleting the claim does
+/// not erase who decided.
+#[sqlx::test(migrations = "./migrations")]
+async fn every_review_decision_has_an_audit_line_that_outlives_the_claim(db: PgPool) {
+    let site = Site::new(db);
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (_, staff) = site.person(STAFF).await;
+    let (cora, cora_cookie) = site.person("cora@example.test").await;
+    site.upload("/tins/claims", &cora_cookie, &BUSINESS).await;
+    let claim = site.newest_claim(cora).await;
+    let decide = format!("/staff/claims/{claim}/decision");
+    let resend = format!("/tins/claims/{claim}/resend");
+    let fix = [("registered_name", Text("Cora Trading Inc")), ("supporting", File("more.pdf", PDF))];
+
+    let response = site.post(&decide, &support, "decision=fix&reasons=blurry&note=Retake+it").await;
+    assert_eq!(location(&response), "/staff?notice=claim_sent_back");
+    site.upload(&resend, &cora_cookie, &fix).await;
+    let response = site.post(&decide, &staff, "decision=fix&reasons=name_mismatch").await;
+    assert_eq!(location(&response), "/staff?notice=claim_sent_back");
+    let response = site.post(&decide, &support, "decision=reject&note=Not+the+company%27s+papers").await;
+    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    let response = site.post(&format!("/tins/claims/{claim}/delete"), &cora_cookie, "").await;
+    assert_eq!(location(&response), "/tins?notice=claim_deleted");
+    assert!(!claim_exists(&site.db, claim).await);
+
+    let lines = claim_audit_lines(&site.db, cora).await;
+    let lines: Vec<(&str, &str, &str, &str, Option<&str>)> = lines
+        .iter()
+        .map(|line| (line.0.as_str(), line.1.as_str(), line.2.as_str(), line.3.as_str(), line.4.as_deref()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("sent_back", "pending", "helper@example.test", "web", Some("Blurry photo: Retake it")),
+            ("sent_back", "pending", STAFF, "web", Some("Name doesn't match")),
+            // Rejected while waiting for the second fix.
+            ("rejected", "needs_fix", "helper@example.test", "web", Some("Not the company's papers")),
+            ("deleted", "rejected", "cora@example.test", "web", None),
+        ]
+    );
+    // The staff history names who decided, the claim long gone.
+    let history = text(site.get(&format!("/staff/users/{cora}"), &staff).await).await;
+    assert!(history.contains("Staff helper@example.test rejected a claim on ***-***-321-00000"), "{history}");
+    assert!(history.contains("Staff helper@example.test sent ***-***-321-00000 back for a fix"), "{history}");
+
+    // An approval has its line too.
+    site.upload("/tins/claims", &cora_cookie, &BUSINESS).await;
+    let again = site.newest_claim(cora).await;
+    let response = site.post(&format!("/staff/claims/{again}/decision"), &support, "decision=approve").await;
+    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    let last = claim_audit_lines(&site.db, cora).await.pop().unwrap();
+    assert_eq!(
+        (last.0.as_str(), last.1.as_str(), last.2.as_str(), last.3.as_str(), last.4),
+        ("approved", "pending", "helper@example.test", "web", None)
+    );
+}

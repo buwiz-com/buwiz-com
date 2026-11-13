@@ -195,11 +195,14 @@ async fn a_claim_is_read_after_it_is_sent(db: PgPool) {
 
     // Deciding the claim purges the file, and the reading goes with it.
     let reviewer: uuid::Uuid =
-        sqlx::query_scalar("INSERT INTO accounts (email) VALUES ('staff@example.test') RETURNING id")
+        sqlx::query_scalar("INSERT INTO accounts (email, role) VALUES ('staff@example.test', 'support') RETURNING id")
             .fetch_one(&db)
             .await
             .unwrap();
-    claims::decide(&db, &state.documents, claim_id, reviewer, &claims::Decision::Approve, "").await.unwrap();
+    let reviewer = buwiz_cloud::account::accounts::Account { id: reviewer, email: "staff@example.test".into() };
+    claims::decide(&db, &state.config, &state.documents, claim_id, &reviewer, &claims::Decision::Approve, "")
+        .await
+        .unwrap();
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM document_readings").fetch_one(&db).await.unwrap();
     assert_eq!(left, 0);
 }

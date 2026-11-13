@@ -938,7 +938,7 @@ async fn decide_claim(
         "fix" => Decision::SendBack(reasons),
         _ => return (StatusCode::BAD_REQUEST, "unknown decision").into_response(),
     };
-    match claims::decide(&state.db, &state.documents, claim_id, reviewer.id, &decision, &note).await {
+    match claims::decide(&state.db, &state.config, &state.documents, claim_id, &reviewer, &decision, &note).await {
         Ok(notice) => see_other(link("/staff", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),

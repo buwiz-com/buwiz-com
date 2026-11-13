@@ -33,7 +33,9 @@ use uuid::Uuid;
 use crate::account::accounts::Account;
 use crate::account::notice::Notice;
 use crate::account::oauth::Bearer;
+use crate::account::roles::{self, Power, Role};
 use crate::account::tin::Tin;
+use crate::base::config::Config;
 use crate::base::crypto;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
@@ -807,31 +809,40 @@ pub enum Decision {
 
 /// Staff approve, reject or send back a claim. Approving and rejecting end
 /// it (also a claim waiting for a fix that never came); only a claim
-/// waiting for review can be sent back.
+/// waiting for review can be sent back. Each decision writes a line in
+/// `claim_audit` in the same transaction (who, the decision, the reasons),
+/// so neither a later send-back nor the claimant deleting the claim erases
+/// who decided. Approving a TIN that was ever paused, on any account, is an
+/// Admin's call. The reviewer's role is checked again inside the
+/// transaction.
 pub async fn decide(
     db: &PgPool,
+    config: &Config,
     store: &DocumentStore,
     claim_id: Uuid,
-    reviewer_id: Uuid,
+    reviewer: &Account,
     decision: &Decision,
     note: &str,
 ) -> Result<Notice, DecideError> {
     let mut tx = db.begin().await?;
-    let row: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT account_id, status FROM tin_claims WHERE id = $1 FOR UPDATE")
-            .bind(claim_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((claimant, status)) = row else {
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    if claimant == reviewer_id {
+    if claim.account_id == reviewer.id {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
-    if *decision == Decision::Approve && is_banned(&mut tx, claimant).await? {
+    let role = roles::recheck(&mut tx, config, reviewer.id).await?;
+    if !role.is_some_and(|role| role.can(Power::Review)) {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if *decision == Decision::Approve && is_banned(&mut tx, claim.account_id).await? {
         return Err(DecideError::Refused(Notice::ClaimantBanned));
     }
+    if *decision == Decision::Approve && role != Some(Role::Admin) && was_paused(&mut tx, &claim.tin).await? {
+        return Err(DecideError::Refused(Notice::AdminMustDecide));
+    }
     let note = note.trim();
+    let status = claim.status.as_str();
     if let Decision::SendBack(reasons) = decision {
         if status != "pending" {
             return Err(DecideError::Refused(Notice::AlreadyDecided));
@@ -850,14 +861,21 @@ pub async fn decide(
         .bind(claim_id)
         .bind(reasons)
         .bind(note)
-        .bind(reviewer_id)
+        .bind(reviewer.id)
         .execute(&mut *tx)
         .await?;
+        let labels: Vec<&str> = reasons.iter().filter_map(|code| fix_reason(code)).map(|(label, _)| label).collect();
+        let why = match (labels.join(", "), note) {
+            (labels, "") => labels,
+            (labels, note) if labels.is_empty() => note.to_owned(),
+            (labels, note) => format!("{labels}: {note}"),
+        };
+        audit(&mut tx, &claim, reviewer, "sent_back", None, Some(&why)).await?;
         tx.commit().await?;
-        tracing::info!(%claim_id, %reviewer_id, "tin claim sent back");
+        tracing::info!(%claim_id, reviewer = %reviewer.id, "tin claim sent back");
         return Ok(Notice::ClaimSentBack);
     }
-    if !matches!(status.as_str(), "pending" | "needs_fix") {
+    if !matches!(status, "pending" | "needs_fix") {
         return Err(DecideError::Refused(Notice::AlreadyDecided));
     }
     let approve = *decision == Decision::Approve;
@@ -872,7 +890,7 @@ pub async fn decide(
     )
     .bind(claim_id)
     .bind(status)
-    .bind(reviewer_id)
+    .bind(reviewer.id)
     .bind(note)
     .execute(&mut *tx)
     .await;
@@ -885,10 +903,32 @@ pub async fn decide(
         }
     }
     let objects = purge_documents(&mut tx, claim_id).await?;
+    audit(&mut tx, &claim, reviewer, status, None, Some(note).filter(|note| !note.is_empty())).await?;
     tx.commit().await?;
     store.delete_all(&objects).await;
-    tracing::info!(%claim_id, %reviewer_id, status, "tin claim decided");
+    tracing::info!(%claim_id, reviewer = %reviewer.id, status, "tin claim decided");
     Ok(Notice::ClaimDecided)
+}
+
+/// [`was_paused`], outside a transaction (for the pages).
+pub async fn paused_ever(db: &PgPool, tin: &Tin) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let paused = was_paused(&mut tx, tin).await?;
+    tx.rollback().await?;
+    Ok(paused)
+}
+
+/// Whether sending for this TIN was ever paused, on any account's claim.
+pub async fn was_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, tin: &Tin) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id
+                        WHERE c.tin_root = $1 AND c.branch_code = $2 AND a.action = 'paused')
+             OR EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND paused_at IS NOT NULL)",
+    )
+    .bind(tin.root())
+    .bind(tin.branch())
+    .fetch_one(&mut **tx)
+    .await
 }
 
 /// Whether the account is banned. A banned account gets no active TIN.
@@ -998,6 +1038,7 @@ struct Locked {
     account_id: Uuid,
     kind: String,
     status: String,
+    tin: Tin,
     tin_masked: String,
 }
 
@@ -1008,12 +1049,9 @@ async fn lock_claim(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uu
     .bind(claim_id)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(row.map(|(account_id, kind, status, root, branch)| Locked {
-        id: claim_id,
-        account_id,
-        kind,
-        status,
-        tin_masked: Tin::parse(&root, &branch).expect("stored TINs are valid").masked(),
+    Ok(row.map(|(account_id, kind, status, root, branch)| {
+        let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+        Locked { id: claim_id, account_id, kind, status, tin_masked: tin.masked(), tin }
     }))
 }
 

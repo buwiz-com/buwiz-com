@@ -417,6 +417,8 @@ pub mod claim_id {
         let compare = comparison(&claim, kind, reading.as_ref());
         let (status_label, status_icon, status_tone) = status_look(claim.shown_status());
         let pauses = claims::pauses(db, &claim.tin()).await?;
+        // Opening sending again on a TIN that was paused is an Admin's call.
+        let admin_must_approve = !reviewer.can(Power::Pause) && claims::paused_ever(db, &claim.tin()).await?;
         let paused_by = match claim.paused_at {
             Some(_) => sqlx::query_scalar::<_, String>(
                 "SELECT a.email FROM tin_claims c JOIN accounts a ON a.id = c.paused_by WHERE c.id = $1",
@@ -599,10 +601,14 @@ pub mod claim_id {
                             } else if claim.is_open() {
                                 <form class="panel side-card decision" method="post" action=(decide)>
                                     <h2>"Decision"</h2>
-                                    <button class="btn btn-solid btn-block" type="submit" name="decision" value="approve">
-                                        icon(name: "verified")
-                                        <span class="ellipsis">"Approve: " (claim.email.clone()) " owns this TIN"</span>
-                                    </button>
+                                    if admin_must_approve {
+                                        <p class="side-text">"Sending for this TIN was paused before: an admin must approve it. You can still send it back or reject it."</p>
+                                    } else {
+                                        <button class="btn btn-solid btn-block" type="submit" name="decision" value="approve">
+                                            icon(name: "verified")
+                                            <span class="ellipsis">"Approve: " (claim.email.clone()) " owns this TIN"</span>
+                                        </button>
+                                    }
                                     if claim.status == "pending" {
                                         <p class="decision-or">"Or send it back with a reason"</p>
                                         <div class="reason-chips">
@@ -1332,6 +1338,9 @@ fn audit_icon(action: &str) -> &'static str {
         "removed" => "remove_circle",
         "revoked" => "block",
         "file_replaced" => "swap_horiz",
+        "approved" => "verified",
+        "rejected" => "cancel",
+        "sent_back" => "assignment_return",
         "activated" | "auto_activated" | "auto_confirmed" => "verified",
         "paused" => "pause_circle",
         "resumed" => "play_circle",
@@ -1372,6 +1381,9 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "revoked" => format!("revoked the ownership of {tin}"),
         "file_replaced" => format!("replaced the {file} on {tin}"),
         "created" => format!("added {tin} without papers"),
+        "approved" => format!("approved {tin}"),
+        "rejected" => format!("rejected a claim on {tin}"),
+        "sent_back" => format!("sent {tin} back for a fix"),
         "activated" => format!("activated {tin} without papers"),
         "auto_activated" => format!("activated {tin} automatically"),
         "auto_confirmed" => format!("confirmed the automatic activation of {tin}"),

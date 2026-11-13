@@ -150,6 +150,25 @@ pub async fn other_admins(
     .await
 }
 
+/// The role `account_id` has as the database stands now, read with a share
+/// lock: a role change or ban of that account waits for the caller's
+/// transaction to end, and one that committed first is seen. Every staff
+/// action rechecks its actor this way inside its own transaction, so a
+/// request that passed the page's check just before its actor was demoted
+/// or banned does nothing.
+pub async fn recheck(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &Config,
+    account_id: uuid::Uuid,
+) -> sqlx::Result<Option<Role>> {
+    let row: Option<(String, Option<String>, bool)> =
+        sqlx::query_as("SELECT email, role, banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR SHARE")
+            .bind(account_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.and_then(|(email, role, banned)| of(config, &email, role.as_deref(), banned)).map(|(role, _)| role))
+}
+
 /// Serialises every change to roles and bans (the staff pages and the seed
 /// tool) for the rest of the transaction, so two Admins demoting each other
 /// at once cannot both pass the "someone stays Admin" check.

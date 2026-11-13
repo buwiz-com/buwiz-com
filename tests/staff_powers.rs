@@ -50,6 +50,8 @@ struct Target {
     spare: Uuid,
     /// Active.
     active: Uuid,
+    /// Waiting for review, on a TIN another account had paused.
+    paused_before: Uuid,
     document: Uuid,
     grant: Uuid,
 }
@@ -74,13 +76,26 @@ async fn target(site: &Site, n: u32) -> Target {
     let unverified = add_claim(&site.db, account, &format!("2{n:08}"), "unverified").await;
     let active = add_claim(&site.db, account, &format!("3{n:08}"), "approved").await;
     let spare = add_claim(&site.db, account, &format!("4{n:08}"), "unverified").await;
+    // Paused once on someone else's account, which then lost it.
+    let (earlier, _) = site.person(&format!("earlier{n}@example.test")).await;
+    let ended = add_claim(&site.db, earlier, &format!("7{n:08}"), "revoked").await;
+    sqlx::query(
+        "INSERT INTO claim_audit (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
+         VALUES ($1, $2, '***-***-000-00000', 'paused', 'approved', $2, 'staff@example.test', 'Complaint', 'web')",
+    )
+    .bind(ended)
+    .bind(earlier)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let paused_before = add_claim(&site.db, account, &format!("7{n:08}"), "pending").await;
     app_token(&site.db, account).await;
     let grant = sqlx::query_scalar("SELECT id FROM oauth_grants WHERE account_id = $1")
         .bind(account)
         .fetch_one(&site.db)
         .await
         .unwrap();
-    Target { account, open, unverified, spare, active, document, grant }
+    Target { account, open, unverified, spare, active, paused_before, document, grant }
 }
 
 /// The actors of the matrix, each signed in (but the first).
@@ -185,6 +200,18 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         )
         .await;
         assert_eq!(site.claim_status(t.open).await == "approved", who.may(false), "{who:?}");
+
+        // Approving a TIN that was paused before (on another account):
+        // Admins only, and Support hears why.
+        let claim_page = format!("/staff/claims/{}", t.paused_before);
+        let response = site.post(&format!("{claim_page}/decision"), &cookie, "decision=approve").await;
+        match who {
+            Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?}"),
+            Who::User => assert_eq!(response.status(), StatusCode::NOT_FOUND, "{who:?}"),
+            Who::Support => assert_eq!(location(&response), format!("{claim_page}?notice=admin_must_decide")),
+            Who::Admin | Who::ServerAdmin => assert_eq!(location(&response), "/staff?notice=claim_decided"),
+        }
+        assert_eq!(site.claim_status(t.paused_before).await == "approved", who.may(true), "{who:?}");
 
         // Delete a claim: Admins only.
         let claim_page = format!("/staff/claims/{}", t.unverified);

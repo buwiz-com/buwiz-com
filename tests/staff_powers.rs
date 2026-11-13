@@ -316,6 +316,36 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             .unwrap();
         assert_eq!(confirmed, who.may(false), "{who:?}");
 
+        // Confirm one Buwiz paused for waiting too long: lifting that pause
+        // is an Admin's, with a reason; Support hears why.
+        let paused_auto = add_claim(&site.db, t.account, &format!("8{n:08}"), "approved").await;
+        sqlx::query(
+            "UPDATE tin_claims SET verified_by = 'auto', decided_by = NULL, paused_at = now(), pause_reason = 'Unconfirmed'
+             WHERE id = $1",
+        )
+        .bind(paused_auto)
+        .execute(&site.db)
+        .await
+        .unwrap();
+        let claim_page = format!("/staff/claims/{paused_auto}");
+        site.hit(&format!("{claim_page}/confirm"));
+        let response = site.post(&format!("{claim_page}/confirm"), &cookie, "reason=Checked").await;
+        match who {
+            Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?}"),
+            Who::User => assert_eq!(response.status(), StatusCode::NOT_FOUND, "{who:?}"),
+            Who::Support => assert_eq!(location(&response), format!("{claim_page}?notice=admin_must_confirm")),
+            Who::Admin | Who::ServerAdmin => {
+                assert_eq!(location(&response), format!("{claim_page}?notice=auto_confirmed"))
+            }
+        }
+        let (confirmed, paused): (bool, bool) =
+            sqlx::query_as("SELECT auto_confirmed_at IS NOT NULL, paused_at IS NOT NULL FROM tin_claims WHERE id = $1")
+                .bind(paused_auto)
+                .fetch_one(&site.db)
+                .await
+                .unwrap();
+        assert_eq!((confirmed, !paused), (who.may(true), who.may(true)), "{who:?}");
+
         // Change a role: Admins only.
         let path = format!("{user}/role");
         let done = format!("{user}?notice=role_changed");
@@ -693,6 +723,64 @@ async fn every_admin_action_rechecks_its_actor_in_its_transaction(db: PgPool) {
     assert!(still_paused);
     assert!(claim_audit_lines(db, ana).await.is_empty());
     assert!(account_audit_lines(db, ana).await.is_empty() && account_audit_lines(db, dan).await.is_empty());
+}
+
+/// Support's own actions (confirm, sign out everywhere, sign one app out)
+/// recheck their actor too: one demoted after the page's check does
+/// nothing, and an Admin demoted to Support no longer signs out an Admin.
+#[sqlx::test(migrations = "./migrations")]
+async fn support_actions_recheck_their_actor_in_their_transaction(db: PgPool) {
+    let site = Site::with_admins(db, &[]);
+    let (db, config, store) = (&site.db, &site.state.config, &site.state.documents);
+    let (helper, _) = site.staff_with_role("helper@example.test", "support").await;
+    let (boss, _) = site.staff_with_role("boss@example.test", "admin").await;
+    let (other, _) = site.staff_with_role("other@example.test", "admin").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let auto = add_claim(db, ana, "000123451", "approved").await;
+    sqlx::query("UPDATE tin_claims SET verified_by = 'auto', decided_by = NULL WHERE id = $1")
+        .bind(auto)
+        .execute(db)
+        .await
+        .unwrap();
+    app_token(db, ana).await;
+    let grant: Uuid =
+        sqlx::query_scalar("SELECT id FROM oauth_grants WHERE account_id = $1").bind(ana).fetch_one(db).await.unwrap();
+    app_token(db, other).await;
+    let sessions = live_sessions(db, ana).await;
+
+    let admin_only = |outcome: Result<Notice, DecideError>| match outcome {
+        Err(DecideError::Refused(Notice::AdminOnly)) => {}
+        other => panic!("not refused: {other:?}"),
+    };
+    // The page saw Support; then an Admin took the role away.
+    let staff = as_staff(&site, helper).await;
+    sqlx::query("UPDATE accounts SET role = NULL WHERE id = $1").bind(helper).execute(db).await.unwrap();
+    admin_only(buwiz_cloud::account::verify::confirm(db, config, store, auto, &staff.account, "").await);
+    admin_only(admin::sign_out(db, config, &staff, ana, "Lost laptop").await);
+    admin_only(admin::sign_out_app(db, config, &staff, ana, grant, "Lost phone").await);
+    // The page saw an Admin, now Support: an Admin is no longer theirs to
+    // sign out.
+    let staff = as_staff(&site, boss).await;
+    sqlx::query("UPDATE accounts SET role = 'support' WHERE id = $1").bind(boss).execute(db).await.unwrap();
+    admin_only(admin::sign_out(db, config, &staff, other, "Lost laptop").await);
+
+    let confirmed: bool = sqlx::query_scalar("SELECT auto_confirmed_at IS NOT NULL FROM tin_claims WHERE id = $1")
+        .bind(auto)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(!confirmed);
+    assert!(!grant_revoked(db, grant).await);
+    assert_eq!(live_sessions(db, ana).await, sessions);
+    let other_grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM oauth_grants WHERE account_id = $1 AND revoked_at IS NULL")
+            .bind(other)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_eq!(other_grants, 1);
+    assert!(claim_audit_lines(db, ana).await.is_empty());
+    assert!(account_audit_lines(db, ana).await.is_empty() && account_audit_lines(db, other).await.is_empty());
 }
 
 /// A staff member who is also a claimant never reads the reasons staff

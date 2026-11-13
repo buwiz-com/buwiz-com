@@ -1061,8 +1061,14 @@ async fn resume_claim(
 }
 
 /// Support or an Admin confirms an automatic activation after checking its
-/// papers, which are then deleted.
-async fn confirm_auto(State(state): State<AppState>, headers: HeaderMap, Path(claim_id): Path<Uuid>) -> Response {
+/// papers, which are then deleted. A paused one is an Admin's, with a
+/// reason when it lifts Buwiz's pause.
+async fn confirm_auto(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
@@ -1071,7 +1077,15 @@ async fn confirm_auto(State(state): State<AppState>, headers: HeaderMap, Path(cl
         Ok(staff) => staff,
         Err(response) => return response,
     };
-    let outcome = crate::account::verify::confirm(&state.db, &state.documents, claim_id, &staff.account).await;
+    let outcome = crate::account::verify::confirm(
+        &state.db,
+        &state.config,
+        &state.documents,
+        claim_id,
+        &staff.account,
+        &form.reason,
+    )
+    .await;
     staff_outcome(&back_to, outcome)
 }
 

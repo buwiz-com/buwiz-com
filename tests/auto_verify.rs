@@ -458,8 +458,11 @@ async fn an_activation_nobody_confirms_in_30_days_is_paused_with_its_papers(db: 
     let page = text(site.get(&format!("/staff/claims/{claim}"), &admin).await).await;
     assert!(page.contains("Paused by Buwiz on"), "{page}");
 
-    // An Admin confirms: the pause Buwiz made is lifted and the papers go.
+    // An Admin confirms, with a reason: the pause Buwiz made is lifted and
+    // the papers go.
     let response = site.post(&format!("/staff/claims/{claim}/confirm"), &admin, "").await;
+    assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=reason_missing"));
+    let response = site.post(&format!("/staff/claims/{claim}/confirm"), &admin, "reason=Papers+checked").await;
     assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=auto_confirmed"));
     assert!(gate::own(&site.db, ana, &tin).await.unwrap().can_send());
     assert_eq!(papers(&site.db, claim).await, (0, 0));
@@ -624,4 +627,61 @@ async fn another_account_at_another_branch_counts(db: PgPool) {
     let (_, _, _, document) = sent(&site, "jo@example.test", "000123561").await;
     read_clearly(&site.db, document, "000123561").await;
     assert_eq!(doubts(consider(&site, document).await), [Doubt::OtherAccount]);
+}
+
+/// Confirming lifts Buwiz's own pause, and only an Admin reopens a paused
+/// TIN: Support confirms only one that is not paused, and an Admin lifting
+/// Buwiz's pause gives a reason.
+#[sqlx::test(migrations = "./migrations")]
+async fn only_an_admin_confirms_a_paused_activation(db: PgPool) {
+    let site = Site::with_auto(db);
+    let (_, admin) = site.staff_with_role("boss@example.test", "admin").await;
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _, claim, document) = sent(&site, "ana@example.test", "000123571").await;
+    read_clearly(&site.db, document, "000123571").await;
+    assert_eq!(consider(&site, document).await, Outcome::Activated(claim));
+    sqlx::query("UPDATE tin_claims SET decided_at = now() - interval '31 days' WHERE id = $1")
+        .bind(claim)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(verify::upkeep(&site.db).await.unwrap(), [claim]);
+    let page = format!("/staff/claims/{claim}");
+    let confirm = format!("{page}/confirm");
+
+    // Support: refused, the page says why and offers no button.
+    let response = site.post(&confirm, &support, "reason=Looks+fine").await;
+    assert_eq!(location(&response), format!("{page}?notice=admin_must_confirm"));
+    let shown = text(site.get(&page, &support).await).await;
+    assert!(!shown.contains(&format!("action=\"{confirm}\"")), "{shown}");
+    assert!(shown.contains("an admin confirms it"), "{shown}");
+    assert!(!row(&site.db, claim).await.4);
+    let tin = Tin::parse("000123571", "").unwrap();
+    assert_eq!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::Paused);
+
+    // An Admin: the reason is asked for, and kept on the resume line.
+    let shown = text(site.get(&page, &admin).await).await;
+    assert!(shown.contains(&format!("action=\"{confirm}\"")) && shown.contains("name=\"reason\""), "{shown}");
+    let response = site.post(&confirm, &admin, "reason=+").await;
+    assert_eq!(location(&response), format!("{page}?notice=reason_missing"));
+    let response = site.post(&confirm, &admin, "reason=Papers+checked").await;
+    assert_eq!(location(&response), format!("{page}?notice=auto_confirmed"));
+    assert!(gate::own(&site.db, ana, &tin).await.unwrap().can_send());
+    let resumed = claim_audit_lines(&site.db, ana).await.into_iter().find(|line| line.0 == "resumed").unwrap();
+    assert_eq!((resumed.2.as_str(), resumed.3.as_str()), ("boss@example.test", "web"));
+    assert!(resumed.4.as_deref().unwrap().contains("Papers checked"), "{resumed:?}");
+
+    // A staff pause: Support cannot confirm either; an Admin can, without
+    // a reason, and the pause stays.
+    let (bob, _, claim, document) = sent(&site, "bob@example.test", "000123572").await;
+    read_clearly(&site.db, document, "000123572").await;
+    assert_eq!(consider(&site, document).await, Outcome::Activated(claim));
+    site.post(&format!("/staff/claims/{claim}/pause"), &admin, "reason=Complaint").await;
+    let page = format!("/staff/claims/{claim}");
+    let response = site.post(&format!("{page}/confirm"), &support, "").await;
+    assert_eq!(location(&response), format!("{page}?notice=admin_must_confirm"));
+    let response = site.post(&format!("{page}/confirm"), &admin, "").await;
+    assert_eq!(location(&response), format!("{page}?notice=auto_confirmed"));
+    let tin = Tin::parse("000123572", "").unwrap();
+    assert_eq!(gate::own(&site.db, bob, &tin).await.unwrap(), gate::Standing::Paused);
 }

@@ -440,7 +440,14 @@ pub mod claim_id {
             None => String::new(),
         };
         let auto_waiting = claim.verified_by.as_deref() == Some("auto") && claim.auto_confirmed_at.is_none();
-        let can_confirm = auto_waiting && reviewer.can(Power::ConfirmAuto) && !own_claim_of(&claim, &reviewer);
+        // Only an Admin reopens a paused TIN, and lifting Buwiz's own pause
+        // takes a reason.
+        let paused_by_buwiz = claim.paused_at.is_some() && paused_by == "Buwiz";
+        let confirm_needs_admin = claim.paused_at.is_some() && !reviewer.can(Power::Pause);
+        let can_confirm = auto_waiting
+            && reviewer.can(Power::ConfirmAuto)
+            && !own_claim_of(&claim, &reviewer)
+            && !confirm_needs_admin;
         let confirm = format!("/staff/claims/{claim_id}/confirm");
         let auto_sure = claim.auto_check.as_ref().map(|check| {
             let percent = |field: &str| format!("{:.0}%", check["confidence"][field].as_f64().unwrap_or(0.0) * 100.0);
@@ -570,7 +577,16 @@ pub mod claim_id {
                                         <p class="side-text">"Confirmed by staff " (date_time(at)) "; its papers were deleted."</p>
                                     } else {
                                         <p class="side-text">"No person has confirmed it yet. Check the papers, then confirm. They are deleted when you confirm; until then they are kept, even if the TIN is removed or revoked."</p>
-                                        if can_confirm {
+                                        if can_confirm && paused_by_buwiz {
+                                            confirm_form(
+                                                label: "Looks right: confirm and lift the pause",
+                                                action: confirm.clone(),
+                                                question: format!("Confirm {tin} for {}?", claim.email),
+                                                detail: "You checked the papers and they match. They are deleted now, and the pause Buwiz put on it is lifted: the owner can send again at once.".to_owned(),
+                                                confirm: "Confirm",
+                                                reason: true
+                                            )
+                                        } else if can_confirm {
                                             confirm_form(
                                                 label: "Looks right: confirm",
                                                 action: confirm.clone(),
@@ -580,6 +596,8 @@ pub mod claim_id {
                                             )
                                         } else if own_claim_of(&claim, &reviewer) {
                                             <p class="side-text">"This is your own TIN. Another staff member confirms it."</p>
+                                        } else if confirm_needs_admin {
+                                            <p class="side-text">"Sending for this TIN is paused, so an admin confirms it."</p>
                                         }
                                     }
                                 </section>

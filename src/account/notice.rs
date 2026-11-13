@@ -129,6 +129,7 @@ notices! {
     AppAlreadySignedOut = "app_already_signed_out" => info "That app was already signed out. Nothing changed.",
     OwnPage = "own_page" => info "This is your own account. Ask another staff member to look at it.",
     AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
+    AdminMustConfirm = "admin_must_confirm" => error "Sending for this TIN is paused: an admin confirms it, and lifting Buwiz's pause takes a reason.",
 }
 
 #[cfg(test)]

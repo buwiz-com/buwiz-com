@@ -43,7 +43,9 @@ use uuid::Uuid;
 use crate::account::accounts::Account;
 use crate::account::claims::DecideError;
 use crate::account::notice::Notice;
+use crate::account::roles::{self, Power, Role};
 use crate::account::tin::Tin;
+use crate::base::config::Config;
 use crate::base::crypto;
 use crate::base::state::AppState;
 use crate::base::storage::DocumentStore;
@@ -617,15 +619,24 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
 /// Staff confirm an automatic activation after looking at its papers (also
 /// one the owner removed or staff revoked since): the papers are deleted,
 /// and a pause Buwiz put on it for waiting too long is lifted. Not on one's
-/// own TIN. The route checks the power
+/// own TIN. Only an Admin reopens a paused TIN: Support confirms only one
+/// that is not paused, and an Admin lifting Buwiz's pause gives `reason`
+/// (a staff pause stays, and needs none). The actor's role is checked
+/// again inside the transaction; the route checks the power first
 /// ([`crate::account::roles::Power::ConfirmAuto`]).
 pub async fn confirm(
     db: &PgPool,
+    config: &Config,
     store: &DocumentStore,
     claim_id: Uuid,
     actor: &Account,
+    reason: &str,
 ) -> Result<Notice, DecideError> {
     let mut tx = db.begin().await?;
+    let role = roles::recheck(&mut tx, config, actor.id).await?;
+    if !role.is_some_and(|role| role.can(Power::ConfirmAuto)) {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
     #[derive(sqlx::FromRow)]
     struct Row {
         account_id: Uuid,
@@ -635,11 +646,12 @@ pub async fn confirm(
         branch_code: String,
         verified_by: Option<String>,
         confirmed: bool,
+        paused: bool,
         paused_by_buwiz: bool,
     }
     let row: Option<Row> = sqlx::query_as(
         "SELECT account_id, kind, status, tin_root, branch_code, verified_by, auto_confirmed_at IS NOT NULL AS confirmed,
-             paused_at IS NOT NULL AND paused_by IS NULL AS paused_by_buwiz
+             paused_at IS NOT NULL AS paused, paused_at IS NOT NULL AND paused_by IS NULL AS paused_by_buwiz
          FROM tin_claims WHERE id = $1 FOR UPDATE",
     )
     .bind(claim_id)
@@ -653,6 +665,7 @@ pub async fn confirm(
         branch_code: branch,
         verified_by,
         confirmed,
+        paused,
         paused_by_buwiz,
     }) = row
     else {
@@ -664,6 +677,15 @@ pub async fn confirm(
     if owner == actor.id {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
+    if paused && role != Some(Role::Admin) {
+        return Err(DecideError::Refused(Notice::AdminMustConfirm));
+    }
+    let resumed = if paused_by_buwiz {
+        let reason = crate::account::admin::required_reason(reason)?;
+        Some(format!("Confirmed after Buwiz paused it for waiting too long: {reason}"))
+    } else {
+        None
+    };
     sqlx::query(
         "UPDATE tin_claims SET auto_confirmed_at = now(), auto_confirmed_by = $2,
              paused_at = CASE WHEN $3 THEN NULL ELSE paused_at END,
@@ -685,8 +707,8 @@ pub async fn confirm(
     .await?;
     let masked = Tin::parse(&root, &branch).map_err(|_| anyhow::anyhow!("stored TIN"))?.masked();
     let mut lines = vec![("auto_confirmed", None)];
-    if paused_by_buwiz {
-        lines.push(("resumed", Some("Confirmed by staff after Buwiz paused it for waiting too long.")));
+    if let Some(reason) = resumed.as_deref() {
+        lines.push(("resumed", Some(reason)));
     }
     for (action, reason) in lines {
         sqlx::query(

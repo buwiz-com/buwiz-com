@@ -25,7 +25,7 @@ reads the list.
 |---|---|---|
 | See the queue, claims, their files, and every account | ✓ | ✓ |
 | Approve, reject, send back (never one's own claim) | ✓ (approving a TIN that was ever paused is an Admin's) | ✓ |
-| Confirm a TIN activated automatically (never one's own) | ✓ | ✓ |
+| Confirm a TIN activated automatically (never one's own) | ✓ (not while it is paused) | ✓ (lifting Buwiz's pause takes a reason) |
 | Sign an account out everywhere, or out of one app (never an Admin) | ✓ | ✓ |
 | Delete a claim, revoke an ownership, activate without papers (one's own too), pause and resume, ban and lift a ban, the test label, change a role | – | ✓ |
 
@@ -37,7 +37,8 @@ one's own account, an `ADMIN_EMAILS` person, and a change that would leave
 no Admin; a change to the role the account has says nothing changed. Every
 staff action takes a reason (500 characters at most, like the review
 notes), signing one app out included, but two: approving a claim and
-confirming an automatic activation. Rejecting a claim needs a note to the
+confirming an automatic activation (unless the confirmation lifts the
+pause Buwiz put on it). Rejecting a claim needs a note to the
 person, and sending it back needs a fix reason or a note. Nobody pauses or
 resumes their own TIN.
 
@@ -157,8 +158,10 @@ only the name check stands between them and that TIN.
   revoked included, with their papers). Support or an Admin checks the
   papers and presses **Looks right: confirm**: the papers are deleted.
 - One still unconfirmed after 30 days is **paused by Buwiz** (no staff
-  name, a fixed reason, an audit line), papers kept. Confirming lifts that
-  pause; a staff pause stays.
+  name, a fixed reason, an audit line), papers kept. Only an Admin
+  confirms a paused one: confirming lifts Buwiz's pause and takes a
+  reason (it goes on the "resumed" line); a staff pause stays. Support
+  confirms only one that is not paused.
 
 What it proves is weak: the person types the TIN and name and uploads the
 picture, and a card drawn in a few lines of code passes (`tests/ocr.rs`).

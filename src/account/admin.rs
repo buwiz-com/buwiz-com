@@ -155,8 +155,22 @@ pub async fn change_role(
 }
 
 /// Support may sign anyone out but an Admin; an Admin anyone.
-fn may_sign_out(config: &Config, actor: &Staff, target: &Target) -> bool {
-    actor.role == Role::Admin || target.role(config) != Some(Role::Admin)
+fn may_sign_out(config: &Config, actor: Role, target: &Target) -> bool {
+    actor == Role::Admin || target.role(config) != Some(Role::Admin)
+}
+
+/// The actor's role as it stands now, if it may still sign people out: the
+/// page's check came before, and a demotion or ban may have come since.
+/// Read before the account acted on is locked, as the other actions do.
+async fn sign_out_role(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &Config,
+    actor: &Staff,
+) -> Result<Role, DecideError> {
+    roles::recheck(tx, config, actor.account.id)
+        .await?
+        .filter(|role| role.can(Power::SignOut))
+        .ok_or(DecideError::Refused(Notice::AdminOnly))
 }
 
 /// Staff end every sign-in of an account ([`accounts::end_sign_ins`]), saying
@@ -170,8 +184,9 @@ pub async fn sign_out(
 ) -> Result<Notice, DecideError> {
     let reason = required_reason(reason)?;
     let mut tx = db.begin().await?;
+    let role = sign_out_role(&mut tx, config, actor).await?;
     let target = lock_account(&mut tx, account_id).await?;
-    if !may_sign_out(config, actor, &target) {
+    if !may_sign_out(config, role, &target) {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
     accounts::end_sign_ins(&mut tx, target.id, true).await?;
@@ -201,8 +216,9 @@ pub async fn sign_out_app(
 ) -> Result<Notice, DecideError> {
     let reason = required_reason(reason)?;
     let mut tx = db.begin().await?;
+    let role = sign_out_role(&mut tx, config, actor).await?;
     let target = lock_account(&mut tx, account_id).await?;
-    if !may_sign_out(config, actor, &target) {
+    if !may_sign_out(config, role, &target) {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
     let client: Option<String> = sqlx::query_scalar(

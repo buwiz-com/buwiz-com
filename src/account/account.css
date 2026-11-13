@@ -917,6 +917,9 @@
 .id-badge.waiting { background: var(--wait-bg); color: var(--wait-ink); }
 .id-badge.none { background: var(--chip); color: var(--muted); }
 .id-badge.staff { background: var(--text); color: var(--bg); }
+.id-badge.support { background: var(--wait-bg); color: var(--wait-ink); }
+.staff-actions .end-form + .end-form, .staff-actions .end-form + p, .staff-actions p + .end-form { margin-top: 14px; }
+.staff-actions select { width: 100%; margin-top: 4px; }
 
 /* Staff: one claim */
 .claim-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }

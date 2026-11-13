@@ -16,6 +16,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::account::accounts::{self, Account, CodeError};
+use crate::account::admin;
 use crate::account::agents;
 use crate::account::claims::{
     self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Papers, Resend, SubmitError, Upload,
@@ -23,6 +24,7 @@ use crate::account::claims::{
 use crate::account::mcp;
 use crate::account::notice::Notice;
 use crate::account::oauth;
+use crate::account::roles::{self, Power, Role, Staff};
 use crate::account::tin::Tin;
 use crate::base::state::AppState;
 use crate::filing::devices;
@@ -108,7 +110,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
             post(replace_document).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)),
         )
         .route("/tins/claims/{claim_id}/documents/{document_id}/remove", post(remove_document))
-        // Staff. Everyone else gets a 404 (see `require_admin`).
+        // Staff. Everyone else gets a 404 (see `require_staff`).
         .route("/staff/claims", get(|| async { Redirect::permanent("/staff") }))
         .route("/staff/claims/{claim_id}/decision", post(decide_claim))
         .route("/staff/claims/{claim_id}/delete", post(staff_delete_claim))
@@ -116,6 +118,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/documents/{document_id}", get(staff_document))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
+        .route("/staff/users/{account_id}/role", post(change_role))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
         .route("/devices/{device_id}/revoke", post(revoke_device))
@@ -838,13 +841,25 @@ async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Path(d
     }
 }
 
-/// Signed-in staff member, or the response to send instead.
-async fn require_admin(state: &AppState, headers: &HeaderMap, back_to: &str) -> Result<Account, Response> {
+/// A signed-in staff member with `power`, or the response to send instead:
+/// a 404 for everyone who is not staff, as if the page did not exist; for
+/// staff without the power, back to `back_to` with `admin_only` and nothing
+/// changed.
+async fn require_staff(state: &AppState, headers: &HeaderMap, back_to: &str, power: Power) -> Result<Staff, Response> {
     let account = require_session(state, headers, back_to).await?;
-    if state.config.is_admin(&account.email) {
-        Ok(account)
-    } else {
-        Err((StatusCode::NOT_FOUND, "not found").into_response())
+    match roles::staff(&state.db, &state.config, &account).await {
+        Ok(Some(staff)) if staff.can(power) => Ok(staff),
+        Ok(Some(_)) => Err(see_other(link(back_to, Some(Notice::AdminOnly), &[]))),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "not found").into_response()),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+/// Where a staff action goes back to with its notice.
+fn staff_outcome(back_to: &str, outcome: Result<Notice, DecideError>) -> Response {
+    match outcome {
+        Ok(notice) | Err(DecideError::Refused(notice)) => see_other(link(back_to, Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
     }
 }
 
@@ -861,8 +876,8 @@ async fn decide_claim(
         return refused;
     }
     let back_to = format!("/staff/claims/{claim_id}");
-    let reviewer = match require_admin(&state, &headers, &back_to).await {
-        Ok(reviewer) => reviewer,
+    let reviewer = match require_staff(&state, &headers, &back_to, Power::Review).await {
+        Ok(staff) => staff.account,
         Err(response) => return response,
     };
     let (mut decision, mut note, mut reasons) = (String::new(), String::new(), Vec::new());
@@ -904,8 +919,8 @@ async fn staff_delete_claim(
         return refused;
     }
     let back_to = format!("/staff/claims/{claim_id}");
-    let staff = match require_admin(&state, &headers, &back_to).await {
-        Ok(staff) => staff,
+    let staff = match require_staff(&state, &headers, &back_to, Power::DeleteClaim).await {
+        Ok(staff) => staff.account,
         Err(response) => return response,
     };
     let by = By::Staff { reason: &form.reason };
@@ -927,8 +942,8 @@ async fn revoke_claim(
         return refused;
     }
     let back_to = format!("/staff/claims/{claim_id}");
-    let staff = match require_admin(&state, &headers, &back_to).await {
-        Ok(staff) => staff,
+    let staff = match require_staff(&state, &headers, &back_to, Power::EndOwnership).await {
+        Ok(staff) => staff.account,
         Err(response) => return response,
     };
     match claims::end_ownership(&state.db, claim_id, &staff, By::Staff { reason: &form.reason }).await {
@@ -939,7 +954,7 @@ async fn revoke_claim(
 
 /// A claim document, shown inline to staff only.
 async fn staff_document(State(state): State<AppState>, headers: HeaderMap, Path(document_id): Path<Uuid>) -> Response {
-    if let Err(response) = require_admin(&state, &headers, "/staff").await {
+    if let Err(response) = require_staff(&state, &headers, "/staff", Power::Review).await {
         return response;
     }
     let document =
@@ -959,38 +974,74 @@ async fn staff_document(State(state): State<AppState>, headers: HeaderMap, Path(
     response
 }
 
-/// Staff end every sign-in of an account.
-async fn sign_out_user(State(state): State<AppState>, headers: HeaderMap, Path(account_id): Path<Uuid>) -> Response {
-    if let Err(refused) = same_origin(&state, &headers) {
-        return refused;
-    }
-    let back_to = format!("/staff/users/{account_id}");
-    if let Err(response) = require_admin(&state, &headers, &back_to).await {
-        return response;
-    }
-    match accounts::sign_out_everywhere(&state.db, account_id).await {
-        Ok(()) => see_other(link(&back_to, Some(Notice::SignedOutEverywhere), &[])),
-        Err(error) => internal(error),
-    }
-}
-
-/// Staff end one app's or agent's sign-in.
-async fn sign_out_user_app(
+/// Staff end every sign-in of an account, with a reason.
+async fn sign_out_user(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((account_id, grant_id)): Path<(Uuid, Uuid)>,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
 ) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
     let back_to = format!("/staff/users/{account_id}");
-    if let Err(response) = require_admin(&state, &headers, &back_to).await {
-        return response;
+    let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    staff_outcome(&back_to, admin::sign_out(&state.db, &state.config, &staff, account_id, &form.reason).await)
+}
+
+/// Staff end one app's or agent's sign-in; the reason is optional.
+async fn sign_out_user_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, grant_id)): Path<(Uuid, Uuid)>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
     }
-    match accounts::sign_out_app(&state.db, account_id, grant_id).await {
-        Ok(_) => see_other(link(&back_to, Some(Notice::AppSignedOut), &[])),
-        Err(error) => internal(error),
+    let back_to = format!("/staff/users/{account_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let outcome = admin::sign_out_app(&state.db, &state.config, &staff, account_id, grant_id, &form.reason).await;
+    staff_outcome(&back_to, outcome)
+}
+
+#[derive(Deserialize)]
+struct RoleForm {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// An Admin changes an account's staff role: `admin`, `support` or `none`.
+async fn change_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<RoleForm>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
     }
+    let back_to = format!("/staff/users/{account_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::ChangeRole).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let role = match form.role.as_str() {
+        "none" => None,
+        raw => match Role::parse(raw) {
+            Some(role) => Some(role),
+            None => return see_other(link(&back_to, Some(Notice::RoleUnknown), &[])),
+        },
+    };
+    staff_outcome(&back_to, admin::change_role(&state.db, &state.config, &staff, account_id, role, &form.reason).await)
 }
 
 #[cfg(test)]

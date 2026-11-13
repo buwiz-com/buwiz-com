@@ -34,6 +34,8 @@ fn tin_digits(text: &str) -> Option<String> {
 pub enum QueueFilter {
     Waiting,
     SentBack,
+    /// Saved without papers: nothing to review yet.
+    Unverified,
     Approved,
     Rejected,
     /// Approved once, then removed by the owner or revoked by staff.
@@ -41,7 +43,8 @@ pub enum QueueFilter {
 }
 
 impl QueueFilter {
-    pub const ALL: [Self; 5] = [Self::Waiting, Self::SentBack, Self::Approved, Self::Rejected, Self::Ended];
+    pub const ALL: [Self; 6] =
+        [Self::Waiting, Self::SentBack, Self::Unverified, Self::Approved, Self::Rejected, Self::Ended];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Waiting)
@@ -51,6 +54,7 @@ impl QueueFilter {
         match self {
             Self::Waiting => "waiting",
             Self::SentBack => "sent_back",
+            Self::Unverified => "unverified",
             Self::Approved => "approved",
             Self::Rejected => "rejected",
             Self::Ended => "ended",
@@ -61,6 +65,7 @@ impl QueueFilter {
         match self {
             Self::Waiting => "Waiting",
             Self::SentBack => "Sent back",
+            Self::Unverified => "Not verified",
             Self::Approved => "Approved",
             Self::Rejected => "Rejected",
             Self::Ended => "Removed",
@@ -71,6 +76,7 @@ impl QueueFilter {
         match self {
             Self::Waiting => &["pending"],
             Self::SentBack => &["needs_fix"],
+            Self::Unverified => &["unverified"],
             Self::Approved => &["approved"],
             Self::Rejected => &["rejected"],
             Self::Ended => &["removed", "revoked"],
@@ -83,6 +89,7 @@ impl QueueFilter {
         match self {
             Self::Waiting => "coalesce(c.resent_at, c.submitted_at, c.created_at), c.id",
             Self::SentBack => "c.sent_back_at, c.id",
+            Self::Unverified => "c.created_at DESC, c.id",
             Self::Approved | Self::Rejected => "c.decided_at DESC, c.id",
             Self::Ended => "c.removed_at DESC, c.id",
         }
@@ -215,6 +222,13 @@ pub struct UserRow {
     pub created_at: OffsetDateTime,
     /// The newest website sign-in or app token, whichever is later.
     pub last_active: Option<OffsetDateTime>,
+    /// The stored staff role (`admin`, `support`); see [`crate::account::roles`]
+    /// for the role that counts.
+    pub role: Option<String>,
+    pub test_account: bool,
+    pub banned_at: Option<OffsetDateTime>,
+    pub ban_reason: Option<String>,
+    pub banned_by_email: Option<String>,
 }
 
 const USER_COLUMNS: &str = "a.id, a.email, a.created_at,
@@ -222,9 +236,18 @@ const USER_COLUMNS: &str = "a.id, a.email, a.created_at,
          (SELECT max(s.created_at) FROM web_sessions s WHERE s.account_id = a.id),
          (SELECT max(t.created_at) FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id
           WHERE g.account_id = a.id)
-     ) AS last_active";
+     ) AS last_active,
+     a.role, a.test_account, a.banned_at, a.ban_reason,
+     (SELECT b.email FROM accounts b WHERE b.id = a.banned_by) AS banned_by_email";
 
-pub async fn users(db: &PgPool, filter: UserFilter, search: &str, staff: &[String]) -> sqlx::Result<Vec<UserRow>> {
+/// Accounts for the users list. `admin_emails` is `ADMIN_EMAILS`, whose
+/// people are staff whatever their account says.
+pub async fn users(
+    db: &PgPool,
+    filter: UserFilter,
+    search: &str,
+    admin_emails: &[String],
+) -> sqlx::Result<Vec<UserRow>> {
     sqlx::query_as(&format!(
         "SELECT {USER_COLUMNS} FROM accounts a
          WHERE ($1::text IS NULL OR a.email ILIKE $1 OR EXISTS (
@@ -237,8 +260,8 @@ pub async fn users(db: &PgPool, filter: UserFilter, search: &str, staff: &[Strin
                WHEN 'verified' THEN EXISTS (SELECT 1 FROM tin_claims c
                                             WHERE c.account_id = a.id AND c.status = 'approved')
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
-                                              AND c.status IN ('pending', 'needs_fix', 'approved'))
-               WHEN 'staff' THEN a.email = ANY($4)
+                                              AND c.status IN ('unverified', 'pending', 'needs_fix', 'approved'))
+               WHEN 'staff' THEN a.banned_at IS NULL AND (a.role IS NOT NULL OR a.email = ANY($4))
                ELSE true
            END
          ORDER BY last_active DESC NULLS LAST, a.created_at DESC
@@ -247,7 +270,7 @@ pub async fn users(db: &PgPool, filter: UserFilter, search: &str, staff: &[Strin
     .bind(contains(search))
     .bind(tin_digits(search))
     .bind(filter.code())
-    .bind(staff)
+    .bind(admin_emails)
     .bind(LIST_LIMIT)
     .fetch_all(db)
     .await
@@ -281,7 +304,8 @@ pub async fn claims_of(db: &PgPool, account_ids: &[Uuid]) -> sqlx::Result<Vec<Us
 }
 
 /// A line of `claim_audit`: a claim deleted, a TIN removed or revoked, a
-/// file replaced or removed.
+/// file replaced or removed, a TIN activated without papers, paused or
+/// resumed.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct AuditRow {
     pub tin_masked: String,
@@ -291,14 +315,42 @@ pub struct AuditRow {
     pub actor_id: Uuid,
     pub actor_email: String,
     pub reason: Option<String>,
+    /// `web`, `auto` or `seed`.
+    pub source: String,
     pub created_at: OffsetDateTime,
 }
 
 /// The audit lines about an account's claims, newest first.
 pub async fn audit(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<AuditRow>> {
     sqlx::query_as(
-        "SELECT tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, created_at
+        "SELECT tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, source, created_at
          FROM claim_audit WHERE account_id = $1 ORDER BY created_at DESC LIMIT 40",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await
+}
+
+/// A line of `account_audit`: what staff or the seed tool did to the
+/// account itself.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AccountAuditRow {
+    pub action: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub actor_id: Uuid,
+    pub actor_email: String,
+    /// `web` or `seed`.
+    pub source: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// The account's own audit lines, newest first.
+pub async fn account_audit(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<AccountAuditRow>> {
+    sqlx::query_as(
+        "SELECT action, old_value, new_value, actor_id, actor_email, source, reason, created_at
+         FROM account_audit WHERE account_id = $1 ORDER BY created_at DESC LIMIT 40",
     )
     .bind(account_id)
     .fetch_all(db)
@@ -316,7 +368,8 @@ pub enum IdStatus {
 
 impl IdStatus {
     /// Staff first; then a claim waiting for review or a fix; then any
-    /// approved claim.
+    /// approved claim. A TIN saved without papers proves no identity, so it
+    /// counts for neither.
     pub fn of(is_staff: bool, statuses: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         if is_staff {
             return Self::Staff;
@@ -423,6 +476,8 @@ mod tests {
         assert_eq!(IdStatus::of(false, ["approved", "needs_fix"]), IdStatus::Waiting);
         assert_eq!(IdStatus::of(false, ["rejected", "approved"]), IdStatus::Verified);
         assert_eq!(IdStatus::of(false, ["rejected"]), IdStatus::None);
+        assert_eq!(IdStatus::of(false, ["unverified"]), IdStatus::None);
+        assert_eq!(IdStatus::of(false, ["unverified", "approved"]), IdStatus::Verified);
     }
 
     #[test]

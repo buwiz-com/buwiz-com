@@ -147,8 +147,18 @@ async fn staff_can_sign_an_account_out_everywhere(db: PgPool) {
 
     let page = text(site.get(&format!("/staff/users/{juan}"), &staff).await).await;
     assert!(page.contains("Buwiz app") && page.contains("1 browser signed in"), "{page}");
+    // Staff must say why; nothing happens without a reason.
     let response = site.post(&format!("/staff/users/{juan}/sign-out"), &staff, "").await;
+    assert_eq!(location(&response), format!("/staff/users/{juan}?notice=reason_missing"));
+    assert_eq!(site.send(me()).await.status(), StatusCode::OK);
+    let response = site.post(&format!("/staff/users/{juan}/sign-out"), &staff, "reason=Lost+phone").await;
     assert_eq!(location(&response), format!("/staff/users/{juan}?notice=signed_out_everywhere"));
+    let lines = account_audit_lines(&site.db, juan).await;
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        (lines[0].0.as_str(), lines[0].3.as_str(), lines[0].5.as_deref()),
+        ("signed_out", STAFF, Some("Lost phone"))
+    );
 
     assert_eq!(site.send(me()).await.status(), StatusCode::UNAUTHORIZED);
     assert!(site.get("/tins", &cookie).await.status().is_redirection());

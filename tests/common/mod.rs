@@ -35,11 +35,22 @@ pub const ACCOUNT_HOST: &str = "account.localhost:3008";
 pub struct Site {
     pub db: PgPool,
     pub router: axum::Router,
+    pub state: AppState,
 }
 
 impl Site {
     pub fn new(db: PgPool) -> Self {
         Self::with_store(db, DocumentStore::Database)
+    }
+
+    /// A site whose `ADMIN_EMAILS` is `admins` instead of [`STAFF`].
+    pub fn with_admins(db: PgPool, admins: &[&str]) -> Self {
+        Self::configured(
+            db,
+            DocumentStore::Database,
+            NO_DOWNLOADS,
+            admins.iter().map(|admin| (*admin).to_owned()).collect(),
+        )
     }
 
     pub fn with_store(db: PgPool, store: DocumentStore) -> Self {
@@ -53,6 +64,10 @@ impl Site {
 
     /// The filing site is on [`FORMS`], as `FORMS_ORIGIN` puts it.
     pub fn build(db: PgPool, store: DocumentStore, downloads_url: &str) -> Self {
+        Self::configured(db, store, downloads_url, vec![STAFF.into()])
+    }
+
+    fn configured(db: PgPool, store: DocumentStore, downloads_url: &str, admin_emails: Vec<String>) -> Self {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
@@ -61,7 +76,7 @@ impl Site {
             extra_origins: Vec::new(),
             secure_cookies: false,
             document_key: [7; 32],
-            admin_emails: vec![STAFF.into()],
+            admin_emails,
             mail: MailConfig::Log,
             trust_list: None,
             downloads_url: downloads_url.into(),
@@ -73,7 +88,7 @@ impl Site {
         // The account site never reaches the Sender in these tests.
         let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
         let state = AppState::new(config, db.clone(), store, key, sender);
-        Self { db, router: buwiz_cloud::app(state) }
+        Self { db, router: buwiz_cloud::app(state.clone()), state }
     }
 
     /// A request without a `Host` goes to the account host, [`ACCOUNT_HOST`].
@@ -91,6 +106,14 @@ impl Site {
             .unwrap();
         let token = accounts::start_session(&self.db, id).await.unwrap();
         (id, format!("buwiz_session={token}"))
+    }
+
+    /// A signed-in account with the stored staff role `role` (`admin`,
+    /// `support`).
+    pub async fn staff_with_role(&self, email: &str, role: &str) -> (Uuid, String) {
+        let (id, cookie) = self.person(email).await;
+        sqlx::query("UPDATE accounts SET role = $2 WHERE id = $1").bind(id).bind(role).execute(&self.db).await.unwrap();
+        (id, cookie)
     }
 
     pub async fn get(&self, path: &str, cookie: &str) -> Response {
@@ -321,4 +344,44 @@ pub async fn refusal(response: Response) -> (u16, String, String) {
         error["code"].as_str().unwrap_or_default().to_owned(),
         error["message"].as_str().unwrap_or_default().to_owned(),
     )
+}
+
+/// An account's `account_audit` lines, oldest first: (action, old value,
+/// new value, actor email, source, reason).
+pub async fn account_audit_lines(
+    db: &PgPool,
+    account_id: Uuid,
+) -> Vec<(String, Option<String>, Option<String>, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT action, old_value, new_value, actor_email, source, reason FROM account_audit
+         WHERE account_id = $1 ORDER BY created_at, id",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// An account's `claim_audit` lines, oldest first: (action, claim status,
+/// actor email, source, reason).
+pub async fn claim_audit_lines(db: &PgPool, account_id: Uuid) -> Vec<(String, String, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT action, claim_status, actor_email, source, reason FROM claim_audit
+         WHERE account_id = $1 ORDER BY created_at, id",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// Live website sessions of an account.
+pub async fn live_sessions(db: &PgPool, account_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM web_sessions WHERE account_id = $1 AND revoked_at IS NULL AND expires_at > now()",
+    )
+    .bind(account_id)
+    .fetch_one(db)
+    .await
+    .unwrap()
 }

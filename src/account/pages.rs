@@ -18,6 +18,7 @@ use crate::account::agents::{self, AuthorizeProblem};
 use crate::account::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
 use crate::account::notice::Notice;
 use crate::account::oauth;
+use crate::account::roles::{self, Power, Staff};
 use crate::account::tin::Tin;
 use crate::account::web::{link, safe_next, session_account};
 use crate::base::state::AppState;
@@ -104,20 +105,27 @@ async fn signed_in(cx: &Cx) -> Result<Account> {
     }
 }
 
-/// Staff only; signed-in people who are not get a 404.
-async fn admin(cx: &Cx) -> Result<Account> {
+/// The signed-in account's staff role, if it has one.
+async fn staff_role(cx: &Cx, account: &Account) -> Result<Option<Staff>> {
+    roles::staff(&state(cx).db, &state(cx).config, account).await.map_err(fail)
+}
+
+/// Staff with `power` only; signed-in people who are not get a 404.
+async fn staff_member(cx: &Cx, power: Power) -> Result<Staff> {
     let account = signed_in(cx).await?;
-    if state(cx).config.is_admin(&account.email) {
-        Ok(account)
-    } else {
-        Err(topcoat::router::error::not_found().into())
+    match staff_role(cx, &account).await? {
+        Some(staff) if staff.can(power) => Ok(staff),
+        _ => Err(topcoat::router::error::not_found().into()),
     }
 }
 
 #[layout("/")]
 async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let account = current(cx).await?;
-    let admin = account.as_ref().is_some_and(|account| state(cx).config.is_admin(&account.email));
+    let admin = match &account {
+        Some(account) => staff_role(cx, account).await?.is_some(),
+        None => false,
+    };
     let path = uri(cx).path().to_owned();
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let waiting = if staff_area { crate::account::staff::open_counts(&state(cx).db).await?.0 } else { 0 };

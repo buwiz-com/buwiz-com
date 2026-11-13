@@ -97,6 +97,13 @@ notices! {
     TinAlreadyAdded = "tin_already_added" => error "This TIN is already on My TINs. Verify it there to send returns.",
     NotUnverified = "not_unverified" => error "This TIN already has its papers. See where it stands on My TINs.",
     TooManyUnverified = "too_many_unverified" => error "You have 20 TINs waiting to be verified. Verify or remove some first.",
+    AdminOnly = "admin_only" => error "Only an admin can do this.",
+    OwnAccount = "own_account" => error "You can't do this to your own account.",
+    RoleChanged = "role_changed" => info "Role changed.",
+    RoleUnknown = "role_unknown" => error "Pick Admin, Support or No staff role.",
+    LastAdmin = "last_admin" => error "Buwiz needs at least one admin. Make someone else an admin first.",
+    RoleFromServer = "role_from_server" => error "This person is an admin through the server setting ADMIN_EMAILS. Change it there.",
+    AccountMissing = "account_missing" => error "That account does not exist.",
 }
 
 #[cfg(test)]

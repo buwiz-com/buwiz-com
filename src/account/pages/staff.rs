@@ -4,7 +4,10 @@
 
 use super::*;
 use crate::account::claims::FIX_REASONS;
-use crate::account::staff::{self as queries, AppRow, AuditRow, IdStatus, QueueFilter, QueueRow, UserFilter};
+use crate::account::roles::Role;
+use crate::account::staff::{
+    self as queries, AccountAuditRow, AppRow, AuditRow, IdStatus, QueueFilter, QueueRow, UserFilter,
+};
 use crate::ocr::extract::{self, Kind, Verdict};
 use crate::ocr::{self, Reading};
 
@@ -63,7 +66,7 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
 
 #[page("/staff")]
 pub async fn claims_page(cx: &Cx) -> Result<impl View> {
-    admin(cx).await?;
+    staff_member(cx, Power::Review).await?;
     let filter = QueueFilter::parse(query(cx, "status").as_deref());
     let search = query(cx, "q").unwrap_or_default();
     let db = &state(cx).db;
@@ -148,6 +151,7 @@ async fn queue_row(row: QueueRow) -> Result<impl View> {
             (format!("Waiting {}", span_since(since)), OffsetDateTime::now_utc() - since > time::Duration::days(1))
         }
         "needs_fix" => (format!("Sent back {}", ago(claim.sent_back_at)), false),
+        "unverified" => (format!("Saved {}", short_date(claim.created_at)), false),
         "removed" | "revoked" => (format!("Ended {}", claim.removed_at.map(short_date).unwrap_or_default()), false),
         _ => (format!("Decided {}", claim.decided_at.map(short_date).unwrap_or_default()), false),
     };
@@ -333,7 +337,7 @@ pub mod claim_id {
 
     #[page("/staff/claims/{claim_id}")]
     pub async fn claim_page(cx: &Cx) -> Result<impl View> {
-        let reviewer = admin(cx).await?;
+        let reviewer = staff_member(cx, Power::Review).await?;
         let claim_id = path_id(cx, 0)?;
         let db = &state(cx).db;
         let Some(claim) = claims::find(db, claim_id).await? else {
@@ -346,7 +350,7 @@ pub mod claim_id {
         let claimant_tins = claims::for_account(db, claim.account_id)
             .await?
             .iter()
-            .filter(|other| matches!(other.status.as_str(), "pending" | "needs_fix" | "approved"))
+            .filter(|other| matches!(other.status.as_str(), "unverified" | "pending" | "needs_fix" | "approved"))
             .count();
         let kind = ClaimKind::parse(&claim.kind).unwrap_or(ClaimKind::Business);
         let stored = |document: DocumentKind| {
@@ -405,7 +409,7 @@ pub mod claim_id {
             claim.status == "pending" && OffsetDateTime::now_utc() - claim.waiting_since() > time::Duration::days(1);
         let fix_reasons: Vec<&str> =
             claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(label, _)| label).collect();
-        let own_claim = claim.account_id == reviewer.id;
+        let own_claim = claim.account_id == reviewer.account.id;
         let decide = format!("/staff/claims/{claim_id}/decision");
         let delete = format!("/staff/claims/{claim_id}/delete");
         let revoke = format!("/staff/claims/{claim_id}/revoke");
@@ -644,7 +648,7 @@ async fn document_viewer(documents: Vec<(usize, DocumentRow)>) -> Result<impl Vi
 
 #[page("/staff/users")]
 pub async fn users_page(cx: &Cx) -> Result<impl View> {
-    admin(cx).await?;
+    staff_member(cx, Power::SeeUsers).await?;
     let filter = UserFilter::parse(query(cx, "filter").as_deref());
     let search = query(cx, "q").unwrap_or_default();
     let config = &state(cx).config;
@@ -665,14 +669,15 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
             }
             let tins = own
                 .iter()
-                .filter(|claim| matches!(claim.status.as_str(), "pending" | "needs_fix" | "approved"))
+                .filter(|claim| matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix" | "approved"))
                 .map(|claim| {
                     let tin = crate::account::tin::Tin::parse(&claim.tin_root, &claim.branch_code)
                         .expect("stored TINs are valid");
                     (tin.to_string(), claim.status.clone())
                 })
                 .collect();
-            let id_status = IdStatus::of(config.is_admin(&user.email), own.iter().map(|claim| claim.status.as_str()));
+            let is_staff = user_role(config, &user).is_some();
+            let id_status = IdStatus::of(is_staff, own.iter().map(|claim| claim.status.as_str()));
             UserListRow { color: index % 5, user, names, tins, id_status }
         })
         .collect();
@@ -717,6 +722,20 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
     })
 }
 
+/// The role that counts for a listed account (see [`roles::of`]).
+fn user_role(config: &crate::base::config::Config, user: &queries::UserRow) -> Option<(Role, bool)> {
+    roles::of(config, &user.email, user.role.as_deref(), user.banned_at.is_some())
+}
+
+/// The badge for a staff role: (label, CSS tone).
+fn role_badge(role: Option<(Role, bool)>) -> Option<(&'static str, &'static str)> {
+    match role? {
+        (Role::Admin, true) => Some(("Admin · server setting", "staff")),
+        (Role::Admin, false) => Some(("Admin", "staff")),
+        (Role::Support, _) => Some(("Support", "support")),
+    }
+}
+
 struct UserListRow {
     color: usize,
     user: queries::UserRow,
@@ -759,7 +778,7 @@ pub mod account_id {
 
     #[page("/staff/users/{account_id}")]
     pub async fn user_page(cx: &Cx) -> Result<impl View> {
-        admin(cx).await?;
+        let viewer = staff_member(cx, Power::SeeUsers).await?;
         let account_id = path_id(cx, 0)?;
         let config = &state(cx).config;
         let db = &state(cx).db;
@@ -771,8 +790,26 @@ pub mod account_id {
         let apps = queries::apps(db, account_id).await?;
         let sessions = queries::sessions(db, account_id).await?;
         let audit = queries::audit(db, account_id).await?;
-        let id_status = IdStatus::of(config.is_admin(&user.email), claims.iter().map(|claim| claim.status.as_str()));
+        let account_audit = queries::account_audit(db, account_id).await?;
+        let role = user_role(config, &user);
+        let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
         let (id_label, id_icon, id_tone) = id_status.look();
+        let badge = role_badge(role);
+        let is_admin = role.is_some_and(|(role, _)| role == Role::Admin);
+        let from_server = role.is_some_and(|(_, from_server)| from_server);
+        // Support may sign anyone out but an Admin.
+        let may_sign_out = viewer.role == Role::Admin || !is_admin;
+        let admin_viewer = viewer.can(Power::ChangeRole);
+        let own_account = viewer.account.id == account_id;
+        let stored_role = user.role.clone().unwrap_or_else(|| "none".to_owned());
+        let role_choices: Vec<(&'static str, &'static str, bool)> = [
+            ("none", "No staff role"),
+            ("support", "Support: reviews claims, sees users, signs people out"),
+            ("admin", "Admin: everything"),
+        ]
+        .into_iter()
+        .map(|(value, label)| (value, label, value == stored_role))
+        .collect();
         let mut names: Vec<String> = Vec::new();
         for claim in claims.iter().filter(|claim| claim.status != "withdrawn") {
             if !names.contains(&claim.registered_name) {
@@ -795,7 +832,7 @@ pub mod account_id {
             .collect();
         let live_sessions = sessions.iter().filter(|(_, live)| *live).count();
         let signed_in: Vec<AppRow> = apps.iter().filter(|app| app.signed_in).cloned().collect();
-        let history = history(&user, &claims, &apps, &sessions, &audit);
+        let history = history(&user, &claims, &apps, &sessions, &audit, &account_audit);
         let subtitle = {
             let mut parts = vec![format!("Joined {}", date(user.created_at))];
             parts.push(format!("active {}", ago(user.last_active)));
@@ -817,9 +854,9 @@ pub mod account_id {
                         </span>
                         <span class="user-actions">
                             <span class=(format!("id-badge {id_tone}"))>icon(name: id_icon) (id_label)</span>
-                            <form method="post" action=(format!("/staff/users/{account_id}/sign-out")) data-confirm="Sign out everywhere?" data-confirm-detail="This account is signed out of every browser, the desktop app and every AI agent. They can sign in again." data-confirm-label="Sign out everywhere" data-confirm-tone="danger">
-                                <button class="btn btn-ghost btn-small" type="submit">icon(name: "logout") "Sign out everywhere"</button>
-                            </form>
+                            if let Some((label, tone)) = badge {
+                                <span class=(format!("id-badge {tone}"))>icon(name: "shield_person") (label)</span>
+                            }
                         </span>
                     </section>
                     <div class="user-grid">
@@ -864,6 +901,42 @@ pub mod account_id {
                             </section>
                         </div>
                         <aside class="user-side">
+                            <section class="panel side-card staff-actions">
+                                <h2>"Staff actions"</h2>
+                                if may_sign_out {
+                                    confirm_form(
+                                        label: "Sign out everywhere",
+                                        action: format!("/staff/users/{account_id}/sign-out"),
+                                        question: "Sign out everywhere?".to_owned(),
+                                        detail: "This account is signed out of every browser, the desktop app and every AI agent. They can sign in again.".to_owned(),
+                                        confirm: "Sign out everywhere",
+                                        reason: true
+                                    )
+                                }
+                                if !admin_viewer {
+                                    <p class="side-text">"Only an admin can change roles, bans and test labels."</p>
+                                } else if from_server {
+                                    <p class="side-text">"Admin through the server setting ADMIN_EMAILS. Change it there."</p>
+                                } else if own_account {
+                                    <p class="side-text">"This is you. Another admin can change your role."</p>
+                                } else {
+                                    <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/role")) data-confirm=(format!("Change {}'s role?", user.email)) data-confirm-detail="It takes effect on their next page." data-confirm-label="Change role">
+                                        <label class="decision-label">
+                                            "Role"
+                                            <select name="role">
+                                                for (value, label, chosen) in role_choices {
+                                                    <option value=(value) selected=(chosen)>(label)</option>
+                                                }
+                                            </select>
+                                        </label>
+                                        <label class="decision-label">
+                                            "Reason"
+                                            <textarea name="reason" rows="2" maxlength="500" required=(true) placeholder="Kept in the account's history."></textarea>
+                                        </label>
+                                        <button class="btn btn-ghost" type="submit">"Change role"</button>
+                                    </form>
+                                }
+                            </section>
                             <section class="panel side-card">
                                 <h2>"Connected apps"</h2>
                                 if signed_in.is_empty() && live_sessions == 0 {
@@ -879,7 +952,7 @@ pub mod account_id {
                                     </div>
                                 }
                                 for app in signed_in {
-                                    connected_app(account_id: account_id, app: app)
+                                    connected_app(account_id: account_id, app: app, may_sign_out: may_sign_out)
                                 }
                             </section>
                             <section class="panel side-card">
@@ -930,7 +1003,7 @@ async fn document_card(document: DocumentRow, tin: String, status: String) -> Re
 }
 
 #[component]
-async fn connected_app(account_id: Uuid, app: AppRow) -> Result<impl View> {
+async fn connected_app(account_id: Uuid, app: AppRow, may_sign_out: bool) -> Result<impl View> {
     let name = app.name();
     let detail = if app.is_agent() {
         format!("Read only · allowed {}", short_date(app.created_at))
@@ -951,9 +1024,11 @@ async fn connected_app(account_id: Uuid, app: AppRow) -> Result<impl View> {
                 <b>(name.clone())</b>
                 <span>(detail)</span>
             </span>
-            <form method="post" action=(action) data-confirm=(format!("Sign {name} out?")) data-confirm-detail="It loses access to this account until the person connects it again." data-confirm-label=(if app.is_agent() { "Remove" } else { "Sign out" }) data-confirm-tone="danger">
-                <button class="btn btn-ghost btn-small" type="submit">(if app.is_agent() { "Remove" } else { "Sign out" })</button>
-            </form>
+            if may_sign_out {
+                <form method="post" action=(action) data-confirm=(format!("Sign {name} out?")) data-confirm-detail="It loses access to this account until the person connects it again." data-confirm-label=(if app.is_agent() { "Remove" } else { "Sign out" }) data-confirm-tone="danger">
+                    <button class="btn btn-ghost btn-small" type="submit">(if app.is_agent() { "Remove" } else { "Sign out" })</button>
+                </form>
+            }
         </div>
     })
 }
@@ -967,6 +1042,7 @@ fn history(
     apps: &[AppRow],
     sessions: &[(OffsetDateTime, bool)],
     audit: &[AuditRow],
+    account_audit: &[AccountAuditRow],
 ) -> Vec<(OffsetDateTime, &'static str, String)> {
     let mut events = vec![(user.created_at, "person_add", "Created the account".to_owned())];
     for (at, _) in sessions {
@@ -990,7 +1066,18 @@ fn history(
     }
     for claim in claims {
         let tin = claim.tin().to_string();
-        events.push((claim.created_at, "upload_file", format!("Sent {} TIN {tin}", ClaimKind::label(&claim.kind))));
+        let kind = ClaimKind::label(&claim.kind);
+        match claim.submitted_at {
+            Some(at) if at == claim.created_at => {
+                events.push((claim.created_at, "upload_file", format!("Sent {kind} TIN {tin}")));
+            }
+            sent => {
+                events.push((claim.created_at, "bookmark_add", format!("Added {kind} TIN {tin} without papers")));
+                if let Some(at) = sent {
+                    events.push((at, "upload_file", format!("Sent the papers for {tin}")));
+                }
+            }
+        }
         if let Some(at) = claim.sent_back_at {
             events.push((at, "assignment_return", format!("{tin} sent back for a fix")));
         }
@@ -999,7 +1086,11 @@ fn history(
         }
         if let Some(at) = claim.decided_at {
             let (icon_name, what) = match claim.status.as_str() {
-                "approved" | "removed" | "revoked" => ("verified", format!("{tin} approved")),
+                "approved" | "removed" | "revoked" => match claim.verified_by.as_deref() {
+                    Some("admin") => ("verified", format!("{tin} activated without papers")),
+                    Some("seed") => ("verified", format!("{tin} activated by the seed tool")),
+                    _ => ("verified", format!("{tin} approved")),
+                },
                 "rejected" => ("cancel", format!("{tin} not approved")),
                 _ => ("undo", format!("Withdrew {tin}")),
             };
@@ -1008,6 +1099,9 @@ fn history(
     }
     for line in audit {
         events.push((line.created_at, audit_icon(&line.action), audit_text(line, user.id)));
+    }
+    for line in account_audit {
+        events.push((line.created_at, account_audit_icon(&line.action), account_audit_text(line)));
     }
     events.sort_by_key(|event| std::cmp::Reverse(event.0));
     events.truncate(40);
@@ -1020,7 +1114,22 @@ fn audit_icon(action: &str) -> &'static str {
         "removed" => "remove_circle",
         "revoked" => "block",
         "file_replaced" => "swap_horiz",
+        "activated" => "verified",
+        "paused" => "pause_circle",
+        "resumed" => "play_circle",
         _ => "draft",
+    }
+}
+
+/// Who did it, as the history names them: the person themself, a staff
+/// member, or the seed tool and who ran it.
+fn actor_text(actor_id: Uuid, actor_email: &str, source: &str, account_id: Option<Uuid>) -> String {
+    if source == "seed" {
+        format!("The seed tool, run by {actor_email},")
+    } else if Some(actor_id) == account_id {
+        "The person".to_owned()
+    } else {
+        format!("Staff {actor_email}")
     }
 }
 
@@ -1030,6 +1139,7 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
     let tin = &line.tin_masked;
     let file = line.document_kind.as_deref().map(DocumentKind::label).unwrap_or_default();
     let what = match line.action.as_str() {
+        "deleted" if line.claim_status == "unverified" => format!("deleted {tin}, saved without papers"),
         "deleted" => {
             let status = match line.claim_status.as_str() {
                 "pending" => "waiting",
@@ -1041,9 +1151,51 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "removed" => format!("removed {tin}"),
         "revoked" => format!("revoked the ownership of {tin}"),
         "file_replaced" => format!("replaced the {file} on {tin}"),
+        "activated" => format!("activated {tin} without papers"),
+        "paused" => format!("paused {tin}"),
+        "resumed" => format!("resumed {tin}"),
         _ => format!("removed the {file} from {tin}"),
     };
-    let who = if line.actor_id == account_id { "The person".to_owned() } else { format!("Staff {}", line.actor_email) };
+    let who = actor_text(line.actor_id, &line.actor_email, &line.source, Some(account_id));
+    match &line.reason {
+        Some(reason) => format!("{who} {what}: {reason}"),
+        None => format!("{who} {what}"),
+    }
+}
+
+fn account_audit_icon(action: &str) -> &'static str {
+    match action {
+        "banned" => "block",
+        "unbanned" => "lock_open",
+        "role_changed" => "shield_person",
+        "test_marked" | "test_unmarked" => "science",
+        "signed_out" | "app_signed_out" => "logout",
+        "created" => "person_add",
+        _ => "draft",
+    }
+}
+
+/// An `account_audit` line as the history reads it, with its reason.
+fn account_audit_text(line: &AccountAuditRow) -> String {
+    let what = match line.action.as_str() {
+        "banned" => "banned the account".to_owned(),
+        "unbanned" => "lifted the ban".to_owned(),
+        "role_changed" => format!(
+            "changed the role from {} to {}",
+            roles::role_label(line.old_value.as_deref()),
+            roles::role_label(line.new_value.as_deref())
+        ),
+        "test_marked" => "marked it as a test account".to_owned(),
+        "test_unmarked" => "removed the test label".to_owned(),
+        "signed_out" => "signed the account out everywhere".to_owned(),
+        "app_signed_out" => match line.new_value.as_deref().and_then(crate::account::oauth::client_name) {
+            Some(name) => format!("signed the {name} app out"),
+            None => "signed an app or agent out".to_owned(),
+        },
+        "created" => "created the login".to_owned(),
+        other => other.replace('_', " "),
+    };
+    let who = actor_text(line.actor_id, &line.actor_email, &line.source, None);
     match &line.reason {
         Some(reason) => format!("{who} {what}: {reason}"),
         None => format!("{who} {what}"),

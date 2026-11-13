@@ -27,6 +27,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     let claim = &row.claim;
     let has = |kind: &str| row.document_kinds.iter().any(|stored| stored == kind);
     let mut flags = Vec::new();
+    if row.test_account {
+        flags.push(("info", "science", "Test".to_owned()));
+    }
     if row.rivals > 0 {
         flags.push(("bad", "group", "Another account claims this TIN".to_owned()));
     } else if claim.is_open() {
@@ -719,8 +722,8 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
             let id_status = IdStatus::of(role.is_some(), own.iter().map(|claim| claim.status.as_str()));
             // The list says "Support"; Admins already read "Staff".
             let badge = role_badge(role).filter(|(_, tone)| *tone == "support");
-            let banned = user.banned_at.is_some();
-            UserListRow { color: index % 5, user, names, tins, id_status, badge, banned }
+            let (test, banned) = (user.test_account, user.banned_at.is_some());
+            UserListRow { color: index % 5, user, names, tins, id_status, badge, test, banned }
         })
         .collect();
     let chips: Vec<(UserFilter, String)> = UserFilter::ALL
@@ -786,6 +789,7 @@ struct UserListRow {
     tins: Vec<(String, String)>,
     id_status: IdStatus,
     badge: Option<(&'static str, &'static str)>,
+    test: bool,
     banned: bool,
 }
 
@@ -810,6 +814,9 @@ async fn user_row(row: UserListRow) -> Result<impl View> {
             <span class=(format!("id-badge {id_tone}"))>icon(name: id_icon) (id_label)</span>
             if let Some((label, tone)) = row.badge {
                 <span class=(format!("id-badge {tone}"))>(label)</span>
+            }
+            if row.test {
+                <span class="id-badge test">icon(name: "science") "Test"</span>
             }
             if row.banned {
                 <span class="id-badge banned">icon(name: "block") "Banned"</span>
@@ -907,6 +914,9 @@ pub mod account_id {
                             if let Some((label, tone)) = badge {
                                 <span class=(format!("id-badge {tone}"))>icon(name: "shield_person") (label)</span>
                             }
+                            if user.test_account {
+                                <span class="id-badge test">icon(name: "science") "Test account"</span>
+                            }
                             if user.banned_at.is_some() {
                                 <span class="id-badge banned">icon(name: "block") "Banned"</span>
                             }
@@ -973,6 +983,19 @@ pub mod account_id {
                                 } else if own_account {
                                     <p class="side-text">"This is you. Another admin can change your role."</p>
                                 } else {
+                                    if user.test_account {
+                                        <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Remove the test label from {}?", user.email)) data-confirm-detail="Staff no longer see it as a test account." data-confirm-label="Remove">
+                                            <input type="hidden" name="test" value="off">
+                                            reason_field()
+                                            <button class="btn btn-ghost" type="submit">"Remove the test label"</button>
+                                        </form>
+                                    } else {
+                                        <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Mark {} as a test account?", user.email)) data-confirm-detail="A label for staff only. Sends work as usual." data-confirm-label="Mark">
+                                            <input type="hidden" name="test" value="on">
+                                            reason_field()
+                                            <button class="btn btn-ghost" type="submit">"Mark as test account"</button>
+                                        </form>
+                                    }
                                     if let Some(at) = user.banned_at {
                                         <p class="side-text">
                                             "Banned by " (user.banned_by_email.clone().unwrap_or_default()) " on " (date(at)) ": "
@@ -1278,4 +1301,15 @@ fn account_audit_text(line: &AccountAuditRow) -> String {
         Some(reason) => format!("{who} {what}: {reason}"),
         None => format!("{who} {what}"),
     }
+}
+
+/// The required reason of a staff form, kept in the account's history.
+#[component]
+async fn reason_field() -> Result<impl View> {
+    Ok(view! {
+        <label class="decision-label">
+            "Reason"
+            <textarea name="reason" rows="2" maxlength="500" required=(true) placeholder="Kept in the account's history."></textarea>
+        </label>
+    })
 }

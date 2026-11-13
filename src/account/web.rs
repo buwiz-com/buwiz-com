@@ -122,6 +122,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/{account_id}/role", post(change_role))
         .route("/staff/users/{account_id}/ban", post(ban_user))
         .route("/staff/users/{account_id}/unban", post(unban_user))
+        .route("/staff/users/{account_id}/test", post(mark_test))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
         .route("/devices/{device_id}/revoke", post(revoke_device))
@@ -1075,6 +1076,37 @@ async fn unban_user(
         Err(response) => return response,
     };
     staff_outcome(&back_to, admin::unban(&state.db, &staff, account_id, &form.reason).await)
+}
+
+#[derive(Deserialize)]
+struct TestForm {
+    #[serde(default)]
+    test: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// An Admin puts the test-account label on (`test=on`) or takes it off.
+async fn mark_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<TestForm>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/users/{account_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::MarkTest).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let test = match form.test.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return (StatusCode::BAD_REQUEST, "test must be on or off").into_response(),
+    };
+    staff_outcome(&back_to, admin::mark_test(&state.db, &staff, account_id, test, &form.reason).await)
 }
 
 #[derive(Deserialize)]

@@ -225,6 +225,16 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         expect_post(&site, (who, &cookie), &path, "reason=Lost+laptop", false, &user, &done).await;
         assert_eq!(live_sessions(&site.db, t.account).await == 0, who.may(false), "{who:?}");
 
+        // The test label: Admins only.
+        let done = format!("{user}?notice=test_marked");
+        expect_post(&site, (who, &cookie), &format!("{user}/test"), "test=on&reason=Trial", true, &user, &done).await;
+        let labelled: bool = sqlx::query_scalar("SELECT test_account FROM accounts WHERE id = $1")
+            .bind(t.account)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+        assert_eq!(labelled, who.may(true), "{who:?}");
+
         // Ban and lift: Admins only.
         let banned = || async {
             sqlx::query_scalar::<_, bool>("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1")

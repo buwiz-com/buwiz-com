@@ -1,4 +1,5 @@
-//! What staff do to accounts: change a role, ban and lift a ban, and sign
+//! What staff do to accounts: change a role, ban and lift a ban, label a
+//! test account, and sign
 //! an account out everywhere or out of one app. Each runs in one transaction (lock, check,
 //! change, a line in `account_audit` with who, when and why). The routes
 //! check the power first ([`crate::account::roles`]); the checks here are
@@ -299,4 +300,42 @@ pub async fn unban(db: &PgPool, actor: &Staff, account_id: Uuid, reason: &str) -
     tx.commit().await?;
     tracing::info!(account_id = %target.id, actor = %actor.account.id, "ban lifted");
     Ok(Notice::BanLifted)
+}
+
+/// An Admin labels an account as a test account, or takes the label off.
+/// Only staff see it; sends work as usual.
+pub async fn mark_test(
+    db: &PgPool,
+    actor: &Staff,
+    account_id: Uuid,
+    test: bool,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = required_reason(reason)?;
+    let notice = if test { Notice::TestMarked } else { Notice::TestUnmarked };
+    let mut tx = db.begin().await?;
+    let target = lock_account(&mut tx, account_id).await?;
+    let labelled: bool = sqlx::query_scalar("SELECT test_account FROM accounts WHERE id = $1")
+        .bind(target.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if labelled == test {
+        return Ok(notice);
+    }
+    sqlx::query("UPDATE accounts SET test_account = $2 WHERE id = $1")
+        .bind(target.id)
+        .bind(test)
+        .execute(&mut *tx)
+        .await?;
+    let line = Line {
+        account_id: target.id,
+        action: if test { "test_marked" } else { "test_unmarked" },
+        old_value: None,
+        new_value: None,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
+    tx.commit().await?;
+    Ok(notice)
 }

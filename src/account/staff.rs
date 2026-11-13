@@ -110,6 +110,8 @@ pub struct QueueRow {
     pub reading_kind: Option<String>,
     pub tin_match: Option<String>,
     pub name_match: Option<String>,
+    /// The claimant's account is labelled a test account.
+    pub test_account: bool,
 }
 
 pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Result<Vec<QueueRow>> {
@@ -120,7 +122,7 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
                 AND o.status IN ('pending', 'needs_fix', 'approved')) AS rivals,
              ARRAY(SELECT DISTINCT d.kind FROM claim_documents d
                    WHERE d.claim_id = c.id AND d.purged_at IS NULL) AS document_kinds,
-             reading.reading_kind, reading.tin_match, reading.name_match
+             reading.reading_kind, reading.tin_match, reading.name_match, a.test_account
          FROM tin_claims c JOIN accounts a ON a.id = c.account_id
          LEFT JOIN LATERAL (
              SELECT d.kind AS reading_kind, r.tin_match, r.name_match
@@ -185,11 +187,13 @@ pub enum UserFilter {
     Verified,
     NoTin,
     Staff,
+    Test,
     Banned,
 }
 
 impl UserFilter {
-    pub const ALL: [Self; 6] = [Self::Everyone, Self::Waiting, Self::Verified, Self::NoTin, Self::Staff, Self::Banned];
+    pub const ALL: [Self; 7] =
+        [Self::Everyone, Self::Waiting, Self::Verified, Self::NoTin, Self::Staff, Self::Test, Self::Banned];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Everyone)
@@ -202,6 +206,7 @@ impl UserFilter {
             Self::Verified => "verified",
             Self::NoTin => "no_tin",
             Self::Staff => "staff",
+            Self::Test => "test",
             Self::Banned => "banned",
         }
     }
@@ -213,6 +218,7 @@ impl UserFilter {
             Self::Verified => "Verified",
             Self::NoTin => "No TIN yet",
             Self::Staff => "Staff",
+            Self::Test => "Test accounts",
             Self::Banned => "Banned",
         }
     }
@@ -265,6 +271,7 @@ pub async fn users(
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
                                               AND c.status IN ('unverified', 'pending', 'needs_fix', 'approved'))
                WHEN 'staff' THEN a.banned_at IS NULL AND (a.role IS NOT NULL OR a.email = ANY($4))
+               WHEN 'test' THEN a.test_account
                WHEN 'banned' THEN a.banned_at IS NOT NULL
                ELSE true
            END

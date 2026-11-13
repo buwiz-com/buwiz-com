@@ -108,6 +108,8 @@ notices! {
     AccountBannedStaff = "account_banned_staff" => info "Account banned. It can't sign in or send until you lift the ban.",
     BanLifted = "ban_lifted" => info "Ban lifted. The person can sign in again.",
     BanAdmin = "ban_admin" => error "Change this person's role first; an admin can't be banned.",
+    TestMarked = "test_marked" => info "Marked as a test account.",
+    TestUnmarked = "test_unmarked" => info "No longer marked as a test account.",
     TinActivated = "tin_activated" => info "Activated without papers. The reason is in the account's history.",
     ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
 }

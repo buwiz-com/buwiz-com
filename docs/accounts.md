@@ -40,7 +40,7 @@ notes), signing one app out included, but two: approving a claim and
 confirming an automatic activation (unless the confirmation lifts the
 pause Buwiz put on it). Rejecting a claim needs a note to the
 person, and sending it back needs a fix reason or a note. Nobody pauses or
-resumes their own TIN.
+resumes their own TIN, nor labels their own account a test account.
 
 ### Bans and test accounts
 

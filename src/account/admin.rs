@@ -334,7 +334,8 @@ pub async fn unban(
 }
 
 /// An Admin labels an account as a test account, or takes the label off.
-/// Only staff see it; sends work as usual.
+/// Only staff see it; sends work as usual. Not one's own account. Locks as
+/// a ban does: the roles lock, the actor, then the account.
 pub async fn mark_test(
     db: &PgPool,
     config: &Config,
@@ -345,7 +346,11 @@ pub async fn mark_test(
 ) -> Result<Notice, DecideError> {
     let reason = required_reason(reason)?;
     let notice = if test { Notice::TestMarked } else { Notice::TestUnmarked };
+    if account_id == actor.account.id {
+        return Err(DecideError::Refused(Notice::OwnAccount));
+    }
     let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
     if !roles::may(&mut tx, config, actor.account.id, Power::MarkTest).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }

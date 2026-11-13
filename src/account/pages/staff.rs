@@ -35,6 +35,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     } else if claim.is_open() {
         flags.push(("good", "person_check", "First claim on this TIN".to_owned()));
     }
+    if claim.paused_at.is_some() {
+        flags.push(("warn", "pause_circle", "Paused".to_owned()));
+    }
     if claim.status == "pending" && claim.resent_at.is_some() {
         flags.push(("warn", "replay", "Resent after a fix".to_owned()));
     }
@@ -338,6 +341,10 @@ async fn typed_vs_document(comparison: Comparison) -> Result<impl View> {
 pub mod claim_id {
     use super::*;
 
+    fn own_claim_of(claim: &ClaimRow, reviewer: &Staff) -> bool {
+        claim.account_id == reviewer.account.id
+    }
+
     #[page("/staff/claims/{claim_id}")]
     pub async fn claim_page(cx: &Cx) -> Result<impl View> {
         let reviewer = staff_member(cx, Power::Review).await?;
@@ -403,7 +410,21 @@ pub mod claim_id {
 
         let reading = ocr::for_claim(db, claim_id).await?;
         let compare = comparison(&claim, kind, reading.as_ref());
-        let (status_label, status_icon, status_tone) = status_look(&claim.status);
+        let (status_label, status_icon, status_tone) = status_look(claim.shown_status());
+        let pauses = claims::pauses(db, &claim.tin()).await?;
+        let paused_by = match claim.paused_at {
+            Some(_) => sqlx::query_scalar::<_, String>(
+                "SELECT a.email FROM tin_claims c JOIN accounts a ON a.id = c.paused_by WHERE c.id = $1",
+            )
+            .bind(claim.id)
+            .fetch_optional(db)
+            .await?
+            .unwrap_or_default(),
+            None => String::new(),
+        };
+        let can_pause = reviewer.can(Power::Pause) && claim.status == "approved" && !own_claim_of(&claim, &reviewer);
+        let pause = format!("/staff/claims/{claim_id}/pause");
+        let resume = format!("/staff/claims/{claim_id}/resume");
         let age = match claim.status.as_str() {
             "pending" => Some(format!("Waiting {}", span_since(claim.waiting_since()))),
             _ => None,
@@ -466,7 +487,7 @@ pub mod claim_id {
                                     for rival in other_accounts {
                                         <li>
                                             <a href=(format!("/staff/claims/{}", rival.id))>(rival.email.clone())</a>
-                                            " · " (status_look(&rival.status).0) " since " (short_date(rival.created_at))
+                                            " · " (status_look(rival.shown_status()).0) " since " (short_date(rival.created_at))
                                         </li>
                                     }
                                 </ul>
@@ -573,6 +594,47 @@ pub mod claim_id {
                                     <p class="side-text">(status_label) " · " (claim.decided_at.map(date_time).unwrap_or_default())</p>
                                     if let Some(note) = claim.decision_note.clone() {
                                         <p class="side-text quote">(note)</p>
+                                    }
+                                </section>
+                            }
+                            if !pauses.is_empty() {
+                                <section class="panel side-card">
+                                    <h2>"Paused before"</h2>
+                                    for line in pauses {
+                                        <p class="side-text">
+                                            (if line.action == "paused" { "Paused by " } else { "Resumed by " })
+                                            (line.actor_email.clone()) " on " (date(line.created_at))
+                                            if let Some(reason) = line.reason.clone() {
+                                                ": " (reason)
+                                            }
+                                        </p>
+                                    }
+                                </section>
+                            }
+                            if can_pause {
+                                <section class="panel side-card end-claim">
+                                    if let Some(at) = claim.paused_at {
+                                        <h2>"Paused"</h2>
+                                        <p class="side-text">"Paused by " (paused_by.clone()) " on " (date(at)) ": " (claim.pause_reason.clone().unwrap_or_default())</p>
+                                        confirm_form(
+                                            label: "Resume sending",
+                                            action: resume,
+                                            question: format!("Resume sending for {tin}?"),
+                                            detail: "The owner can send returns again at once.".to_owned(),
+                                            confirm: "Resume",
+                                            reason: true
+                                        )
+                                    } else {
+                                        <h2>"Pause sending"</h2>
+                                        <p class="side-text">"Keeps the TIN on this account but stops every send at once. The owner sees your reason on My TINs."</p>
+                                        confirm_form(
+                                            label: "Pause sending",
+                                            action: pause,
+                                            question: format!("Pause sending for {tin}?"),
+                                            detail: "Tickets and sends are refused until you resume. Returns already sent are not affected.".to_owned(),
+                                            confirm: "Pause",
+                                            reason: true
+                                        )
                                     }
                                 </section>
                             }
@@ -711,7 +773,9 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
             }
             let tins = own
                 .iter()
-                .filter(|claim| matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix" | "approved"))
+                .filter(|claim| {
+                    matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix" | "approved" | "paused")
+                })
                 .map(|claim| {
                     let tin = crate::account::tin::Tin::parse(&claim.tin_root, &claim.branch_code)
                         .expect("stored TINs are valid");
@@ -945,7 +1009,7 @@ pub mod account_id {
                                     <p class="side-text">"No TIN added."</p>
                                 }
                                 for claim in claims.clone() {
-                                    let (label, status_icon, tone) = status_look(&claim.status);
+                                    let (label, status_icon, tone) = status_look(claim.shown_status());
                                     <div class="user-tin">
                                         kind_pill(kind: claim.kind.clone())
                                         tin_text(tin: claim.tin().to_string())

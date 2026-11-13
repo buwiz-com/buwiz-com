@@ -110,6 +110,12 @@ notices! {
     BanAdmin = "ban_admin" => error "Change this person's role first; an admin can't be banned.",
     TestMarked = "test_marked" => info "Marked as a test account.",
     TestUnmarked = "test_unmarked" => info "No longer marked as a test account.",
+    PausedLocked = "paused_locked" => error "This TIN is paused. Write to support@buwiz.com to remove it.",
+    TinIsPaused = "tin_is_paused" => error "This TIN is on My TINs, and sending for it is paused. Write to support@buwiz.com.",
+    TinPaused = "tin_paused" => info "Sending paused. The owner sees your reason on My TINs.",
+    TinResumed = "tin_resumed" => info "Sending resumed.",
+    NotPausable = "not_pausable" => error "Only an active TIN can be paused.",
+    NotPaused = "not_paused" => error "This TIN is not paused.",
     TinActivated = "tin_activated" => info "Activated without papers. The reason is in the account's history.",
     ClaimantBanned = "claimant_banned" => error "This account is banned. Lift the ban before making its TIN active.",
 }

@@ -116,6 +116,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/claims/{claim_id}/delete", post(staff_delete_claim))
         .route("/staff/claims/{claim_id}/revoke", post(revoke_claim))
         .route("/staff/claims/{claim_id}/activate", post(activate_claim))
+        .route("/staff/claims/{claim_id}/pause", post(pause_claim))
+        .route("/staff/claims/{claim_id}/resume", post(resume_claim))
         .route("/staff/documents/{document_id}", get(staff_document))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
@@ -981,6 +983,42 @@ async fn activate_claim(
     let outcome =
         claims::activate_without_papers(&state.db, &state.documents, claim_id, &staff.account, &form.reason).await;
     staff_outcome(&back_to, outcome)
+}
+
+/// An Admin pauses an active TIN, with a reason the owner reads.
+async fn pause_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/claims/{claim_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::Pause).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    staff_outcome(&back_to, claims::pause(&state.db, claim_id, &staff.account, &form.reason).await)
+}
+
+/// An Admin resumes a paused TIN, with a reason.
+async fn resume_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(claim_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/claims/{claim_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::Pause).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    staff_outcome(&back_to, claims::resume(&state.db, claim_id, &staff.account, &form.reason).await)
 }
 
 /// A claim document, shown inline to staff only.

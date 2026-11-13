@@ -207,6 +207,25 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         expect_post(&site, (who, &cookie), &path, "reason=Known+owner", true, &claim_page, &done).await;
         assert_eq!(site.claim_status(t.spare).await == "approved", who.may(true), "{who:?}");
 
+        // Pause and resume: Admins only.
+        let other = add_claim(&site.db, t.account, &format!("5{n:08}"), "approved").await;
+        let claim_page = format!("/staff/claims/{other}");
+        let paused = || async {
+            sqlx::query_scalar::<_, bool>("SELECT paused_at IS NOT NULL FROM tin_claims WHERE id = $1")
+                .bind(other)
+                .fetch_one(&site.db)
+                .await
+                .unwrap()
+        };
+        let done = format!("{claim_page}?notice=tin_paused");
+        expect_post(&site, (who, &cookie), &format!("{claim_page}/pause"), "reason=Check", true, &claim_page, &done)
+            .await;
+        assert_eq!(paused().await, who.may(true), "{who:?}");
+        let done = format!("{claim_page}?notice=tin_resumed");
+        expect_post(&site, (who, &cookie), &format!("{claim_page}/resume"), "reason=Ok", true, &claim_page, &done)
+            .await;
+        assert!(!paused().await, "{who:?}");
+
         // Change a role: Admins only.
         let path = format!("{user}/role");
         let done = format!("{user}?notice=role_changed");

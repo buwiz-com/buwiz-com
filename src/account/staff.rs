@@ -36,15 +36,17 @@ pub enum QueueFilter {
     SentBack,
     /// Saved without papers: nothing to review yet.
     Unverified,
+    /// Active and not paused.
     Approved,
+    Paused,
     Rejected,
     /// Approved once, then removed by the owner or revoked by staff.
     Ended,
 }
 
 impl QueueFilter {
-    pub const ALL: [Self; 6] =
-        [Self::Waiting, Self::SentBack, Self::Unverified, Self::Approved, Self::Rejected, Self::Ended];
+    pub const ALL: [Self; 7] =
+        [Self::Waiting, Self::SentBack, Self::Unverified, Self::Approved, Self::Paused, Self::Rejected, Self::Ended];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Waiting)
@@ -56,6 +58,7 @@ impl QueueFilter {
             Self::SentBack => "sent_back",
             Self::Unverified => "unverified",
             Self::Approved => "approved",
+            Self::Paused => "paused",
             Self::Rejected => "rejected",
             Self::Ended => "ended",
         }
@@ -67,6 +70,7 @@ impl QueueFilter {
             Self::SentBack => "Sent back",
             Self::Unverified => "Not verified",
             Self::Approved => "Approved",
+            Self::Paused => "Paused",
             Self::Rejected => "Rejected",
             Self::Ended => "Removed",
         }
@@ -77,7 +81,7 @@ impl QueueFilter {
             Self::Waiting => &["pending"],
             Self::SentBack => &["needs_fix"],
             Self::Unverified => &["unverified"],
-            Self::Approved => &["approved"],
+            Self::Approved | Self::Paused => &["approved"],
             Self::Rejected => &["rejected"],
             Self::Ended => &["removed", "revoked"],
         }
@@ -85,12 +89,22 @@ impl QueueFilter {
 
     /// Open claims oldest first, so nobody waits longest; decided ones
     /// newest first.
+    /// Whether the tab holds paused TINs, not paused ones, or either.
+    fn paused(self) -> Option<bool> {
+        match self {
+            Self::Approved => Some(false),
+            Self::Paused => Some(true),
+            _ => None,
+        }
+    }
+
     fn order(self) -> &'static str {
         match self {
             Self::Waiting => "coalesce(c.resent_at, c.submitted_at, c.created_at), c.id",
             Self::SentBack => "c.sent_back_at, c.id",
             Self::Unverified => "c.created_at DESC, c.id",
             Self::Approved | Self::Rejected => "c.decided_at DESC, c.id",
+            Self::Paused => "c.paused_at DESC, c.id",
             Self::Ended => "c.removed_at DESC, c.id",
         }
     }
@@ -130,7 +144,7 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
              WHERE d.claim_id = c.id AND d.purged_at IS NULL AND r.status = 'read'
              ORDER BY d.created_at DESC LIMIT 1
          ) reading ON true
-         WHERE c.status = ANY($1)
+         WHERE c.status = ANY($1) AND ($5::bool IS NULL OR (c.paused_at IS NOT NULL) = $5)
            AND ($2::text IS NULL OR a.email ILIKE $2 OR c.registered_name ILIKE $2 OR c.trade_name ILIKE $2
                 OR ($3::text IS NOT NULL AND c.tin_root || c.branch_code LIKE $3))
          ORDER BY {}
@@ -141,6 +155,7 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
     .bind(contains(search))
     .bind(tin_digits(search))
     .bind(LIST_LIMIT)
+    .bind(filter.paused())
     .fetch_all(db)
     .await
 }
@@ -301,12 +316,14 @@ pub struct UserClaim {
     pub tin_root: String,
     pub branch_code: String,
     pub registered_name: String,
+    /// As people read it: an active TIN staff paused is `paused`.
     pub status: String,
 }
 
 pub async fn claims_of(db: &PgPool, account_ids: &[Uuid]) -> sqlx::Result<Vec<UserClaim>> {
     sqlx::query_as(
-        "SELECT account_id, tin_root, branch_code, registered_name, status FROM tin_claims
+        "SELECT account_id, tin_root, branch_code, registered_name,
+             CASE WHEN paused_at IS NOT NULL THEN 'paused' ELSE status END AS status FROM tin_claims
          WHERE account_id = ANY($1) AND status <> 'withdrawn' ORDER BY created_at",
     )
     .bind(account_ids)

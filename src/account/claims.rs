@@ -610,6 +610,12 @@ impl ClaimRow {
         Tin::parse(&self.tin_root, &self.branch_code).expect("stored TINs are valid")
     }
 
+    /// The status as people read it: an active TIN staff paused is
+    /// `paused`.
+    pub fn shown_status(&self) -> &str {
+        if self.status == "approved" && self.paused_at.is_some() { "paused" } else { &self.status }
+    }
+
     /// Waiting for staff or for the claimant's fix.
     pub fn is_open(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "needs_fix")
@@ -1078,6 +1084,11 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
     if claim.status != "approved" {
         return Err(DecideError::Refused(Notice::TinNotActive));
     }
+    // Removing a paused TIN and adding it again would get round the pause:
+    // only staff end it. (The pause stays on record in claim_audit.)
+    if matches!(by, By::Owner) && is_paused(&mut tx, claim_id).await? {
+        return Err(DecideError::Refused(Notice::PausedLocked));
+    }
     let (status, notice) = match by {
         By::Owner => ("removed", Notice::TinRemoved),
         By::Staff { .. } => ("revoked", Notice::OwnershipRevoked),
@@ -1097,6 +1108,81 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
     tx.commit().await?;
     tracing::info!(%claim_id, actor = %actor.id, status, "tin ownership ended");
     Ok(notice)
+}
+
+async fn is_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT paused_at IS NOT NULL FROM tin_claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+/// An Admin pauses an active TIN: it stays owned (nobody else can be
+/// approved for it) but nothing sends until it is resumed. The owner reads
+/// the reason on My TINs. Not on one's own TIN, like ending an ownership.
+pub async fn pause(db: &PgPool, claim_id: Uuid, actor: &Account, reason: &str) -> Result<Notice, DecideError> {
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    let reason = check_actor(&claim, actor, &By::Staff { reason }).map_err(DecideError::Refused)?;
+    if claim.status != "approved" || is_paused(&mut tx, claim_id).await? {
+        return Err(DecideError::Refused(Notice::NotPausable));
+    }
+    sqlx::query("UPDATE tin_claims SET paused_at = now(), paused_by = $2, pause_reason = $3 WHERE id = $1")
+        .bind(claim_id)
+        .bind(actor.id)
+        .bind(&reason)
+        .execute(&mut *tx)
+        .await?;
+    audit(&mut tx, &claim, actor, "paused", None, reason.as_deref()).await?;
+    tx.commit().await?;
+    tracing::info!(%claim_id, actor = %actor.id, "tin paused");
+    Ok(Notice::TinPaused)
+}
+
+/// An Admin resumes a paused TIN: it is exactly as before the pause.
+pub async fn resume(db: &PgPool, claim_id: Uuid, actor: &Account, reason: &str) -> Result<Notice, DecideError> {
+    let mut tx = db.begin().await?;
+    let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
+        return Err(DecideError::Refused(Notice::ClaimMissing));
+    };
+    let reason = check_actor(&claim, actor, &By::Staff { reason }).map_err(DecideError::Refused)?;
+    if claim.status != "approved" || !is_paused(&mut tx, claim_id).await? {
+        return Err(DecideError::Refused(Notice::NotPaused));
+    }
+    sqlx::query("UPDATE tin_claims SET paused_at = NULL, paused_by = NULL, pause_reason = NULL WHERE id = $1")
+        .bind(claim_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(&mut tx, &claim, actor, "resumed", None, reason.as_deref()).await?;
+    tx.commit().await?;
+    tracing::info!(%claim_id, actor = %actor.id, "tin resumed");
+    Ok(Notice::TinResumed)
+}
+
+/// A line of `claim_audit` about pausing a TIN, on any of its claims.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct PauseLine {
+    pub action: String,
+    pub actor_email: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Every pause and resume of this TIN, on any account's claim, oldest
+/// first: what a reviewer should know before making it active again.
+pub async fn pauses(db: &PgPool, tin: &Tin) -> sqlx::Result<Vec<PauseLine>> {
+    sqlx::query_as(
+        "SELECT a.action, a.actor_email, a.reason, a.created_at
+         FROM claim_audit a JOIN tin_claims c ON c.id = a.claim_id
+         WHERE c.tin_root = $1 AND c.branch_code = $2 AND a.action IN ('paused', 'resumed')
+         ORDER BY a.created_at, a.id",
+    )
+    .bind(tin.root())
+    .bind(tin.branch())
+    .fetch_all(db)
+    .await
 }
 
 /// One stored file of the claimant's own open claim, locked for a change.

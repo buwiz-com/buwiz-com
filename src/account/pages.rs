@@ -744,6 +744,7 @@ fn status_look(status: &str) -> (&'static str, &'static str, &'static str) {
         "pending" => ("Being checked", "schedule", "waiting"),
         "needs_fix" => ("Needs a fix", "error", "fix"),
         "approved" => ("Active", "check_circle", "active"),
+        "paused" => ("Paused", "pause_circle", "paused"),
         "rejected" => ("Not approved", "cancel", "rejected"),
         "removed" => ("Removed", "remove_circle", "withdrawn"),
         "revoked" => ("Revoked", "block", "rejected"),

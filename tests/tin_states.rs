@@ -494,7 +494,8 @@ async fn the_add_link_prefills_or_goes_to_the_tins_own_page(db: PgPool) {
         ("tin=000123493", format!("/tins/claims/{fix}/fix")),
         ("tin=000123494", "/tins?notice=claim_already_pending".to_owned()),
         ("tin=000123495", "/tins?notice=tin_already_active".to_owned()),
-        ("tin=000123496", "/tins?notice=tin_already_active".to_owned()),
+        // A paused TIN never reads as active (review finding 9).
+        ("tin=000123496", "/tins?notice=tin_is_paused".to_owned()),
     ] {
         let response = site.get(&format!("/tins/new?{query}"), &cookie).await;
         assert!(response.status().is_redirection(), "{query}");

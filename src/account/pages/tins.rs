@@ -92,12 +92,12 @@ async fn device_row(device: devices::DeviceView) -> Result<impl View> {
 /// and what the person can do next.
 #[component]
 async fn tin_card(claim: ClaimRow) -> Result<impl View> {
-    let (label, status_icon, tone) = status_look(&claim.status);
-    let status = claim.status.clone();
+    let (label, status_icon, tone) = status_look(claim.shown_status());
+    let status = claim.shown_status().to_owned();
     let checked = match status.as_str() {
         "needs_fix" => ("Needs a fix", "warn"),
         "rejected" => ("Not approved", "warn"),
-        "approved" => ("Checked", "done"),
+        "approved" | "paused" => ("Checked", "done"),
         _ => ("Checked", ""),
     };
     let papers = if claim.kind == "personal" { "your TIN ID" } else { "your papers" };
@@ -134,12 +134,21 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
                 <ol class="track" aria-label="Review progress">
                     <li class="done">"Sent"</li>
                     <li class=(checked.1)>(checked.0)</li>
-                    <li class=(match status.as_str() { "approved" => "done", "revoked" => "warn", _ => "" })>"Active"</li>
+                    <li class=(match status.as_str() { "approved" => "done", "revoked" | "paused" => "warn", _ => "" })>"Active"</li>
                 </ol>
             }
             match status.as_str() {
                 "unverified" => <p class="tin-note unverified">"Not verified yet. You can prepare and save returns for this TIN in the app. To send them to the BIR, verify it with " (verify_with) "."</p>,
                 "approved" => <p class="tin-note active">"Active since " (claim.decided_at.map(date).unwrap_or_default()) ". File from the Buwiz app on your computer."</p>,
+                "paused" => {
+                    <div class="tin-note paused">
+                        <p><strong>"Sending is paused."</strong> " Our staff paused this TIN on " (claim.paused_at.map(date).unwrap_or_default()) ". You can still prepare returns; sending to the BIR waits until it is resumed."</p>
+                        if let Some(reason) = claim.pause_reason.clone() {
+                            <p>(reason)</p>
+                        }
+                        <p>"Questions? Write to support@buwiz.com."</p>
+                    </div>
+                },
                 "pending" => <p class="tin-note waiting">"A person is checking " (papers) ", usually within one business day. You can already prepare returns in the app."</p>,
                 "needs_fix" => {
                     <div class="tin-note fix">
@@ -307,7 +316,8 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
         query(cx, "tin").and_then(|tin| Tin::parse_fields(&tin, &query(cx, "branch").unwrap_or_default()).ok());
     if let Some(tin) = &wanted {
         let own: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, status FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
+            "SELECT id, CASE WHEN paused_at IS NOT NULL THEN 'paused' ELSE status END FROM tin_claims
+             WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3
                AND status IN ('unverified', 'pending', 'needs_fix', 'approved')",
         )
         .bind(account.id)
@@ -319,6 +329,7 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
             Some((id, status)) if status == "unverified" => Some(format!("/tins/claims/{id}/verify")),
             Some((id, status)) if status == "needs_fix" => Some(format!("/tins/claims/{id}/fix")),
             Some((_, status)) if status == "pending" => Some(link("/tins", Some(Notice::ClaimAlreadyPending), &[])),
+            Some((_, status)) if status == "paused" => Some(link("/tins", Some(Notice::TinIsPaused), &[])),
             Some(_) => Some(link("/tins", Some(Notice::TinAlreadyActive), &[])),
             None => None,
         };

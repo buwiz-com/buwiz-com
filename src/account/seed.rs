@@ -248,7 +248,8 @@ type RefusedTin = (String, String);
 /// TINs refused on their own). `full` shows TINs in full (a dry run).
 fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>), SeedError> {
     let text = std::str::from_utf8(file).map_err(|_| SeedError::Refused(vec!["the file is not UTF-8".into()]))?;
-    let parsed: SeedFile = toml::from_str(text).map_err(|error| SeedError::Refused(vec![error.to_string()]))?;
+    let parsed: SeedFile =
+        toml::from_str(text).map_err(|error| SeedError::Refused(vec![toml_problem(&error, text, full)]))?;
     let mut problems = Vec::new();
     let mut refused_tins = Vec::new();
     let mut emails: Vec<String> = Vec::new();
@@ -326,6 +327,28 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
         logins.push(PlannedLogin { email, role: login.role.map(RoleEntry::role), test: login.test, tins: planned });
     }
     if problems.is_empty() { Ok((logins, refused_tins)) } else { Err(SeedError::Refused(problems)) }
+}
+
+/// A file that does not parse, as a run shows it. toml's own message
+/// quotes the line it stopped on, and some quote the value too: on a TIN
+/// line, a full TIN. A dry run (TINs in full anyway) keeps it; a real run
+/// gives the line and column and the message with every digit hidden.
+fn toml_problem(error: &toml::de::Error, text: &str, full: bool) -> String {
+    if full {
+        return error.to_string();
+    }
+    let message: String = error.message().chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    let message = message.trim();
+    match error.span().and_then(|span| text.get(..span.start)) {
+        Some(before) => {
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or_default().chars().count() + 1;
+            format!(
+                "the file does not parse, at line {line}, column {column}: {message} (digits hidden; a dry run shows the line)"
+            )
+        }
+        None => format!("the file does not parse: {message} (digits hidden; a dry run shows the line)"),
+    }
 }
 
 /// Whether a `branch` key names another branch than the one `tin` was read
@@ -1470,6 +1493,45 @@ mod tests {
             tin("state = \"not_verified\"\n")
         );
         assert!(refused(&twice).contains("TIN 000-123-453-00000: in the file twice"));
+    }
+
+    /// toml's own message quotes the line it stopped on, and some messages
+    /// quote the value: on a TIN line, a full TIN. A real run says where
+    /// and what, with no digit of the file; a dry run (TINs in full anyway)
+    /// keeps toml's message.
+    #[test]
+    fn a_real_run_shows_no_line_of_a_file_that_does_not_parse() {
+        let file = |lines: &str| {
+            format!(
+                "[[login]]\nemail = \"a@example.test\"\n[[login.tin]]\n{lines}\nname = \"A\"\nstate = \"not_verified\"\n"
+            )
+        };
+        for broken in [
+            "tin = \"000-123-453\nkind = \"personal\"",
+            "tin = \"000-123-453\" x\nkind = \"personal\"",
+            "tin = 000123453\nkind = \"personal\"",
+            "tin = 123456789\nkind = \"personal\"",
+            "tinn = \"000-123-453\"\nkind = \"personal\"",
+            // A message that quotes the value itself.
+            "tin = \"000-123-453\"\nkind = \"000-123-453\"",
+        ] {
+            let text = file(broken);
+            let problem = match plan(text.as_bytes(), false) {
+                Err(SeedError::Refused(problems)) => problems.join("\n"),
+                other => panic!("{broken}: not refused: {:?}", other.map(|(logins, _)| logins.len())),
+            };
+            for digits in ["123", "453", "456", "789"] {
+                assert!(!problem.contains(digits), "{broken}: {problem}");
+            }
+            assert!(problem.contains("line ") && problem.contains("column "), "{broken}: {problem}");
+            assert!(!problem.contains("tin = "), "{broken}: {problem}");
+            // The dry run keeps toml's own words, line and all.
+            let dry = match plan(text.as_bytes(), true) {
+                Err(SeedError::Refused(problems)) => problems.join("\n"),
+                other => panic!("{broken}: not refused: {:?}", other.map(|(logins, _)| logins.len())),
+            };
+            assert!(dry.contains("123"), "{broken}: {dry}");
+        }
     }
 
     #[test]

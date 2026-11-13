@@ -306,7 +306,9 @@ of its own.
   refused. A file it could not delete is listed on stderr with the seed
   run's id, and the command exits 1: delete those objects by hand.
 - **TINs** are shown in full only in a dry run. A real run masks them
-  everywhere, refusals included, and `seed_runs` stores them masked.
+  everywhere, refusals included, and `seed_runs` stores them masked. A file
+  that does not parse is named by line and column, with no line of it and
+  every digit of the message hidden; the dry run shows the line.
 - It waits at most 5 seconds for a lock another change holds (a role
   change, a ban, a claim being decided), then gives up having written
   nothing: run it again.

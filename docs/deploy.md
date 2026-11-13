@@ -340,7 +340,11 @@ account or claim it changes or makes, the `--as` account included.
    Read every line: `Database:` is the production database; `Before:`
    has the counts you expect; `ADMIN_EMAILS:` is the server's list; every
    digit of every TIN; every `kept …` line (staff changed it on the
-   website; the file loses) and every `refused TIN …`. If it refuses, fix
+   website; the file loses), every `refused TIN …`, and every `note: …`
+   line: another account has a claim on a TIN the file makes active
+   (waiting for review, sent back, or saved without papers), which can no
+   longer be approved. The dry run names that account; the real run says
+   "another account". If it refuses, fix
    the file (or the database, on `/staff`) and dry-run again. Its last
    line is the rest of the real run's command:
    `--target <host:port/name> --expect <digest>`.

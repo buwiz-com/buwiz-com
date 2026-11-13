@@ -1076,6 +1076,8 @@ impl Seed<'_> {
             return Ok(());
         }
         let mut how = "new".to_owned();
+        // A claim waiting on `move_from` that the move deletes.
+        let mut moved_away = None;
         match (owner, &entry.move_from) {
             (Some(owner), Some(from)) if owner.email == *from => {
                 // The old row stays for its returns. Its owner sees that
@@ -1140,6 +1142,7 @@ impl Seed<'_> {
                 }
                 let files = objects.len();
                 sqlx::query("DELETE FROM tin_claims WHERE id = $1").bind(waiting_id).execute(&mut *self.tx).await?;
+                moved_away = Some(waiting_id);
                 self.objects.extend(objects);
                 let reason = move_reason(self);
                 let line = ClaimLine {
@@ -1206,6 +1209,25 @@ impl Seed<'_> {
             format!("TIN {shown} active on {email} ({how})"),
             format!("TIN {masked} active on {email} ({how})"),
         );
+        // Other accounts' claims on it can no longer be approved while it
+        // is active here: the plan says so (whose only in a dry run), and
+        // the notes are part of its digest.
+        for other in live.iter().filter(|claim| claim.account_id != account_id && Some(claim.id) != moved_away) {
+            let state = match other.status.as_str() {
+                "pending" => "waiting for review",
+                "needs_fix" => "sent back for a fix",
+                "unverified" => "saved as not verified",
+                _ => continue,
+            };
+            let note = |tin: &str, who: &str| {
+                format!(
+                    "note: TIN {tin} on {email}: {who} has a claim on it {state}; it cannot be approved while this \
+                     TIN is active on {email}"
+                )
+            };
+            let who = if self.shown_full { other.email.as_str() } else { "another account" };
+            self.unchanged(note(&shown, who), note(&masked, "another account"));
+        }
         Ok(())
     }
 }

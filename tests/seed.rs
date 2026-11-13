@@ -923,3 +923,52 @@ async fn a_move_that_deletes_stored_files_needs_the_object_store(db: PgPool) {
     assert_eq!(count(&db, "tin_claims").await, 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Activating a TIN on which other accounts have a claim waiting, or saved
+/// without papers, says so in the plan: those claims can no longer be
+/// approved while it is active. The dry run names them; a real run says
+/// "another account". The notes are part of the plan's digest.
+#[sqlx::test(migrations = "./migrations")]
+async fn activating_a_tin_others_wait_on_says_so_in_the_plan(db: PgPool) {
+    let opts = options("admin@example.test", false);
+    seed(&db, "[[login]]\nemail = \"admin@example.test\"\nrole = \"admin\"\n", &opts).await.unwrap();
+    let carl: Uuid = sqlx::query_scalar("INSERT INTO accounts (email) VALUES ('carl@example.test') RETURNING id")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let dora: Uuid = sqlx::query_scalar("INSERT INTO accounts (email) VALUES ('dora@example.test') RETURNING id")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let waiting = add_claim(&db, carl, "000123456", "pending").await;
+    add_claim(&db, dora, "000123456", "unverified").await;
+    let file = "[[login]]\nemail = \"new@example.test\"\n[[login.tin]]\ntin = \"000-123-456\"\nkind = \"personal\"\nname = \"N E W\"\nstate = \"active\"\nreason = \"Known\"\n";
+
+    let dry = seed(&db, file, &options("admin@example.test", true)).await.unwrap();
+    let lines = dry.lines.join("\n");
+    assert!(
+        lines.contains(
+            "note: TIN 000-123-456-00000 on new@example.test: carl@example.test has a claim on it waiting for review"
+        ),
+        "{lines}"
+    );
+    assert!(lines.contains("dora@example.test has a claim on it saved as not verified"), "{lines}");
+    // Without the waiting claim the plan is another one.
+    sqlx::query("UPDATE tin_claims SET status = 'withdrawn' WHERE id = $1").bind(waiting).execute(&db).await.unwrap();
+    let fewer = seed(&db, file, &options("admin@example.test", true)).await.unwrap();
+    assert_ne!(fewer.digest, dry.digest);
+    assert!(!fewer.lines.join("\n").contains("carl@example.test"), "{:?}", fewer.lines);
+    sqlx::query("UPDATE tin_claims SET status = 'pending' WHERE id = $1").bind(waiting).execute(&db).await.unwrap();
+
+    let real = seed(&db, file, &opts).await.unwrap();
+    let lines = real.lines.join("\n");
+    assert!(
+        lines.contains(
+            "note: TIN ***-***-456-00000 on new@example.test: another account has a claim on it waiting for review"
+        ),
+        "{lines}"
+    );
+    assert!(lines.contains("another account has a claim on it saved as not verified"), "{lines}");
+    assert!(!lines.contains("carl@example.test") && !lines.contains("dora@example.test"), "{lines}");
+    assert_eq!(real.digest, dry.digest);
+}

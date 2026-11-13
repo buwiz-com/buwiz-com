@@ -125,7 +125,7 @@ fn tools() -> Value {
         {
             "name": "list_tin_claims",
             "title": "TIN claims",
-            "description": "Every TIN the person has asked to activate, with its review status and any note from the reviewer.",
+            "description": "Every TIN the person has added or asked to activate, with its review status, why a claim was sent back, and the reviewer's note on a rejection.",
             "inputSchema": no_input,
             "annotations": read_only,
         },
@@ -168,13 +168,28 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
             let claims: Vec<Value> = claims
                 .into_iter()
                 .map(|claim| {
-                    json!({
+                    // Staff's own words reach an agent only as the reason
+                    // for a rejection, which the claimant reads on My TINs
+                    // too; a claim sent back shows its fixed reasons.
+                    let status =
+                        if claim.status == "approved" && claim.paused_at.is_some() { "paused" } else { &claim.status };
+                    let mut row = json!({
                         "tin_masked": claim.tin().masked(),
                         "registered_name": claim.registered_name,
-                        "status": claim.status,
-                        "note": if claim.status == "needs_fix" { claim.fix_note } else { claim.decision_note },
+                        "status": status,
+                        "note": if claim.status == "rejected" { claim.decision_note.clone() } else { None },
                         "sent_at": claim.created_at.unix_timestamp(),
-                    })
+                    });
+                    if claim.status == "needs_fix" {
+                        let reasons: Vec<&str> = claim
+                            .fix_reasons
+                            .iter()
+                            .filter_map(|code| claims::fix_reason(code))
+                            .map(|(_, text)| text)
+                            .collect();
+                        row["reasons"] = json!(reasons);
+                    }
+                    row
                 })
                 .collect();
             json!({ "claims": claims })

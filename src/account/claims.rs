@@ -1067,14 +1067,105 @@ pub async fn tax_profiles(
     bearer: Bearer,
 ) -> Result<Json<Value>, ApiError> {
     let full = bearer.sees_full_tins();
-    let include_open =
-        query.get("include").is_some_and(|include| include.split(',').any(|item| item.trim() == "pending"));
-    let profiles = if include_open {
+    let include: Vec<&str> =
+        query.get("include").map(|include| include.split(',').map(str::trim).collect()).unwrap_or_default();
+    if include.contains(&"all") {
+        let profiles = all_profiles(&state.db, bearer.account.id, full, &state.config.account_origin).await?;
+        return Ok(Json(json!({ "include": "all", "profiles": profiles })));
+    }
+    let profiles = if include.contains(&"pending") {
         profiles_with_open(&state.db, bearer.account.id, full).await?
     } else {
         active_profiles(&state.db, bearer.account.id, full).await?
     };
     Ok(Json(json!({ "profiles": profiles })))
+}
+
+/// The longest staff note the TIN list hands the apps.
+pub const SHOWN_NOTE_CHARS: usize = 200;
+
+#[derive(sqlx::FromRow)]
+struct ListedClaim {
+    id: Uuid,
+    tin_root: String,
+    branch_code: String,
+    registered_name: String,
+    status: String,
+    paused: bool,
+    decided_at: Option<OffsetDateTime>,
+    fix_reasons: Vec<String>,
+    fix_note: Option<String>,
+}
+
+/// `include=all`: every TIN on the account that is not ended, each with
+/// where it stands for sending ([`gate::classify`], so the list and the
+/// gate agree), the words for it and the link to its next step. TINs that
+/// can send come first, then paused ones, both in the order they became
+/// active; then the rest, oldest first. Only the BIR app (`full`) gets the
+/// TIN, filing permissions, the links and the staff's note.
+async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -> sqlx::Result<Vec<Value>> {
+    let rows: Vec<ListedClaim> = sqlx::query_as(
+        "SELECT id, tin_root, branch_code, registered_name, status, paused_at IS NOT NULL AS paused, decided_at,
+             fix_reasons, fix_note
+         FROM tin_claims
+         WHERE account_id = $1 AND status IN ('unverified', 'pending', 'needs_fix', 'approved')
+         ORDER BY created_at, id",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    let mut listed: Vec<(gate::Standing, ListedClaim)> =
+        rows.into_iter().map(|row| (gate::classify(row.id, &row.status, row.paused, &row.fix_reasons), row)).collect();
+    // A stable sort keeps the oldest-first order within each group.
+    listed.sort_by_key(|(standing, row)| match standing {
+        gate::Standing::Sendable { .. } => (0, row.decided_at),
+        gate::Standing::Paused => (1, row.decided_at),
+        _ => (2, None),
+    });
+    Ok(listed.into_iter().map(|(standing, row)| listed_json(&standing, &row, full, origin)).collect())
+}
+
+fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin: &str) -> Value {
+    let tin = Tin::parse(&row.tin_root, &row.branch_code).expect("stored TINs are valid");
+    let active = row.status == "approved";
+    let action = match standing {
+        gate::Standing::Unverified => Some(("Verify to send", "verify")),
+        gate::Standing::NeedsFix { .. } => Some(("Fix and send again", "fix")),
+        _ => None,
+    };
+    let mut profile = json!({
+        "id": row.id,
+        "tin_masked": tin.masked(),
+        "registered_name": row.registered_name,
+        "activated_at": row.decided_at.filter(|_| active).map(OffsetDateTime::unix_timestamp),
+        "permissions": match (full, standing.can_send()) {
+            (true, true) => PROFILE_PERMISSIONS,
+            (true, false) => OPEN_PERMISSIONS,
+            (false, _) => VIEW_PERMISSIONS,
+        },
+        "status": standing.api_status(),
+        "can_send": standing.can_send(),
+        "message": standing.list_message(),
+        "action": match action {
+            Some((label, page)) if full => json!({ "label": label, "url": format!("{origin}/tins/claims/{}/{page}", row.id) }),
+            _ => Value::Null,
+        },
+    });
+    if full {
+        profile["tin"] = json!(tin.to_string());
+    }
+    if let gate::Standing::NeedsFix { reasons } = standing {
+        profile["reasons"] = json!(reasons);
+        profile["reason_codes"] = json!(row.fix_reasons);
+        profile["note"] = json!(row.fix_note.as_deref().filter(|_| full).map(shown_note));
+    }
+    profile
+}
+
+/// A staff note as the apps show it: on one line, at most
+/// [`SHOWN_NOTE_CHARS`] characters.
+fn shown_note(note: &str) -> String {
+    note.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(SHOWN_NOTE_CHARS).collect()
 }
 
 /// The account's active TINs that can send: a paused one is left out.
@@ -1175,6 +1266,13 @@ mod tests {
         let limited = open_profile_json(Uuid::nil(), &tin, "Juan", "needs_fix", false);
         assert_eq!(limited["permissions"], json!(VIEW_PERMISSIONS));
         assert!(limited.get("tin").is_none());
+    }
+
+    #[test]
+    fn notes_are_shown_on_one_line_and_cut_short() {
+        assert_eq!(shown_note("  Retake it\n in   daylight. "), "Retake it in daylight.");
+        let long = "é".repeat(SHOWN_NOTE_CHARS + 50);
+        assert_eq!(shown_note(&long).chars().count(), SHOWN_NOTE_CHARS);
     }
 
     #[test]

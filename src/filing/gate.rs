@@ -112,6 +112,29 @@ impl Standing {
         matches!(self, Self::Sendable { .. })
     }
 
+    /// The `status` of the TIN list's row (`include=all`): `approved` only
+    /// for a TIN that can send.
+    pub fn api_status(&self) -> &'static str {
+        match self {
+            Self::Sendable { .. } => "approved",
+            Self::Unverified => "unverified",
+            Self::Pending => "pending",
+            Self::NeedsFix { .. } => "needs_fix",
+            Self::Paused => "paused",
+            Self::NotActive => "not_active",
+        }
+    }
+
+    /// The TIN list's line for the row: where it stands and what is next.
+    pub fn list_message(&self) -> String {
+        match self {
+            Self::Sendable { .. } => "Active. You can send returns for this TIN.".to_owned(),
+            Self::Unverified => "Not verified. Verify it with its papers to send returns.".to_owned(),
+            Self::Pending => "Waiting for review, usually within one business day.".to_owned(),
+            Self::NeedsFix { .. } | Self::Paused | Self::NotActive => self.message(),
+        }
+    }
+
     /// The refusal code, as the apps read it.
     pub fn code(&self) -> &'static str {
         match self {

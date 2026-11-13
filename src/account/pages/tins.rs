@@ -257,8 +257,8 @@ async fn progress(step: u8, label: &'static str, rest: &'static str) -> Result<i
 
 /// A file field drawn as a drop zone. With JavaScript the native input
 /// covers the zone invisibly (so dropping a file works) and the chosen
-/// file's name shows; `data-required` becomes `required` when the slot's
-/// kind of TIN is picked.
+/// file's name shows. A required slot is `required`, so the browser asks
+/// for its file before sending, as Add a TIN's script does.
 #[component]
 async fn file_slot(
     field: &'static str,
@@ -298,6 +298,7 @@ async fn file_slot(
                     }
                     if required {
                         data-required="true"
+                        required=(true)
                     }
                 >
             </label>
@@ -517,7 +518,10 @@ pub async fn new_tin_page(cx: &Cx) -> Result<impl View> {
                                     <span data-send-label="">"Send for review"</span>
                                     icon(name: "send")
                                 </button>
-                                <button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formnovalidate=(true) data-skip="">"Skip for now"</button>
+                                // `?skip=1` tells the server before any file arrives, so it
+                                // drops chosen files unread; `skip` in the body is for pages
+                                // served before it.
+                                <button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formaction="/tins/claims?skip=1" formnovalidate=(true) data-skip="">"Skip for now"</button>
                             </span>
                         </div>
                         <p class="fine">icon(name: "schedule") "No papers at hand? Skip for now: the TIN is saved as Not verified. You can prepare returns for it, and verify it later to send them."</p>

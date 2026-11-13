@@ -101,7 +101,7 @@ async fn a_tin_added_without_papers_is_not_verified(db: PgPool) {
     let add = text(site.get("/tins/new", &cookie).await).await;
     assert!(
         add.contains(
-            r#"<button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formnovalidate="" data-skip="">Skip for now</button>"#
+            r#"<button class="btn btn-ghost-dark" type="submit" name="skip" value="1" formaction="/tins/claims?skip=1" formnovalidate="" data-skip="">Skip for now</button>"#
         ),
         "{add}"
     );
@@ -613,4 +613,48 @@ async fn an_agent_hears_of_papers_sent_only_once_they_were(db: PgPool) {
     let listed = claims().await;
     assert_eq!(listed[0]["status"], "pending");
     assert_eq!(listed[0]["sent_at"], submitted, "{listed}");
+}
+
+/// "Skip for now" posts to `/tins/claims?skip=1`: the server knows before
+/// any file arrives, so files chosen anyway are passed over unread. A file
+/// far over the size limit does not even stop the save.
+#[sqlx::test(migrations = "./migrations")]
+async fn skipping_does_not_read_the_files_chosen(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, cookie) = site.person("ana@example.test").await;
+    let big: &'static [u8] = Box::leak(vec![0x89; 11 * 1024 * 1024].into_boxed_slice());
+    let parts = [
+        ("kind", Text("personal")),
+        ("tin", Text("000123482")),
+        ("registered_name", Text("SYNTHETIC TAXPAYER")),
+        ("tin_id", File("huge.png", big)),
+        ("selfie", File("me.png", PNG)),
+    ];
+    // Without the link's word the file is read, and refused for its size.
+    let read = site.upload("/tins/claims", &cookie, &parts).await;
+    assert_eq!(location(&read), "/tins/new?notice=file_too_big");
+    let saved = site.upload("/tins/claims?skip=1", &cookie, &parts).await;
+    assert_eq!(location(&saved), "/tins?notice=tin_saved");
+    let claim = site.newest_claim(ana).await;
+    assert_eq!(standing(&site.db, claim).await, ("unverified".to_owned(), false));
+    let files = scalar_i64(&site.db, "SELECT count(*) FROM claim_documents WHERE claim_id = $1", claim).await;
+    assert_eq!(files, 0);
+}
+
+/// The verify page's required papers are required in the browser too.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_verify_page_asks_the_browser_for_its_required_papers(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, cookie) = site.person("ana@example.test").await;
+    site.upload("/tins/claims", &cookie, &skipped("000123483")).await;
+    let claim = site.newest_claim(ana).await;
+    let page = text(site.get(&format!("/tins/claims/{claim}/verify"), &cookie).await).await;
+    let input = |field: &str| {
+        let at = page.find(&format!(r#"id="{field}""#)).unwrap_or_else(|| panic!("{field}: {page}"));
+        let start = page[..at].rfind("<input").unwrap();
+        page[start..start + page[start..].find('>').unwrap()].to_owned()
+    };
+    assert!(input("tin_id").contains(" required"), "{}", input("tin_id"));
+    assert!(!input("selfie").contains(" required"), "{}", input("selfie"));
+    assert!(!input("national_id").contains(" required"), "{}", input("national_id"));
 }

@@ -39,7 +39,13 @@ use crate::sites::seo;
 /// Room for the largest claim: 40 MB of files, plus form overhead. Each
 /// file is also checked on its own (10 MB).
 const CLAIM_BODY_LIMIT: usize = 41 * 1024 * 1024;
-const CLAIM_TOTAL_BYTES: usize = 40 * 1024 * 1024;
+macro_rules! claim_total_mb {
+    () => {
+        40
+    };
+}
+pub(crate) use claim_total_mb;
+const CLAIM_TOTAL_BYTES: usize = claim_total_mb!() * 1024 * 1024;
 
 pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
     Router::new()
@@ -571,7 +577,18 @@ async fn device_decision(
     }
 }
 
-async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipart: Multipart) -> Response {
+#[derive(Deserialize)]
+struct SkipQuery {
+    #[serde(default)]
+    skip: Option<String>,
+}
+
+async fn submit_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkipQuery>,
+    multipart: Multipart,
+) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
@@ -580,7 +597,10 @@ async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipa
         Err(redirect) => return redirect,
     };
     let back = |notice: Notice| see_other(link("/tins/new", Some(notice), &[]));
-    let form = match read_claim_form(multipart).await {
+    // "Skip for now" says so in the link, before any file: files chosen
+    // anyway are not read into memory.
+    let skip_files = query.skip.as_deref() == Some("1");
+    let form = match read_form(multipart, skip_files).await {
         Ok(form) => form,
         Err(notice) => return back(notice),
     };
@@ -591,7 +611,7 @@ async fn submit_claim(State(state): State<AppState>, headers: HeaderMap, multipa
         Ok(tin) => tin,
         Err(notice) => return back(notice),
     };
-    let papers_later = form.skip;
+    let papers_later = skip_files || form.skip;
     let claim = NewClaim {
         kind,
         tin,
@@ -694,7 +714,13 @@ struct ClaimForm {
     skip: bool,
 }
 
-async fn read_claim_form(mut multipart: Multipart) -> Result<ClaimForm, Notice> {
+async fn read_claim_form(multipart: Multipart) -> Result<ClaimForm, Notice> {
+    read_form(multipart, false).await
+}
+
+/// [`read_claim_form`]; with `skip_files`, file fields are passed over
+/// unread (the body limit still holds).
+async fn read_form(mut multipart: Multipart, skip_files: bool) -> Result<ClaimForm, Notice> {
     let mut form = ClaimForm::default();
     let mut total = 0usize;
     while let Some(field) = multipart.next_field().await.map_err(|_| Notice::BadUpload)? {
@@ -718,6 +744,9 @@ async fn read_claim_form(mut multipart: Multipart) -> Result<ClaimForm, Notice> 
         let Some(kind) = DocumentKind::parse(&name) else {
             continue;
         };
+        if skip_files {
+            continue;
+        }
         let filename = field.file_name().unwrap_or_default().to_owned();
         let bytes = field.bytes().await.map_err(|_| Notice::FileTooBig)?;
         // An empty file input still sends a part with no name and no bytes.

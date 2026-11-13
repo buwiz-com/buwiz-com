@@ -2,8 +2,11 @@
 //! code (`?notice=tin_digits`), so a crafted link cannot put its own words
 //! on our pages.
 
+use crate::account::claims::{max_file_mb, max_supporting_files, max_unverified};
+use crate::account::web::claim_total_mb;
+
 macro_rules! notices {
-    ($($variant:ident = $code:literal => $tone:ident $message:literal,)*) => {
+    ($($variant:ident = $code:literal => $tone:ident $message:expr,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Notice {
             $($variant,)*
@@ -60,8 +63,8 @@ notices! {
     NeedId = "need_id" => error "Attach a scan or photo of a government ID.",
     NeedTinId = "need_tin_id" => error "Attach a photo of your TIN ID, or the digital TIN ID file from ORUS.",
     WrongDocuments = "wrong_documents" => error "Attach only the papers asked for this kind of TIN.",
-    TooManySupporting = "too_many_supporting" => error "Attach at most 5 supporting documents.",
-    FileTooBig = "file_too_big" => error "Each file must be 10 MB or smaller, and all files together 40 MB or smaller.",
+    TooManySupporting = "too_many_supporting" => error concat!("Attach at most ", max_supporting_files!(), " supporting documents."),
+    FileTooBig = "file_too_big" => error concat!("Each file must be ", max_file_mb!(), " MB or smaller, and all files together ", claim_total_mb!(), " MB or smaller."),
     FileType = "file_type" => error "Files must be PDF, JPEG, PNG, WebP or HEIC.",
     BadUpload = "bad_upload" => error "The upload did not finish. Try again.",
     TinAlreadyActive = "tin_already_active" => error "This TIN is already active on your account.",
@@ -96,7 +99,7 @@ notices! {
     TinSaved = "tin_saved" => info "Saved as Not verified. You can prepare returns for this TIN now; verify it with its papers to send them.",
     TinAlreadyAdded = "tin_already_added" => error "This TIN is already on My TINs. Verify it there to send returns.",
     NotUnverified = "not_unverified" => error "This TIN already has its papers. See where it stands on My TINs.",
-    TooManyUnverified = "too_many_unverified" => error "You have 20 TINs waiting to be verified. Verify or remove some first.",
+    TooManyUnverified = "too_many_unverified" => error concat!("You have ", max_unverified!(), " TINs waiting to be verified. Verify or remove some first."),
     AdminOnly = "admin_only" => error "Only an admin can do this.",
     OwnAccount = "own_account" => error "You can't do this to your own account.",
     RoleChanged = "role_changed" => info "Role changed.",
@@ -130,5 +133,14 @@ mod tests {
             assert_eq!(Notice::from_code(notice.code()), Some(notice));
         }
         assert_eq!(Notice::from_code("<script>"), None);
+    }
+
+    #[test]
+    fn limits_in_notices_are_the_limits() {
+        use crate::account::claims::{MAX_FILE_BYTES, MAX_SUPPORTING_FILES, MAX_UNVERIFIED};
+        assert!(Notice::TooManyUnverified.message().contains(&format!(" {MAX_UNVERIFIED} ")));
+        assert!(Notice::TooManySupporting.message().contains(&format!(" {MAX_SUPPORTING_FILES} ")));
+        let file_mb = MAX_FILE_BYTES / 1024 / 1024;
+        assert!(Notice::FileTooBig.message().contains(&format!(" {file_mb} MB")));
     }
 }

@@ -40,10 +40,29 @@ use crate::base::state::AppState;
 use crate::base::storage::DocumentStore;
 use crate::filing::gate;
 
-pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
-pub const MAX_SUPPORTING_FILES: usize = 5;
+// The limits are macros too, so the notices that name them (notice.rs) are
+// written from the same numbers.
+macro_rules! max_file_mb {
+    () => {
+        10
+    };
+}
+macro_rules! max_supporting_files {
+    () => {
+        5
+    };
+}
+macro_rules! max_unverified {
+    () => {
+        20
+    };
+}
+pub(crate) use {max_file_mb, max_supporting_files, max_unverified};
+
+pub const MAX_FILE_BYTES: usize = max_file_mb!() * 1024 * 1024;
+pub const MAX_SUPPORTING_FILES: usize = max_supporting_files!();
 /// TINs an account may have waiting to be verified at once.
-pub const MAX_UNVERIFIED: i64 = 20;
+pub const MAX_UNVERIFIED: i64 = max_unverified!();
 /// Permissions an approved TIN grants in the Buwiz BIR app.
 pub const PROFILE_PERMISSIONS: &[&str] = &["profile.view", "filing.prepare", "filing.submit"];
 /// What a TIN still being checked allows in the BIR app: preparing

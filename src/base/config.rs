@@ -94,7 +94,7 @@ impl Config {
     }
 
     pub fn is_admin(&self, email: &str) -> bool {
-        self.admin_emails.iter().any(|admin| admin == email)
+        crate::account::roles::in_list(&self.admin_emails, email)
     }
 
     pub fn is_own_origin(&self, origin: &str) -> bool {

@@ -648,7 +648,7 @@ impl Seed<'_> {
                 .bind(email)
                 .fetch_optional(&mut *self.tx)
                 .await?;
-        let in_setting = self.admin_emails.iter().any(|admin| admin == email);
+        let in_setting = roles::in_list(self.admin_emails, email);
         let banned = row.as_ref().is_some_and(|(_, _, banned)| *banned);
         let role = row.as_ref().and_then(|(_, role, _)| role.as_deref());
         let admin_now = roles::effective(in_setting, role, banned).is_some_and(|(role, _)| role == Role::Admin);
@@ -787,7 +787,7 @@ impl Seed<'_> {
                 self.account_line(actor, line).await?;
                 let mut text =
                     format!("role {email} {} → {}", roles::role_label(old.map(Role::as_str)), roles::role_label(new));
-                if self.admin_emails.iter().any(|admin| admin == email) && role != Some(Role::Admin) {
+                if roles::in_list(self.admin_emails, email) && role != Some(Role::Admin) {
                     text.push_str(" (still an Admin through ADMIN_EMAILS)");
                 }
                 self.changed(text.clone(), text);

@@ -108,6 +108,18 @@ pub fn in_server_setting(config: &Config, email: &str) -> bool {
     config.is_admin(email)
 }
 
+/// Whether `email` is in the list `admin_emails` (`ADMIN_EMAILS`, as the
+/// server or the seed tool was given it).
+pub fn in_list(admin_emails: &[String], email: &str) -> bool {
+    admin_emails.iter().any(|admin| admin == email)
+}
+
+/// The SQL for "this account (alias `account`) is staff": not banned, and
+/// with a stored role or in the list bound as `list`.
+pub fn is_staff_sql(account: &str, list: &str) -> String {
+    format!("({account}.banned_at IS NULL AND ({account}.role IS NOT NULL OR {account}.email = ANY({list})))")
+}
+
 /// [`of`], given whether the email is in `ADMIN_EMAILS`.
 pub fn effective(in_admin_emails: bool, role: Option<&str>, banned: bool) -> Option<(Role, bool)> {
     if banned {

@@ -4,7 +4,8 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use buwiz_cloud::account::admin;
 use buwiz_cloud::account::notice::Notice;
 use buwiz_cloud::account::roles::{self, Role};
@@ -113,7 +114,7 @@ async fn actors(site: &Site) -> Vec<(Who, String)> {
 /// the signed out, a 404 for everyone not staff, `done` when allowed, and
 /// back to `back_to` with `admin_only` for staff without the power.
 async fn expect_post(
-    site: &Site,
+    site: &Tracked,
     (who, cookie): (Who, &str),
     path: &str,
     form: &str,
@@ -121,6 +122,7 @@ async fn expect_post(
     back_to: &str,
     done: &str,
 ) {
+    site.hit(path);
     let response = site.post(path, cookie, form).await;
     match who {
         Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?} {path}"),
@@ -159,6 +161,52 @@ async fn claim_exists(db: &PgPool, claim: Uuid) -> bool {
         .unwrap()
 }
 
+/// Every staff route and page, as the router and the pages name them; the
+/// matrix below exercises each.
+const MATRIX: &[&str] = &[
+    "/staff",
+    "/staff/claims",
+    "/staff/claims/{claim_id}",
+    "/staff/claims/{claim_id}/decision",
+    "/staff/claims/{claim_id}/delete",
+    "/staff/claims/{claim_id}/revoke",
+    "/staff/claims/{claim_id}/activate",
+    "/staff/claims/{claim_id}/pause",
+    "/staff/claims/{claim_id}/resume",
+    "/staff/claims/{claim_id}/confirm",
+    "/staff/documents/{document_id}",
+    "/staff/users",
+    "/staff/users/{account_id}",
+    "/staff/users/{account_id}/sign-out",
+    "/staff/users/{account_id}/apps/{grant_id}/sign-out",
+    "/staff/users/{account_id}/role",
+    "/staff/users/{account_id}/ban",
+    "/staff/users/{account_id}/unban",
+    "/staff/users/{account_id}/test",
+];
+
+/// `path` with its ids put back as the route's placeholders.
+fn route_of(path: &str) -> String {
+    let path = path.split('?').next().unwrap();
+    let names = ["claim_id", "document_id", "account_id", "grant_id"];
+    let mut parts = Vec::new();
+    for (index, part) in path.split('/').enumerate() {
+        if Uuid::parse_str(part).is_ok() {
+            let before = path.split('/').nth(index - 1).unwrap();
+            let name = match before {
+                "claims" => names[0],
+                "documents" => names[1],
+                "users" => names[2],
+                _ => names[3],
+            };
+            parts.push(format!("{{{name}}}"));
+        } else {
+            parts.push(part.to_owned());
+        }
+    }
+    parts.join("/")
+}
+
 /// Every staff page and action, for a signed-out visitor, a plain user,
 /// Support, an Admin by role and an Admin through `ADMIN_EMAILS`. The
 /// Admin by role is not in `ADMIN_EMAILS`, so any route still deciding by
@@ -166,8 +214,13 @@ async fn claim_exists(db: &PgPool, claim: Uuid) -> bool {
 #[sqlx::test(migrations = "./migrations")]
 async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
     let site = Site::new(db);
-    for (n, (who, cookie)) in actors(&site).await.into_iter().enumerate() {
-        let t = target(&site, n as u32).await;
+    let site = &Tracked { site, hits: Default::default() };
+    for (n, (who, cookie)) in actors(site).await.into_iter().enumerate() {
+        // The old address of the queue moves to /staff, for everyone.
+        site.hit("/staff/claims");
+        let moved = site.get("/staff/claims", &cookie).await;
+        assert_eq!((moved.status(), location(&moved)), (StatusCode::PERMANENT_REDIRECT, "/staff".to_owned()));
+        let t = target(site, n as u32).await;
         let user = format!("/staff/users/{}", t.account);
 
         for page in [
@@ -178,6 +231,7 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             format!("/staff/claims/{}", t.open),
             format!("/staff/documents/{}", t.document),
         ] {
+            site.hit(&page);
             let response = site.get(&page, &cookie).await;
             match who {
                 Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?} {page}"),
@@ -189,21 +243,14 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         // Review: Support and Admins.
         let claim_page = format!("/staff/claims/{}", t.open);
         let path = format!("{claim_page}/decision");
-        expect_post(
-            &site,
-            (who, &cookie),
-            &path,
-            "decision=approve",
-            false,
-            &claim_page,
-            "/staff?notice=claim_decided",
-        )
-        .await;
+        expect_post(site, (who, &cookie), &path, "decision=approve", false, &claim_page, "/staff?notice=claim_decided")
+            .await;
         assert_eq!(site.claim_status(t.open).await == "approved", who.may(false), "{who:?}");
 
         // Approving a TIN that was paused before (on another account):
         // Admins only, and Support hears why.
         let claim_page = format!("/staff/claims/{}", t.paused_before);
+        site.hit(&format!("{claim_page}/decision"));
         let response = site.post(&format!("{claim_page}/decision"), &cookie, "decision=approve").await;
         match who {
             Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?}"),
@@ -216,7 +263,7 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         // Delete a claim: Admins only.
         let claim_page = format!("/staff/claims/{}", t.unverified);
         let path = format!("{claim_page}/delete");
-        expect_post(&site, (who, &cookie), &path, "reason=Duplicate", true, &claim_page, "/staff?notice=claim_deleted")
+        expect_post(site, (who, &cookie), &path, "reason=Duplicate", true, &claim_page, "/staff?notice=claim_deleted")
             .await;
         assert_eq!(!claim_exists(&site.db, t.unverified).await, who.may(true), "{who:?}");
 
@@ -224,14 +271,14 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         let claim_page = format!("/staff/claims/{}", t.active);
         let path = format!("{claim_page}/revoke");
         let done = format!("{claim_page}?notice=ownership_revoked");
-        expect_post(&site, (who, &cookie), &path, "reason=Wrong+owner", true, &claim_page, &done).await;
+        expect_post(site, (who, &cookie), &path, "reason=Wrong+owner", true, &claim_page, &done).await;
         assert_eq!(site.claim_status(t.active).await == "revoked", who.may(true), "{who:?}");
 
         // Activate without papers: Admins only.
         let claim_page = format!("/staff/claims/{}", t.spare);
         let path = format!("{claim_page}/activate");
         let done = format!("{claim_page}?notice=tin_activated");
-        expect_post(&site, (who, &cookie), &path, "reason=Known+owner", true, &claim_page, &done).await;
+        expect_post(site, (who, &cookie), &path, "reason=Known+owner", true, &claim_page, &done).await;
         assert_eq!(site.claim_status(t.spare).await == "approved", who.may(true), "{who:?}");
 
         // Pause and resume: Admins only.
@@ -245,12 +292,11 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
                 .unwrap()
         };
         let done = format!("{claim_page}?notice=tin_paused");
-        expect_post(&site, (who, &cookie), &format!("{claim_page}/pause"), "reason=Check", true, &claim_page, &done)
+        expect_post(site, (who, &cookie), &format!("{claim_page}/pause"), "reason=Check", true, &claim_page, &done)
             .await;
         assert_eq!(paused().await, who.may(true), "{who:?}");
         let done = format!("{claim_page}?notice=tin_resumed");
-        expect_post(&site, (who, &cookie), &format!("{claim_page}/resume"), "reason=Ok", true, &claim_page, &done)
-            .await;
+        expect_post(site, (who, &cookie), &format!("{claim_page}/resume"), "reason=Ok", true, &claim_page, &done).await;
         assert!(!paused().await, "{who:?}");
 
         // Confirm an automatic activation: Support and Admins.
@@ -262,7 +308,7 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             .unwrap();
         let claim_page = format!("/staff/claims/{auto}");
         let done = format!("{claim_page}?notice=auto_confirmed");
-        expect_post(&site, (who, &cookie), &format!("{claim_page}/confirm"), "", false, &claim_page, &done).await;
+        expect_post(site, (who, &cookie), &format!("{claim_page}/confirm"), "", false, &claim_page, &done).await;
         let confirmed: bool = sqlx::query_scalar("SELECT auto_confirmed_at IS NOT NULL FROM tin_claims WHERE id = $1")
             .bind(auto)
             .fetch_one(&site.db)
@@ -273,24 +319,24 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         // Change a role: Admins only.
         let path = format!("{user}/role");
         let done = format!("{user}?notice=role_changed");
-        expect_post(&site, (who, &cookie), &path, "role=support&reason=Joins+the+team", true, &user, &done).await;
+        expect_post(site, (who, &cookie), &path, "role=support&reason=Joins+the+team", true, &user, &done).await;
         assert_eq!(stored_role(&site.db, t.account).await.is_some(), who.may(true), "{who:?}");
 
         // One app: Support and Admins.
         let path = format!("{user}/apps/{}/sign-out", t.grant);
         let done = format!("{user}?notice=app_signed_out");
-        expect_post(&site, (who, &cookie), &path, "reason=Lost+phone", false, &user, &done).await;
+        expect_post(site, (who, &cookie), &path, "reason=Lost+phone", false, &user, &done).await;
         assert_eq!(grant_revoked(&site.db, t.grant).await, who.may(false), "{who:?}");
 
         // Everywhere: Support and Admins.
         let path = format!("{user}/sign-out");
         let done = format!("{user}?notice=signed_out_everywhere");
-        expect_post(&site, (who, &cookie), &path, "reason=Lost+laptop", false, &user, &done).await;
+        expect_post(site, (who, &cookie), &path, "reason=Lost+laptop", false, &user, &done).await;
         assert_eq!(live_sessions(&site.db, t.account).await == 0, who.may(false), "{who:?}");
 
         // The test label: Admins only.
         let done = format!("{user}?notice=test_marked");
-        expect_post(&site, (who, &cookie), &format!("{user}/test"), "test=on&reason=Trial", true, &user, &done).await;
+        expect_post(site, (who, &cookie), &format!("{user}/test"), "test=on&reason=Trial", true, &user, &done).await;
         let labelled: bool = sqlx::query_scalar("SELECT test_account FROM accounts WHERE id = $1")
             .bind(t.account)
             .fetch_one(&site.db)
@@ -307,15 +353,39 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
                 .unwrap()
         };
         let done = format!("{user}?notice=account_banned_staff");
-        expect_post(&site, (who, &cookie), &format!("{user}/ban"), "reason=Abuse", true, &user, &done).await;
+        expect_post(site, (who, &cookie), &format!("{user}/ban"), "reason=Abuse", true, &user, &done).await;
         assert_eq!(banned().await, who.may(true), "{who:?}");
         let done = format!("{user}?notice=ban_lifted");
-        expect_post(&site, (who, &cookie), &format!("{user}/unban"), "reason=Sorted", true, &user, &done).await;
+        expect_post(site, (who, &cookie), &format!("{user}/unban"), "reason=Sorted", true, &user, &done).await;
         assert!(!banned().await, "{who:?}");
+    }
+    let hit = site.hits.lock().unwrap().clone();
+    let listed: std::collections::BTreeSet<String> = MATRIX.iter().map(|route| (*route).to_owned()).collect();
+    assert_eq!(hit, listed, "routes the matrix lists but never tried, or tried but does not list");
+}
+
+/// A [`Site`] that remembers which staff routes a test tried.
+struct Tracked {
+    site: Site,
+    hits: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl std::ops::Deref for Tracked {
+    type Target = Site;
+    fn deref(&self) -> &Site {
+        &self.site
     }
 }
 
-/// `Config::is_admin` (the email list) is read in one place only.
+impl Tracked {
+    fn hit(&self, path: &str) {
+        self.hits.lock().unwrap().insert(route_of(path));
+    }
+}
+
+/// The email list decides in one place only, [`roles`]: no route, page,
+/// query or the seed tool checks membership of `ADMIN_EMAILS` on its own,
+/// in Rust (`.is_admin(`, `admin == email`) or in SQL (`email = ANY(`).
 #[test]
 fn only_roles_reads_the_email_list() {
     fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
@@ -325,7 +395,7 @@ fn only_roles_reads_the_email_list() {
                 walk(&path, found);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                if source.contains(".is_admin(") {
+                if [".is_admin(", "admin == email", "email = ANY("].iter().any(|reads| source.contains(reads)) {
                     found.push(path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap().display().to_string());
                 }
             }
@@ -334,6 +404,37 @@ fn only_roles_reads_the_email_list() {
     let mut found = Vec::new();
     walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
     assert_eq!(found, ["src/account/roles.rs"]);
+}
+
+/// Every staff route and page in the source, as written there.
+fn staff_routes_in_the_source() -> std::collections::BTreeSet<String> {
+    let mut routes = std::collections::BTreeSet::new();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/account");
+    let mut files = vec![dir.join("web.rs")];
+    for entry in std::fs::read_dir(dir.join("pages")).unwrap() {
+        files.push(entry.unwrap().path());
+    }
+    files.push(dir.join("pages.rs"));
+    for file in files {
+        let source = std::fs::read_to_string(&file).unwrap();
+        for marker in [".route(\"", "#[page(\""] {
+            for piece in source.split(marker).skip(1) {
+                let path = &piece[..piece.find('"').unwrap()];
+                if path == "/staff" || path.starts_with("/staff/") {
+                    routes.insert(path.to_owned());
+                }
+            }
+        }
+    }
+    routes
+}
+
+/// The roles matrix covers every staff route there is: a new one fails here
+/// until the matrix lists it (and the matrix fails until it exercises it).
+#[test]
+fn the_roles_matrix_lists_every_staff_route() {
+    let listed: std::collections::BTreeSet<String> = MATRIX.iter().map(|route| (*route).to_owned()).collect();
+    assert_eq!(staff_routes_in_the_source(), listed);
 }
 
 /// The break-glass list works with no role stored anywhere, wins over a
@@ -719,4 +820,94 @@ async fn reasons_are_short_and_no_op_or_own_actions_say_so(db: PgPool) {
     assert_eq!(location(&response), format!("/staff/claims/{own}?notice=own_tin_pause"));
     let response = site.post(&format!("/staff/claims/{own}/resume"), &boss_cookie, "reason=Check").await;
     assert_eq!(location(&response), format!("/staff/claims/{own}?notice=own_tin_pause"));
+}
+
+/// Every staff action, posted from another site (or with no `Origin` and a
+/// cross-site fetch), is refused before anything else and changes nothing,
+/// even for an Admin.
+#[sqlx::test(migrations = "./migrations")]
+async fn staff_actions_refuse_cross_site_posts(db: PgPool) {
+    let site = Site::new(db);
+    let (_, admin) = site.person(STAFF).await;
+    let t = target(&site, 0).await;
+    let user = format!("/staff/users/{}", t.account);
+    let posts = staff_posts(&t, &user);
+    let before = everything(&site.db).await;
+    for (path, form) in &posts {
+        for (origin, fetch) in [(Some("https://evil.example.test"), None), (None, Some("cross-site")), (None, None)] {
+            let mut request = Request::post(path.as_str())
+                .header(header::COOKIE, &admin)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            if let Some(fetch) = fetch {
+                request = request.header("sec-fetch-site", fetch);
+            }
+            let response = site.send(request.body(Body::from(form.clone())).unwrap()).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path} {origin:?} {fetch:?}");
+        }
+    }
+    assert_eq!(everything(&site.db).await, before);
+}
+
+/// A banned Support member has no website session: every staff action
+/// asks them to sign in and changes nothing.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_banned_support_member_cannot_use_staff_powers(db: PgPool) {
+    let site = Site::new(db);
+    let (helper, cookie) = site.staff_with_role("helper@example.test", "support").await;
+    let (admin, _) = site.person(STAFF).await;
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = $2, ban_reason = 'Left' WHERE id = $1")
+        .bind(helper)
+        .bind(admin)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let t = target(&site, 0).await;
+    let user = format!("/staff/users/{}", t.account);
+    let before = everything(&site.db).await;
+    for (path, form) in staff_posts(&t, &user) {
+        let response = site.post(&path, &cookie, &form).await;
+        assert!(location(&response).starts_with("/login?"), "{path}: {} {}", response.status(), location(&response));
+    }
+    for page in ["/staff".to_owned(), "/staff/users".to_owned(), user.clone(), format!("/staff/claims/{}", t.open)] {
+        assert!(location(&site.get(&page, &cookie).await).starts_with("/login?"), "{page}");
+    }
+    assert_eq!(everything(&site.db).await, before);
+}
+
+/// Every staff POST route, with a form that would succeed for an Admin.
+fn staff_posts(t: &Target, user: &str) -> Vec<(String, String)> {
+    let claim = |id: Uuid, action: &str| format!("/staff/claims/{id}/{action}");
+    vec![
+        (claim(t.open, "decision"), "decision=approve".into()),
+        (claim(t.unverified, "delete"), "reason=Duplicate".into()),
+        (claim(t.active, "revoke"), "reason=Wrong+owner".into()),
+        (claim(t.spare, "activate"), "reason=Known".into()),
+        (claim(t.active, "pause"), "reason=Check".into()),
+        (claim(t.active, "resume"), "reason=Ok".into()),
+        (claim(t.active, "confirm"), String::new()),
+        (format!("{user}/sign-out"), "reason=Lost+laptop".into()),
+        (format!("{user}/apps/{}/sign-out", t.grant), "reason=Lost+phone".into()),
+        (format!("{user}/role"), "role=support&reason=Joins".into()),
+        (format!("{user}/ban"), "reason=Abuse".into()),
+        (format!("{user}/unban"), "reason=Sorted".into()),
+        (format!("{user}/test"), "test=on&reason=Trial".into()),
+    ]
+}
+
+/// What a staff action could change: claims, accounts, sign-ins and both
+/// audit tables.
+async fn everything(db: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT concat_ws('|', 'claims', (SELECT string_agg(id || status || coalesce(paused_at::text, ''), ',' ORDER BY id) FROM tin_claims))
+         UNION ALL SELECT concat_ws('|', 'accounts', (SELECT string_agg(id || coalesce(role, '') || test_account || coalesce(banned_at::text, ''), ',' ORDER BY id) FROM accounts))
+         UNION ALL SELECT concat_ws('|', 'sessions', (SELECT count(*) FROM web_sessions WHERE revoked_at IS NULL))
+         UNION ALL SELECT concat_ws('|', 'grants', (SELECT count(*) FROM oauth_grants WHERE revoked_at IS NULL))
+         UNION ALL SELECT concat_ws('|', 'audit', (SELECT count(*) FROM claim_audit), (SELECT count(*) FROM account_audit))",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap()
 }

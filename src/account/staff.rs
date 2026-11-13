@@ -318,13 +318,14 @@ pub async fn users(
                                             WHERE c.account_id = a.id AND c.status = 'approved')
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
                                               AND c.{LIVE_SQL})
-               WHEN 'staff' THEN a.banned_at IS NULL AND (a.role IS NOT NULL OR a.email = ANY($4))
+               WHEN 'staff' THEN {staff}
                WHEN 'test' THEN a.test_account
                WHEN 'banned' THEN a.banned_at IS NOT NULL
                ELSE true
            END
          ORDER BY last_active DESC NULLS LAST, a.created_at DESC
-         LIMIT $5"
+         LIMIT $5",
+        staff = crate::account::roles::is_staff_sql("a", "$4")
     ))
     .bind(contains(search))
     .bind(tin_digits(search))

@@ -101,8 +101,8 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     let claims = mcp_claims(&site, &agent).await;
     assert!(claims.contains("\"approved\"") && !claims.contains(REASON), "{claims}");
     // Another staff member reads it as a staff member activating their own
-    // TIN, flagged in the queue and on the claim; boss cannot open their
-    // own history.
+    // TIN, flagged in the queue and on the claim; so does boss, on their
+    // own page.
     let (_, staff) = site.person(STAFF).await;
     let history = text(site.get(&format!("/staff/users/{boss}"), &staff).await).await;
     assert!(
@@ -116,10 +116,10 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Activated by its owner, an admin"), "{review}");
-    let own = site.get(&format!("/staff/users/{boss}"), &boss_cookie).await;
-    assert_eq!(location(&own), "/staff/users?notice=own_page");
+    let own = text(site.get(&format!("/staff/users/{boss}"), &boss_cookie).await).await;
+    assert!(own.contains(&format!("activated their own TIN ***-***-453-00000 without papers: {REASON}")), "{own}");
 
-    // Approving one's own papers stays refused.
+    // An Admin may decide their own papers too; the page says it is theirs.
     let parts = [
         ("kind", Text("personal")),
         ("tin", Text("000123454")),
@@ -128,11 +128,13 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     ];
     site.upload("/tins/claims", &boss_cookie, &parts).await;
     let papers = site.newest_claim(boss).await;
-    let response = site.post(&format!("/staff/claims/{papers}/decision"), &boss_cookie, "decision=approve").await;
-    assert_eq!(location(&response), format!("/staff/claims/{papers}?notice=own_claim"));
     let page = text(site.get(&format!("/staff/claims/{papers}"), &boss_cookie).await).await;
-    assert!(page.contains("This is your own claim. Another staff member reviews its papers, or you can activate it without papers; the reason goes in your history."), "{page}");
+    assert!(page.contains("This is your own claim. Your decision goes in your history"), "{page}");
     assert!(page.contains("Or activate without papers"), "{page}");
+    let response = site.post(&format!("/staff/claims/{papers}/decision"), &boss_cookie, "decision=approve").await;
+    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    let history = text(site.get(&format!("/staff/users/{boss}"), &staff).await).await;
+    assert!(history.contains("Staff boss@example.test approved their own claim on ***-***-454-00000"), "{history}");
 }
 
 async fn token_for(site: &Site, account: Uuid, scope: &str) -> String {

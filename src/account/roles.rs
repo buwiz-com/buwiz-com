@@ -70,7 +70,7 @@ pub enum Power {
     /// Admin's, unless the one signing out is an Admin).
     SignOut,
     /// Confirm a TIN activated automatically, once its papers look right
-    /// (never one's own; a paused one only as an Admin).
+    /// (one's own or a paused one only as an Admin).
     ConfirmAuto,
     DeleteClaim,
     EndOwnership,

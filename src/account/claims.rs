@@ -821,7 +821,8 @@ pub enum Decision {
 /// `claim_audit` in the same transaction (who, the decision, the reasons),
 /// so neither a later send-back nor the claimant deleting the claim erases
 /// who decided. Approving a TIN that was ever paused, on any account, is an
-/// Admin's call. The reviewer's role is checked again inside the
+/// Admin's call, and so is deciding one's own claim (its audit line names
+/// the owner as the actor). The reviewer's role is checked again inside the
 /// transaction.
 pub async fn decide(
     db: &PgPool,
@@ -836,15 +837,15 @@ pub async fn decide(
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    if claim.account_id == reviewer.id {
-        return Err(DecideError::Refused(Notice::OwnClaim));
-    }
     if note.trim().chars().count() > crate::account::admin::MAX_REASON_CHARS {
         return Err(DecideError::Refused(Notice::ReasonTooLong));
     }
     let role = roles::recheck(&mut tx, config, reviewer.id).await?;
     if !role.is_some_and(|role| role.can(Power::Review)) {
         return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if claim.account_id == reviewer.id && role != Some(Role::Admin) {
+        return Err(DecideError::Refused(Notice::OwnClaim));
     }
     if *decision == Decision::Approve && is_banned(&mut tx, claim.account_id).await? {
         return Err(DecideError::Refused(Notice::ClaimantBanned));
@@ -1086,13 +1087,15 @@ async fn lock_claim(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uu
     }))
 }
 
-/// The owner acts on their own claim; staff on someone else's, with a
-/// reason. Returns the trimmed reason.
-fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>) -> Result<Option<String>, Notice> {
+/// The owner acts on their own claim; staff with a reason, on their own
+/// claim too when `own` is the notice to refuse it with (`None`: allowed;
+/// the Admin-only actions, whose audit line names the owner as the actor).
+/// Returns the trimmed reason.
+fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>, own: Option<Notice>) -> Result<Option<String>, Notice> {
     match by {
         By::Owner if claim.account_id != actor.id => Err(Notice::ClaimMissing),
         By::Owner => Ok(None),
-        By::Staff { .. } if claim.account_id == actor.id => Err(Notice::OwnClaim),
+        By::Staff { .. } if claim.account_id == actor.id && own.is_some() => Err(own.expect("checked")),
         By::Staff { reason, .. } => crate::account::admin::reason_text(reason).map(Some),
     }
 }
@@ -1139,7 +1142,8 @@ pub async fn delete(
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    // Their own claim, staff delete as its owner, on My TINs.
+    let reason = check_actor(&claim, actor, &by, Some(Notice::OwnClaimDelete)).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::DeleteClaim).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1171,7 +1175,7 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    let reason = check_actor(&claim, actor, &by, None).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::EndOwnership).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1213,7 +1217,7 @@ async fn is_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uui
 
 /// An Admin pauses an active TIN: it stays owned (nobody else can be
 /// approved for it) but nothing sends until it is resumed. The owner reads
-/// the reason on My TINs. Not on one's own TIN, like ending an ownership.
+/// the reason on My TINs. An Admin may pause their own TIN too.
 pub async fn pause(
     db: &PgPool,
     config: &Config,
@@ -1226,10 +1230,7 @@ pub async fn pause(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let by = By::Staff { reason, config };
-    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
-        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
-        notice => DecideError::Refused(notice),
-    })?;
+    let reason = check_actor(&claim, actor, &by, None).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::Pause).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1261,10 +1262,7 @@ pub async fn resume(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let by = By::Staff { reason, config };
-    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
-        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
-        notice => DecideError::Refused(notice),
-    })?;
+    let reason = check_actor(&claim, actor, &by, None).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::Pause).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }

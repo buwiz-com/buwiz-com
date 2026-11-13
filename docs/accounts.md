@@ -24,10 +24,11 @@ reads the list.
 | | Support | Admin |
 |---|---|---|
 | See the queue, claims, their files, and every account | ✓ | ✓ |
-| Approve, reject, send back (never one's own claim) | ✓ (approving a TIN that was ever paused is an Admin's) | ✓ |
-| Confirm a TIN activated automatically (never one's own) | ✓ (not while it is paused) | ✓ (lifting Buwiz's pause takes a reason) |
+| Approve, reject, send back | ✓ (not one's own claim; approving a TIN that was ever paused is an Admin's) | ✓ (one's own too) |
+| Confirm a TIN activated automatically | ✓ (not one's own, nor while it is paused) | ✓ (one's own too; lifting Buwiz's pause takes a reason) |
 | Sign an account out everywhere, or out of one app (never an Admin) | ✓ | ✓ |
-| Delete a claim, revoke an ownership, activate without papers (one's own too), pause and resume, ban and lift a ban, the test label, change a role | – | ✓ |
+| Revoke an ownership, activate without papers, pause and resume (one's own TINs too) | – | ✓ |
+| Delete a claim (one's own: as its owner, on My TINs), ban and lift a ban, the test label, change a role (never on one's own account) | – | ✓ |
 
 Staff without a power are sent back with "Only an admin can do this";
 everyone who is not staff gets a 404. Each action checks its actor's role
@@ -39,8 +40,15 @@ staff action takes a reason (500 characters at most, like the review
 notes), signing one app out included, but two: approving a claim and
 confirming an automatic activation (unless the confirmation lifts the
 pause Buwiz put on it). Rejecting a claim needs a note to the
-person, and sending it back needs a fix reason or a note. Nobody pauses or
-resumes their own TIN, nor labels their own account a test account.
+person, and sending it back needs a fix reason or a note. Nobody bans
+themselves, changes their own role or labels their own account a test
+account; their own page says so instead of showing those forms.
+
+Staff open their own page under `/staff/users` and read it in full,
+History and every reason included, and their own claims' pages too. An
+Admin acts on their own TINs as on anyone's, with the usual reason: each
+of those audit lines names the account itself as the actor, and the
+History reads "Staff … paused their own TIN …".
 
 ### Bans and test accounts
 
@@ -63,9 +71,8 @@ a working sign-in, and every call it makes with them answers
 Every staff action on an account goes to `account_audit` with who, when and
 why; actions on claims go to `claim_audit`, review decisions (approved,
 rejected, sent back) included, so who decided outlives the claim. Both are
-on the user's page under History, which staff never see for their own
-account (`/staff/users/{self}` sends them back to the list: another staff
-member looks), so nobody reads the reasons written about them.
+on the user's page under History, which staff read on their own page
+too.
 
 ## TIN activation
 

@@ -618,8 +618,8 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
 
 /// Staff confirm an automatic activation after looking at its papers (also
 /// one the owner removed or staff revoked since): the papers are deleted,
-/// and a pause Buwiz put on it for waiting too long is lifted. Not on one's
-/// own TIN. Only an Admin reopens a paused TIN: Support confirms only one
+/// and a pause Buwiz put on it for waiting too long is lifted. On one's own
+/// TIN only as an Admin. Only an Admin reopens a paused TIN: Support confirms only one
 /// that is not paused, and an Admin lifting Buwiz's pause gives `reason`
 /// (a staff pause stays, and needs none). The actor's role is checked
 /// again inside the transaction; the route checks the power first
@@ -674,7 +674,8 @@ pub async fn confirm(
     if verified_by.as_deref() != Some("auto") || confirmed {
         return Err(DecideError::Refused(Notice::NotAuto));
     }
-    if owner == actor.id {
+    // Like a decision: on one's own TIN, an Admin's alone.
+    if owner == actor.id && role != Some(Role::Admin) {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
     if paused && role != Some(Role::Admin) {

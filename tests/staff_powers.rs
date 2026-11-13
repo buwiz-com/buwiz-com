@@ -531,11 +531,10 @@ async fn roles_cannot_lock_everyone_out(db: PgPool) {
         location(&site.post(&path(carl), &ana_cookie, "role=support&reason=+").await),
         back(carl, "reason_missing")
     );
-    // Staff never open their own page (it carries reasons about them).
-    let own = site.get(&format!("/staff/users/{ana}"), &ana_cookie).await;
-    assert_eq!(location(&own), "/staff/users?notice=own_page");
-    let list = text(site.get("/staff/users?notice=own_page", &ana_cookie).await).await;
-    assert!(list.contains("This is your own account. Ask another staff member to look at it."), "{list}");
+    // Their own page opens, without the role form.
+    let own = text(site.get(&format!("/staff/users/{ana}"), &ana_cookie).await).await;
+    assert!(own.contains("This is your own account: another admin changes its role, ban or test label."), "{own}");
+    assert!(!own.contains(&format!("action=\"/staff/users/{ana}/role\"")), "{own}");
     assert_eq!(stored_role(&site.db, carl).await, None);
     assert!(account_audit_lines(&site.db, carl).await.is_empty());
 
@@ -783,11 +782,11 @@ async fn support_actions_recheck_their_actor_in_their_transaction(db: PgPool) {
     assert!(account_audit_lines(db, ana).await.is_empty() && account_audit_lines(db, other).await.is_empty());
 }
 
-/// A staff member who is also a claimant never reads the reasons staff
-/// wrote about them: why an Admin activated their TIN, where a TIN of theirs
-/// went.
+/// A staff member who is also a claimant reads their own page in full,
+/// with the reasons staff wrote about them: why an Admin activated their
+/// TIN, where a TIN of theirs went.
 #[sqlx::test(migrations = "./migrations")]
-async fn staff_cannot_read_the_reasons_about_themselves(db: PgPool) {
+async fn staff_read_their_own_page_in_full(db: PgPool) {
     let site = Site::new(db);
     let (_, staff) = site.person(STAFF).await;
     let (helper, helper_cookie) = site.staff_with_role("helper@example.test", "support").await;
@@ -808,27 +807,23 @@ async fn staff_cannot_read_the_reasons_about_themselves(db: PgPool) {
     .await
     .unwrap();
 
-    let own = site.get(&format!("/staff/users/{helper}"), &helper_cookie).await;
-    assert_eq!(location(&own), "/staff/users?notice=own_page");
-    for page in [
-        "/staff/users".to_owned(),
-        format!("/staff/claims/{claim}"),
-        format!("/staff/claims/{moved}"),
-        "/staff?status=approved".to_owned(),
-    ] {
-        let body = text(site.get(&page, &helper_cookie).await).await;
-        assert!(!body.contains("Known to the owner") && !body.contains("carl@example.test"), "{page}: {body}");
+    for cookie in [&helper_cookie, &staff] {
+        let response = site.get(&format!("/staff/users/{helper}"), cookie).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let history = text(response).await;
+        assert!(history.contains("Known to the owner from the old office"), "{history}");
+        assert!(history.contains("moved to carl@example.test"), "{history}");
     }
-    // Another staff member reads it all.
-    let history = text(site.get(&format!("/staff/users/{helper}"), &staff).await).await;
-    assert!(history.contains("Known to the owner from the old office"), "{history}");
-    assert!(history.contains("moved to carl@example.test"), "{history}");
+    // Support has no account powers, on their own page or anyone's.
+    let own = text(site.get(&format!("/staff/users/{helper}"), &helper_cookie).await).await;
+    assert!(own.contains("Only an admin can change roles, bans and test labels."), "{own}");
 }
 
-/// On the page of their own claim, staff read neither the note of the
-/// staff member who approved it nor the reasons it was paused and resumed.
+/// On the page of their own claim, staff read the note of the staff member
+/// who approved it and the reasons it was paused and resumed, as everyone
+/// on staff does.
 #[sqlx::test(migrations = "./migrations")]
-async fn staff_do_not_read_the_decision_note_or_pause_reasons_of_their_own_claim(db: PgPool) {
+async fn staff_read_the_decision_note_and_pause_reasons_of_their_own_claim(db: PgPool) {
     let site = Site::new(db);
     let (_, staff) = site.person(STAFF).await;
     let (helper, helper_cookie) = site.staff_with_role("helper@example.test", "support").await;
@@ -839,14 +834,11 @@ async fn staff_do_not_read_the_decision_note_or_pause_reasons_of_their_own_claim
     site.post(&format!("{page}/pause"), &staff, "reason=Complaint+from+a+client").await;
     site.post(&format!("{page}/resume"), &staff, "reason=Client+withdrew+it").await;
 
-    let own = text(site.get(&page, &helper_cookie).await).await;
-    for secret in ["Vouched for by Ana", "Complaint from a client", "Client withdrew it"] {
-        assert!(!own.contains(secret), "{secret}: {own}");
-    }
-    // Another staff member reads them.
-    let other = text(site.get(&page, &staff).await).await;
-    for secret in ["Vouched for by Ana", "Complaint from a client", "Client withdrew it"] {
-        assert!(other.contains(secret), "{secret}: {other}");
+    for cookie in [&helper_cookie, &staff] {
+        let body = text(site.get(&page, cookie).await).await;
+        for note in ["Vouched for by Ana", "Complaint from a client", "Client withdrew it"] {
+            assert!(body.contains(note), "{note}: {body}");
+        }
     }
 }
 
@@ -885,11 +877,11 @@ async fn signing_one_app_out_needs_a_reason_and_says_when_nothing_changed(db: Pg
 }
 
 /// Reasons are 500 characters at most, as on the page; a role change to
-/// the same role says nothing changed; pausing one's own TIN says so.
+/// the same role says nothing changed.
 #[sqlx::test(migrations = "./migrations")]
 async fn reasons_are_short_and_no_op_or_own_actions_say_so(db: PgPool) {
     let site = Site::new(db);
-    let (boss, boss_cookie) = site.staff_with_role("boss@example.test", "admin").await;
+    let (_, boss_cookie) = site.staff_with_role("boss@example.test", "admin").await;
     let (ana, _) = site.staff_with_role("ana@example.test", "support").await;
     let unverified = add_claim(&site.db, ana, "000123451", "unverified").await;
     let active = add_claim(&site.db, ana, "000123452", "approved").await;
@@ -927,12 +919,6 @@ async fn reasons_are_short_and_no_op_or_own_actions_say_so(db: PgPool) {
     let response = site.post(&format!("{user}/role"), &boss_cookie, "role=support&reason=Again").await;
     assert_eq!(location(&response), format!("{user}?notice=role_unchanged"));
     assert!(account_audit_lines(&site.db, ana).await.is_empty());
-
-    let own = add_claim(&site.db, boss, "000123454", "approved").await;
-    let response = site.post(&format!("/staff/claims/{own}/pause"), &boss_cookie, "reason=Check").await;
-    assert_eq!(location(&response), format!("/staff/claims/{own}?notice=own_tin_pause"));
-    let response = site.post(&format!("/staff/claims/{own}/resume"), &boss_cookie, "reason=Check").await;
-    assert_eq!(location(&response), format!("/staff/claims/{own}?notice=own_tin_pause"));
 }
 
 /// Every staff action, posted from another site (or with no `Origin` and a

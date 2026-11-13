@@ -125,9 +125,8 @@ notices! {
     NotAuto = "not_auto" => error "This TIN was not activated automatically, or it was already confirmed.",
     ReasonTooLong = "reason_too_long" => error "Keep it to 500 characters.",
     RoleUnchanged = "role_unchanged" => info "Nothing changed: they already have that role.",
-    OwnTinPause = "own_tin_pause" => error "You can't pause or resume your own TIN. Another admin does it.",
     AppAlreadySignedOut = "app_already_signed_out" => info "That app was already signed out. Nothing changed.",
-    OwnPage = "own_page" => info "This is your own account. Ask another staff member to look at it.",
+    OwnClaimDelete = "own_claim_delete" => error "This is your own claim: delete it from My TINs.",
     AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
     AdminMustConfirm = "admin_must_confirm" => error "Sending for this TIN is paused: an admin confirms it, and lifting Buwiz's pause takes a reason.",
 }

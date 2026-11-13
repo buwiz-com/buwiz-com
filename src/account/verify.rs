@@ -9,10 +9,16 @@
 //! - only a personal head-office TIN, only one TIN ID, only a photo read by
 //!   OCR (never a PDF's text layer), both TIN and name a full match, read
 //!   with at least 90% confidence, and a typed name of two words or more;
-//! - only a claim waiting for its first review, of an account that is not
-//!   banned, on a TIN no other account ever had a row for, that this
-//!   account was never refused, revoked or (after an automatic activation)
-//!   removed;
+//! - only a claim waiting for its first review (never sent back, on this
+//!   claim or an earlier one of the account), of an account that is not
+//!   banned, on a TIN no other account ever had a row for (at any branch),
+//!   that this account was never refused, revoked or (after an automatic
+//!   activation) removed, that was never paused, and that never had a
+//!   business claim. "Personal" is the claimant's own word: a business's
+//!   TIN claimed as personal by someone who never claimed it as a business
+//!   still passes this. Deleted claims count too: their audit lines are
+//!   matched by account and masked TIN (the last three digits; a collision
+//!   only leaves more claims for staff);
 //! - at most one automatic activation per account waiting for a person to
 //!   confirm it, and 20 a day across Buwiz, both counted under one lock so
 //!   readings finishing at once cannot pass them;
@@ -109,11 +115,17 @@ pub struct Facts {
     pub tin: Tin,
     pub registered_name: String,
     pub tin_ids: Vec<TinIdFile>,
-    /// Another account has or had a row on this TIN, in any status.
+    /// Another account has or had a row on this TIN's root, at any branch
+    /// and in any status, deleted ones included.
     pub other_account: bool,
-    /// This account had this TIN rejected or revoked, or removed it after
-    /// it was activated automatically.
+    /// This account had this TIN rejected, revoked or deleted, or removed
+    /// it after it was activated automatically.
     pub refused_before: bool,
+    /// Sending for this TIN was ever paused, on any account.
+    pub paused_before: bool,
+    /// The TIN ever had another claim of kind business, on any account,
+    /// deleted ones included.
+    pub business_before: bool,
     /// Another automatic activation on this account waits for a person.
     pub another_unconfirmed: bool,
     /// Automatic activations across Buwiz in the last 24 hours.
@@ -134,6 +146,9 @@ pub enum Doubt {
     NotRead,
     ReadFailed(String),
     PdfText,
+    /// A file of a type that is neither a PDF nor a photo checked
+    /// automatically (HEIC).
+    NotAPhoto,
     NotATinId,
     TinDiffers,
     NameDiffers,
@@ -141,6 +156,8 @@ pub enum Doubt {
     LowConfidence,
     OtherAccount,
     RefusedBefore,
+    PausedBefore,
+    BusinessBefore,
     AnotherUnconfirmed,
     DailyLimit,
 }
@@ -159,6 +176,7 @@ impl Doubt {
             Self::NotRead => "not_read",
             Self::ReadFailed(_) => "read_failed",
             Self::PdfText => "pdf_text",
+            Self::NotAPhoto => "not_a_photo",
             Self::NotATinId => "not_a_tin_id",
             Self::TinDiffers => "tin_differs",
             Self::NameDiffers => "name_differs",
@@ -166,6 +184,8 @@ impl Doubt {
             Self::LowConfidence => "low_confidence",
             Self::OtherAccount => "other_account",
             Self::RefusedBefore => "refused_before",
+            Self::PausedBefore => "paused_before",
+            Self::BusinessBefore => "business_before",
             Self::AnotherUnconfirmed => "another_unconfirmed",
             Self::DailyLimit => "daily_limit",
         }
@@ -185,6 +205,9 @@ impl Doubt {
             Self::NotRead => "the TIN ID has not been read yet".to_owned(),
             Self::ReadFailed(reason) => format!("the TIN ID couldn't be read: {reason}"),
             Self::PdfText => "the TIN ID is a PDF; only photos are checked automatically".to_owned(),
+            Self::NotAPhoto => {
+                "the TIN ID is not a JPEG, PNG or WebP photo; only those are checked automatically".to_owned()
+            }
             Self::NotATinId => "the file doesn't look like a TIN ID".to_owned(),
             Self::TinDiffers => "the TIN on the ID isn't the one typed".to_owned(),
             Self::NameDiffers => "the name on the ID doesn't fully match the one typed".to_owned(),
@@ -193,8 +216,14 @@ impl Doubt {
                 format!("OCR wasn't sure enough of the TIN or the name (it needs {:.0}%)", MIN_CONFIDENCE * 100.0)
             }
             Self::OtherAccount => "another account has or had this TIN".to_owned(),
-            Self::RefusedBefore => {
-                "this account had this TIN refused or revoked, or removed it after an automatic activation".to_owned()
+            Self::RefusedBefore => "this account had this TIN refused, revoked or deleted, or removed it after an \
+                                    automatic activation"
+                .to_owned(),
+            Self::PausedBefore => {
+                "sending for this TIN was paused before, on some account, so an admin decides it".to_owned()
+            }
+            Self::BusinessBefore => {
+                "this TIN was claimed as a business before, so whether it is personal is for staff to judge".to_owned()
             }
             Self::AnotherUnconfirmed => {
                 "another automatic activation on this account is still waiting for a person".to_owned()
@@ -243,6 +272,12 @@ pub fn assess(facts: &Facts) -> Result<Evidence, Vec<Doubt>> {
     if facts.refused_before {
         doubts.push(Doubt::RefusedBefore);
     }
+    if facts.paused_before {
+        doubts.push(Doubt::PausedBefore);
+    }
+    if facts.business_before {
+        doubts.push(Doubt::BusinessBefore);
+    }
     if facts.another_unconfirmed {
         doubts.push(Doubt::AnotherUnconfirmed);
     }
@@ -269,6 +304,10 @@ pub fn assess(facts: &Facts) -> Result<Evidence, Vec<Doubt>> {
 /// What the one TIN ID's reading shows, or the doubts it raises.
 fn read_evidence(facts: &Facts, file: &TinIdFile, doubts: &mut Vec<Doubt>) -> Option<Evidence> {
     let photo = matches!(file.content_type.as_str(), "image/jpeg" | "image/png" | "image/webp");
+    if !photo && file.content_type != "application/pdf" {
+        doubts.push(Doubt::NotAPhoto);
+        return None;
+    }
     let Some(reading) = file.reading.as_ref().filter(|reading| reading.status != "reading") else {
         doubts.push(if photo { Doubt::NotRead } else { Doubt::PdfText });
         return None;
@@ -462,11 +501,31 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
             }),
         })
         .collect();
-    let (other_account, refused_before, another_unconfirmed, today): (bool, bool, bool, i64) = sqlx::query_as(
+    // Rows, and the audit lines deleted claims leave behind. Those keep the
+    // TIN masked (its last three digits and branch), so they are matched
+    // on that: another TIN with the same last digits only leaves more
+    // claims for staff. `$5` matches any branch of the root, `$6` this one.
+    let any_branch = format!("***-***-{}-%", &tin.root()[6..]);
+    let (other_account, refused_before, sent_back_elsewhere, business_before, another_unconfirmed, today): (
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        i64,
+    ) = sqlx::query_as(
         "SELECT
-             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND account_id <> $3),
+             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND account_id <> $3)
+               OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id <> $3 AND tin_masked LIKE $5),
              EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND account_id = $3
-                       AND (status IN ('rejected', 'revoked') OR (status = 'removed' AND verified_by = 'auto'))),
+                       AND (status IN ('rejected', 'revoked') OR (status = 'removed' AND verified_by = 'auto')))
+               OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $3 AND claim_id <> $4 AND tin_masked = $6
+                            AND action IN ('rejected', 'revoked', 'deleted')),
+             EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $3 AND claim_id <> $4 AND tin_masked = $6
+                       AND action = 'sent_back'),
+             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND kind = 'business' AND id <> $4)
+               OR EXISTS (SELECT 1 FROM claim_audit WHERE claim_id <> $4 AND claim_kind = 'business'
+                            AND tin_masked LIKE $5),
              EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $3 AND id <> $4
                        AND verified_by = 'auto' AND auto_confirmed_at IS NULL),
              (SELECT count(*) FROM claim_audit WHERE action = 'auto_activated' AND created_at > now() - interval '24 hours')",
@@ -475,19 +534,24 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
     .bind(tin.branch())
     .bind(account_id)
     .bind(claim_id)
+    .bind(&any_branch)
+    .bind(tin.masked())
     .fetch_one(&mut *tx)
     .await?;
+    let paused_before = crate::account::claims::was_paused(&mut tx, &tin).await?;
     let facts = Facts {
         verification,
         banned,
         kind,
         status: status.clone(),
-        sent_back,
+        sent_back: sent_back || sent_back_elsewhere,
         tin: tin.clone(),
         registered_name,
         tin_ids,
         other_account,
         refused_before,
+        paused_before,
+        business_before,
         another_unconfirmed,
         today,
     };
@@ -503,11 +567,17 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
             .execute(&mut *tx)
             .await;
             match updated {
+                // The row is locked and was pending: exactly one row, or
+                // nothing is activated.
+                Ok(done) if done.rows_affected() != 1 => {
+                    anyhow::bail!("activating claim {claim_id} changed {} rows", done.rows_affected());
+                }
                 Ok(_) => {
                     sqlx::query(
                         "INSERT INTO claim_audit
-                             (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
-                         VALUES ($1, $2, $3, 'auto_activated', $4, $2, $5, $6, 'auto')",
+                             (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source,
+                              claim_kind)
+                         VALUES ($1, $2, $3, 'auto_activated', $4, $2, $5, $6, 'auto', 'personal')",
                     )
                     .bind(claim_id)
                     .bind(account_id)
@@ -559,6 +629,7 @@ pub async fn confirm(
     #[derive(sqlx::FromRow)]
     struct Row {
         account_id: Uuid,
+        kind: String,
         status: String,
         tin_root: String,
         branch_code: String,
@@ -567,7 +638,7 @@ pub async fn confirm(
         paused_by_buwiz: bool,
     }
     let row: Option<Row> = sqlx::query_as(
-        "SELECT account_id, status, tin_root, branch_code, verified_by, auto_confirmed_at IS NOT NULL AS confirmed,
+        "SELECT account_id, kind, status, tin_root, branch_code, verified_by, auto_confirmed_at IS NOT NULL AS confirmed,
              paused_at IS NOT NULL AND paused_by IS NULL AS paused_by_buwiz
          FROM tin_claims WHERE id = $1 FOR UPDATE",
     )
@@ -576,6 +647,7 @@ pub async fn confirm(
     .await?;
     let Some(Row {
         account_id: owner,
+        kind,
         status,
         tin_root: root,
         branch_code: branch,
@@ -619,8 +691,8 @@ pub async fn confirm(
     for (action, reason) in lines {
         sqlx::query(
             "INSERT INTO claim_audit
-                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'web')",
+                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source, claim_kind)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'web', $9)",
         )
         .bind(claim_id)
         .bind(owner)
@@ -630,6 +702,7 @@ pub async fn confirm(
         .bind(actor.id)
         .bind(&actor.email)
         .bind(reason)
+        .bind(&kind)
         .execute(&mut *tx)
         .await?;
     }
@@ -646,30 +719,32 @@ pub async fn confirm(
 /// claims paused.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
     let mut tx = db.begin().await?;
-    let paused: Vec<(Uuid, Uuid, String, String, String)> = sqlx::query_as(&format!(
+    let paused: Vec<(Uuid, Uuid, String, String, String, String)> = sqlx::query_as(&format!(
         "UPDATE tin_claims c SET paused_at = now(), paused_by = NULL, pause_reason = $1
          FROM accounts a
          WHERE a.id = c.account_id AND c.verified_by = 'auto' AND c.auto_confirmed_at IS NULL
            AND c.status = 'approved' AND c.paused_at IS NULL
            AND c.decided_at < now() - interval '{CONFIRM_WITHIN_DAYS} days'
            AND NOT EXISTS (SELECT 1 FROM claim_audit l WHERE l.claim_id = c.id AND l.action = 'paused' AND l.source = 'auto')
-         RETURNING c.id, c.account_id, a.email, c.tin_root, c.branch_code"
+         RETURNING c.id, c.account_id, a.email, c.tin_root, c.branch_code, c.kind"
     ))
     .bind(UNCONFIRMED_PAUSE)
     .fetch_all(&mut *tx)
     .await?;
-    for (claim_id, account_id, email, root, branch) in &paused {
+    for (claim_id, account_id, email, root, branch, kind) in &paused {
         let masked = Tin::parse(root, branch).map(|tin| tin.masked()).unwrap_or_default();
         sqlx::query(
             "INSERT INTO claim_audit
-                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
-             VALUES ($1, $2, $3, 'paused', 'approved', $2, $4, $5, 'auto')",
+                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source,
+                  claim_kind)
+             VALUES ($1, $2, $3, 'paused', 'approved', $2, $4, $5, 'auto', $6)",
         )
         .bind(claim_id)
         .bind(account_id)
         .bind(masked)
         .bind(email)
         .bind(UNCONFIRMED_PAUSE)
+        .bind(kind)
         .execute(&mut *tx)
         .await?;
     }
@@ -724,6 +799,8 @@ mod tests {
             tin_ids: vec![file()],
             other_account: false,
             refused_before: false,
+            paused_before: false,
+            business_before: false,
             another_unconfirmed: false,
             today: 0,
         }
@@ -809,11 +886,27 @@ mod tests {
             (only(|facts| facts.refused_before = true), RefusedBefore),
             (only(|facts| facts.another_unconfirmed = true), AnotherUnconfirmed),
             (only(|facts| facts.today = DAILY_LIMIT), DailyLimit),
+            (only(|facts| facts.paused_before = true), PausedBefore),
+            (only(|facts| facts.business_before = true), BusinessBefore),
+            (only(|facts| facts.tin_ids[0].content_type = "image/heic".into()), NotAPhoto),
         ];
         for (doubts, expected) in cases {
             assert_eq!(doubts, vec![expected.clone()], "{expected:?}");
             assert!(!expected.words().is_empty() && !expected.code().is_empty());
         }
+    }
+
+    /// A HEIC photo is not a PDF: it is named for what it is.
+    #[test]
+    fn a_photo_of_a_type_not_checked_is_named_as_such() {
+        let doubts = only(|facts| facts.tin_ids[0].content_type = "image/heic".into());
+        assert_eq!(doubts, vec![Doubt::NotAPhoto]);
+        assert!(!Doubt::NotAPhoto.words().contains("PDF"), "{}", Doubt::NotAPhoto.words());
+        let unread = only(|facts| {
+            facts.tin_ids[0].content_type = "image/heic".into();
+            facts.tin_ids[0].reading = None;
+        });
+        assert_eq!(unread, vec![Doubt::NotAPhoto]);
     }
 
     #[test]

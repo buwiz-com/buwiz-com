@@ -24,7 +24,7 @@
 --   was ever active `staff` when it names a reviewer (`decided_by`: staff
 --   approval, an admin, the seed tool) and `unknown` when it does not (the
 --   automatic check).
--- - Each audit line's source, from the lines that stay.
+-- - Each audit line's source and claim kind, from the lines that stay.
 -- Audit lines of the new actions (activated, paused, approved, …) are not
 -- lost: they move, whole, to `rollback_archive.claim_audit`, outside the
 -- schema the release before this one reads. They are the only record of
@@ -58,6 +58,7 @@ DELETE FROM tin_claims WHERE status = 'unverified';
 DELETE FROM claim_audit
  WHERE action NOT IN ('deleted', 'removed', 'revoked', 'file_replaced', 'file_removed');
 
+ALTER TABLE claim_audit DROP COLUMN claim_kind;
 ALTER TABLE claim_audit DROP COLUMN source;
 ALTER TABLE claim_audit DROP CONSTRAINT claim_audit_action_check;
 ALTER TABLE claim_audit ADD CONSTRAINT claim_audit_action_check

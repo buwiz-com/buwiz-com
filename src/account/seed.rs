@@ -644,6 +644,8 @@ struct Seed<'a> {
 struct ClaimLine<'a> {
     claim_id: Uuid,
     account_id: Uuid,
+    /// The claim's kind (`personal` or `business`).
+    kind: &'a str,
     action: &'static str,
     status_before: &'a str,
     reason: &'a str,
@@ -654,6 +656,7 @@ struct LiveClaim {
     id: Uuid,
     account_id: Uuid,
     email: String,
+    kind: String,
     status: String,
     paused: bool,
 }
@@ -961,8 +964,8 @@ impl Seed<'_> {
     async fn claim_line(&mut self, actor: &Account, tin: &Tin, line: ClaimLine<'_>) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO claim_audit
-                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'seed')",
+                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source, claim_kind)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'seed', $9)",
         )
         .bind(line.claim_id)
         .bind(line.account_id)
@@ -972,6 +975,7 @@ impl Seed<'_> {
         .bind(actor.id)
         .bind(&actor.email)
         .bind(line.reason)
+        .bind(line.kind)
         .execute(&mut *self.tx)
         .await?;
         Ok(())
@@ -987,8 +991,8 @@ impl Seed<'_> {
     ) -> Result<(), SeedError> {
         let tin = &entry.tin;
         let shown = self.shown(tin);
-        let live: Vec<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(&format!(
-            "SELECT c.id, c.account_id, a.email, c.status, c.paused_at IS NOT NULL
+        let live: Vec<(Uuid, Uuid, String, String, String, bool)> = sqlx::query_as(&format!(
+            "SELECT c.id, c.account_id, a.email, c.kind, c.status, c.paused_at IS NOT NULL
              FROM tin_claims c JOIN accounts a ON a.id = c.account_id
              WHERE c.tin_root = $1 AND c.branch_code = $2 AND c.{}
              ORDER BY c.created_at
@@ -1001,7 +1005,14 @@ impl Seed<'_> {
         .await?;
         let live: Vec<LiveClaim> = live
             .into_iter()
-            .map(|(id, account_id, email, status, paused)| LiveClaim { id, account_id, email, status, paused })
+            .map(|(id, account_id, email, kind, status, paused)| LiveClaim {
+                id,
+                account_id,
+                email,
+                kind,
+                status,
+                paused,
+            })
             .collect();
         let mine = live.iter().find(|claim| claim.account_id == account_id);
 
@@ -1040,8 +1051,14 @@ impl Seed<'_> {
                     .fetch_one(&mut *self.tx)
                     .await?;
                     let reason = self.reason("saved as not verified by the seed file");
-                    let line =
-                        ClaimLine { claim_id, account_id, action: "created", status_before: "new", reason: &reason };
+                    let line = ClaimLine {
+                        claim_id,
+                        account_id,
+                        kind: entry.kind.as_str(),
+                        action: "created",
+                        status_before: "new",
+                        reason: &reason,
+                    };
                     self.claim_line(actor, tin, line).await?;
                     let masked = tin.masked();
                     self.changed(
@@ -1120,10 +1137,11 @@ impl Seed<'_> {
                 .execute(&mut *self.tx)
                 .await?;
                 let reason = move_reason(self);
-                let (owner_id, owner_account) = (owner.id, owner.account_id);
+                let (owner_id, owner_account, owner_kind) = (owner.id, owner.account_id, owner.kind.clone());
                 let line = ClaimLine {
                     claim_id: owner_id,
                     account_id: owner_account,
+                    kind: &owner_kind,
                     action: "revoked",
                     status_before: "approved",
                     reason: &reason,
@@ -1150,8 +1168,8 @@ impl Seed<'_> {
                 };
                 // A claim that never became active has no returns: it goes,
                 // with its files, and only the audit line stays.
-                let (waiting_id, waiting_account, waiting_status) =
-                    (waiting.id, waiting.account_id, waiting.status.clone());
+                let (waiting_id, waiting_account, waiting_status, waiting_kind) =
+                    (waiting.id, waiting.account_id, waiting.status.clone(), waiting.kind.clone());
                 let objects: Vec<String> = sqlx::query_scalar(
                     "SELECT object_key FROM claim_documents
                      WHERE claim_id = $1 AND purged_at IS NULL AND object_key IS NOT NULL",
@@ -1176,6 +1194,7 @@ impl Seed<'_> {
                 let line = ClaimLine {
                     claim_id: waiting_id,
                     account_id: waiting_account,
+                    kind: &waiting_kind,
                     action: "deleted",
                     status_before: &waiting_status,
                     reason: &reason,
@@ -1229,7 +1248,14 @@ impl Seed<'_> {
         let reason = self.reason(&entry.reason);
         // A row this run made had no status before.
         let status_before = if unverified.is_some() { "unverified" } else { "new" };
-        let line = ClaimLine { claim_id, account_id, action: "activated", status_before, reason: &reason };
+        let line = ClaimLine {
+            claim_id,
+            account_id,
+            kind: entry.kind.as_str(),
+            action: "activated",
+            status_before,
+            reason: &reason,
+        };
         self.claim_line(actor, tin, line).await?;
         let how = how.trim_start_matches("new; ").to_owned();
         let masked = tin.masked();

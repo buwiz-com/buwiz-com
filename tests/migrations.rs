@@ -346,6 +346,18 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     assert!(accounts.iter().all(|account| *account == (None, false, None)), "{accounts:?}");
     let sources: Vec<String> = sqlx::query_scalar("SELECT source FROM claim_audit").fetch_all(&db).await.unwrap();
     assert_eq!(sources, ["web", "web", "web"]);
+    // Lines from before name no claim kind; new ones name a known one.
+    let kinds: i64 = sqlx::query_scalar("SELECT count(*) FROM claim_audit WHERE claim_kind IS NOT NULL")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(kinds, 0);
+    fails_with(
+        &db,
+        &format!("UPDATE claim_audit SET claim_kind = 'shop' WHERE account_id = '{}'", seeded.ana),
+        "claim_audit_claim_kind_check",
+    )
+    .await;
 
     let indexes: BTreeSet<String> =
         sqlx::query_scalar("SELECT indexname::text FROM pg_indexes WHERE tablename = 'tin_claims'")

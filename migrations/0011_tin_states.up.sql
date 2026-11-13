@@ -78,3 +78,6 @@ ALTER TABLE claim_audit ADD CONSTRAINT claim_audit_action_check
 -- where its line comes from: there is no default to fall back on.
 ALTER TABLE claim_audit ADD COLUMN source text NOT NULL DEFAULT 'web' CHECK (source IN ('web', 'auto', 'seed'));
 ALTER TABLE claim_audit ALTER COLUMN source DROP DEFAULT;
+-- The claim's kind, so the history still says what a deleted claim was
+-- (automatic activation looks back on it). Empty on lines from before.
+ALTER TABLE claim_audit ADD COLUMN claim_kind text CHECK (claim_kind IN ('personal', 'business'));

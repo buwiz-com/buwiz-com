@@ -869,6 +869,10 @@ async fn every_account_and_claim_the_seed_makes_has_an_audit_line(db: PgPool) {
     .await
     .unwrap();
     assert_eq!(unaudited, 0);
+    // Each claim line names the claim's kind, so it outlives the claim.
+    let kindless: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claim_audit WHERE claim_kind IS NULL").fetch_one(&db).await.unwrap();
+    assert_eq!(kindless, 0);
     // Run again, nothing is made and nothing is said to be.
     let again = seed(&db, EXAMPLE, &listing("root@example.test", false, &["root@example.test"])).await.unwrap();
     assert_eq!(again.changes, 0, "{:?}", again.lines);

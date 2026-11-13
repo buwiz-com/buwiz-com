@@ -423,11 +423,15 @@ lines. The card itself is not checked: no photo, hologram, QR code or BIR
 lookup. Once it passes, that person owns the TIN on Buwiz and **can file
 real returns to the BIR under it at once**, before any person has looked,
 with Buwiz vouching for the receipt; the real owner is locked out until
-staff revoke it. The limits (one unconfirmed per account, 20 a day, a clean
-history for the TIN, papers kept, a pause after 30 days unconfirmed) bound
-the damage; they do not prevent it. And whether a claim is activated or
-left for staff tells the claimant whether any other account ever had that
-TIN.
+staff revoke it. "Personal" is the claimant's own choice: a person can
+pick it for a corporation's TIN, whose TIN and registered name are printed
+on every receipt it issues, draw a "TIN ID" with that name, and it passes,
+unless that TIN was ever claimed as a business on Buwiz. "Business TINs are
+always checked by staff" holds only for claims that say they are one. The
+limits (one unconfirmed per account, 20 a day, a clean history for the
+TIN, papers kept, a pause after 30 days unconfirmed) bound the damage; they
+do not prevent it. And whether a claim is activated or left for staff
+tells the claimant whether any other account ever had that TIN.
 
 Before turning it on, decide whether an automatically activated TIN may
 send before a person confirms it (as built, it may), and keep someone

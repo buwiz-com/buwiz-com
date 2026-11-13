@@ -123,14 +123,29 @@ automatic activation made while the setting was on and still unconfirmed
 after 30 days (with none, it changes nothing), and the staff pages count
 the unconfirmed ones for their tab. When on, after OCR reads a claim's TIN ID,
 the claim becomes active by itself only if all of these hold: a personal
-head-office TIN waiting for its first review (never sent back); exactly one
-TIN ID, a photo read by OCR (never a PDF); TIN and name a full match with
-what is typed, each at least 90% sure, and a name of two words or more; the
-account not banned; no other account ever had a row for the TIN; this
-account never had it rejected or revoked, or removed it after an automatic
-activation; no other automatic activation of the account waiting for a
+head-office TIN waiting for its first review (never sent back, on this
+claim or an earlier one); exactly one TIN ID, a JPEG, PNG or WebP photo
+read by OCR (never a PDF, nor HEIC); TIN and name a full match with what is
+typed, each at least 90% sure, and a name of two words or more; the
+account not banned; no other account ever had a row for the TIN's root, at
+any branch; this account never had it rejected, revoked or deleted, or
+removed it after an automatic activation; sending for the TIN was never
+paused, on any account; the TIN never had a business claim, on any
+account; no other automatic activation of the account waiting for a
 person; fewer than 20 automatic activations in the last 24 hours. The
 limits are counted under one lock.
+
+A deleted claim leaves only its audit line, which keeps the TIN masked
+(last three digits and branch) and, from this release, the claim's kind.
+The rule reads those lines too, matched on the masked TIN: another TIN
+with the same last three digits in someone's history leaves a claim for
+staff that might have passed. The more TINs Buwiz has seen, the more often
+that happens (with about 700 in other accounts' histories, about half of
+new claims).
+
+"Personal" is what the claimant picks. A person can pick it for a
+business's TIN that nobody ever claimed as a business on Buwiz; then
+only the name check stands between them and that TIN.
 
 - When it activates: `verified_by = 'auto'`, what it rests on in
   `auto_check`, and an audit line from source `auto`. **The papers are

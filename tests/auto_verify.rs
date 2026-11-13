@@ -237,9 +237,11 @@ async fn anything_in_doubt_leaves_the_claim_for_staff(db: PgPool) {
     assert_eq!(doubts(consider(&site, document).await), [Doubt::Banned]);
     assert_eq!(row(&site.db, claim).await.0, "pending");
 
-    // Another account saved the TIN without papers.
+    // Another account saved the TIN without papers (as personal: a
+    // business claim on it is a doubt of its own).
     let (carl, _) = site.person("carl@example.test").await;
-    add_claim(&site.db, carl, "000123462", "unverified").await;
+    let carls = add_claim(&site.db, carl, "000123462", "unverified").await;
+    sqlx::query("UPDATE tin_claims SET kind = 'personal' WHERE id = $1").bind(carls).execute(&site.db).await.unwrap();
     let (_, _, _, document) = sent(&site, "bob@example.test", "000123462").await;
     read_clearly(&site.db, document, "000123462").await;
     assert_eq!(doubts(consider(&site, document).await), [Doubt::OtherAccount]);
@@ -506,4 +508,120 @@ async fn only_an_automatic_activation_of_someone_else_can_be_confirmed(db: PgPoo
     let (_, plain) = site.person("plain@example.test").await;
     let response = site.post(&format!("/staff/claims/{own}/confirm"), &plain, "").await;
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+/// Saves `root` without papers for `email`, as `kind`: (account, cookie,
+/// claim).
+async fn saved(site: &Site, email: &str, root: &'static str, kind: &'static str) -> (Uuid, String, Uuid) {
+    let (account, cookie) = site.person(email).await;
+    let parts = [("kind", Text(kind)), ("tin", Text(root)), ("registered_name", Text(NAME)), ("skip", Text("1"))];
+    site.upload("/tins/claims", &cookie, &parts).await;
+    let claim = site.newest_claim(account).await;
+    assert_eq!(site.claim_status(claim).await, "unverified");
+    (account, cookie, claim)
+}
+
+async fn delete_own(site: &Site, cookie: &str, claim: Uuid) {
+    let response = site.post(&format!("/tins/claims/{claim}/delete"), cookie, "").await;
+    assert!(location(&response).starts_with("/tins?notice="), "{}", location(&response));
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// What the rule looks back on survives a deleted claim: the audit lines
+/// stay, and count as the rows did.
+#[sqlx::test(migrations = "./migrations")]
+async fn deleting_a_claim_does_not_erase_what_the_rule_looks_back_on(db: PgPool) {
+    let site = Site::with_auto(db);
+    let (_, staff) = site.person(STAFF).await;
+
+    // Rejected, deleted by its owner, sent again with a clean photo.
+    let (_, cookie, claim, _) = sent(&site, "ana@example.test", "000123531").await;
+    site.post(&format!("/staff/claims/{claim}/decision"), &staff, "decision=reject&note=Not+hers").await;
+    assert_eq!(site.claim_status(claim).await, "rejected");
+    delete_own(&site, &cookie, claim).await;
+    let (_, _, _, document) = sent(&site, "ana@example.test", "000123531").await;
+    read_clearly(&site.db, document, "000123531").await;
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::RefusedBefore]);
+
+    // Sent back, deleted, added again.
+    let (_, cookie, claim, _) = sent(&site, "bob@example.test", "000123532").await;
+    site.post(&format!("/staff/claims/{claim}/decision"), &staff, "decision=fix&reasons=blurry").await;
+    assert_eq!(site.claim_status(claim).await, "needs_fix");
+    delete_own(&site, &cookie, claim).await;
+    let (_, _, _, document) = sent(&site, "bob@example.test", "000123532").await;
+    read_clearly(&site.db, document, "000123532").await;
+    // Sent back before, and deleted before: both are named.
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::SentBackBefore, Doubt::RefusedBefore]);
+
+    // Another account saved it once (the real owner, say) and deleted it.
+    let (_, cookie, claim) = saved(&site, "carl@example.test", "000123533", "personal").await;
+    delete_own(&site, &cookie, claim).await;
+    let (_, _, _, document) = sent(&site, "dan@example.test", "000123533").await;
+    read_clearly(&site.db, document, "000123533").await;
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::OtherAccount]);
+}
+
+/// A TIN ever paused, on any account, is never activated by itself: as
+/// with Support, an Admin decides it. A resume and a removal since do not
+/// change that.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_tin_paused_before_is_left_for_an_admin(db: PgPool) {
+    let site = Site::with_auto(db);
+    let (_, admin) = site.staff_with_role("boss@example.test", "admin").await;
+    let (ana, cookie) = site.person("ana@example.test").await;
+    let active = add_claim(&site.db, ana, "000123541", "approved").await;
+    sqlx::query("UPDATE tin_claims SET kind = 'personal' WHERE id = $1").bind(active).execute(&site.db).await.unwrap();
+    site.post(&format!("/staff/claims/{active}/pause"), &admin, "reason=Complaint").await;
+    site.post(&format!("/staff/claims/{active}/resume"), &admin, "reason=Cleared").await;
+    let removed = site.post(&format!("/tins/claims/{active}/remove"), &cookie, "").await;
+    assert_eq!(location(&removed), "/tins?notice=tin_removed");
+    let (_, _, _, document) = sent(&site, "ana@example.test", "000123541").await;
+    read_clearly(&site.db, document, "000123541").await;
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::PausedBefore]);
+    assert!(Doubt::PausedBefore.words().contains("paused"));
+}
+
+/// "Personal" is the claimant's own word: a TIN that ever had a business
+/// claim, on any account, deleted ones included, is left for staff.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_tin_ever_claimed_as_a_business_is_left_for_staff(db: PgPool) {
+    let site = Site::with_auto(db);
+    // This account claimed it as a business once, then withdrew.
+    let (hal, _) = site.person("hal@example.test").await;
+    let withdrawn = add_claim(&site.db, hal, "000123551", "withdrawn").await;
+    let _ = withdrawn;
+    let (_, _, _, document) = sent(&site, "hal@example.test", "000123551").await;
+    read_clearly(&site.db, document, "000123551").await;
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::BusinessBefore]);
+
+    // Another account saved it as a business, then deleted it.
+    let (_, cookie, claim) = saved(&site, "fay@example.test", "000123552", "business").await;
+    delete_own(&site, &cookie, claim).await;
+    let (_, _, _, document) = sent(&site, "gil@example.test", "000123552").await;
+    read_clearly(&site.db, document, "000123552").await;
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::OtherAccount, Doubt::BusinessBefore]);
+}
+
+/// Another account holding the same 9-digit root at a branch is another
+/// account on this TIN.
+#[sqlx::test(migrations = "./migrations")]
+async fn another_account_at_another_branch_counts(db: PgPool) {
+    let site = Site::with_auto(db);
+    let (ivy, _) = site.person("ivy@example.test").await;
+    sqlx::query(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status)
+         VALUES ($1, 'personal', '000123561', '00001', 'Ivy', 'unverified')",
+    )
+    .bind(ivy)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let (_, _, _, document) = sent(&site, "jo@example.test", "000123561").await;
+    read_clearly(&site.db, document, "000123561").await;
+    assert_eq!(doubts(consider(&site, document).await), [Doubt::OtherAccount]);
 }

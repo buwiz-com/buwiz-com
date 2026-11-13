@@ -77,7 +77,7 @@ impl Config {
             extra_origins: list("EXTRA_ORIGINS").iter().map(|raw| origin(raw)).collect::<anyhow::Result<_>>()?,
             secure_cookies,
             document_key: document_key(&required("DOCUMENT_KEY")?)?,
-            admin_emails: list("ADMIN_EMAILS").into_iter().map(|email| email.to_lowercase()).collect(),
+            admin_emails: admin_emails(),
             mail,
             trust_list: std::env::var("TRUST_LIST_JWS")
                 .ok()
@@ -108,6 +108,11 @@ fn var_or(name: &str, default: &str) -> String {
 
 fn required(name: &str) -> anyhow::Result<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty()).with_context(|| format!("{name} is not set"))
+}
+
+/// `ADMIN_EMAILS`, lowercased.
+pub fn admin_emails() -> Vec<String> {
+    list("ADMIN_EMAILS").into_iter().map(|email| email.to_lowercase()).collect()
 }
 
 fn list(name: &str) -> Vec<String> {

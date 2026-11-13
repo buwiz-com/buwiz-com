@@ -346,12 +346,12 @@ pub async fn refusal(response: Response) -> (u16, String, String) {
     )
 }
 
-/// An account's `account_audit` lines, oldest first: (action, old value,
-/// new value, actor email, source, reason).
-pub async fn account_audit_lines(
-    db: &PgPool,
-    account_id: Uuid,
-) -> Vec<(String, Option<String>, Option<String>, String, String, Option<String>)> {
+/// A line of `account_audit`: (action, old value, new value, actor email,
+/// source, reason).
+pub type AccountLine = (String, Option<String>, Option<String>, String, String, Option<String>);
+
+/// An account's `account_audit` lines, oldest first.
+pub async fn account_audit_lines(db: &PgPool, account_id: Uuid) -> Vec<AccountLine> {
     sqlx::query_as(
         "SELECT action, old_value, new_value, actor_email, source, reason FROM account_audit
          WHERE account_id = $1 ORDER BY created_at, id",

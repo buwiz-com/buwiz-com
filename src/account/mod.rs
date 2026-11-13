@@ -12,6 +12,7 @@ pub mod notice;
 pub mod oauth;
 pub mod pages;
 pub mod roles;
+pub mod seed;
 pub mod staff;
 pub mod tin;
 pub mod web;

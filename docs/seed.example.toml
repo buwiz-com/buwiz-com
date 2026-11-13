@@ -1,0 +1,58 @@
+# An example file for `buwiz-cloud seed <FILE> --as <admin email> [--dry-run]`.
+# Synthetic data only. Write the real file outside the repository.
+#
+# One [[login]] per Buwiz login. A key left out keeps what the database
+# has; nothing is ever removed or downgraded. Running the same file again
+# changes nothing.
+
+[[login]]
+email = "admin@example.test"
+role = "admin"              # admin | support | none
+
+[[login]]
+email = "support@example.test"
+role = "support"
+
+[[login]]
+email = "jane@example.test"
+test = true                 # a label staff see; sends work as usual
+  [[login.tin]]
+  tin = "000-123-453"       # 9 digits; dashes allowed
+  branch = "00000"          # optional, head office by default
+  kind = "personal"         # personal | business
+  name = "JANE EXAMPLE"     # the registered name
+  state = "active"          # active | not_verified
+  reason = "Owner's test login"   # required for active; staff see it only
+
+[[login]]
+email = "shop@example.test"
+  [[login.tin]]
+  tin = "000-123-454"
+  kind = "business"
+  name = "EXAMPLE TRADING CORP"
+  state = "not_verified"    # saved without papers; it can prepare, not send
+
+[[login]]
+email = "juan@example.test"
+  # Not a valid TIN: refused and left out; the login is still made.
+  [[login.tin]]
+  tin = "000-000-000"
+  kind = "personal"
+  name = "JUAN EXAMPLE"
+  state = "active"
+  reason = "Login only"
+
+# To move a TIN that is active (or waiting for review) on another login,
+# name that login. Its active row is ended (its returns stay with it); a
+# claim still waiting for review is deleted. The old login never sees who
+# has the TIN now.
+#
+# [[login]]
+# email = "new-owner@example.test"
+#   [[login.tin]]
+#   tin = "000-123-455"
+#   kind = "business"
+#   name = "EXAMPLE HOLDINGS INC"
+#   state = "active"
+#   reason = "Moves to the company's own login"
+#   move_from = "old-owner@example.test"

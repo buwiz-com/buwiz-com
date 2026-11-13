@@ -29,7 +29,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::account::oauth::Bearer;
+use crate::account::oauth::{Bearer, SigningOut};
 use crate::base::crypto;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
@@ -269,12 +269,14 @@ pub async fn list(State(state): State<AppState>, bearer: Bearer) -> Result<Json<
     Ok(Json(json!({ "devices": for_account(&state.db, bearer.account.id).await? })))
 }
 
-/// `POST /api/devices/{id}/revoke`.
+/// `POST /api/devices/{id}/revoke`. A banned account's app may still
+/// remove its own device, as it may sign out.
 pub async fn revoke_api(
     State(state): State<AppState>,
-    bearer: Bearer,
+    signing_out: SigningOut,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
+    let bearer = signing_out.bearer;
     bearer.require_app()?;
     if revoke(&state.db, bearer.account.id, id).await? {
         Ok(Json(json!({ "revoked": true })))

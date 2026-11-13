@@ -224,6 +224,21 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         let done = format!("{user}?notice=signed_out_everywhere");
         expect_post(&site, (who, &cookie), &path, "reason=Lost+laptop", false, &user, &done).await;
         assert_eq!(live_sessions(&site.db, t.account).await == 0, who.may(false), "{who:?}");
+
+        // Ban and lift: Admins only.
+        let banned = || async {
+            sqlx::query_scalar::<_, bool>("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1")
+                .bind(t.account)
+                .fetch_one(&site.db)
+                .await
+                .unwrap()
+        };
+        let done = format!("{user}?notice=account_banned_staff");
+        expect_post(&site, (who, &cookie), &format!("{user}/ban"), "reason=Abuse", true, &user, &done).await;
+        assert_eq!(banned().await, who.may(true), "{who:?}");
+        let done = format!("{user}?notice=ban_lifted");
+        expect_post(&site, (who, &cookie), &format!("{user}/unban"), "reason=Sorted", true, &user, &done).await;
+        assert!(!banned().await, "{who:?}");
     }
 }
 

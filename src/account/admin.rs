@@ -1,5 +1,5 @@
-//! What staff do to accounts: change a role, and sign an account out
-//! everywhere or out of one app. Each runs in one transaction (lock, check,
+//! What staff do to accounts: change a role, ban and lift a ban, and sign
+//! an account out everywhere or out of one app. Each runs in one transaction (lock, check,
 //! change, a line in `account_audit` with who, when and why). The routes
 //! check the power first ([`crate::account::roles`]); the checks here are
 //! the ones that depend on the account acted on.
@@ -224,4 +224,79 @@ pub async fn sign_out_app(
     }
     tx.commit().await?;
     Ok(Notice::AppSignedOut)
+}
+
+/// An Admin bans an account: it loses its website sessions and the
+/// sign-ins not yet picked up by an app or agent, and cannot sign in. Its
+/// app sign-ins stay, but every API call but signing out is refused
+/// (`account_banned`). Refused for one's own account and for any Admin.
+pub async fn ban(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    account_id: Uuid,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = required_reason(reason)?;
+    if account_id == actor.account.id {
+        return Err(DecideError::Refused(Notice::OwnAccount));
+    }
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    let target = lock_account(&mut tx, account_id).await?;
+    if roles::in_server_setting(config, &target.email) {
+        return Err(DecideError::Refused(Notice::RoleFromServer));
+    }
+    if target.role(config) == Some(Role::Admin) {
+        return Err(DecideError::Refused(Notice::BanAdmin));
+    }
+    if target.banned {
+        return Ok(Notice::AccountBannedStaff);
+    }
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = $2, ban_reason = $3 WHERE id = $1")
+        .bind(target.id)
+        .bind(actor.account.id)
+        .bind(&reason)
+        .execute(&mut *tx)
+        .await?;
+    accounts::end_sign_ins(&mut tx, target.id, false).await?;
+    let line = Line {
+        account_id: target.id,
+        action: "banned",
+        old_value: None,
+        new_value: None,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
+    tx.commit().await?;
+    tracing::info!(account_id = %target.id, actor = %actor.account.id, "account banned");
+    Ok(Notice::AccountBannedStaff)
+}
+
+/// An Admin lifts a ban. The account's app sign-ins work again at once.
+pub async fn unban(db: &PgPool, actor: &Staff, account_id: Uuid, reason: &str) -> Result<Notice, DecideError> {
+    let reason = required_reason(reason)?;
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    let target = lock_account(&mut tx, account_id).await?;
+    if !target.banned {
+        return Ok(Notice::BanLifted);
+    }
+    sqlx::query("UPDATE accounts SET banned_at = NULL, banned_by = NULL, ban_reason = NULL WHERE id = $1")
+        .bind(target.id)
+        .execute(&mut *tx)
+        .await?;
+    let line = Line {
+        account_id: target.id,
+        action: "unbanned",
+        old_value: None,
+        new_value: None,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
+    tx.commit().await?;
+    tracing::info!(account_id = %target.id, actor = %actor.account.id, "ban lifted");
+    Ok(Notice::BanLifted)
 }

@@ -126,14 +126,20 @@ pub async fn start_session(db: &PgPool, account_id: Uuid) -> sqlx::Result<String
     Ok(token)
 }
 
+/// The account of a website session. A banned account has none: a ban
+/// ends its sessions, and this refuses any that is left.
 pub async fn session_account(db: &PgPool, token: &str) -> sqlx::Result<Option<Account>> {
     sqlx::query_as(
         "SELECT a.id, a.email FROM web_sessions s JOIN accounts a ON a.id = s.account_id
-         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now()",
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND a.banned_at IS NULL",
     )
     .bind(crypto::hash(token))
     .fetch_optional(db)
     .await
+}
+
+pub async fn is_banned(db: &PgPool, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT banned_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await
 }
 
 pub async fn end_session(db: &PgPool, token: &str) -> sqlx::Result<()> {

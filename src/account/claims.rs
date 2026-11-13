@@ -1015,8 +1015,8 @@ async fn audit(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO claim_audit
-             (claim_id, account_id, tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             (claim_id, account_id, tin_masked, action, claim_status, document_kind, actor_id, actor_email, reason, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'web')",
     )
     .bind(claim.id)
     .bind(claim.account_id)

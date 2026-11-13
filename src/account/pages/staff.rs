@@ -715,9 +715,12 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                     (tin.to_string(), claim.status.clone())
                 })
                 .collect();
-            let is_staff = user_role(config, &user).is_some();
-            let id_status = IdStatus::of(is_staff, own.iter().map(|claim| claim.status.as_str()));
-            UserListRow { color: index % 5, user, names, tins, id_status }
+            let role = user_role(config, &user);
+            let id_status = IdStatus::of(role.is_some(), own.iter().map(|claim| claim.status.as_str()));
+            // The list says "Support"; Admins already read "Staff".
+            let badge = role_badge(role).filter(|(_, tone)| *tone == "support");
+            let banned = user.banned_at.is_some();
+            UserListRow { color: index % 5, user, names, tins, id_status, badge, banned }
         })
         .collect();
     let chips: Vec<(UserFilter, String)> = UserFilter::ALL
@@ -782,6 +785,8 @@ struct UserListRow {
     /// (TIN, claim status)
     tins: Vec<(String, String)>,
     id_status: IdStatus,
+    badge: Option<(&'static str, &'static str)>,
+    banned: bool,
 }
 
 #[component]
@@ -803,6 +808,12 @@ async fn user_row(row: UserListRow) -> Result<impl View> {
                 }
             </span>
             <span class=(format!("id-badge {id_tone}"))>icon(name: id_icon) (id_label)</span>
+            if let Some((label, tone)) = row.badge {
+                <span class=(format!("id-badge {tone}"))>(label)</span>
+            }
+            if row.banned {
+                <span class="id-badge banned">icon(name: "block") "Banned"</span>
+            }
             <span class="row-dates">
                 <span>"Joined " (short_date(row.user.created_at))</span>
                 <span>"Active " (ago(row.user.last_active))</span>
@@ -896,6 +907,9 @@ pub mod account_id {
                             if let Some((label, tone)) = badge {
                                 <span class=(format!("id-badge {tone}"))>icon(name: "shield_person") (label)</span>
                             }
+                            if user.banned_at.is_some() {
+                                <span class="id-badge banned">icon(name: "block") "Banned"</span>
+                            }
                         </span>
                     </section>
                     <div class="user-grid">
@@ -959,6 +973,31 @@ pub mod account_id {
                                 } else if own_account {
                                     <p class="side-text">"This is you. Another admin can change your role."</p>
                                 } else {
+                                    if let Some(at) = user.banned_at {
+                                        <p class="side-text">
+                                            "Banned by " (user.banned_by_email.clone().unwrap_or_default()) " on " (date(at)) ": "
+                                            (user.ban_reason.clone().unwrap_or_default())
+                                        </p>
+                                        confirm_form(
+                                            label: "Lift the ban",
+                                            action: format!("/staff/users/{account_id}/unban"),
+                                            question: format!("Lift the ban on {}?", user.email),
+                                            detail: "They can sign in and send again.".to_owned(),
+                                            confirm: "Lift ban",
+                                            reason: true
+                                        )
+                                    } else if is_admin {
+                                        <p class="side-text">"An admin can't be banned. Change the role first."</p>
+                                    } else {
+                                        confirm_form(
+                                            label: "Ban this account",
+                                            action: format!("/staff/users/{account_id}/ban"),
+                                            question: format!("Ban {}?", user.email),
+                                            detail: "They can't sign in or send returns until you lift the ban. Their TINs stay on the account.".to_owned(),
+                                            confirm: "Ban",
+                                            reason: true
+                                        )
+                                    }
                                     <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/role")) data-confirm=(format!("Change {}'s role?", user.email)) data-confirm-detail="It takes effect on their next page." data-confirm-label="Change role">
                                         <label class="decision-label">
                                             "Role"

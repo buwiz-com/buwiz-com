@@ -185,10 +185,11 @@ pub enum UserFilter {
     Verified,
     NoTin,
     Staff,
+    Banned,
 }
 
 impl UserFilter {
-    pub const ALL: [Self; 5] = [Self::Everyone, Self::Waiting, Self::Verified, Self::NoTin, Self::Staff];
+    pub const ALL: [Self; 6] = [Self::Everyone, Self::Waiting, Self::Verified, Self::NoTin, Self::Staff, Self::Banned];
 
     pub fn parse(raw: Option<&str>) -> Self {
         Self::ALL.into_iter().find(|filter| Some(filter.code()) == raw).unwrap_or(Self::Everyone)
@@ -201,6 +202,7 @@ impl UserFilter {
             Self::Verified => "verified",
             Self::NoTin => "no_tin",
             Self::Staff => "staff",
+            Self::Banned => "banned",
         }
     }
 
@@ -211,6 +213,7 @@ impl UserFilter {
             Self::Verified => "Verified",
             Self::NoTin => "No TIN yet",
             Self::Staff => "Staff",
+            Self::Banned => "Banned",
         }
     }
 }
@@ -262,6 +265,7 @@ pub async fn users(
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
                                               AND c.status IN ('unverified', 'pending', 'needs_fix', 'approved'))
                WHEN 'staff' THEN a.banned_at IS NULL AND (a.role IS NOT NULL OR a.email = ANY($4))
+               WHEN 'banned' THEN a.banned_at IS NOT NULL
                ELSE true
            END
          ORDER BY last_active DESC NULLS LAST, a.created_at DESC

@@ -120,6 +120,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
         .route("/staff/users/{account_id}/role", post(change_role))
+        .route("/staff/users/{account_id}/ban", post(ban_user))
+        .route("/staff/users/{account_id}/unban", post(unban_user))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
         .route("/devices/{device_id}/revoke", post(revoke_device))
@@ -492,6 +494,13 @@ async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(fo
         }
         Err(CodeError::Internal(error)) => return internal(error),
     };
+    // The code was right, but a banned account gets no session. Its code
+    // was emailed like any other, so typing an email tells nothing.
+    match accounts::is_banned(&state.db, account.id).await {
+        Ok(false) => {}
+        Ok(true) => return see_other(link("/login", Some(Notice::AccountBanned), &[])),
+        Err(error) => return internal(error),
+    }
     let token = match accounts::start_session(&state.db, account.id).await {
         Ok(token) => token,
         Err(error) => return internal(error),
@@ -1030,6 +1039,42 @@ async fn sign_out_user_app(
     };
     let outcome = admin::sign_out_app(&state.db, &state.config, &staff, account_id, grant_id, &form.reason).await;
     staff_outcome(&back_to, outcome)
+}
+
+/// An Admin bans an account, with a reason.
+async fn ban_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/users/{account_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::Ban).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    staff_outcome(&back_to, admin::ban(&state.db, &state.config, &staff, account_id, &form.reason).await)
+}
+
+/// An Admin lifts a ban, with a reason.
+async fn unban_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/users/{account_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::Ban).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    staff_outcome(&back_to, admin::unban(&state.db, &staff, account_id, &form.reason).await)
 }
 
 #[derive(Deserialize)]

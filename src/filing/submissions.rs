@@ -66,7 +66,8 @@ pub fn parse_filename(name: &str) -> Result<IafName, &'static str> {
     if !matches!(digits.len(), 12 | 14) || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid);
     }
-    let tin = Tin::parse(&digits[..9], &digits[9..]).map_err(|_| invalid)?;
+    // A test TIN too: the gate refuses it with its own code.
+    let tin = Tin::parse_any(&digits[..9], &digits[9..]).map_err(|_| invalid)?;
     let word = |text: &str, max: usize| {
         (1..=max).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     };
@@ -734,6 +735,8 @@ mod tests {
         assert_eq!(name.email, "juan@example.ph");
         let old = parse_filename("123456789001-2551Qv2018-122025Q1#a@b.ph#.xml").unwrap();
         assert_eq!(old.tin.branch(), "00001");
+        // A test TIN reads; the gate refuses it (tin_test_only).
+        assert!(parse_filename("00000000000000-1601Cv2018-062025#a@b.ph#.xml").unwrap().tin.is_test());
     }
 
     #[test]
@@ -744,7 +747,6 @@ mod tests {
             "1234567890000-1601Cv2018-062025#a@b.ph#.xml",
             "12345678900000-1601Cv2018-062025#a b@c.ph#.xml",
             "12345678900000-1601Cv2018-062025#a/b@c.ph#.xml",
-            "00000000000000-1601Cv2018-062025#a@b.ph#.xml",
             "12345678900000-1601Cv2018-062025#nobody#.xml",
         ] {
             assert!(parse_filename(bad).is_err(), "{bad}");

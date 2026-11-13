@@ -80,7 +80,8 @@ Tickets (`POST /api/tickets`), both submission calls and the relay refuse
 a TIN that cannot send with `403 {"error":{"code","message"}}`. The code
 says where the caller's **own** row for that TIN stands; another account's
 row is never looked at, so "someone else owns it", "never added" and "it
-ended" all read `tin_not_active`, word for word alike.
+ended" all read `tin_not_active`, word for word alike. An app that does
+not know a code yet treats it as `tin_not_active`.
 
 | `code` | When | `message` |
 |---|---|---|
@@ -88,6 +89,7 @@ ended" all read `tin_not_active`, word for word alike.
 | `tin_pending` | Papers waiting for review | This TIN's papers are still being checked, usually within one business day. You can send once it is active. |
 | `tin_needs_fix` | Sent back for a fix | `Sent back for a fix: ` and the fixed reason sentences (never the staff's own note), or `Sent back for a fix. See what to change on My TINs at account.buwiz.com.` |
 | `tin_paused` | Active, but sending is paused | Sending is paused for this TIN. Write to support@buwiz.com. |
+| `tin_test_only` | Active, but a test TIN (root `000-000-000`, which staff add to test accounts only): it never sends, in any relay mode | This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR. |
 | `tin_not_active` | Anything else | this TIN is not active on your account |
 | `account_banned` | The account is banned (every bearer call but `POST /api/auth/logout`; the token refresh still works) | This Buwiz account is banned: it can't send returns. Write to support@buwiz.com. |
 
@@ -102,14 +104,15 @@ its file name or ticket names. Retry only `429 quota_exceeded`, network errors a
 `GET /api/tax-profiles?include=all` (Bearer, any scope; `all` may come in a
 comma list, `include=all,pending`) answers
 `{"include":"all","profiles":[…]}`: every TIN on the account that has not
-ended, each with `status` (`approved`, `paused`, `unverified`, `pending`,
-`needs_fix`), `can_send`, a `message`, and an `action` link to Verify or
-Fix. `status` is `approved` exactly when `can_send` is true; both come from
+ended, each with `status` (`approved`, `paused`, `test_only`,
+`unverified`, `pending`, `needs_fix`), `can_send`, a `message`, and an
+`action` link to Verify or Fix. A test TIN's row also has
+`"test_only": true` (no other row has the field). `status` is `approved` exactly when `can_send` is true; both come from
 the same rule as the refusals above. A `needs_fix` row also carries
 `reasons`, `reason_codes` and the staff `note` (at most 200 characters, BIR
 app only). Only the BIR app (`app` scope) gets `tin`, filing permissions,
 the link and the note. Without `all`, the list means what it always did,
-except that a paused TIN is left out. `tests/fixtures/tax_profiles_all.json`
+except that a paused TIN and a test TIN are left out. `tests/fixtures/tax_profiles_all.json`
 is the golden example; [accounts.md](accounts.md#licence-gate) has more.
 
 ## 2. Open the pipe

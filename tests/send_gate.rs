@@ -546,7 +546,7 @@ async fn the_sql_and_the_rust_forms_of_the_gate_agree(db: PgPool) {
             .fetch_one(db)
             .await
             .unwrap();
-            let standing = gate::classify(id, status, paused, &[]);
+            let standing = gate::classify(id, status, paused, &[], false);
             assert_eq!(sendable, standing.can_send(), "{status} paused={paused}");
             assert_eq!(live, gate::is_live(status), "{status}");
             assert_eq!(live, standing != gate::Standing::NotActive, "{status}");
@@ -554,6 +554,46 @@ async fn the_sql_and_the_rust_forms_of_the_gate_agree(db: PgPool) {
             let tin = buwiz_cloud::tin::Tin::parse(&format!("000{root}"), "").unwrap();
             let own = gate::own(db, ana, &tin).await.unwrap();
             assert_eq!(own, if live { standing.clone() } else { gate::Standing::NotActive }, "{status}");
+        }
+    }
+    // A test TIN, in each state one can be in (an admin activated it).
+    let mut branch = 0;
+    for status in ["approved", "removed", "revoked"] {
+        for paused in [false, true] {
+            if paused && status != "approved" {
+                continue;
+            }
+            branch += 1;
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+                 VALUES ($1, 'personal', '000000000', $2, 'TEST TAXPAYER', $3, now(), 'admin') RETURNING id",
+            )
+            .bind(ana)
+            .bind(format!("{branch:05}"))
+            .bind(status)
+            .fetch_one(db)
+            .await
+            .unwrap();
+            if paused {
+                pause(db, id).await;
+            }
+            let sendable: bool =
+                sqlx::query_scalar(&format!("SELECT {} FROM tin_claims c WHERE c.id = $1", gate::SENDABLE_SQL))
+                    .bind(id)
+                    .fetch_one(db)
+                    .await
+                    .unwrap();
+            let standing = gate::classify(id, status, paused, &[], true);
+            assert!(!sendable && !standing.can_send(), "{status} paused={paused}");
+            let tin = buwiz_cloud::tin::Tin::parse_any("000000000", &format!("{branch:05}")).unwrap();
+            let own = gate::own(db, ana, &tin).await.unwrap();
+            let expected = match (status, paused) {
+                ("approved", true) => gate::Standing::Paused,
+                ("approved", false) => gate::Standing::TestOnly,
+                _ => gate::Standing::NotActive,
+            };
+            assert_eq!((&standing, &own), (&expected, &expected), "{status} paused={paused}");
+            assert_eq!(gate::of_claim(db, ana, id).await.unwrap(), expected, "{status} paused={paused}");
         }
     }
     let index: String =

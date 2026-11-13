@@ -1,8 +1,17 @@
 //! TIN root + branch code: the key BIR files returns under.
+//!
+//! A TIN is valid when its root has 9 digits, not all zeros, and its branch
+//! code 5 (or the old 3, or none for head office). A root of all zeros is a
+//! test TIN: staff put one on a test account only, and it never sends
+//! ([`crate::filing::gate`]). The `_any` readers take one; the others
+//! refuse it with [`Notice::TinZero`], as people's forms always did.
 
 use std::fmt::{self, Display, Formatter};
 
 use crate::account::notice::Notice;
+
+/// The root of every test TIN: `000-000-000`, at any branch.
+pub const TEST_ROOT: &str = "000000000";
 
 /// A BIR registration: 9-digit TIN root and 5-digit branch code
 /// (head office `00000`).
@@ -14,14 +23,18 @@ pub struct Tin {
 
 impl Tin {
     /// Accepts dashes and spaces. A 3-digit branch is the old form and gets
-    /// `00` in front; an empty branch means head office.
+    /// `00` in front; an empty branch means head office. A test TIN is
+    /// refused ([`Notice::TinZero`]).
     pub fn parse(root: &str, branch: &str) -> Result<Self, Notice> {
+        Self::parse_any(root, branch).and_then(Self::not_test)
+    }
+
+    /// [`Tin::parse`], a test TIN too: for stored rows, the gate (which
+    /// refuses test TINs itself) and the staff form that adds one.
+    pub fn parse_any(root: &str, branch: &str) -> Result<Self, Notice> {
         let root = digits(root);
         if root.len() != 9 {
             return Err(Notice::TinDigits);
-        }
-        if root.bytes().all(|digit| digit == b'0') {
-            return Err(Notice::TinZero);
         }
         let branch = match digits(branch) {
             branch if branch.is_empty() => "00000".to_owned(),
@@ -35,10 +48,15 @@ impl Tin {
     /// Both parts in one field, as printed on Form 2303: `123-456-789-00000`
     /// or just the 9-digit root.
     pub fn parse_combined(raw: &str) -> Result<Self, Notice> {
+        Self::parse_combined_any(raw).and_then(Self::not_test)
+    }
+
+    /// [`Tin::parse_combined`], a test TIN too.
+    pub fn parse_combined_any(raw: &str) -> Result<Self, Notice> {
         let all = digits(raw);
         match all.len() {
-            9 => Self::parse(&all, ""),
-            12 | 14 => Self::parse(&all[..9], &all[9..]),
+            9 => Self::parse_any(&all, ""),
+            12 | 14 => Self::parse_any(&all[..9], &all[9..]),
             _ => Err(Notice::TinDigits),
         }
     }
@@ -46,11 +64,26 @@ impl Tin {
     /// The TIN and branch code fields of a form. The TIN field may carry the
     /// branch too, as printed on Form 2303; then the branch field is ignored.
     pub fn parse_fields(tin: &str, branch: &str) -> Result<Self, Notice> {
+        Self::parse_fields_any(tin, branch).and_then(Self::not_test)
+    }
+
+    /// [`Tin::parse_fields`], a test TIN too.
+    pub fn parse_fields_any(tin: &str, branch: &str) -> Result<Self, Notice> {
         if digits(tin).len() > 9 || digits(branch).is_empty() {
-            Self::parse_combined(tin)
+            Self::parse_combined_any(tin)
         } else {
-            Self::parse(tin, branch)
+            Self::parse_any(tin, branch)
         }
+    }
+
+    fn not_test(self) -> Result<Self, Notice> {
+        if self.is_test() { Err(Notice::TinZero) } else { Ok(self) }
+    }
+
+    /// A made-up TIN for testing: its root is all zeros. BIR has no such
+    /// TIN, and nothing is ever sent for it.
+    pub fn is_test(&self) -> bool {
+        self.root == TEST_ROOT
     }
 
     pub fn root(&self) -> &str {
@@ -111,6 +144,22 @@ mod tests {
         assert!(Tin::parse("12345678", "").is_err());
         assert!(Tin::parse("000000000", "").is_err());
         assert!(Tin::parse("123456789", "12").is_err());
+    }
+
+    #[test]
+    fn test_tins_are_read_only_where_asked_for() {
+        for (raw, branch) in [("000-000-000", ""), ("000000000", "00001"), ("000-000-000-00000", "")] {
+            let tin = Tin::parse_fields_any(raw, branch).unwrap();
+            assert!(tin.is_test(), "{raw}");
+            assert_eq!(Tin::parse_fields(raw, branch), Err(Notice::TinZero), "{raw}");
+        }
+        assert_eq!(Tin::parse_combined_any("000-000-000-00002").unwrap().to_string(), "000-000-000-00002");
+        assert_eq!(Tin::parse_combined("000-000-000-00002"), Err(Notice::TinZero));
+        assert_eq!(Tin::parse_any("000000000", "").unwrap().masked(), "***-***-000-00000");
+        // The shape is still checked, and a real TIN is no test TIN.
+        assert_eq!(Tin::parse_any("00000000", ""), Err(Notice::TinDigits));
+        assert_eq!(Tin::parse_any("000000000", "12"), Err(Notice::TinBranch));
+        assert!(!Tin::parse_any("000123453", "").unwrap().is_test());
     }
 
     #[test]

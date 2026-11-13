@@ -239,7 +239,8 @@ The order:
 2. Run check 6 above and wait for `0`, then stop the app:
    `sudo systemctl stop buwiz.service`.
 3. From the release's checkout, run the newer down file, then the older,
-   each in one transaction:
+   each in one transaction (from a release with migration 13, run
+   [its down file](#migration-13-test-tins) first):
    ```sh
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0012_staff_roles.down.sql
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql
@@ -436,6 +437,38 @@ tells the claimant whether any other account ever had that TIN.
 Before turning it on, decide whether an automatically activated TIN may
 send before a person confirms it (as built, it may), and keep someone
 checking the tab daily.
+
+## Migration 13 (test TINs)
+
+The release with test TINs ([accounts.md](accounts.md#bans-and-test-accounts))
+runs migration 13 when it starts. It adds one check to `tin_claims`: a row
+whose TIN root is `000000000` (a test TIN) is one an Admin or the seed tool
+made active (`verified_by` `admin` or `seed`). No column changes. The
+release before it (at 12) refuses to start on a database at 13, as with
+any newer migration.
+
+**Before you deploy.** The database is at 12, and no row has such a root
+(every form refused one); both as read-only checks:
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 12
+SELECT count(*) FROM tin_claims WHERE tin_root = '000000000';        -- 0
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 12.** The release before this one cannot read a test
+TIN: every page that lists one stops with an error. So the down file
+refuses while any row holds one, ended ones too, and then changes nothing.
+Revoke each test TIN on the staff pages first (the history keeps who and
+why), stop the app, delete the rows (none can have tickets or returns, as
+the gate refuses them, but the file's comment has the statements for those
+too), then:
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0013_test_tins.down.sql
+psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 12
+```
+and put the previous binaries back. Their audit lines stay (the TIN masked,
+`***-***-000-…`). Going further back, to 10, runs 13's down file first,
+then 12's and 11's as [above](#rolling-back).
 
 ## OCR of claim documents
 

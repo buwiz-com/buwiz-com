@@ -183,6 +183,10 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                         // without them (or activated without them).
                         "sent_at": claim.submitted_at.map(OffsetDateTime::unix_timestamp),
                     });
+                    // A made-up TIN staff put on a test account: it never sends.
+                    if claim.tin().is_test() {
+                        row["test_only"] = json!(true);
+                    }
                     if claim.status == "needs_fix" {
                         let reasons: Vec<&str> = claim
                             .fix_reasons

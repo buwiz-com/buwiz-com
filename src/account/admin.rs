@@ -411,9 +411,22 @@ pub async fn unban(
     Ok(Notice::BanLifted)
 }
 
-/// An Admin labels an account as a test account, or takes the label off.
-/// Only staff see it; sends work as usual. Not one's own account. Locks as
-/// a ban does: the roles lock, the actor, then the account.
+/// Whether the account holds a test TIN that has not ended.
+pub(crate) async fn holds_test_tins(tx: &mut Transaction<'_, Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND {})",
+        crate::filing::gate::LIVE_SQL
+    ))
+    .bind(account_id)
+    .bind(crate::account::tin::TEST_ROOT)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// An Admin labels an account as a test account, or takes the label off
+/// (refused while it holds a test TIN: revoke those first). Only staff see
+/// it; sends work as usual. Not one's own account. Locks as a ban does: the
+/// roles lock, the actor, then the account.
 pub async fn mark_test(
     db: &PgPool,
     config: &Config,
@@ -439,6 +452,12 @@ pub async fn mark_test(
         .await?;
     if labelled == test {
         return Ok(notice);
+    }
+    // A test TIN lives on a test account only: the label stays while one
+    // is on it. Its own add takes the roles lock too, so none comes in
+    // meanwhile.
+    if !test && holds_test_tins(&mut tx, target.id).await? {
+        return Err(DecideError::Refused(Notice::TestTinsHeld));
     }
     sqlx::query("UPDATE accounts SET test_account = $2 WHERE id = $1")
         .bind(target.id)

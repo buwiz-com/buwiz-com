@@ -183,6 +183,7 @@ const MATRIX: &[&str] = &[
     "/staff/users/{account_id}/ban",
     "/staff/users/{account_id}/unban",
     "/staff/users/{account_id}/test",
+    "/staff/users/{account_id}/test-tin",
     "/staff/users/new",
 ];
 
@@ -374,6 +375,21 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             .await
             .unwrap();
         assert_eq!(labelled, who.may(true), "{who:?}");
+
+        // A test TIN on the (now) test account: Admins only.
+        let done = format!("{user}?notice=test_tin_added");
+        let form = format!(
+            "tin=000-000-000-{:05}&kind=personal&registered_name=Test&reason=Trial",
+            t.account.as_u128() % 99_999
+        );
+        expect_post(site, (who, &cookie), &format!("{user}/test-tin"), &form, true, &user, &done).await;
+        let test_tins: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1 AND tin_root = '000000000'")
+                .bind(t.account)
+                .fetch_one(&site.db)
+                .await
+                .unwrap();
+        assert_eq!(test_tins == 1, who.may(true), "{who:?}");
 
         // A new login: Admins only.
         let email = format!("new-{}@example.test", format!("{who:?}").to_lowercase());
@@ -1014,6 +1030,7 @@ fn staff_posts(t: &Target, user: &str) -> Vec<(String, String)> {
         (format!("{user}/ban"), "reason=Abuse".into()),
         (format!("{user}/unban"), "reason=Sorted".into()),
         (format!("{user}/test"), "test=on&reason=Trial".into()),
+        (format!("{user}/test-tin"), "tin=000-000-000&kind=personal&registered_name=Test&reason=Trial".into()),
         ("/staff/users/new".into(), "email=new%40example.test&role=support&reason=Joins".into()),
     ]
 }

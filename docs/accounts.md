@@ -67,6 +67,22 @@ app can say why. Lifting the ban restores everything. An Admin can't be
 banned. The **test label** is for staff only: they see and filter it, and
 sends work as usual.
 
+A **test TIN** is a made-up one: its root is `000-000-000`, at any branch,
+which is exactly what the TIN check refuses on every form (a TIN must have
+9 digits, not all zeros, and a branch of 3 or 5 digits). An Admin adds one
+on the staff page of an account with the test label ("Add a test TIN":
+the TIN, its name and kind, a reason), active at once and without papers
+(`verified_by = 'admin'`, an `activated` line with the reason). A real TIN
+is refused there (it is added the usual way, and verified), and so is any
+account without the label. It never sends, whatever `BIR_RELAY_MODE` says:
+the send gate refuses it with `tin_test_only` (tickets, both submission
+calls, the relay), and the Sender refuses one too. It shows as a test TIN
+on My TINs, on the staff pages and in the apps' TIN list (`status:
+test_only`, `test_only: true`); the plain licence list leaves it out. The
+label cannot come off an account while it holds one that has not ended
+(`test_tins_held`): revoke it first. Migration 13 keeps it so in the
+database: such a row is only ever an Admin's or the seed tool's.
+
 A ban that commits while a request for the account is under way wins:
 activation, approval, an app's sign-in approval and an agent's consent
 lock the account and look again as they write, and no new sign-in (device
@@ -235,15 +251,15 @@ The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 ## Licence gate
 
 `GET /api/tax-profiles` lists the account's active TINs that can send (a
-paused one is left out). The apps unlock their BIR tools when any profile
+paused one and a test TIN are left out). The apps unlock their BIR tools when any profile
 has permissions. With `?include=pending`, it also lists TINs that are still
 being checked or were sent back. Each of those has a `status` and no
 `filing.submit` permission.
 
 With `?include=all` (also in a comma list) the answer is
 `{"include":"all","profiles":[…]}`: every TIN on the account that has not
-ended, with `status` (`approved`, `paused`, `unverified`, `pending`,
-`needs_fix`), `can_send`, `message` and `action` (the id-based Verify or Fix
+ended, with `status` (`approved`, `paused`, `test_only`, `unverified`,
+`pending`, `needs_fix`), `can_send`, `message` and `action` (the id-based Verify or Fix
 link). `approved` means it can send. Sent-back rows add `reasons`,
 `reason_codes` and the staff `note`. Only the BIR app's token gets the full
 TIN, filing permissions, links and the note. The golden example is

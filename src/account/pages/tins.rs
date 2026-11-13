@@ -111,11 +111,15 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
     let remove = format!("/tins/claims/{}/remove", claim.id);
     let verify = format!("/tins/claims/{}/verify", claim.id);
     let tin = claim.tin().to_string();
+    let test_tin = claim.tin().is_test();
     Ok(view! {
         <article class="tin-card">
             <div class="tin-card-top">
                 kind_pill(kind: claim.kind.clone())
                 pill(label: label.to_owned(), icon_name: status_icon, tone: format!("status-{tone}"))
+                if test_tin {
+                    pill(label: "Test TIN".to_owned(), icon_name: "science", tone: "status-unverified".to_owned())
+                }
             </div>
             <div class="tin-who">
                 tin_text(tin: claim.tin().to_string())
@@ -139,6 +143,7 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
             }
             match status.as_str() {
                 "unverified" => <p class="tin-note unverified">"Not verified yet. You can prepare and save returns for this TIN in the app. To send them to the BIR, verify it with " (verify_with) "."</p>,
+                "approved" if test_tin => <p class="tin-note unverified">"A test TIN, active since " (claim.decided_at.map(date).unwrap_or_default()) ". You can prepare returns for it in the app; Buwiz never sends them to the BIR."</p>,
                 "approved" => <p class="tin-note active">"Active since " (claim.decided_at.map(date).unwrap_or_default()) ". File from the Buwiz app on your computer."</p>,
                 "paused" => {
                     <div class="tin-note paused">

@@ -706,7 +706,7 @@ pub async fn confirm(
     .bind(claim_id)
     .fetch_all(&mut *tx)
     .await?;
-    let masked = Tin::parse(&root, &branch).map_err(|_| anyhow::anyhow!("stored TIN"))?.masked();
+    let masked = Tin::parse_any(&root, &branch).map_err(|_| anyhow::anyhow!("stored TIN"))?.masked();
     let mut lines = vec![("auto_confirmed", None)];
     if let Some(reason) = resumed.as_deref() {
         lines.push(("resumed", Some(reason)));
@@ -755,7 +755,7 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
     .fetch_all(&mut *tx)
     .await?;
     for (claim_id, account_id, email, root, branch, kind) in &paused {
-        let masked = Tin::parse(root, branch).map(|tin| tin.masked()).unwrap_or_default();
+        let masked = Tin::parse_any(root, branch).map(|tin| tin.masked()).unwrap_or_default();
         sqlx::query(
             "INSERT INTO claim_audit
                  (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source,

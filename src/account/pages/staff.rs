@@ -33,6 +33,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     if row.test_account {
         flags.push(("info", "science", "Test".to_owned()));
     }
+    if claim.tin().is_test() {
+        flags.push(("info", "science", "Test TIN: never sends".to_owned()));
+    }
     if row.rivals > 0 {
         flags.push(("bad", "group", "Another account claims this TIN".to_owned()));
     } else if claim.is_open() {
@@ -390,6 +393,9 @@ pub mod claim_id {
         }
         if claim.self_activated() {
             checks.push(("warn", "how_to_reg", SELF_ACTIVATED.to_owned()));
+        }
+        if claim.tin().is_test() {
+            checks.push(("info", "science", "Test TIN: Buwiz never sends returns for it".to_owned()));
         }
         if claim.is_open() {
             for required in kind.required() {
@@ -865,9 +871,10 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 // `paused` is an approved row as the list shows it.
                 .filter(|claim| claim.status == "paused" || crate::filing::gate::is_live(&claim.status))
                 .map(|claim| {
-                    let tin = crate::account::tin::Tin::parse(&claim.tin_root, &claim.branch_code)
-                        .expect("stored TINs are valid");
-                    (tin.to_string(), claim.status.clone())
+                    let tin = crate::account::tin::Tin::parse_any(&claim.tin_root, &claim.branch_code)
+                        .expect("stored TINs have the shape of one");
+                    let shown = if tin.is_test() { format!("{tin} · test") } else { tin.to_string() };
+                    (shown, claim.status.clone())
                 })
                 .collect();
             let role = user_role(config, &user);
@@ -919,6 +926,37 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 <p class="fine left">"Active is the newest website sign-in or app token. Up to " (queries::LIST_LIMIT.to_string()) " accounts show; search to narrow."</p>
             </div>
         </main>
+    })
+}
+
+/// An Admin adds a made-up TIN to a test account: active at once, it never
+/// sends.
+#[component]
+async fn test_tin_form(account_id: Uuid) -> Result<impl View> {
+    Ok(view! {
+        <details>
+            <summary>"Add a test TIN"</summary>
+            <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test-tin"))>
+                <p class="side-text">"A made-up TIN, 000-000-000 at any branch, active at once for trying the apps. Buwiz never sends its returns to the BIR."</p>
+                <label class="decision-label">
+                    "TIN"
+                    <input type="text" name="tin" required=(true) value="000-000-000-00000" inputmode="numeric">
+                </label>
+                <label class="decision-label">
+                    "Registered name"
+                    <input type="text" name="registered_name" required=(true) maxlength="200">
+                </label>
+                <label class="decision-label">
+                    "Kind"
+                    <select name="kind">
+                        <option value="personal" selected=(true)>"Personal"</option>
+                        <option value="business">"Business"</option>
+                    </select>
+                </label>
+                reason_field()
+                <button class="btn btn-ghost" type="submit">"Add the test TIN"</button>
+            </form>
+        </details>
     })
 }
 
@@ -1055,6 +1093,8 @@ pub mod account_id {
         .into_iter()
         .map(|(value, label)| (value, label, value == stored_role))
         .collect();
+        let holds_test_tins =
+            claims.iter().any(|claim| claim.tin().is_test() && crate::filing::gate::is_live(&claim.status));
         let mut names: Vec<String> = Vec::new();
         for claim in claims.iter().filter(|claim| claim.status != "withdrawn") {
             if !names.contains(&claim.registered_name) {
@@ -1137,6 +1177,9 @@ pub mod account_id {
                                     <div class="user-tin">
                                         kind_pill(kind: claim.kind.clone())
                                         tin_text(tin: claim.tin().to_string())
+                                        if claim.tin().is_test() {
+                                            pill(label: "Test TIN".to_owned(), icon_name: "science", tone: "status-unverified".to_owned())
+                                        }
                                         <span class="user-tin-name">(claim.registered_name.clone())</span>
                                         <span class=(format!("user-tin-status {tone}"))>
                                             icon(name: status_icon)
@@ -1148,6 +1191,9 @@ pub mod account_id {
                                         </span>
                                         <a href=(format!("/staff/claims/{}", claim.id))>"Open claim"</a>
                                     </div>
+                                }
+                                if admin_viewer && user.test_account && user.banned_at.is_none() {
+                                    test_tin_form(account_id: account_id)
                                 }
                             </section>
                         </div>
@@ -1171,7 +1217,9 @@ pub mod account_id {
                                 } else if from_server {
                                     <p class="side-text">"Admin through the server setting ADMIN_EMAILS. Change it there."</p>
                                 } else {
-                                    if user.test_account {
+                                    if holds_test_tins {
+                                        <p class="side-text">"It holds test TINs: revoke them before you remove the test label."</p>
+                                    } else if user.test_account {
                                         <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Remove the test label from {}?", user.email)) data-confirm-detail="Staff no longer see it as a test account." data-confirm-label="Remove">
                                             <input type="hidden" name="test" value="off">
                                             reason_field()
@@ -1358,6 +1406,8 @@ fn history(
         let tin = claim.tin().to_string();
         let kind = ClaimKind::label(&claim.kind);
         match claim.submitted_at {
+            // Staff added it, active at once: its activation says so.
+            _ if claim.tin().is_test() => {}
             Some(at) if at == claim.created_at => {
                 events.push((claim.created_at, "upload_file", format!("Sent {kind} TIN {tin}")));
             }
@@ -1377,6 +1427,7 @@ fn history(
         if let Some(at) = claim.decided_at {
             let (icon_name, what) = match claim.status.as_str() {
                 "approved" | "removed" | "revoked" => match claim.verified_by.as_deref() {
+                    Some("admin") if claim.tin().is_test() => ("science", format!("Test TIN {tin} added, active")),
                     Some("admin") => ("verified", format!("{tin} activated without papers")),
                     Some("seed") => ("verified", format!("{tin} activated by the seed tool")),
                     Some("auto") => ("bolt", format!("{tin} activated automatically from its TIN ID")),

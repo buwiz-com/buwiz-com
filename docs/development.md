@@ -42,12 +42,15 @@ tests without them.
 ### Running them safely
 
 The site tests use `#[sqlx::test]`, which makes a database per test from
-`DATABASE_URL`. **It also loads a `.env` it finds in the working directory
-or any directory above it, and that file wins even over a `DATABASE_URL`
-set on the command line** (sqlx's `dotenvy`). In a checkout whose `.env`
-points at a real database, plain `cargo test` would create and drop test
-databases there. So in any checkout that has, or sits under, an `.env` with
-real settings:
+`DATABASE_URL`. **It also loads the first `.env` it finds in the working
+directory or any directory above it** (sqlx reads `DATABASE_URL` through
+`dotenvy::var`). That fills in every setting the environment lacks: an
+exported `DATABASE_URL` is kept, but forget to export it and the file's
+database is used, and every other setting in the file (object-store and
+mail keys included) enters the test process either way. In a checkout
+whose `.env` points at a real database, plain `cargo test` can create and
+drop test databases there. So in any checkout that has, or sits under, an
+`.env` with real settings:
 
 - do not run plain `cargo test`;
 - build the test binaries, then run each from an empty directory with a

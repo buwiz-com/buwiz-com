@@ -36,8 +36,10 @@ before the actor was demoted or banned does nothing. Role changes refuse
 one's own account, an `ADMIN_EMAILS` person, and a change that would leave
 no Admin; a change to the role the account has says nothing changed. Every
 staff action takes a reason (500 characters at most, like the review
-notes), signing one app out included. Nobody pauses or resumes their own
-TIN.
+notes), signing one app out included, but two: approving a claim and
+confirming an automatic activation. Rejecting a claim needs a note to the
+person, and sending it back needs a fix reason or a note. Nobody pauses or
+resumes their own TIN.
 
 ### Bans and test accounts
 
@@ -51,8 +53,11 @@ sends work as usual.
 
 A ban that commits while a request for the account is under way wins:
 activation, approval, an app's sign-in approval and an agent's consent
-lock the account and look again as they write, and no token is issued to a
-banned account.
+lock the account and look again as they write, and no new sign-in (device
+code or agent code) gets a token for a banned account. The token refresh
+of an app already signed in still issues tokens, on purpose: the app keeps
+a working sign-in, and every call it makes with them answers
+`account_banned`.
 
 Every staff action on an account goes to `account_audit` with who, when and
 why; actions on claims go to `claim_audit`, review decisions (approved,
@@ -112,8 +117,11 @@ An Admin can also:
 
 ### Automatic activation (`AUTO_VERIFY`)
 
-**Off unless `AUTO_VERIFY=on`** (`src/account/verify.rs`). While off,
-nothing is checked or written. When on, after OCR reads a claim's TIN ID,
+**Off unless `AUTO_VERIFY=on`** (`src/account/verify.rs`). While off, no
+claim is checked or activated. The hourly upkeep still runs: it pauses an
+automatic activation made while the setting was on and still unconfirmed
+after 30 days (with none, it changes nothing), and the staff pages count
+the unconfirmed ones for their tab. When on, after OCR reads a claim's TIN ID,
 the claim becomes active by itself only if all of these hold: a personal
 head-office TIN waiting for its first review (never sent back); exactly one
 TIN ID, a photo read by OCR (never a PDF); TIN and name a full match with

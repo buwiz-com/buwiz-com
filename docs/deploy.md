@@ -91,6 +91,10 @@ first, keep the old binaries, and know the way back.
 Run these against production (read only), from a machine with the Neon
 connection string, in this order:
 
+0. **The database is at migration 10.** Must return `10`:
+   ```sql
+   SELECT max(version) FROM _sqlx_migrations;
+   ```
 1. **Every active TIN says since when.** Must return no rows, or migration
    11 fails on its `decided_at` check:
    ```sql
@@ -121,6 +125,10 @@ connection string, in this order:
    SELECT count(*) FROM submissions WHERE status = 'sending';
    ```
 
+Close every `psql` session you opened for these (no `BEGIN` left open).
+The migrations wait at most 10 seconds for a lock; an open transaction on
+these tables makes start-up fail with `lock timeout` instead of hanging.
+
 Better still, restore the latest backup into the local Docker Postgres and
 start the new binary on that copy first (with `DATABASE_URL` pointing at
 `127.0.0.1`, never at Neon). Take a Neon branch right before the deploy as
@@ -140,10 +148,49 @@ set `decided_at` and `verified_by`.
    ```
 2. Re-run check 6, then `deploy/ec2/deploy.sh <sha>` as usual.
 3. Watch `journalctl -u buwiz.service` for `migrations failed`. If it
-   crash-loops on a migration, stop it, put the `.prev` binary back and
-   start it: a failed migration ran in one transaction and left the
-   database at 10, so the old binary starts.
-4. Smoke-test as below, then sign in as the admin login and open `/staff`.
+   crash-loops on a migration, stop it (`sudo systemctl stop
+   buwiz.service`) and see where the database stands: sqlx commits each
+   migration on its own, so 11 can be in when 12 failed.
+   ```sql
+   SELECT max(version) FROM _sqlx_migrations;
+   ```
+   - **10:** put the previous binaries back ([below](#putting-the-previous-binaries-back))
+     and start them.
+   - **11:** first take 11 back, from the release's checkout:
+     `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql`
+     (the app never ran on it, so none of its refusals apply), check
+     `max(version)` is `10`, then put the previous binaries back and start
+     them.
+   - **12:** both went in and the failure is something else: read the
+     journal, and roll back as [below](#rolling-back) if you must.
+4. Once it runs, check both migrations went in, and read the start-up
+   lines:
+   ```sql
+   SELECT version, success FROM _sqlx_migrations WHERE version >= 11 ORDER BY version;   -- 11 t, 12 t
+   ```
+   ```sh
+   journalctl -u buwiz.service -b --no-pager | grep -i 'ADMIN_EMAILS'   # must print nothing
+   ```
+   A line there names an `ADMIN_EMAILS` entry that is not a plain address
+   (a semicolon, a space, quotes): that person is not an Admin. Fix the
+   parameter and restart.
+5. Smoke-test as below, then sign in as the admin login and open `/staff`.
+
+#### Putting the previous binaries back
+
+Stop both services first: copying over a running executable fails ("Text
+file busy") or crashes it, and leaves an old Gatekeeper with a new Sender.
+Copy to a new name and move it into place, as `install.sh` does:
+
+```sh
+sudo systemctl stop buwiz.service buwiz-sender.service
+sudo cp -p /opt/buwiz/buwiz-cloud.prev /opt/buwiz/buwiz-cloud.new && sudo mv /opt/buwiz/buwiz-cloud.new /opt/buwiz/buwiz-cloud
+sudo cp -p /opt/buwiz/buwiz-sender.prev /opt/buwiz/buwiz-sender.new && sudo mv /opt/buwiz/buwiz-sender.new /opt/buwiz/buwiz-sender
+sudo systemctl start buwiz-sender.service buwiz.service
+systemctl is-active buwiz-sender.service buwiz.service   # active, active
+```
+
+(Or `deploy/ec2/deploy.sh <previous sha>` once the database is at 10.)
 
 ### Rolling back
 
@@ -167,38 +214,52 @@ stays active was activated without papers. Rolling back twice adds to them.
 **What makes it refuse** (it then changes nothing and the database stays at
 12; the newer down file makes every check of the older one first):
 - an account is banned (the old release would let it sign in and send):
-  lift each ban first;
-- a TIN is paused (the old release would send for it): resume or revoke;
-- a TIN saved without papers has files: decide those claims first;
-- a TIN activated automatically waits for a person: confirm or revoke it;
+  lift each ban;
+- a TIN is paused (the old release would send for it): resume or revoke it;
+- a TIN saved without papers has files: decide those claims;
+- a TIN activated automatically that no person confirmed: confirm each on
+  the "Activated automatically" tab, revoked and removed ones too
+  (revoking one does not confirm it);
 - any account has a stored role: make sure `ADMIN_EMAILS` names your
-  admins, then set `buwiz.rollback_drop_roles = 'yes'` in the same
-  transaction (below).
+  admins; the override is a second, separate command (below).
 
 The order:
-1. Run check 6 above and wait for `0`, then stop the app:
+1. **While the app runs,** resolve each refusal above on the staff pages,
+   so each change has its audit line, and a confirmation deletes the
+   papers from R2 (a confirmation made in SQL leaves them there for good).
+   Count what is left; each must be `0` but the last (the stored roles):
+   ```sql
+   SELECT (SELECT count(*) FROM accounts WHERE banned_at IS NOT NULL) AS banned,
+          (SELECT count(*) FROM tin_claims WHERE paused_at IS NOT NULL) AS paused,
+          (SELECT count(*) FROM claim_documents d JOIN tin_claims c ON c.id = d.claim_id
+            WHERE c.status = 'unverified') AS unverified_files,
+          (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) AS unconfirmed,
+          (SELECT count(*) FROM accounts WHERE role IS NOT NULL) AS roles;
+   ```
+2. Run check 6 above and wait for `0`, then stop the app:
    `sudo systemctl stop buwiz.service`.
-2. Resolve each refusal above (on a stopped app, with SQL; or before
-   stopping it, on the staff pages).
 3. From the release's checkout, run the newer down file, then the older,
    each in one transaction:
    ```sh
-   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
-     -c "SET LOCAL buwiz.rollback_drop_roles = 'yes'" -f migrations/0012_staff_roles.down.sql
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0012_staff_roles.down.sql
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 10
    ```
-   Leave out the `SET LOCAL` line unless you mean to drop the roles. If the
-   first file refuses, nothing changed; if the second refuses, the
-   database is at 11 and nothing of 11 changed: fix what it names and run
-   the second again.
-4. Put the previous binaries back and start:
+   **Only if** the first refuses because accounts have a stored staff role,
+   and you have checked that `ADMIN_EMAILS` names your admins, run it again
+   with the override, then the second file:
    ```sh
-   sudo cp -p /opt/buwiz/buwiz-cloud.prev /opt/buwiz/buwiz-cloud
-   sudo cp -p /opt/buwiz/buwiz-sender.prev /opt/buwiz/buwiz-sender
-   sudo systemctl restart buwiz-sender.service buwiz.service
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET LOCAL buwiz.rollback_drop_roles = 'yes'" -f migrations/0012_staff_roles.down.sql
    ```
-   (Or `deploy/ec2/deploy.sh <previous sha>` once the database is at 10.)
+   If the first file refuses for anything else, nothing changed and the
+   database is at 12: start the app, resolve it on the staff pages, and go
+   back to step 2. The second file makes no check the first did not make
+   on the same stopped database, so it refuses only if something changed
+   in between; then the database is at 11 and nothing of 11 changed: fix
+   what it names and run the second again.
+4. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back).
 
 `tests/migrations.rs` runs this whole rollback, by sqlx and by hand, on a
 database with a row in every state.
@@ -322,8 +383,10 @@ activation of a personal TIN from its TIN ID photo
 unless the value is exactly `on`, and this release ships with it unset. To
 turn it on, set `/buwiz/AUTO_VERIFY=on` and `sudo systemctl restart
 buwiz.service`; to turn it off, delete the parameter (or set `off`) and
-restart. Turning it off does not undo activations already made: confirm or
-revoke them in the "Activated automatically" tab.
+restart. Turning it off does not undo activations already made, and the
+hourly upkeep still pauses one left unconfirmed for 30 days. Check each in
+the "Activated automatically" tab: revoke any that look wrong, and confirm
+each (revoked ones too), which deletes its papers.
 
 **The risk, plainly.** It checks that the TIN and name the person typed
 match a photo the same person uploaded. Anyone who knows a taxpayer's TIN

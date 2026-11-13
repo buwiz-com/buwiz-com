@@ -134,8 +134,24 @@ pub struct Options {
     /// `--as`: the Admin running it, recorded as the actor of every change.
     pub actor: String,
     pub dry_run: bool,
-    /// `ADMIN_EMAILS` of the server it runs for.
-    pub admin_emails: Vec<String>,
+    /// `ADMIN_EMAILS` of the server it runs for; `None` with
+    /// `--no-admin-emails`, for a server that has no such list.
+    pub admin_emails: Option<Vec<String>>,
+    /// `--target host:port/name`: the database the operator means.
+    pub target: Option<String>,
+    /// `--expect <digest>`: the plan digest the dry run printed.
+    pub expect: Option<String>,
+    /// Who runs it, as far as the machine knows.
+    pub operator: Operator,
+}
+
+/// Who runs the seed, as the machine knows them (recorded in `seed_runs`
+/// beside `--as`, which anyone can type).
+#[derive(Clone, Debug)]
+pub struct Operator {
+    /// The OS user, and the user behind `sudo` when there is one.
+    pub os_user: String,
+    pub host: String,
 }
 
 /// What a run did, or would do.
@@ -151,6 +167,10 @@ pub struct Report {
     pub lines: Vec<String>,
     pub changes: usize,
     pub dry_run: bool,
+    /// The database it ran against, `host:port/name`.
+    pub target: String,
+    /// The digest of the plan, for `--expect`.
+    pub digest: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -181,9 +201,29 @@ impl From<sqlx::Error> for SeedError {
     }
 }
 
+/// A TIN as a run shows it: in full in a dry run (`full`), so a typo shows
+/// before anything is done; masked otherwise.
+fn shown(tin: &Tin, full: bool) -> String {
+    if full { tin.to_string() } else { tin.masked() }
+}
+
+/// What was typed for a TIN that is not one, as a run shows it: as typed
+/// in a dry run, otherwise its last three digits only.
+fn shown_raw(raw: &str, full: bool) -> String {
+    let digits: Vec<char> = raw.chars().filter(char::is_ascii_digit).collect();
+    match digits.len() {
+        _ if full => raw.to_owned(),
+        0..3 => "with fewer than 3 digits".to_owned(),
+        count => format!("ending in {}", digits[count - 3..].iter().collect::<String>()),
+    }
+}
+
+/// A TIN refused on its own: (as the run shows it, masked).
+type RefusedTin = (String, String);
+
 /// Reads and checks the file on its own, without the database: (logins,
-/// TINs refused on their own).
-fn plan(file: &[u8]) -> Result<(Vec<PlannedLogin>, Vec<String>), SeedError> {
+/// TINs refused on their own). `full` shows TINs in full (a dry run).
+fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>), SeedError> {
     let text = std::str::from_utf8(file).map_err(|_| SeedError::Refused(vec!["the file is not UTF-8".into()]))?;
     let parsed: SeedFile = toml::from_str(text).map_err(|error| SeedError::Refused(vec![error.to_string()]))?;
     let mut problems = Vec::new();
@@ -217,11 +257,13 @@ fn plan(file: &[u8]) -> Result<(Vec<PlannedLogin>, Vec<String>), SeedError> {
                 }
                 Ok(tin) => tin,
                 Err(notice) => {
-                    refused_tins.push(format!("refused TIN {} for {email}: {}", entry.tin, notice.message()));
+                    let line =
+                        |full| format!("refused TIN {} for {email}: {}", shown_raw(&entry.tin, full), notice.message());
+                    refused_tins.push((line(full), line(false)));
                     continue;
                 }
             };
-            let shown = tin.to_string();
+            let shown = shown(&tin, full);
             if tins.contains(&tin) {
                 problems.push(format!("TIN {shown}: in the file twice"));
                 continue;
@@ -309,12 +351,84 @@ async fn check_migrations(db: &PgPool) -> Result<(), SeedError> {
     Ok(())
 }
 
-/// Runs the file against `db` as `options` say. A dry run does everything,
-/// then rolls back.
+/// The database a pool is connected to, as `--target` names it:
+/// `host:port/name`, the name as the server reports it.
+async fn connected_target(db: &PgPool) -> sqlx::Result<String> {
+    let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(db).await?;
+    let options = db.connect_options();
+    Ok(format!("{}:{}/{name}", options.get_host(), options.get_port()))
+}
+
+/// The digest of a plan: the database, who runs it as whom with which
+/// `ADMIN_EMAILS`, the file and every line of the plan (TINs masked; the
+/// file's hash tells two TINs with the same last digits apart).
+fn plan_digest(
+    target: &str,
+    actor: &str,
+    admin_emails: Option<&[String]>,
+    file_sha256: &[u8],
+    lines: &[String],
+) -> String {
+    let mut text = format!(
+        "buwiz seed plan 1\ntarget {target}\nas {actor}\nadmin_emails {}\nfile {}\n",
+        admin_emails.map_or_else(|| "-".to_owned(), |list| list.join(",")),
+        crypto::hex(file_sha256)
+    );
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    crypto::hex(&crypto::sha256(text.as_bytes()))
+}
+
+/// Runs the file against `db` as `options` say: [`prepare`], then
+/// [`Pending::finish`].
 pub async fn run(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Options) -> Result<Report, SeedError> {
-    let (logins, refused_tins) = plan(file)?;
+    prepare(db, store, file, options).await?.finish(store).await
+}
+
+/// A run made in its transaction and not yet committed: what it would
+/// write is in [`Pending::report`].
+pub struct Pending {
+    tx: Transaction<'static, Postgres>,
+    report: Report,
+    actor: Account,
+    file_sha256: Vec<u8>,
+    summary: serde_json::Value,
+    objects: Vec<String>,
+    expect: Option<String>,
+    operator: Operator,
+}
+
+/// Checks the file, the options and the database, then makes every change
+/// in one transaction and holds it open: nothing is visible to anyone
+/// until [`Pending::finish`]. A real run must name the database it is
+/// connected to (`--target`), so it never writes to another by accident.
+pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Options) -> Result<Pending, SeedError> {
+    let _ = store;
+    let full = options.dry_run;
+    let (logins, refused_tins) = plan(file, full)?;
     let actor_email = accounts::normalize_email(&options.actor)
         .map_err(|_| SeedError::Refused(vec![format!("--as {:?} is not a valid email", options.actor)]))?;
+    if options.admin_emails.as_ref().is_some_and(Vec::is_empty) {
+        return Err(SeedError::Refused(vec![
+            "ADMIN_EMAILS is empty: give the server's list, or --no-admin-emails for a server without one".to_owned(),
+        ]));
+    }
+    let target = connected_target(db).await?;
+    match &options.target {
+        Some(named) if *named != target => {
+            return Err(SeedError::Refused(vec![format!(
+                "this run is connected to {target}, not {named}; nothing was written"
+            )]));
+        }
+        None if !options.dry_run => {
+            return Err(SeedError::Refused(vec![format!(
+                "a real run names its database: --target {target} (the dry run prints it); nothing was written"
+            )]));
+        }
+        _ => {}
+    }
     check_migrations(db).await?;
     let (accounts_before, claims_before): (i64, i64) =
         sqlx::query_as("SELECT (SELECT count(*) FROM accounts), (SELECT count(*) FROM tin_claims)")
@@ -325,11 +439,13 @@ pub async fn run(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Opti
     let mut tx = db.begin().await?;
     sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")).execute(&mut *tx).await?;
     roles::lock(&mut tx).await?;
+    let admin_emails = options.admin_emails.as_deref().unwrap_or_default();
     let mut seed = Seed {
         tx,
         run_id,
-        admin_emails: &options.admin_emails,
-        shown_full: options.dry_run,
+        admin_emails,
+        server_list: options.admin_emails.is_some(),
+        shown_full: full,
         lines: Vec::new(),
         changes: Vec::new(),
         problems: Vec::new(),
@@ -341,7 +457,7 @@ pub async fn run(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Opti
     for login in &logins {
         ids.push(seed.login(&actor, login).await?);
     }
-    if roles::other_admins(&mut *seed.tx, &options.admin_emails, None).await? == 0 {
+    if roles::other_admins(&mut *seed.tx, admin_emails, None).await? == 0 {
         seed.problems.push("the roles in the file leave Buwiz with no Admin".to_owned());
     }
     for (login, account_id) in logins.iter().zip(&ids) {
@@ -349,38 +465,85 @@ pub async fn run(db: &PgPool, store: &DocumentStore, file: &[u8], options: &Opti
             seed.tin(&actor, *account_id, &login.email, tin).await?;
         }
     }
-    let Seed { mut tx, lines, changes, problems, objects, .. } = seed;
+    let Seed { tx, mut lines, changes, problems, objects, .. } = seed;
     if !problems.is_empty() {
         return Err(SeedError::Refused(problems));
     }
-    let mut lines = lines;
     lines.extend(refused_tins.iter().cloned());
+    let masked: Vec<String> = lines.iter().map(|(_, masked)| masked.clone()).collect();
     let file_sha256 = crypto::sha256(file);
-    let summary = json!({ "changes": changes, "refused": refused_tins });
-    sqlx::query("INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary) VALUES ($1, $2, $3, $4, $5)")
-        .bind(run_id)
-        .bind(actor.id)
-        .bind(&actor.email)
-        .bind(&file_sha256)
-        .bind(&summary)
-        .execute(&mut *tx)
-        .await?;
-    if options.dry_run {
-        tx.rollback().await?;
-    } else {
-        tx.commit().await?;
-        store.delete_all(&objects).await;
-        tracing::info!(%run_id, actor = %actor.email, changes = changes.len(), "seed run");
-    }
-    Ok(Report {
+    let digest = plan_digest(&target, &actor.email, options.admin_emails.as_deref(), &file_sha256, &masked);
+    let refused: Vec<&String> = refused_tins.iter().map(|(_, masked)| masked).collect();
+    let summary = json!({ "changes": changes, "refused": refused });
+    let report = Report {
         run_id,
         file_sha256: crypto::hex(&file_sha256),
         accounts: accounts_before,
         claims: claims_before,
-        lines,
+        lines: lines.into_iter().map(|(shown, _)| shown).collect(),
         changes: changes.len(),
         dry_run: options.dry_run,
+        target,
+        digest,
+    };
+    Ok(Pending {
+        tx,
+        report,
+        actor,
+        file_sha256,
+        summary,
+        objects,
+        expect: options.expect.clone(),
+        operator: options.operator.clone(),
     })
+}
+
+impl Pending {
+    /// What the run would write.
+    pub fn report(&self) -> &Report {
+        &self.report
+    }
+
+    /// A dry run rolls back. A real run checks the plan against `--expect`,
+    /// records itself in `seed_runs` and commits, then deletes the stored
+    /// files of the claims it deleted.
+    pub async fn finish(self, store: &DocumentStore) -> Result<Report, SeedError> {
+        let Self { mut tx, report, actor, file_sha256, summary, objects, expect, operator } = self;
+        if let Some(expected) = expect.filter(|_| !report.dry_run)
+            && expected != report.digest
+        {
+            tx.rollback().await?;
+            return Err(SeedError::Refused(vec![format!(
+                "the plan is not the one the dry run showed (--expect {expected}, this plan {}); nothing was \
+                 written. Run the dry run again and read it.",
+                report.digest
+            )]));
+        }
+        sqlx::query(
+            "INSERT INTO seed_runs (id, actor_id, actor_email, os_user, host_name, target, file_sha256, plan_digest,
+                 summary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(report.run_id)
+        .bind(actor.id)
+        .bind(&actor.email)
+        .bind(&operator.os_user)
+        .bind(&operator.host)
+        .bind(&report.target)
+        .bind(&file_sha256)
+        .bind(&report.digest)
+        .bind(&summary)
+        .execute(&mut *tx)
+        .await?;
+        if report.dry_run {
+            tx.rollback().await?;
+        } else {
+            tx.commit().await?;
+            store.delete_all(&objects).await;
+            tracing::info!(run_id = %report.run_id, changes = report.changes, "seed run");
+        }
+        Ok(report)
+    }
 }
 
 /// A run under way, in its transaction.
@@ -388,9 +551,12 @@ struct Seed<'a> {
     tx: Transaction<'static, Postgres>,
     run_id: Uuid,
     admin_emails: &'a [String],
+    /// The server's `ADMIN_EMAILS` was given (not `--no-admin-emails`).
+    server_list: bool,
     /// A dry run shows full TINs, so a typo shows before anything is done.
     shown_full: bool,
-    lines: Vec<String>,
+    /// Every line of the plan: (as the run shows it, masked).
+    lines: Vec<(String, String)>,
     /// The changes alone, for `seed_runs` (TINs masked).
     changes: Vec<String>,
     /// What refuses the file.
@@ -421,12 +587,22 @@ struct LiveClaim {
 
 impl Seed<'_> {
     fn shown(&self, tin: &Tin) -> String {
-        if self.shown_full { tin.to_string() } else { tin.masked() }
+        shown(tin, self.shown_full)
     }
 
     fn changed(&mut self, line: String, masked: String) {
-        self.lines.push(line);
+        self.lines.push((line, masked.clone()));
         self.changes.push(masked);
+    }
+
+    /// A line that changes nothing: (as shown, masked).
+    fn unchanged(&mut self, line: String, masked: String) {
+        self.lines.push((line, masked));
+    }
+
+    /// `text` with the TIN as the run shows it, and masked.
+    fn both(&self, tin: &Tin, text: impl Fn(&str) -> String) -> (String, String) {
+        (text(&self.shown(tin)), text(&tin.masked()))
     }
 
     fn reason(&self, what: &str) -> String {
@@ -446,13 +622,21 @@ impl Seed<'_> {
         let banned = row.as_ref().is_some_and(|(_, _, banned)| *banned);
         let role = row.as_ref().and_then(|(_, role, _)| role.as_deref());
         let admin_now = roles::effective(in_setting, role, banned).is_some_and(|(role, _)| role == Role::Admin);
+        // A server with ADMIN_EMAILS has its Admins: one of them runs it.
         let bootstrap = !admin_now
             && !banned
+            && !self.server_list
             && roles::other_admins(&mut *self.tx, self.admin_emails, None).await? == 0
             && logins.iter().any(|login| login.email == email && login.role == Some(Some(Role::Admin)));
         if !admin_now && !bootstrap {
             let why = if banned {
                 format!("--as {email} is banned")
+            } else if self.server_list {
+                format!(
+                    "--as {email} is not an Admin on this database nor in ADMIN_EMAILS: run it as an Admin, one of \
+                     the server's ADMIN_EMAILS for a start (the file makes the first Admin only on a server without \
+                     that list)"
+                )
             } else if roles::other_admins(&mut *self.tx, self.admin_emails, None).await? > 0 {
                 format!("--as {email} is not an Admin on this database")
             } else {
@@ -568,7 +752,8 @@ impl Seed<'_> {
             changed = true;
         }
         if !changed {
-            self.lines.push(format!("unchanged login {email}"));
+            let line = format!("unchanged login {email}");
+            self.unchanged(line.clone(), line);
         }
         Ok(id)
     }
@@ -629,7 +814,9 @@ impl Seed<'_> {
                         "needs_fix" => "sent back",
                         _ => "not verified",
                     };
-                    self.lines.push(format!("unchanged TIN {shown} on {email} ({state}; never downgraded)"));
+                    let (line, masked) =
+                        self.both(tin, |tin| format!("unchanged TIN {tin} on {email} ({state}; never downgraded)"));
+                    self.unchanged(line, masked);
                 }
                 None => {
                     sqlx::query(
@@ -656,11 +843,14 @@ impl Seed<'_> {
         if let Some(claim) = mine {
             match claim.status.as_str() {
                 "approved" if claim.paused => {
-                    self.lines.push(format!("unchanged TIN {shown} active on {email} (paused: left paused)"));
+                    let (line, masked) =
+                        self.both(tin, |tin| format!("unchanged TIN {tin} active on {email} (paused: left paused)"));
+                    self.unchanged(line, masked);
                     return Ok(());
                 }
                 "approved" => {
-                    self.lines.push(format!("unchanged TIN {shown} active on {email}"));
+                    let (line, masked) = self.both(tin, |tin| format!("unchanged TIN {tin} active on {email}"));
+                    self.unchanged(line, masked);
                     return Ok(());
                 }
                 "pending" | "needs_fix" => {
@@ -813,35 +1003,57 @@ fn database_target(url: &str) -> String {
     }
 }
 
-const USAGE: &str = "usage: buwiz-cloud seed <FILE> --as <admin email> [--dry-run]";
+const USAGE: &str = "usage: buwiz-cloud seed <FILE> --as <admin email> --dry-run [--no-admin-emails]
+       buwiz-cloud seed <FILE> --as <admin email> --target <host:port/name> [--expect <digest>] [--no-admin-emails]
 
-/// The command line: `seed <FILE> --as <email> [--dry-run]`. Reads
-/// `DATABASE_URL` and `ADMIN_EMAILS`, and the `S3_*` settings only to
-/// delete the files of a claim waiting for review that a move deletes.
-/// Exit codes: 0 done (or a dry run), 2 refused, 1 an error.
-pub async fn cli(args: &[String]) -> ExitCode {
-    let (mut file, mut actor, mut dry_run) = (None, None, false);
+Run it with the server's own settings (DATABASE_URL, ADMIN_EMAILS, S3_*): see docs/deploy.md.
+  --dry-run            make every change, show it (TINs in full), then roll back
+  --target T           a real run: the database it must be connected to, as the dry run prints it
+  --expect D           a real run: refuse unless the plan's digest is D, as the dry run printed it
+  --no-admin-emails    the server has no ADMIN_EMAILS (without this, ADMIN_EMAILS must be set)";
+
+/// The command line, parsed.
+struct Args {
+    file: String,
+    actor: String,
+    dry_run: bool,
+    target: Option<String>,
+    expect: Option<String>,
+    no_admin_emails: bool,
+}
+
+fn parse_args(args: &[String]) -> Option<Args> {
+    let (mut file, mut actor, mut dry_run, mut target, mut expect, mut no_admin_emails) =
+        (None, None, false, None, None, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
-            "--as" => actor = args.next().cloned(),
+            "--no-admin-emails" => no_admin_emails = true,
+            "--as" => actor = Some(args.next()?.clone()),
+            "--target" => target = Some(args.next()?.clone()),
+            "--expect" => expect = Some(args.next()?.clone()),
             other if file.is_none() && !other.starts_with('-') => file = Some(other.to_owned()),
-            _ => {
-                eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            }
+            _ => return None,
         }
     }
-    let (Some(file), Some(actor)) = (file, actor) else {
+    if dry_run && expect.is_some() {
+        return None;
+    }
+    Some(Args { file: file?, actor: actor?, dry_run, target, expect, no_admin_emails })
+}
+
+/// The command line: see [`USAGE`]. Reads `DATABASE_URL` and
+/// `ADMIN_EMAILS`, and the `S3_*` settings to delete the files of a claim
+/// waiting for review that a move deletes. Exit codes: 0 done (or a dry
+/// run), 2 refused (nothing written), 1 an error (nothing written).
+pub async fn cli(args: &[String]) -> ExitCode {
+    let Some(args) = parse_args(args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    match cli_run(&file, actor, dry_run).await {
-        Ok(output) => {
-            print!("{output}");
-            ExitCode::SUCCESS
-        }
+    match cli_run(args).await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(SeedError::Refused(problems)) => {
             eprintln!("Refused; nothing was written:");
             for problem in problems {
@@ -856,38 +1068,107 @@ pub async fn cli(args: &[String]) -> ExitCode {
     }
 }
 
-async fn cli_run(path: &str, actor: String, dry_run: bool) -> Result<String, SeedError> {
+/// The server's `ADMIN_EMAILS` as the command was given it: never guessed
+/// from a shell that lacks it.
+fn admin_emails_given(no_admin_emails: bool) -> Result<Option<Vec<String>>, SeedError> {
+    let set = std::env::var("ADMIN_EMAILS").is_ok_and(|raw| !raw.trim().is_empty());
+    match (set, no_admin_emails) {
+        (true, false) => Ok(Some(crate::base::config::admin_emails())),
+        (false, true) => Ok(None),
+        (false, false) => Err(SeedError::Refused(vec![
+            "ADMIN_EMAILS is not set. Run the seed with the server's own settings (docs/deploy.md), or pass \
+             --no-admin-emails if the server has no ADMIN_EMAILS"
+                .to_owned(),
+        ])),
+        (true, true) => Err(SeedError::Refused(vec![
+            "ADMIN_EMAILS is set, and --no-admin-emails says the server has none: drop one of them".to_owned(),
+        ])),
+    }
+}
+
+/// Who runs it, as far as this machine knows: the OS user (and the one
+/// behind `sudo`) and the host name.
+fn operator() -> Operator {
+    let output = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    let user = output("id", &["-un"]).or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "unknown".to_owned());
+    let os_user = match std::env::var("SUDO_USER").ok().filter(|sudo| !sudo.is_empty() && *sudo != user) {
+        Some(sudo) => format!("{user} (sudo from {sudo})"),
+        None => user,
+    };
+    Operator { os_user, host: output("hostname", &[]).unwrap_or_else(|| "unknown".to_owned()) }
+}
+
+async fn cli_run(args: Args) -> Result<(), SeedError> {
+    let path = &args.file;
     let bytes =
         std::fs::read(path).map_err(|error| SeedError::Refused(vec![format!("cannot read {path}: {error}")]))?;
+    let admin_emails = admin_emails_given(args.no_admin_emails)?;
     let url = std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is not set"))?;
-    let admin_emails = crate::base::config::admin_emails();
     let store = crate::base::config::document_store(false)?;
-    let db = PgPoolOptions::new().max_connections(2).connect(&url).await.map_err(anyhow::Error::from)?;
-    let report = run(&db, &store, &bytes, &Options { actor, dry_run, admin_emails }).await?;
+    let db = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .map_err(|error| anyhow::anyhow!("cannot connect to {}: {error}", database_target(&url)))?;
+    let options = Options {
+        actor: args.actor,
+        dry_run: args.dry_run,
+        admin_emails,
+        target: args.target,
+        expect: args.expect,
+        operator: operator(),
+    };
+    let pending = prepare(&db, &store, &bytes, &options).await?;
+    let report = pending.report();
+    // Everything it is about to write, before it writes.
     let mut out = String::new();
-    let _ = writeln!(out, "Database: {}", database_target(&url));
+    let _ = writeln!(out, "Database: {}", report.target);
     let _ = writeln!(out, "Before: {} accounts, {} TIN claims", report.accounts, report.claims);
+    let _ = match &options.admin_emails {
+        Some(list) => writeln!(out, "ADMIN_EMAILS: {}", list.join(", ")),
+        None => writeln!(out, "ADMIN_EMAILS: none (--no-admin-emails)"),
+    };
     let _ = writeln!(out, "File sha256: {}", report.file_sha256);
     if report.dry_run {
         let _ = writeln!(out, "Dry run: nothing is written. TINs are shown in full; check every digit.");
     } else {
-        let _ = writeln!(out, "Seed run {}", report.run_id);
+        let _ = writeln!(out, "Plan digest: {}", report.digest);
+        let _ = writeln!(out, "Seed run {}, writing:", report.run_id);
     }
     for line in &report.lines {
         let _ = writeln!(out, "  {line}");
     }
+    print!("{out}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let report = pending.finish(&store).await?;
+    let mut out = String::new();
     match (report.changes, report.dry_run) {
         (0, _) => {
             let _ = writeln!(out, "Nothing to change.");
         }
         (count, true) => {
-            let _ = writeln!(out, "{count} change(s) would be made. Run again without --dry-run to make them.");
+            let _ = writeln!(out, "{count} change(s) would be made.");
         }
         (count, false) => {
             let _ = writeln!(out, "{count} change(s) made, recorded as seed run {}.", report.run_id);
         }
     }
-    Ok(out)
+    if report.dry_run {
+        let _ = writeln!(out, "Plan digest: {}", report.digest);
+        let _ = writeln!(out, "To make these changes, run it again without --dry-run, adding:");
+        let _ = writeln!(out, "  --target {} --expect {}", report.target, report.digest);
+    }
+    print!("{out}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -912,16 +1193,22 @@ mod tests {
               state = "active"
               reason = "Owner's test login"
         "#;
-        let (logins, refused) = plan(file).unwrap();
+        let (logins, refused) = plan(file, true).unwrap();
         assert_eq!(logins.len(), 1);
         assert_eq!(logins[0].email, "juan@example.test");
         assert!(logins[0].tins.is_empty());
-        assert_eq!(refused, ["refused TIN 000-000-000 for juan@example.test: That TIN is not valid."]);
+        assert_eq!(
+            refused,
+            [(
+                "refused TIN 000-000-000 for juan@example.test: That TIN is not valid.".to_owned(),
+                "refused TIN ending in 000 for juan@example.test: That TIN is not valid.".to_owned()
+            )]
+        );
     }
 
     #[test]
     fn the_whole_file_is_refused_for_one_bad_entry() {
-        let refused = |file: &str| match plan(file.as_bytes()) {
+        let refused = |file: &str| match plan(file.as_bytes(), true) {
             Err(SeedError::Refused(problems)) => problems.join("\n"),
             other => panic!("not refused: {:?}", other.map(|(logins, _)| logins.len())),
         };
@@ -959,7 +1246,7 @@ mod tests {
                 "[[login]]\nemail = \"a@example.test\"\n[[login.tin]]\ntin = \"{tin}\"\nbranch = \"{branch}\"\nkind = \"business\"\nname = \"A\"\nstate = \"not_verified\"\n"
             )
         };
-        match plan(file("000-123-453-00002", "00000").as_bytes()) {
+        match plan(file("000-123-453-00002", "00000").as_bytes(), true) {
             Err(SeedError::Refused(problems)) => {
                 assert!(problems.join("\n").contains("branch"), "{problems:?}");
             }
@@ -967,7 +1254,7 @@ mod tests {
         }
         // The same branch twice, or in one place only, is fine.
         for (tin, branch) in [("000-123-453-00002", "00002"), ("000-123-453-002", "00002"), ("000-123-453", "00002")] {
-            let (logins, _) = plan(file(tin, branch).as_bytes()).unwrap();
+            let (logins, _) = plan(file(tin, branch).as_bytes(), true).unwrap();
             assert_eq!(logins[0].tins[0].tin.branch(), "00002", "{tin} {branch}");
         }
     }

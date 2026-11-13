@@ -30,12 +30,21 @@ CREATE TABLE account_audit (
 CREATE INDEX account_audit_account ON account_audit (account_id, created_at DESC);
 
 -- One row per run of `buwiz-cloud seed`: who ran it, the file's hash and
--- what it changed.
+-- what it changed. `actor_*` is the `--as` Admin, which anyone with the
+-- database's address can type; `os_user` and `host_name` are who ran it
+-- as far as that machine knew (the OS user, and the one behind sudo), and
+-- `target` the database it wrote to (`host:port/name`). No TIN is stored
+-- in full: `summary` masks them.
 CREATE TABLE seed_runs (
     id          uuid PRIMARY KEY,
     actor_id    uuid NOT NULL,
     actor_email text NOT NULL,
+    os_user     text NOT NULL,
+    host_name   text NOT NULL,
+    target      text NOT NULL,
     file_sha256 bytea NOT NULL,
+    -- The digest the run printed, which `--expect` compares.
+    plan_digest text NOT NULL,
     summary     jsonb NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now()
 );

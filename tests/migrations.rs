@@ -511,8 +511,8 @@ async fn rows_from_migration_10_survive(db: PgPool) {
             "UPDATE accounts SET role = 'support', test_account = true WHERE id = '{bob}';
              INSERT INTO account_audit (account_id, action, old_value, new_value, actor_id, actor_email, source, reason)
              VALUES ('{bob}', 'role_changed', NULL, 'support', '{ana}', 'ana@example.test', 'web', 'Helps with the queue.');
-             INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary)
-             VALUES (gen_random_uuid(), '{ana}', 'ana@example.test', decode('00', 'hex'), '{{}}')"
+             INSERT INTO seed_runs (id, actor_id, actor_email, os_user, host_name, target, file_sha256, plan_digest, summary)
+             VALUES (gen_random_uuid(), '{ana}', 'ana@example.test', 'ops', 'box', 'db:5432/buwiz', decode('00', 'hex'), 'd', '{{}}')"
         ),
     )
     .await;
@@ -547,8 +547,8 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
              UPDATE accounts SET banned_at = now(), banned_by = '{bob}', ban_reason = 'Abuse.' WHERE id = '{ana}';
              INSERT INTO account_audit (account_id, action, actor_id, actor_email, source, reason)
              VALUES ('{ana}', 'banned', '{bob}', 'bob@example.test', 'web', 'Abuse.');
-             INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary)
-             VALUES (gen_random_uuid(), '{bob}', 'bob@example.test', decode('00', 'hex'), '{{}}')",
+             INSERT INTO seed_runs (id, actor_id, actor_email, os_user, host_name, target, file_sha256, plan_digest, summary)
+             VALUES (gen_random_uuid(), '{bob}', 'bob@example.test', 'ops', 'box', 'db:5432/buwiz', decode('00', 'hex'), 'd', '{{}}')",
             approved = seeded.approved
         ),
     )
@@ -698,8 +698,8 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
         &db,
         &format!(
             "UPDATE accounts SET role = 'admin' WHERE id = '{bob}';
-             INSERT INTO seed_runs (id, actor_id, actor_email, file_sha256, summary)
-             VALUES (gen_random_uuid(), '{bob}', 'bob@example.test', decode('01', 'hex'), '{{}}')"
+             INSERT INTO seed_runs (id, actor_id, actor_email, os_user, host_name, target, file_sha256, plan_digest, summary)
+             VALUES (gen_random_uuid(), '{bob}', 'bob@example.test', 'ops', 'box', 'db:5432/buwiz', decode('01', 'hex'), 'd', '{{}}')"
         ),
     )
     .await;

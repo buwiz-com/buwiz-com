@@ -3,7 +3,7 @@
 
 mod common;
 
-use buwiz_cloud::account::seed::{self, Options, Report, SeedError};
+use buwiz_cloud::account::seed::{self, Operator, Options, Report, SeedError};
 use buwiz_cloud::base::storage::DocumentStore;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,12 +13,39 @@ use common::*;
 
 const EXAMPLE: &str = include_str!("../docs/seed.example.toml");
 
+/// A run on a server with no `ADMIN_EMAILS` (`--no-admin-emails`), by a
+/// synthetic operator.
 fn options(actor: &str, dry_run: bool) -> Options {
-    Options { actor: actor.into(), dry_run, admin_emails: Vec::new() }
+    Options {
+        actor: actor.into(),
+        dry_run,
+        admin_emails: None,
+        target: None,
+        expect: None,
+        operator: Operator { os_user: "ops (sudo from ana)".into(), host: "box.example.test".into() },
+    }
 }
 
+/// `options` for a server whose `ADMIN_EMAILS` is `admins`.
+fn listing(actor: &str, dry_run: bool, admins: &[&str]) -> Options {
+    Options { admin_emails: Some(admins.iter().map(|admin| (*admin).to_owned()).collect()), ..options(actor, dry_run) }
+}
+
+/// The test database as `--target` names it.
+async fn target_of(db: &PgPool) -> String {
+    let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(db).await.unwrap();
+    let options = db.connect_options();
+    format!("{}:{}/{name}", options.get_host(), options.get_port())
+}
+
+/// Runs the file as `options` say; a real run without a `--target` gets
+/// the test database's, as an operator would type it.
 async fn seed(db: &PgPool, file: &str, options: &Options) -> Result<Report, SeedError> {
-    seed::run(db, &DocumentStore::Database, file.as_bytes(), options).await
+    let mut options = options.clone();
+    if !options.dry_run && options.target.is_none() {
+        options.target = Some(target_of(db).await);
+    }
+    seed::run(db, &DocumentStore::Database, file.as_bytes(), &options).await
 }
 
 async fn count(db: &PgPool, table: &str) -> i64 {
@@ -84,7 +111,8 @@ async fn seeding_a_fresh_database_twice_changes_nothing_the_second_time(db: PgPo
         "TIN ***-***-453-00000 active on jane@example.test (new)",
         "TIN ***-***-454-00000 not verified on shop@example.test (new)",
         "created login juan@example.test",
-        "refused TIN 000-000-000 for juan@example.test: That TIN is not valid.",
+        // A real run never shows what was typed for a TIN in full.
+        "refused TIN ending in 000 for juan@example.test: That TIN is not valid.",
     ] {
         assert!(lines.contains(expected), "{expected}\n{lines}");
     }
@@ -305,8 +333,7 @@ async fn the_first_admin_comes_from_the_file_only_on_a_database_with_none(db: Pg
     let problem = refused(seed(&db, make_mallory, &options("mallory@example.test", false)).await);
     assert!(problem.contains("--as mallory@example.test is not an Admin on this database"), "{problem}");
     // The server's own ADMIN_EMAILS is an Admin, even before signing in.
-    let root =
-        Options { actor: "root@example.test".into(), dry_run: false, admin_emails: vec!["root@example.test".into()] };
+    let root = listing("root@example.test", false, &["root@example.test"]);
     seed(&db, make_mallory, &root).await.unwrap();
     // And the file cannot leave nobody in charge.
     let demote = "[[login]]\nemail = \"eve@example.test\"\nrole = \"none\"\n[[login]]\nemail = \"mallory@example.test\"\nrole = \"none\"\n";
@@ -326,11 +353,13 @@ async fn seed_refuses_a_database_behind_this_release(db: PgPool) {
     assert_eq!(count(&db, "accounts").await, 0);
 }
 
-/// The command itself, run as the owner would: a clean environment, from
-/// a directory with no `.env`, against this test's own database.
-#[sqlx::test(migrations = "./migrations")]
-async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
-    let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(&db).await.unwrap();
+/// The seed command in a clean environment, from a directory with no
+/// `.env`, against this test's own database: (the directory, the seed
+/// file's path, a function running the command with extra settings).
+async fn command_in(
+    db: &PgPool,
+) -> (std::path::PathBuf, String, impl Fn(&[&str], &[(&str, &str)]) -> std::process::Output + use<>) {
+    let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(db).await.unwrap();
     let mut url = url::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
     assert_eq!(url.host_str(), Some("127.0.0.1"));
     url.set_path(&name);
@@ -338,39 +367,77 @@ async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
     std::fs::create_dir(&dir).unwrap();
     let file = dir.join("seed.toml");
     std::fs::write(&file, EXAMPLE).unwrap();
-    let command = |args: &[&str]| {
+    let cwd = dir.clone();
+    let command = move |args: &[&str], settings: &[(&str, &str)]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_buwiz-cloud"))
             .args(args)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("DATABASE_URL", url.as_str())
             .env("DOCUMENT_KEY", "dGhyb3dhd2F5LXRlc3Qta2V5LW5vdC1hLXNlY3JldC0wMDA=")
-            .current_dir(&dir)
+            .envs(settings.iter().copied())
+            .current_dir(&cwd)
             .output()
             .unwrap()
     };
-    let path = file.to_str().unwrap();
+    (dir, file.to_str().unwrap().to_owned(), command)
+}
 
-    let dry = command(&["seed", path, "--as", "admin@example.test", "--dry-run"]);
+/// The command itself, run as the owner would: the dry run, then the real
+/// run with the `--target` and `--expect` the dry run printed.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_seed_command_dry_runs_then_runs(db: PgPool) {
+    let (dir, path, command) = command_in(&db).await;
+    let target = target_of(&db).await;
+    let name = target.rsplit('/').next().unwrap().to_owned();
+    let path = path.as_str();
+    let none = ("ADMIN_EMAILS", "");
+    let command = |args: &[&str]| command(args, &[none]);
+
+    let dry = command(&["seed", path, "--as", "admin@example.test", "--dry-run", "--no-admin-emails"]);
     let out = String::from_utf8_lossy(&dry.stdout);
     assert_eq!(dry.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&dry.stderr));
     assert!(out.contains(&format!("Database: 127.0.0.1:54330/{name}")), "{out}");
     assert!(out.contains("Before: 0 accounts, 0 TIN claims"), "{out}");
+    assert!(out.contains("ADMIN_EMAILS: none (--no-admin-emails)"), "{out}");
     assert!(out.contains("Dry run: nothing is written."), "{out}");
     assert!(out.contains("TIN 000-123-453-00000 active on jane@example.test (new)"), "{out}");
-    assert!(out.contains("Run again without --dry-run"), "{out}");
     assert!(!out.contains("buwiz_cloud:buwiz_cloud"), "the password stays out: {out}");
+    let digest = out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Plan digest: "))
+        .expect("the dry run prints its plan digest")
+        .to_owned();
+    assert!(out.contains(&format!("--target {target} --expect {digest}")), "{out}");
     assert_eq!(counts(&db).await, [0; 5]);
 
-    let real = command(&["seed", path, "--as", "admin@example.test"]);
+    // A real run names its database, or nothing is written.
+    let blind = command(&["seed", path, "--as", "admin@example.test", "--no-admin-emails"]);
+    assert_eq!(blind.status.code(), Some(2), "{}", String::from_utf8_lossy(&blind.stdout));
+    assert_eq!(counts(&db).await, [0; 5]);
+    let real = command(&[
+        "seed",
+        path,
+        "--as",
+        "admin@example.test",
+        "--no-admin-emails",
+        "--target",
+        &target,
+        "--expect",
+        &digest,
+    ]);
     let out = String::from_utf8_lossy(&real.stdout);
-    assert_eq!(real.status.code(), Some(0), "{out}");
-    assert!(out.contains("TIN ***-***-453-00000 active on jane@example.test (new)"), "{out}");
-    let again = command(&["seed", path, "--as", "admin@example.test"]);
+    assert_eq!(real.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&real.stderr));
+    // What it is about to write comes first, then that it was written.
+    let planned = out.find("TIN ***-***-453-00000 active on jane@example.test (new)").expect(&out);
+    let made = out.find("change(s) made").expect(&out);
+    assert!(out.find(&format!("Database: {target}")).unwrap() < planned && planned < made, "{out}");
+    assert!(!out.contains("000-123-453"), "{out}");
+    let again = command(&["seed", path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target]);
     assert!(String::from_utf8_lossy(&again.stdout).contains("Nothing to change."));
 
-    std::fs::write(&file, "[[login]]\nemail = \"x@example.test\"\nwho = 1\n").unwrap();
-    let bad = command(&["seed", path, "--as", "admin@example.test"]);
+    std::fs::write(dir.join("seed.toml"), "[[login]]\nemail = \"x@example.test\"\nwho = 1\n").unwrap();
+    let bad = command(&["seed", path, "--as", "admin@example.test", "--no-admin-emails", "--target", &target]);
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("Refused; nothing was written"));
     assert_eq!(command(&["seed", path]).status.code(), Some(2));
@@ -410,4 +477,130 @@ async fn seed_gives_up_on_a_lock_held_by_a_concurrent_role_change(db: PgPool) {
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
     change.rollback().await.unwrap();
     assert_eq!(counts(&db).await, [0; 5]);
+}
+
+/// A real run writes only to the database the operator names with
+/// `--target`, which must be the one it is connected to; a dry run names it.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_real_run_must_name_the_database_it_is_connected_to(db: PgPool) {
+    let target = target_of(&db).await;
+    let run = |options: Options| {
+        let db = db.clone();
+        async move { seed::run(&db, &DocumentStore::Database, EXAMPLE.as_bytes(), &options).await }
+    };
+    let dry = run(options("admin@example.test", true)).await.unwrap();
+    assert_eq!(dry.target, target);
+    let problem = refused(run(options("admin@example.test", false)).await);
+    assert!(problem.contains("--target"), "{problem}");
+    for wrong in ["127.0.0.1:54330/buwiz_cloud".to_owned(), target.replace(":54330/", ":5432/"), format!("{target}x")] {
+        let problem =
+            refused(run(Options { target: Some(wrong.clone()), ..options("admin@example.test", false) }).await);
+        assert!(problem.contains(&format!("connected to {target}, not {wrong}")), "{problem}");
+    }
+    assert_eq!(counts(&db).await, [0; 5]);
+    let real = run(Options { target: Some(target.clone()), ..options("admin@example.test", false) }).await.unwrap();
+    assert!(real.changes > 0);
+}
+
+/// `--expect` ties a real run to the dry run read before it: if the plan
+/// changed in between, nothing is written.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_real_run_with_expect_refuses_a_plan_that_changed_since_the_dry_run(db: PgPool) {
+    let dry = seed(&db, EXAMPLE, &options("admin@example.test", true)).await.unwrap();
+    assert_eq!(dry.digest.len(), 64, "{}", dry.digest);
+    // Meanwhile jane signs up on the website: the plan is not the same.
+    sqlx::query("INSERT INTO accounts (email) VALUES ('jane@example.test')").execute(&db).await.unwrap();
+    let expecting = |digest: &str| Options { expect: Some(digest.to_owned()), ..options("admin@example.test", false) };
+    let problem = refused(seed(&db, EXAMPLE, &expecting(&dry.digest)).await);
+    assert!(problem.contains("plan") && problem.contains(&dry.digest), "{problem}");
+    assert_eq!(counts(&db).await, [1, 0, 0, 0, 0]);
+    // The dry run again gives the digest the real run then accepts.
+    let again = seed(&db, EXAMPLE, &options("admin@example.test", true)).await.unwrap();
+    assert_ne!(again.digest, dry.digest);
+    let real = seed(&db, EXAMPLE, &expecting(&again.digest)).await.unwrap();
+    assert_eq!((real.digest, real.changes), (again.digest, again.changes));
+}
+
+/// A real run never shows or stores a full TIN, not even in what it
+/// refuses; it records who ran it as far as the machine knows.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_real_run_shows_no_full_tin_and_records_who_ran_it(db: PgPool) {
+    let typo = format!(
+        "{EXAMPLE}\n[[login]]\nemail = \"typo@example.test\"\n  [[login.tin]]\n  tin = \"000-987-65\"\n  kind = \"personal\"\n  name = \"T\"\n  state = \"not_verified\"\n"
+    );
+    let real = seed(&db, &typo, &options("admin@example.test", false)).await.unwrap();
+    let lines = real.lines.join("\n");
+    assert!(lines.contains("***-***-453-00000") && lines.contains("refused TIN"), "{lines}");
+    for full in ["000-123-453", "000123453", "000-987-65", "00098765", "98765"] {
+        assert!(!lines.contains(full), "{full}: {lines}");
+    }
+    let (os_user, host, target, summary): (String, String, String, String) =
+        sqlx::query_as("SELECT os_user, host_name, target, summary::text FROM seed_runs WHERE id = $1")
+            .bind(real.run_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!((os_user.as_str(), host.as_str()), ("ops (sudo from ana)", "box.example.test"));
+    assert_eq!(target, target_of(&db).await);
+    for full in ["000-123-453", "000123453", "000-987-65", "98765"] {
+        assert!(!summary.contains(full), "{full}: {summary}");
+    }
+    // Refusals too: full in a dry run, so a typo shows; masked in a real one.
+    let twice = "[[login]]\nemail = \"a@example.test\"\n[[login.tin]]\ntin = \"000-123-459\"\nkind = \"personal\"\nname = \"A\"\nstate = \"not_verified\"\n[[login]]\nemail = \"b@example.test\"\n[[login.tin]]\ntin = \"000123459\"\nkind = \"personal\"\nname = \"B\"\nstate = \"not_verified\"\n";
+    let problem = refused(seed(&db, twice, &options("admin@example.test", true)).await);
+    assert!(problem.contains("TIN 000-123-459-00000: in the file twice"), "{problem}");
+    let problem = refused(seed(&db, twice, &options("admin@example.test", false)).await);
+    assert!(
+        problem.contains("TIN ***-***-459-00000: in the file twice") && !problem.contains("000-123-459"),
+        "{problem}"
+    );
+}
+
+/// Who is an Admin comes from the server's own `ADMIN_EMAILS`: a list must
+/// be given (or `--no-admin-emails`, for a server without one). While the
+/// server has a list, the file cannot make `--as` the first Admin: an
+/// Admin from that list runs it.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_first_admin_comes_from_the_file_only_when_the_server_has_no_list(db: PgPool) {
+    let make_eve = "[[login]]\nemail = \"eve@example.test\"\nrole = \"admin\"\n";
+    let problem = refused(seed(&db, make_eve, &listing("eve@example.test", false, &[])).await);
+    assert!(problem.contains("ADMIN_EMAILS is empty"), "{problem}");
+    let problem = refused(seed(&db, make_eve, &listing("eve@example.test", false, &["root@example.test"])).await);
+    assert!(problem.contains("--as eve@example.test is not an Admin"), "{problem}");
+    assert!(problem.contains("ADMIN_EMAILS"), "{problem}");
+    assert_eq!(counts(&db).await, [0; 5]);
+    // An Admin of the server's list may run it, before ever signing in.
+    let report = seed(&db, make_eve, &listing("root@example.test", false, &["root@example.test"])).await.unwrap();
+    assert!(
+        report.lines.iter().any(|line| line == "role eve@example.test No staff role → Admin"),
+        "{:?}",
+        report.lines
+    );
+}
+
+/// The command refuses to guess the list from the shell it runs in.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_seed_command_needs_admin_emails_or_says_there_is_none(db: PgPool) {
+    let (dir, path, command) = command_in(&db).await;
+    let target = target_of(&db).await;
+    let missing = command(&["seed", &path, "--as", "admin@example.test", "--dry-run"], &[]);
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert_eq!(missing.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("ADMIN_EMAILS") && stderr.contains("--no-admin-emails"), "{stderr}");
+    let both = command(
+        &["seed", &path, "--as", "root@example.test", "--dry-run", "--no-admin-emails"],
+        &[("ADMIN_EMAILS", "root@example.test")],
+    );
+    assert_eq!(both.status.code(), Some(2), "{}", String::from_utf8_lossy(&both.stderr));
+    // With the server's list, it says which list it used.
+    let listed = command(
+        &["seed", &path, "--as", "root@example.test", "--dry-run"],
+        &[("ADMIN_EMAILS", " Root@Example.test ,ops@example.test")],
+    );
+    let out = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(listed.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&listed.stderr));
+    assert!(out.contains("ADMIN_EMAILS: root@example.test, ops@example.test"), "{out}");
+    assert!(out.contains(&format!("--target {target}")), "{out}");
+    assert_eq!(counts(&db).await, [0; 5]);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

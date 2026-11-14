@@ -23,7 +23,7 @@ use super::Uptime;
 use super::classify::Kind;
 use super::keys::{MANILA, manila_day};
 use super::live::Written;
-use super::sign::{Cause, Light, Scope, Side, SignState};
+use super::sign::{Cause, Light, Notice, Scope, Side, SignState};
 use crate::account::mail::Mailer;
 use crate::account::roles;
 use crate::base::config::Config;
@@ -85,7 +85,7 @@ impl Alert {
                 }
                 Scope::Relay if event.to == "paused" => "Buwiz: sending paused".to_owned(),
                 Scope::Relay => "Buwiz: sending resumed".to_owned(),
-                Scope::Dispatcher | Scope::Upload => continue,
+                Scope::Dispatcher | Scope::Upload | Scope::Watch => continue,
             };
             let mut line = sentence(&event.reason);
             if event.scope == Scope::Overall {
@@ -104,6 +104,37 @@ impl Alert {
             alerts.push(Alert { at: written.at, subject, line, event_id: Some(written.id), key: None });
         }
         alerts
+    }
+
+    /// Something the rules noticed that is no change of the sign.
+    pub fn notice(notice: &Notice, at: OffsetDateTime) -> Self {
+        let (subject, line, key) = match notice {
+            Notice::FailuresInARow { failures, since } => (
+                "BIR: tries keep failing".to_owned(),
+                match since {
+                    Some(since) => format!(
+                        "{failures} tries in a row from {failures} accounts did not get in; the last return got in at {}.",
+                        manila_time(*since)
+                    ),
+                    None => format!("{failures} tries in a row from {failures} accounts did not get in."),
+                },
+                None,
+            ),
+            Notice::RelayWouldPause { reason } => (
+                "Buwiz: the relay would pause".to_owned(),
+                format!(
+                    "The relay would pause: {}. Nothing is held in this release; check the fault (a key is pinned only from a second source the owner trusts, never from this mail).",
+                    reason.trim_end_matches('.')
+                ),
+                Some(("relay_would_pause".to_owned(), Duration::hours(24))),
+            ),
+            Notice::LandedInMaintenance => (
+                "BIR: a return got in during maintenance".to_owned(),
+                "A return got in while the planned maintenance note is in force. The note stays until it ends or an Admin clears it.".to_owned(),
+                None,
+            ),
+        };
+        Self { at, subject, line, event_id: None, key }
     }
 
     /// A live try met an upload-server host key that is not pinned. The

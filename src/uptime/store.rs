@@ -232,7 +232,7 @@ pub fn evidence(
     let classified = &observed.classified;
     Evidence {
         id,
-        at: to_minute(ended_at).max(to_minute(relay.started_at)),
+        at: ended_at.max(relay.started_at),
         source: Source::Relay,
         admission: Admission::parse(&relay.admission),
         outcome: classified.outcome,

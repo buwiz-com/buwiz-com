@@ -46,9 +46,8 @@ pub struct Live {
 #[derive(Default)]
 struct Engine {
     loaded: bool,
+    /// Oldest first by exact end time.
     evidence: VecDeque<Evidence>,
-    /// How many of the newest tries no run has taken in yet.
-    fresh: usize,
     /// The newest note not cleared, as the record has it.
     note: Option<Note>,
     /// The newest `bir_tries` row read at the load: a try recorded before
@@ -116,7 +115,6 @@ impl Locked<'_> {
         while engine.evidence.front().is_some_and(|item| item.at < oldest) || engine.evidence.len() > MAX_EVIDENCE {
             engine.evidence.pop_front();
         }
-        engine.fresh = engine.fresh.min(engine.evidence.len());
     }
 
     fn push(&mut self, evidence: Evidence) {
@@ -128,17 +126,18 @@ impl Locked<'_> {
         {
             self.engine.evidence.remove(at);
         }
-        self.engine.evidence.push_back(evidence);
-        self.engine.fresh += 1;
+        let at = self.engine.evidence.partition_point(|item| item.at <= evidence.at);
+        self.engine.evidence.insert(at, evidence);
         self.prune();
     }
 
     /// The rules, with `note` as the open note and whether an Admin resumes
     /// the relay.
     pub fn evaluate(&mut self, note: Option<&Note>, resume_relay: bool) -> Evaluation {
-        let fresh = self.engine.fresh;
+        let (current, previous) = self.uptime.keys.epochs(self.now);
+        let periods: Vec<i32> = std::iter::once(current).chain(previous).collect();
         let evidence = self.engine.evidence.make_contiguous();
-        let inputs = sign::Inputs { evidence, fresh, note, resume_relay, now: self.now };
+        let inputs = sign::Inputs { evidence, periods: &periods, note, resume_relay, now: self.now };
         sign::evaluate(&self.uptime.live.sign(), &inputs)
     }
 
@@ -184,13 +183,15 @@ impl Locked<'_> {
     /// Shows `evaluation` once it is written, with `note` the open note it
     /// was run with, and queues the staff mail for what changed.
     pub fn show(mut self, evaluation: Evaluation, note: Option<Note>, written: &[Written]) {
-        self.engine.fresh = 0;
         self.engine.note = match evaluation.note_ended {
             Some((id, _)) if note.as_ref().is_some_and(|note| note.id == id) => None,
             _ => note,
         };
         for alert in Alert::for_run(written, &evaluation.state) {
             self.uptime.alerts.push(alert);
+        }
+        for notice in &evaluation.notices {
+            self.uptime.alerts.push(Alert::notice(notice, self.now));
         }
         self.uptime.live.show(evaluation.state);
     }
@@ -201,7 +202,7 @@ impl Locked<'_> {
         let note = self.engine.note.clone();
         let evaluation = self.evaluate(note.as_ref(), false);
         let previous = self.uptime.live.sign();
-        let written = if evaluation.changed(&previous) {
+        let written = if evaluation.must_write(&previous) {
             let mut tx = db.begin().await?;
             let written = self.write(&mut tx, &evaluation, None).await?;
             tx.commit().await?;
@@ -342,7 +343,7 @@ async fn load(uptime: &Uptime, engine: &mut Engine, db: &PgPool, now: OffsetDate
     let rows: Vec<TryRow> = sqlx::query_as(
         "SELECT id, ended_at, source, outcome, stage, dispatcher, upload, failure_kind, counted, late, admission,
                 key_epoch, account_key, network_key
-           FROM bir_tries WHERE mode = 'live' AND ended_at >= $1 ORDER BY id",
+           FROM bir_tries WHERE mode = 'live' AND ended_at >= $1 ORDER BY ended_at, id",
     )
     .bind(now - sign::EVIDENCE_KEPT)
     .fetch_all(db)
@@ -389,7 +390,6 @@ async fn load(uptime: &Uptime, engine: &mut Engine, db: &PgPool, now: OffsetDate
     }
     engine.loaded_upto = rows.last().map_or(0, |row| row.0);
     engine.evidence = rows.into_iter().map(evidence_of).collect();
-    engine.fresh = 0;
     engine.note = note.and_then(|(id, kind, text, starts_at, until)| {
         Some(Note { id, kind: NoteKind::parse(&kind)?, text, starts_at, until })
     });

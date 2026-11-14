@@ -82,6 +82,18 @@ fn observed(ends: Ends) -> Observed {
     }
 }
 
+/// Runs the clock up to `until` as the ticker does (more often than every
+/// 5 minutes), so a test's jumps are not taken for Buwiz not watching.
+async fn watch(uptime: &Uptime, db: &PgPool, until: OffsetDateTime) {
+    loop {
+        let next = uptime.live.sign().evaluated_at + Duration::minutes(4);
+        if next >= until {
+            return;
+        }
+        live::tick(uptime, db, next).await.unwrap();
+    }
+}
+
 /// Records a try by made-up account `account` from made-up network
 /// `198.51.<network>.0/24`, ending at `at`, as the bridge's recorder does.
 async fn record(uptime: &Uptime, db: &PgPool, account: u128, network: u8, ends: Ends, at: OffsetDateTime) {
@@ -92,6 +104,7 @@ async fn record(uptime: &Uptime, db: &PgPool, account: u128, network: u8, ends: 
         admission: "open".into(),
         started_at: at - Duration::seconds(20),
     };
+    watch(uptime, db, at).await;
     store::record(uptime, db, &relay, &observed(ends), at).await;
 }
 
@@ -137,8 +150,10 @@ async fn recorded_tries_move_the_sign_and_every_change_is_an_event(db: PgPool) {
             expect("dispatcher", "no_recent_news", "online", "rule"),
             expect("upload", "no_recent_news", "online", "rule"),
             expect("overall", "no_recent_news", "online", "rule"),
-            expect("upload", "online", "offline", "rule"),
-            expect("overall", "online", "offline", "rule"),
+            expect("upload", "online", "busy", "rule"),
+            expect("overall", "online", "busy", "rule"),
+            expect("upload", "busy", "offline", "rule"),
+            expect("overall", "busy", "offline", "rule"),
         ]
     );
     // Counts only: no key, no id, no address.
@@ -147,7 +162,7 @@ async fn recorded_tries_move_the_sign_and_every_change_is_an_event(db: PgPool) {
         assert!(!reason.contains("198.51") && !reason.contains("0000"), "{reason}");
     }
     assert_eq!(stored_seq(&db).await, sign.seq);
-    assert_eq!(sign.seq, 3, "the first line, then Online, then Offline");
+    assert_eq!(sign.seq, 4, "the first line, then Online, Busy and Offline");
 
     // The user's own network moves nothing.
     for account in 21..=26 {
@@ -161,7 +176,14 @@ async fn recorded_tries_move_the_sign_and_every_change_is_an_event(db: PgPool) {
     let sign = uptime.live.sign();
     assert_eq!(sign.state, Light::Online);
     assert_eq!(sign.waking_since, Some(t(20)));
-    assert_eq!(events(&db).await.len(), 8);
+    assert_eq!(events(&db).await.len(), 10);
+}
+
+/// What a restart must keep of a light: everything but the account ids,
+/// which live in memory only.
+fn kept(lamp: &buwiz_cloud::uptime::sign::Lamp) -> impl PartialEq + std::fmt::Debug {
+    let quorum: Vec<_> = lamp.quorum.iter().map(|voter| (voter.keys.clone(), voter.at)).collect();
+    (lamp.state, lamp.since, lamp.last_state, lamp.last_ok_at, lamp.last_evidence_at, lamp.fresh_from, quorum)
 }
 
 #[sqlx::test]
@@ -176,12 +198,10 @@ async fn the_sign_survives_a_restart_in_every_state(db: PgPool) {
     live::tick(&second, &db, t(13)).await.unwrap();
     let after = second.live.sign();
     assert_eq!((after.seq, after.state, after.since), (before.seq, before.state, before.since));
-    assert_eq!(after.upload, before.upload);
-    assert_eq!(after.dispatcher, before.dispatcher);
+    assert_eq!(kept(&after.upload), kept(&before.upload));
+    assert_eq!(kept(&after.dispatcher), kept(&before.dispatcher));
     assert_eq!(events(&db).await.len(), lines, "nothing changed by the restart");
-    // Tries before the restart cannot be compared with tries after it:
-    // two fresh failures after the restart are not a quorum with the old
-    // ones, and Offline holds until a landing.
+    // Offline holds until a landing.
     record(&second, &db, 11, 11, Ends::MailboxRefused, t(14)).await;
     assert_eq!(second.live.sign().state, Light::Offline);
     record(&second, &db, 5, 5, Ends::Landed, t(15)).await;
@@ -190,8 +210,8 @@ async fn the_sign_survives_a_restart_in_every_state(db: PgPool) {
 
     // Busy, with its dwell, across a restart.
     let third = uptime(t(16));
-    for account in [11, 11, 12] {
-        record(&third, &db, account + 20, (account + 20) as u8, Ends::MailboxRefused, t(16)).await;
+    for account in [31, 32] {
+        record(&third, &db, account, account as u8, Ends::MailboxRefused, t(16)).await;
     }
     assert_eq!(third.live.sign().state, Light::Busy);
     let busy_since = third.live.sign().upload.since;
@@ -215,6 +235,29 @@ async fn the_sign_survives_a_restart_in_every_state(db: PgPool) {
     assert_eq!(stored_seq(&db).await, seq);
 }
 
+/// Tries from before a restart cannot be compared with tries after it (the
+/// keys lived in memory): two fresh failures after it are no quorum with
+/// the two before, though all four are different accounts on different
+/// networks.
+#[sqlx::test]
+async fn fresh_failures_after_a_restart_are_no_quorum_with_older_ones(db: PgPool) {
+    let first = uptime(t(0));
+    for account in 1..=3 {
+        record(&first, &db, account, account as u8, Ends::Landed, t(0)).await;
+    }
+    record(&first, &db, 21, 21, Ends::MailboxRefused, t(5)).await;
+    record(&first, &db, 22, 22, Ends::MailboxRefused, t(6)).await;
+    assert_eq!(first.live.sign().upload.state, Light::Busy);
+
+    let second = uptime(t(7));
+    record(&second, &db, 23, 23, Ends::MailboxRefused, t(7)).await;
+    record(&second, &db, 24, 24, Ends::MailboxRefused, t(8)).await;
+    assert_eq!(second.live.sign().upload.state, Light::Busy, "two after the restart, not four");
+    // A third fresh one makes the quorum.
+    record(&second, &db, 25, 25, Ends::MailboxRefused, t(9)).await;
+    assert_eq!(second.live.sign().upload.state, Light::Offline);
+}
+
 #[sqlx::test]
 async fn a_stored_sign_that_cannot_be_read_starts_again_with_a_higher_seq(db: PgPool) {
     sqlx::query("INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, '{}', now())")
@@ -230,35 +273,29 @@ async fn a_stored_sign_that_cannot_be_read_starts_again_with_a_higher_seq(db: Pg
 }
 
 #[sqlx::test]
-async fn the_relay_pauses_on_faults_that_touch_the_bir(db: PgPool) {
+async fn faults_that_touch_the_bir_are_told_and_nothing_pauses(db: PgPool) {
     let site = Site::new(db.clone());
     let uptime = uptime(t(0));
     record(&uptime, &db, 1, 1, Ends::HostKey, t(1)).await;
     record(&uptime, &db, 1, 1, Ends::HostKey, t(2)).await;
-    assert!(!uptime.live.sign().relay.paused);
     record(&uptime, &db, 2, 2, Ends::HostKey, t(3)).await;
     let sign = uptime.live.sign();
-    assert!(sign.relay.paused);
+    assert!(!sign.relay.paused, "nothing pauses in this release");
     assert_eq!(sign.state, Light::NoRecentNews, "a fault of Buwiz's is no evidence about the BIR");
-    let paused = events(&db).await.into_iter().find(|(scope, ..)| scope == "relay").unwrap();
-    assert_eq!((paused.1.as_str(), paused.2.as_str(), paused.3.as_str()), ("ok", "paused", "relay_paused"));
-    assert!(paused.4.starts_with("3 tries from 2 accounts"), "{}", paused.4);
-    // It survives a restart.
+    assert!(events(&db).await.iter().all(|(scope, ..)| scope != "relay"));
+    // A later release never starts up paused from what this one wrote.
+    let stored: serde_json::Value = sqlx::query_scalar("SELECT state FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(stored["relay"]["paused"], false);
     let restarted = Uptime::new(Level::Record, vec![22], false, t(4));
     live::tick(&restarted, &db, t(4)).await.unwrap();
-    assert!(restarted.live.sign().relay.paused);
+    assert!(!restarted.live.sign().relay.paused);
 
-    // Only an Admin resumes sending.
+    // Resuming is the later staff page's, Admin-only; nothing is paused.
     let (support, _) = site.staff_with_role("support@example.test", "support").await;
     let support = staff(&site, support, Role::Support).await;
     let refused = notes::resume_relay(&restarted, &db, &site.state.config, &support, t(5)).await;
     assert!(matches!(refused, Err(NoteError::AdminOnly)));
     let admin = admin(&site).await;
-    notes::resume_relay(&restarted, &db, &site.state.config, &admin, t(5)).await.unwrap();
-    assert!(!restarted.live.sign().relay.paused);
-    let resumed = events(&db).await.pop().unwrap();
-    assert_eq!((resumed.0.as_str(), resumed.3.as_str()), ("relay", "relay_resumed"));
-    assert_eq!(resumed.5.as_deref(), Some(STAFF));
     assert!(matches!(
         notes::resume_relay(&restarted, &db, &site.state.config, &admin, t(6)).await,
         Err(NoteError::NotPaused)
@@ -506,7 +543,7 @@ async fn the_day_history_adds_up_across_midnight_and_a_restart(db: PgPool) {
     // online, busy, offline, quiet, note minutes.
     assert_eq!(
         (line.online_minutes, line.busy_minutes, line.offline_minutes, line.quiet_minutes, line.note_minutes),
-        (12 + 123, 0, 48 + 90, 537 + 30, 90)
+        (11 + 123, 1, 48 + 90, 537 + 30, 90)
     );
     days::roll_up_recent(&second, &db, after + Duration::hours(1)).await.unwrap();
     assert_eq!(day_row(&db, day).await, line);
@@ -587,8 +624,9 @@ async fn staff_mail_is_batched_every_ten_minutes(db: PgPool) {
     an_outage(&uptime, &db).await;
     // The first change mails at once ...
     let mail = alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap().unwrap();
-    assert_eq!(mail.subject, "BIR: online (and 1 more)");
+    assert_eq!(mail.subject, "BIR: online (and 2 more)");
     assert!(mail.text.contains("10:00 AM  Online: The mailbox is online."), "{}", mail.text);
+    assert!(mail.text.contains("10:11 AM  Busy: The mailbox is busy."), "{}", mail.text);
     assert!(mail.text.contains(
         "10:12 AM  Offline: The mailbox is offline. 3 accounts on 3 networks didn't get past the mailbox within 15 min."
     ));
@@ -596,7 +634,7 @@ async fn staff_mail_is_batched_every_ten_minutes(db: PgPool) {
     assert_eq!(to, ["admin@example.test", STAFF, "support@example.test"], "Admins and Support, not the banned");
     let mailed: i64 =
         sqlx::query_scalar("SELECT count(*) FROM bir_events WHERE mailed_at IS NOT NULL").fetch_one(&db).await.unwrap();
-    assert_eq!(mailed, 2, "the two changes of the overall sign");
+    assert_eq!(mailed, 3, "the three changes of the overall sign");
 
     // ... the next ones wait for the end of the 10 minutes and go together.
     record(&uptime, &db, 5, 5, Ends::Landed, t(15)).await;

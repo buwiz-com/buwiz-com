@@ -436,6 +436,95 @@ async fn the_inspector_shows_the_row_in_the_link(db: PgPool) {
     assert!(side.contains("000-123-452-00000"), "{side}");
 }
 
+/// Adds `n` files to `claim`, oldest first: photos and PDFs in turn, the
+/// last `purged` of them deleted. Returns their ids in order.
+async fn add_files(db: &PgPool, claim: Uuid, n: i32, purged: i32) -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    for at in 0..n {
+        let (kind, content_type, name) =
+            if at % 2 == 0 { ("form_2303", "image/png", "photo") } else { ("authority", "application/pdf", "scan") };
+        let id = sqlx::query_scalar(
+            "INSERT INTO claim_documents (claim_id, kind, filename, content_type, size_bytes, sha256, purged_at, created_at)
+             VALUES ($1, $2, $3, $4, 2048, decode('00', 'hex'), CASE WHEN $5 THEN now() END,
+                     now() - interval '1 hour' + $6 * interval '1 second')
+             RETURNING id",
+        )
+        .bind(claim)
+        .bind(kind)
+        .bind(format!("{name}-{at}.{}", if at % 2 == 0 { "png" } else { "pdf" }))
+        .bind(content_type)
+        .bind(at >= n - purged)
+        .bind(at)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+/// The viewer and the file list of a claim's review, from `page`.
+fn papers(page: &str) -> (&str, &str) {
+    let viewer = &page[page.find("class=\"sx-viewer viewer\"").expect("a viewer")..];
+    let viewer = &viewer[..viewer.find("</section>").unwrap()];
+    let list = &page[page.find("class=\"sx-files\"").expect("a file list")..];
+    let list = &list[..list.find("</ul>").unwrap()];
+    (viewer, list)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_viewer_takes_any_number_of_files_and_lists_each(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "000123451", "pending").await;
+    // 14 files, the last 4 deleted (a business claim resent a few times).
+    let ids = add_files(&site.db, claim, 14, 4).await;
+    for path in [format!("/staff/claims/{claim}"), format!("/staff/queue?status=waiting&open={claim}")] {
+        let page = text(site.get(&path, &staff).await).await;
+        let (viewer, list) = papers(&page);
+        // A radio and a pane for each, the first one chosen: no script and
+        // no rule per position needed.
+        assert_eq!(viewer.matches("class=\"sx-viewer-radio\"").count(), 14, "{path}");
+        assert_eq!(viewer.matches("class=\"sx-viewer-pane\"").count(), 14, "{path}");
+        assert_eq!(viewer.matches(" checked").count(), 1, "{path}");
+        assert!(tag(viewer, "id=\"document-0\"").contains(" checked"), "{viewer}");
+        assert!(
+            tag(viewer, "id=\"document-13\"").contains("aria-label=\"Proof of authority (7) (14 of 14)\""),
+            "{viewer}"
+        );
+        // Each pane marks its own tab, the 14th included.
+        let panes: Vec<&str> = viewer.split("class=\"sx-viewer-pane\"").skip(1).collect();
+        for (index, pane) in panes.iter().enumerate() {
+            assert_eq!(pane.matches("<label ").count(), 14, "{path} pane {index}");
+            assert_eq!(pane.matches("class=\"on\"").count(), 1, "{path} pane {index}");
+            assert!(tag(pane, "class=\"on\"").contains(&format!("for=\"document-{index}\"")), "{path} pane {index}");
+        }
+        // Photos wait until their pane shows.
+        let images: Vec<&str> = viewer.split("<img ").skip(1).collect();
+        assert_eq!(images.len(), 5, "{path}");
+        for image in images {
+            assert!(image[..image.find('>').unwrap()].contains("loading=\"lazy\""), "{image}");
+        }
+        // The plain list names every file; each stored one has its link,
+        // the deleted ones say so.
+        assert_eq!(list.matches("<li>").count(), 14, "{path}");
+        for (at, id) in ids.iter().enumerate() {
+            let link = format!("href=\"/staff/documents/{id}\"");
+            if at < 10 {
+                assert!(list.contains(&link), "{path} file {at}");
+            } else {
+                assert!(!page.contains(&link), "{path} deleted file {at}");
+            }
+        }
+        assert_eq!(list.matches("Open the original").count(), 10, "{path}");
+        assert_eq!(list.matches(">Deleted<").count(), 4, "{path}");
+    }
+    // staff.css has no rule per position left.
+    let css = text(site.get("/assets/staff.css", "").await).await;
+    assert!(!css.contains("nth-of-type") && css.contains(".sx-viewer-radio:checked + .sx-viewer-pane"));
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn support_sees_no_admin_controls_in_the_console(db: PgPool) {
     let site = Site::new(db);

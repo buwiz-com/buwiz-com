@@ -92,7 +92,10 @@ tables (`.sx-table`, which become cards on a phone through the cell areas
 `a-main`, `a-side`, `a-sub`, `a-foot`); cards and sections (`.sx-card`,
 `.sx-sec`, `.sx-sub`); Overview tiles (`.sx-tile`); the activity feed and
 history (`.sx-feed`, `.sx-hist`); facts rows (`.sx-fact`); the document
-viewer (`.sx-viewer`, radio tabs); the claim comparison (`.sx-cmp`); actions
+viewer (`.sx-viewer`: a radio and a pane per file, `:checked + pane`, each
+pane with its own tab row, so any number of files works without script;
+photos `loading="lazy"`) and the plain file list beside it (`.sx-files`,
+every file with its "Open the original"); the claim comparison (`.sx-cmp`); actions
 with a reason (`act`, `reason_act`, `reason_field`: a `<details>` without
 script, a `<dialog>` with it); the New user modal (`.sx-modal`).
 

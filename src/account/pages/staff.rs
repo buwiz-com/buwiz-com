@@ -712,7 +712,7 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
     let pending = claim.status == "pending";
     let decide = format!("/staff/claims/{claim_id}/decision");
     let confirm = format!("/staff/claims/{claim_id}/confirm");
-    let tabs: Vec<(usize, DocumentRow)> = documents.into_iter().enumerate().collect();
+    let files = viewer_files(documents);
     let kind = claim.kind.clone();
     let (email, account_id) = (claim.email.clone(), claim.account_id);
     let decides = claim.is_open() && !own_withheld;
@@ -1032,7 +1032,15 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
         }
     }
     .boxed();
-    let viewer = view! { document_viewer(documents: tabs, empty: empty_viewer) }.boxed();
+    let has_files = !files.is_empty();
+    let listed = files.clone();
+    let viewer = view! { document_viewer(files: files, empty: empty_viewer) }.boxed();
+    let file_rows = view! {
+        if has_files {
+            file_list(files: listed)
+        }
+    }
+    .boxed();
     Ok(view! {
         if wide {
             <div class="sx-stack">
@@ -1043,6 +1051,7 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
                         (pills)
                         (who)
                         (sections)
+                        (file_rows)
                     </div>
                 </div>
             </div>
@@ -1066,6 +1075,7 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
                     </div>
                     (rivals)
                     (viewer)
+                    (file_rows)
                     (who)
                     (sections)
                     <a class="sx-btn block" href=(format!("/staff/claims/{claim_id}"))>(ic("external")) "Open full page"</a>
@@ -1121,65 +1131,139 @@ pub mod claim_id {
     }
 }
 
-/// The claim's files as tabs. The tabs are radio buttons, so they switch
-/// without script; staff.js adds zoom and rotate for photos.
+/// One of a claim's files as the viewer and the file list name it.
+#[derive(Clone)]
+struct ViewerFile {
+    document: DocumentRow,
+    /// The kind, numbered when the claim has more than one of it: `TIN ID`,
+    /// `TIN ID (2)`.
+    label: String,
+    icon: &'static str,
+}
+
+/// The claim's files in their order, each with its label.
+fn viewer_files(documents: Vec<DocumentRow>) -> Vec<ViewerFile> {
+    let mut of_kind: HashMap<String, usize> = HashMap::new();
+    for document in &documents {
+        *of_kind.entry(document.kind.clone()).or_default() += 1;
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    documents
+        .into_iter()
+        .map(|document| {
+            let nth = seen.entry(document.kind.clone()).or_default();
+            *nth += 1;
+            let kind = DocumentKind::label(&document.kind);
+            let label =
+                if *nth > 1 && of_kind[&document.kind] > 1 { format!("{kind} ({nth})") } else { kind.to_owned() };
+            let symbol = glyph(DocumentKind::icon(&document.kind));
+            ViewerFile { document, label, icon: symbol }
+        })
+        .collect()
+}
+
+/// `12 KB`.
+fn kilobytes(document: &DocumentRow) -> String {
+    format!("{} KB", (document.size_bytes + 1023) / 1024)
+}
+
+/// The claim's files, one at a time, for any number of them. Each file is a
+/// radio button followed by its pane, so `:checked + pane` shows it without
+/// script; each pane carries the row of tabs with its own tab marked, so the
+/// row needs no rule per position. The radios are what keyboards and screen
+/// readers use (the tab rows are for the pointer). Photos load only once
+/// their pane shows (`loading="lazy"`): hidden panes and a closed inspector
+/// fetch nothing. staff.js adds zoom and rotate for photos.
 #[component]
-async fn document_viewer(documents: Vec<(usize, DocumentRow)>, empty: String) -> Result<impl View> {
-    let tabs: Vec<(usize, String, &'static str)> = documents
-        .iter()
-        .map(|(index, row)| (*index, DocumentKind::label(&row.kind).to_owned(), glyph(DocumentKind::icon(&row.kind))))
-        .collect();
-    let radios: Vec<usize> = documents.iter().map(|(index, _)| *index).collect();
+async fn document_viewer(files: Vec<ViewerFile>, empty: String) -> Result<impl View> {
+    let tabs: Vec<(usize, String, &'static str)> =
+        files.iter().enumerate().map(|(index, file)| (index, file.label.clone(), file.icon)).collect();
+    let count = files.len();
     Ok(view! {
         <section class="sx-viewer viewer" aria-label="Documents">
-            if documents.is_empty() {
+            if files.is_empty() {
                 <p class="sx-viewer-empty">(empty)</p>
             }
-            for index in radios {
-                <input class="sx-viewer-radio" type="radio" name="document" id=(format!("document-{index}")) checked=(index == 0)>
-            }
-            if !tabs.is_empty() {
-                <div class="sx-viewer-bar">
-                    <div class="sx-viewer-tabs">
-                        for (index, label, icon_name) in tabs {
-                            <label for=(format!("document-{index}"))>(icon_with(icon_name, "ic sm")) (label)</label>
-                        }
-                    </div>
-                    <div class="sx-viewer-tools" data-viewer-tools="" hidden=(true)>
-                        <button type="button" data-zoom="-1" aria-label="Zoom out">(ic("zoom-out"))</button>
-                        <button type="button" data-zoom="1" aria-label="Zoom in">(ic("zoom-in"))</button>
-                        <button type="button" data-rotate="" aria-label="Rotate">(ic("rotate"))</button>
-                    </div>
-                </div>
-            }
-            <div class="sx-viewer-panes">
-                for (_, document) in documents {
-                    let href = format!("/staff/documents/{}", document.id);
-                    <div class="sx-viewer-pane">
-                        <div class="sx-viewer-stage">
-                            if document.purged_at.is_some() {
-                                <p class="sx-viewer-gone">"Deleted when the claim was decided or the file replaced."</p>
-                            } else if document.is_viewable_image() {
-                                <img src=(href.clone()) alt=(DocumentKind::label(&document.kind)) data-zoomable="">
-                            } else {
-                                <a class="sx-viewer-open" href=(href.clone()) target="_blank" rel="noopener">
-                                    (ic("file"))
-                                    "Open the file"
-                                </a>
+            for (index, file) in files.into_iter().enumerate() {
+                let document = file.document;
+                let href = format!("/staff/documents/{}", document.id);
+                let image = document.is_viewable_image();
+                <input class="sx-viewer-radio" type="radio" name="document" id=(format!("document-{index}")) checked=(index == 0) aria-label=(format!("{} ({} of {count})", file.label, index + 1))>
+                <div class="sx-viewer-pane">
+                    <div class="sx-viewer-bar">
+                        <div class="sx-viewer-tabs" aria-hidden="true">
+                            for (other, label, icon_name) in tabs.clone() {
+                                <label for=(format!("document-{other}")) class=(if other == index { "on" } else { "" })>(icon_with(icon_name, "ic sm")) (label)</label>
                             }
                         </div>
-                        <p class="sx-viewer-foot">
-                            <span>
-                                (document.filename.clone()) " · " (format!("{} KB", (document.size_bytes + 1023) / 1024))
-                                (if document.purged_at.is_some() { " · deleted" } else { " · deleted automatically once you decide" })
-                            </span>
-                            if document.purged_at.is_none() {
-                                <a href=(href) target="_blank" rel="noopener">(icon_with("external", "ic sm")) "Open the original"</a>
-                            }
-                        </p>
+                        if image {
+                            <div class="sx-viewer-tools" data-viewer-tools="" hidden=(true)>
+                                <button type="button" data-zoom="-1" aria-label="Zoom out">(ic("zoom-out"))</button>
+                                <button type="button" data-zoom="1" aria-label="Zoom in">(ic("zoom-in"))</button>
+                                <button type="button" data-rotate="" aria-label="Rotate">(ic("rotate"))</button>
+                            </div>
+                        }
                     </div>
-                }
+                    <div class="sx-viewer-stage">
+                        if document.purged_at.is_some() {
+                            <p class="sx-viewer-gone">"Deleted when the claim was decided or the file replaced."</p>
+                        } else if image {
+                            <img src=(href.clone()) alt=(file.label.clone()) data-zoomable="" loading="lazy">
+                        } else {
+                            <a class="sx-viewer-open" href=(href.clone()) target="_blank" rel="noopener">
+                                (ic("file"))
+                                "Open the file"
+                            </a>
+                        }
+                    </div>
+                    <p class="sx-viewer-foot">
+                        <span>
+                            (document.filename.clone()) " · " (kilobytes(&document))
+                            (if document.purged_at.is_some() { " · deleted" } else { " · deleted automatically once you decide" })
+                        </span>
+                        if document.purged_at.is_none() {
+                            <a href=(href) target="_blank" rel="noopener">(icon_with("external", "ic sm")) "Open the original"</a>
+                        }
+                    </p>
+                </div>
+            }
+        </section>
+    })
+}
+
+/// Every file of the claim as a plain list beside the viewer, each stored
+/// one with its "Open the original", so each is one link away whatever the
+/// viewer shows.
+#[component]
+async fn file_list(files: Vec<ViewerFile>) -> Result<impl View> {
+    let count = files.len();
+    Ok(view! {
+        <section class="sx-sub sx-filelist" aria-labelledby="sx-files">
+            <div class="sx-subh">
+                <h3 id="sx-files">"Files"</h3>
+                <span class="sx-fine">(if count == 1 { "1 file".to_owned() } else { format!("{count} files") })</span>
             </div>
+            <ul class="sx-files">
+                for file in files {
+                    let document = file.document;
+                    <li>
+                        <span class="sx-files-ic">(ic(file.icon))</span>
+                        <span class="x">
+                            <b>(file.label.clone())</b>
+                            <span>(document.filename.clone()) " · " (kilobytes(&document))</span>
+                        </span>
+                        if document.purged_at.is_some() {
+                            <span class="sx-faint">"Deleted"</span>
+                        } else {
+                            <a href=(format!("/staff/documents/{}", document.id)) target="_blank" rel="noopener">
+                                (icon_with("external", "ic sm"))
+                                "Open the original"
+                                <span class="sx-vh">(format!(": {}, {}", file.label, document.filename))</span>
+                            </a>
+                        }
+                    </li>
+                }
+            </ul>
         </section>
     })
 }

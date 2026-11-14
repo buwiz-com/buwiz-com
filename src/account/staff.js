@@ -346,24 +346,23 @@ document.documentElement.classList.add("js");
   }
 
   // ---------------------------------------------------------------- document viewer
-  // Zoom and rotate the photo on screen. The tabs are radio buttons.
+  // Zoom and rotate a photo on screen; each photo's pane has its own tools.
+  // The tabs are radio buttons.
   function documentViewer(viewer) {
-    const tools = viewer.querySelector("[data-viewer-tools]");
-    if (!tools || !viewer.querySelector("img[data-zoomable]")) return;
-    tools.hidden = false;
-    const looks = new Map();
-    const visible = () =>
-      Array.from(viewer.querySelectorAll("img[data-zoomable]")).find((image) => image.offsetParent !== null);
-    tools.addEventListener("click", (event) => {
-      const button = event.target.closest("button");
-      const image = visible();
-      if (!button || !image) return;
-      const look = looks.get(image) || { zoom: 1, turn: 0 };
-      if (button.dataset.zoom) look.zoom = Math.min(4, Math.max(0.5, look.zoom + Number(button.dataset.zoom) * 0.25));
-      if (button.hasAttribute("data-rotate")) look.turn = (look.turn + 90) % 360;
-      looks.set(image, look);
-      image.style.transform = `rotate(${look.turn}deg) scale(${look.zoom})`;
-    });
+    for (const tools of viewer.querySelectorAll("[data-viewer-tools]")) {
+      const pane = tools.closest(".sx-viewer-pane");
+      const image = pane && pane.querySelector("img[data-zoomable]");
+      if (!image) continue;
+      tools.hidden = false;
+      const look = { zoom: 1, turn: 0 };
+      tools.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (!button) return;
+        if (button.dataset.zoom) look.zoom = Math.min(4, Math.max(0.5, look.zoom + Number(button.dataset.zoom) * 0.25));
+        if (button.hasAttribute("data-rotate")) look.turn = (look.turn + 90) % 360;
+        image.style.transform = `rotate(${look.turn}deg) scale(${look.zoom})`;
+      });
+    }
   }
 
   function enhance(root) {

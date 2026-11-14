@@ -605,27 +605,24 @@ body.sx {
 .sx-viewer-foot { display: flex; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; font-size: var(--text-xs); }
 .sx-viewer-foot a, .sx-viewer-open { color: #ffffff !important; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
 .sx-viewer-empty, .sx-viewer-gone { padding: var(--space-7) var(--space-4); text-align: center; font-size: var(--text-sm); }
-.sx-viewer-radio:nth-of-type(1):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(1),
-.sx-viewer-radio:nth-of-type(2):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(2),
-.sx-viewer-radio:nth-of-type(3):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(3),
-.sx-viewer-radio:nth-of-type(4):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(4),
-.sx-viewer-radio:nth-of-type(5):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(5),
-.sx-viewer-radio:nth-of-type(6):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(6),
-.sx-viewer-radio:nth-of-type(7):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(7),
-.sx-viewer-radio:nth-of-type(8):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(8),
-.sx-viewer-radio:nth-of-type(9):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(9),
-.sx-viewer-radio:nth-of-type(10):checked ~ .sx-viewer-panes .sx-viewer-pane:nth-child(10) { display: flex; }
-.sx-viewer-radio:nth-of-type(1):checked ~ .sx-viewer-bar label:nth-child(1),
-.sx-viewer-radio:nth-of-type(2):checked ~ .sx-viewer-bar label:nth-child(2),
-.sx-viewer-radio:nth-of-type(3):checked ~ .sx-viewer-bar label:nth-child(3),
-.sx-viewer-radio:nth-of-type(4):checked ~ .sx-viewer-bar label:nth-child(4),
-.sx-viewer-radio:nth-of-type(5):checked ~ .sx-viewer-bar label:nth-child(5),
-.sx-viewer-radio:nth-of-type(6):checked ~ .sx-viewer-bar label:nth-child(6),
-.sx-viewer-radio:nth-of-type(7):checked ~ .sx-viewer-bar label:nth-child(7),
-.sx-viewer-radio:nth-of-type(8):checked ~ .sx-viewer-bar label:nth-child(8),
-.sx-viewer-radio:nth-of-type(9):checked ~ .sx-viewer-bar label:nth-child(9),
-.sx-viewer-radio:nth-of-type(10):checked ~ .sx-viewer-bar label:nth-child(10) { background: var(--color-viewer-on); color: #ffffff; }
-.sx-viewer-radio:focus-visible ~ .sx-viewer-bar .sx-viewer-tabs { outline: 2px solid var(--acc); outline-offset: 2px; border-radius: var(--radius-sm); }
+/* Each pane follows its own radio, and carries the tab row with its own
+   tab marked: no rule per position, so any number of files works. */
+.sx-viewer-radio:checked + .sx-viewer-pane { display: flex; }
+.sx-viewer-tabs label.on { background: var(--color-viewer-on); color: #ffffff; }
+.sx-viewer-radio:focus-visible + .sx-viewer-pane .sx-viewer-tabs { outline: 2px solid var(--acc); outline-offset: 2px; border-radius: var(--radius-sm); }
+/* every file, plainly, beside the viewer */
+.sx-files { display: flex; flex-direction: column; }
+.sx-files li {
+  display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap;
+  padding: var(--space-3) 0; border-bottom: 1px solid var(--color-line); font-size: var(--text-sm);
+}
+.sx-files li:last-child { border-bottom: 0; }
+.sx-files-ic { width: 26px; height: 26px; border-radius: var(--radius-sm); display: grid; place-items: center; flex: none; background: var(--color-surface2); color: var(--color-muted); }
+.sx-files-ic .ic { width: 14px; height: 14px; }
+.sx-files .x { flex: 1 1 160px; min-width: 0; display: flex; flex-direction: column; }
+.sx-files .x b { font-weight: 600; overflow-wrap: anywhere; }
+.sx-files .x span { color: var(--color-muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
+.sx-files a { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-xs); font-weight: 600; white-space: nowrap; }
 
 /* the full claim page: the papers left, the review right */
 .sx-review { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr); gap: var(--space-6); align-items: start; }
@@ -884,6 +881,7 @@ a.sx-tile:hover { border-color: var(--color-line2); }
 
   .sx-btn, .sx-chip, .sx-tab, .sx-reason span { min-height: var(--touch); }
   .sx-menu a { min-height: var(--touch); }
+  .sx-files a { min-height: var(--touch); }
   .sx-tabrow { gap: var(--space-4); }
   .sx-tabrow > .sx-tabs { gap: var(--space-4); }
   .sx-btn.sm { min-height: 36px; }

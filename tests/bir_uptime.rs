@@ -1304,3 +1304,29 @@ async fn no_tin_that_should_not_be_recorded_reaches_the_record(db: PgPool) {
     assert_eq!(result["error"], buwiz_cloud::filing::gate::Standing::TestOnly.failure());
     assert_eq!(tries(&db).await.len(), 1);
 }
+
+/// The hourly upkeep deletes tries older than 90 days.
+#[sqlx::test]
+async fn tries_are_kept_90_days(db: PgPool) {
+    for days in [91, 90, 89, 0] {
+        sqlx::query(
+            "INSERT INTO bir_tries (started_at, ended_at, source, mode, outcome, stage, dispatcher, upload,
+                 failure_class, failure_kind, touched_bir, counted, admission, key_epoch, account_key)
+             SELECT at, at, 'relay', 'live', 'failed', 'none', 'none', 'none', 'ours', 'other', false, false,
+                    'open', 1, decode('0102030405060708', 'hex')
+               FROM (SELECT date_trunc('minute', now() - make_interval(days => $1) - interval '1 minute') AS at) t",
+        )
+        .bind(days)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    buwiz_cloud::submissions::upkeep(&db).await.unwrap();
+    let left: Vec<i64> = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM now() - started_at) / 86400)::bigint FROM bir_tries ORDER BY started_at",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(left, [89, 0]);
+}

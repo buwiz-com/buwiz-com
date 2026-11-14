@@ -837,7 +837,8 @@ pub async fn hpke_key(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 
 /// Startup and hourly upkeep: a send stuck in `sending` for 10 minutes
 /// ended with its server, so its outcome is unknown; XML older than 24 hours
-/// is deleted, and so is a sealed return whose ticket ran out unsent.
+/// is deleted, and so is a sealed return whose ticket ran out unsent; BIR
+/// uptime tries older than 90 days are deleted.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE submissions SET status = 'unknown', error = 'the server stopped while sending',
@@ -861,6 +862,7 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     .execute(db)
     .await?;
     crate::filing::devices::upkeep(db).await?;
+    crate::uptime::store::upkeep(db).await?;
     Ok(())
 }
 

@@ -31,6 +31,9 @@ use crate::base::crypto;
 /// How many sightings a host key keeps.
 pub const HOST_KEY_SIGHTINGS: i64 = 50;
 
+/// How long `bir_tries` rows are kept, in days.
+pub const TRIES_KEPT_DAYS: i32 = 90;
+
 /// The most records being written at once; past it a record is lost (and
 /// logged), so a database that hangs cannot pile tasks up.
 pub const MAX_PENDING: usize = 256;
@@ -320,6 +323,15 @@ pub fn periods(seen: &Value) -> Vec<Period> {
             kex_done_accounts: period.done.len(),
         })
         .collect()
+}
+
+/// The hourly upkeep: tries older than 90 days are deleted.
+pub async fn upkeep(db: &PgPool) -> sqlx::Result<u64> {
+    let deleted = sqlx::query("DELETE FROM bir_tries WHERE started_at < now() - make_interval(days => $1)")
+        .bind(TRIES_KEPT_DAYS)
+        .execute(db)
+        .await?;
+    Ok(deleted.rows_affected())
 }
 
 #[cfg(test)]

@@ -514,9 +514,12 @@ existing row changes, and no existing table is scanned under its lock
 row is NULL). None of the tables holds a TIN, a name or an IP address;
 four columns hold an Admin's email for the audit
 (`bir_events.actor_email`, `bir_notes.set_by_email` and
-`cleared_by_email`, `bir_host_keys.confirmed_email`). `bir_tries` rows are
-deleted after 90 days by the hourly upkeep. The release before it (at 13)
-refuses to start on a database at 14, as with any newer migration.
+`cleared_by_email`, `bir_host_keys.confirmed_email`), and
+`bir_notes.cleared_reason` holds the reason an Admin gave for clearing a
+note (staff only). `bir_tries` rows are deleted after 90 days by the
+hourly upkeep. The release before it (at 13) refuses to start on a
+database at 14, as with any newer migration. One Gatekeeper instance is
+assumed (as today): two would each keep, write and mail their own sign.
 
 **Before you deploy.** The database is at 13 and has no uptime table
 yet (after a rollback, what it kept is in `rollback_archive` and comes
@@ -542,11 +545,35 @@ recorded with mode `unknown` and not counted.
   it does not know is logged and read as `record`.
 - `BIR_UPTIME_UPLOAD_PORTS`: leave it unset (`22`).
 
-A request that reaches the server without `CF-Connecting-IP` is logged as
-an error, at most once an hour ("BIR uptime: a request reached the server
-without CF-Connecting-IP"): every such try would count as one network. No
-one is mailed for it yet (the staff mail is a later release), so watch the
-log after the deploy.
+**Admins and Support are mailed from this release** (every Admin and
+Support account not banned, and `ADMIN_EMAILS`, through the existing mail
+transport): changes of the BIR sign, notes, five failures in a row, "the
+relay would pause" (nothing pauses yet), host keys that are not pinned and
+other faults on Buwiz's side, at most 48, 3 and 8 alerts a Manila day by
+kind, batched every 10 minutes ([bir-uptime.md](bir-uptime.md#157-staff-mail)).
+Tell them before the deploy. A request that reaches the server without
+`CF-Connecting-IP` is logged as an error and mailed, at most once an hour
+("BIR uptime: a request reached the server without CF-Connecting-IP"):
+every such try would count as one network.
+
+**The first start** writes the first line of the history ("Buwiz began
+keeping the sign") and shows No recent news everywhere; the first return
+that gets in turns it Online. **Every later start** (a deploy, a crash, or
+`BIR_UPTIME` set to `off` and back) restores the stored sign as it was and
+ages it by the clock before the server takes requests: it never turns
+Offline into Online or Online into Offline, and the time the server was
+not running (or the sign not evaluated for more than 5 minutes) is written
+as "not watched" and shown as a gap in the day history, never as the BIR's
+state. A quick deploy (under 5 minutes, which a restart is) leaves no gap.
+
+**Stopping.** The server now handles SIGTERM, which `systemctl stop` and
+`restart` send: it stops taking new connections, gives the BIR uptime
+records still being written up to 10 seconds (usually none, so it exits at
+once), and exits with status 0. Connections still open (a relay send under
+way) are cut when it exits, as they were before, when SIGTERM simply killed
+the process; it does not wait for them. Before, the records being written
+at that moment were lost. Ctrl-C (SIGINT) does the same, and no longer
+waits for open connections either.
 
 Check the record after the first real sends:
 ```sql

@@ -132,8 +132,8 @@ pub fn client_ip(headers: &HeaderMap) -> Option<IpAddr> {
 /// Reads the network of a request. In production a request without
 /// `CF-Connecting-IP` is raised at most once an hour, because every try
 /// would then count as one network: it is logged as an error and kept as an
-/// alert ([`NetworkReader::take_missing_header_alert`]) for the staff mail,
-/// which a later release sends. Nobody is mailed yet.
+/// alert ([`NetworkReader::take_missing_header_alert`]) for the staff mail
+/// to Admins and Support ([`super::alerts`]).
 pub struct NetworkReader {
     production: bool,
     missing: Mutex<Missing>,
@@ -176,8 +176,8 @@ impl NetworkReader {
     }
 
     /// The alert for the staff mail: when a missing `CF-Connecting-IP` was
-    /// raised, once per raise (at most once an hour). The mail is sent by a
-    /// later release; until then the alert is only kept here.
+    /// raised, once per raise (at most once an hour). [`super::alerts::flush`]
+    /// takes it in and mails it.
     pub fn take_missing_header_alert(&self) -> Option<OffsetDateTime> {
         self.missing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).alert.take()
     }

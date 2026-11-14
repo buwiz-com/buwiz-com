@@ -78,17 +78,16 @@ as `no_recent_news`.
 
 | `state` | Shown as | Meaning |
 |---|---|---|
-| `online` | Online | Returns land: of the last 10 counted tries, at most 1 failed, and the newest got in. |
-| `busy` | Busy | Some get in, some don't: at least one got in and at least 3 failed, from at least 2 accounts on at least 2 networks, among the last 10. |
+| `online` | Online | Returns land: of the last 10 counted tries (one failure per account), at most 1 failed, and the newest got in; and a return got in within the hour. |
+| `busy` | Busy | Some get in, some don't: failures from at least 2 accounts on at least 2 networks among the last 10. |
 | `offline` | Offline | Nothing gets in: 3 accounts on 3 networks failed within 15 minutes and none got in since. Or an Admin set an outage or maintenance by hand. |
-| `no_recent_news` | No recent news | Nobody filed in the last 60 minutes, so we don't know. |
+| `no_recent_news` | No recent news | Nobody filed (or nothing got in) in the last 60 minutes, so we don't know. It claims neither up nor down. |
 
-Busy and Online change with hysteresis: Busy needs 3 failures to enter and
-at most 1 to leave, and a change that lets more through (`busy` to `online`
-or `no_recent_news`) waits until `busy` is 10 minutes old; a change that
-lets less through happens at once. Offline ends only when a relay return
-gets past that window, or after 3 hours with no try reaching it. The rules
-exactly as the server runs them are in
+Busy and Online change with hysteresis: a change that lets more through
+(`busy` to `online` or `no_recent_news`) waits until `busy` is 10 minutes
+old; a change that lets less through happens at once. Offline ends only
+when a relay return gets past that window, or after 3 hours with no try
+reaching it. The rules exactly as the server runs them are in
 [What the server keeps](#15-what-the-server-keeps).
 
 Each window has its own light with the same four values. The overall
@@ -144,7 +143,7 @@ Manila time.
 | `state`, `since` | Overall state and when it began. |
 | `evaluated_at` | When the server last ran its rules (on every recorded try and every 30 s). |
 | `source` | `tries` (evidence) or `staff` (a hand-set note is in force). |
-| `relay` | `ok`, or `paused`: Buwiz stopped sending because of a fault on its own side that would still touch the BIR (a changed upload-server key, an unknown upload server, front-desk answers it cannot read). While `paused`, new apps send nothing and, under `enforce`, tickets are held with `relay_paused`. |
+| `relay` | `ok`, or `paused`: Buwiz stopped sending because of a fault on its own side that would still touch the BIR (a changed upload-server key, an unknown upload server, front-desk answers it cannot read). While `paused`, new apps send nothing and, under `enforce`, tickets are held with `relay_paused`. Planned: this release never pauses, it mails staff that the relay would pause (§15.1). |
 | `windows.dispatcher`, `windows.upload` | Each light: `state`, `since`, `last_ok_at` (the last counted try that passed this window; `null` if none in 90 days). |
 | `last_success_at` | The last `live` return that got in. |
 | `last_news_at` | The last counted try of any outcome. |
@@ -767,7 +766,8 @@ Gatekeeper (`buwiz-cloud`):
 | `BIR_UPTIME` | `record` | `off`: nothing new runs (the Sender's `sender` frame is still dropped); no sign is kept and no staff mail is sent. `record`: every relay try is recorded and classified (§14), the sign is kept with its events, the day history is written and Admins and Support are mailed (§15); clients see no change. `public`: today, plus `class` on the relay `result` and `mode` on failed and unknown submissions; planned: the routes of §4 to §8, the `buwiz-bir` header and `bir` on results. `enforce`: today the same as `public`; planned: holds on tickets and the v1 relay, the legacy scout and Try anyway. Read in any case, spaces around it ignored. A value it does not know is logged and read as `record`; it never stops the server from starting. |
 | `BIR_UPTIME_UPLOAD_PORTS` | `22` | Comma-separated ports whose relay streams are the upload window; every other stream is the front desk. A value it cannot read is logged and the default is used. |
 
-Going down a level is a setting and a restart.
+Going down a level is a setting and a restart. `off` and back on again is
+a restart after a gap: the time in between is "not watched" (§15.3).
 
 ## 14. The per-try record
 
@@ -902,95 +902,170 @@ that matches no pin is not by itself proof the key changed.
 
 Built in this release, from `record` up; nothing of it is shown to an app
 yet. `src/uptime/sign.rs` is the rule engine: a pure function of the
-previous sign, the recent tries, the open note and the clock, so it is
-tested rule by rule and replayed. `src/uptime/live.rs` runs it after each
-recorded try (in the recorder's own task, after the app has its result: a
-send is never delayed or broken by it) and every 30 seconds for what the
-clock alone changes, writes every change, and holds the sign in memory for
-every read.
+previous sign, the recent tries, the open note, the key periods in memory
+and the clock, so it is tested rule by rule and replayed.
+`src/uptime/live.rs` runs it after each recorded try (in the recorder's
+own task, after the app has its result: a send is never delayed or broken
+by it) and every 30 seconds for what the clock alone changes, writes every
+change, and holds the sign in memory for every read. A single Gatekeeper
+process is assumed: two would each keep, write and mail their own sign.
 
 ### 15.1 The rules
 
 Evidence is a `live` try that is counted (§14.2). A try is evidence for a
 window only if it reached it: the front desk reads `dispatcher` `ok` or
-`fail` (TLS only), the mailbox `upload` `ok`, `fail` or `maybe`. A try of
-class `user_network` or `ours` is never evidence; the engine keeps its kind
-and port in memory so a later release can tell a device its own network
-blocks the upload port (buwiz-com#58), and counts nothing from it.
+`fail` (TLS only), the mailbox `upload` `ok`, `fail` or `maybe`; and a
+relay return that got in (`sent`: its upload server came from the front
+desk and its key is pinned) is `ok` for the front desk whatever scheme
+reached it. A try of class `user_network` or `ours` is never evidence; the
+engine keeps its kind and port in memory so a later release can tell a
+device its own network blocks the upload port (buwiz-com#58), and counts
+nothing from it.
+
+Times are exact in memory (a try's end to the nanosecond) and evidence is
+ordered by when each try ended, not by when its record came; what is
+stored or shown is to the minute. Every run reads all of the last 3
+hours' evidence (at most 20,000 tries), so what it says does not depend on
+which tries were new to it.
 
 | Rule | As built |
 |---|---|
-| The last 10 | A window's newest evidence within 60 minutes, at most 2 per account, from when it last left Offline. |
-| Online | Among the last 10 the newest got in and at most 1 failed (`fail` or `maybe`). |
-| Busy | Among the last 10 at least 1 got in and at least 3 failed, from at least 2 accounts on 2 networks. |
-| Offline | `fail` (not `maybe`) from at least 3 accounts on 3 networks within the last 15 minutes (a failure exactly 15 minutes old counts), all after the newest relay try that got past this window, from accounts that kept their vote. |
-| "Accounts on networks" | The most tries with pairwise different accounts and pairwise different networks (one person on three networks and two people on one network are 2, not 3), counted within one key period. At most one of them may be a direct-app report, and a late direct report (no network) adds none. |
-| Same account | Two tries that share an account key of one key period. A try recorded in the 3 hours after a new day key also carries the previous key, which is how tries across midnight compare. Keys nothing links are neither the same account nor counted as different ones: after a restart a quorum needs fresh evidence. |
-| Lost votes | When a relay try gets past a window, every account that failed on that window in the 15 minutes before loses its Offline vote there for 24 hours. Held by account id in memory, and by its keys in `bir_sign` (so after a restart only tries read back still match). |
+| One account, one failure | For every threshold an account counts at most one failure, and one account's failure cannot by itself say "the newest did not get in". |
+| The last 10 | A window's newest evidence within 60 minutes, newest first by end time, from when it last left Offline, linked to a key period in memory (below), at most 2 per account and at most 1 failure per account. |
+| Online | Among the last 10 a return got in, the failures newer than the newest one that got in are one account's at most, and at most 1 failed (`fail` or `maybe`). |
+| Busy | From Online: the Online rule no longer holds and the failures among the last 10 come from at least 2 accounts on 2 networks. From No recent news: among the last 10 at least 1 got in and at least 3 failed, from at least 2 accounts on 2 networks. |
+| Offline | `fail` (not `maybe`) from at least 3 accounts on 3 networks within the last 15 minutes (a failure exactly 15 minutes old counts, 15 minutes and 1 second does not), one failure per account, all ending after the newest relay try that got past this window, from accounts that kept their vote, linked tries only. The accounts are kept with the light as its quorum. |
+| "Accounts on networks" | The most tries with pairwise different accounts and pairwise different networks (one person on three networks and two people on one network are 2, not 3), counted within one key period, searched only until the threshold is reached. At most one of them may be a direct-app report (of the first 20 different ones), and a late direct report (no network) adds none. |
+| Key periods | Two tries are the same account when they share an account key of one key period. A try recorded in the 3 hours after a new day key also carries the previous key, which is how tries across midnight compare. A try with no key of a period still in memory (one read back after a restart, or from before midnight once the previous key is gone) is neither the same account as another nor a different one: it is left out of the last 10 and every quorum. It still counts as news, and a landing among them still ends an Offline. |
+| Lost votes | Only when a relay landing ends an Offline: every account of that Offline's quorum whose failure ended before the landing loses its Offline vote on that window for 24 hours from the landing, however old its failure. Never in Online or Busy, and never for a failure that ended after the landing. One entry per account and window, holding the latest end; at most 2,000, the latest ending kept. Held by account id in memory, and by its keys in `bir_sign`. |
 | Entering | Offline, at once, from any state. Busy at once from Online or No recent news. From No recent news, Online when the Online rule holds. |
+| Leaving Online | To Busy at once, as above. To No recent news when nothing got past the window in the last 60 minutes (`rule`), or nothing reached it at all (`quiet`): Online is never shown unless a real return got past within the hour. Two accounts failing on one network keep Online until then; one account's failures never leave it. |
 | Leaving Busy | To Online when the Online rule holds, or to No recent news after 60 minutes without evidence, both only once Busy is 10 minutes old (the dwell). Otherwise Busy stays. |
-| Leaving Online | To Busy at once; to No recent news after 60 minutes without evidence on the window. One person's failures never leave Online. |
-| Leaving Offline | To Online at once when a relay try (a scout, an admitted ticket, a Try anyway) gets past the window; the event says which. To No recent news after 3 hours without evidence on the window, with `last_state: offline`. A direct-app report never ends Offline and never counts as "got in since". |
+| Leaving Offline | To Online at once when a relay try (a scout, an admitted ticket, a Try anyway) that got past the window ended after the quorum's first failure, unless the failures after it are still a quorum: that is checked in the same run, so several tries taken in together give no Offline, Online, Offline pair. The event says which kind got in. To No recent news after 3 hours without evidence on that window (each window its own), with `last_state: offline`. A direct-app report never ends Offline and never counts as "got in since". |
 | Overall | Offline if either light is, or an outage or maintenance note is in force; else Busy if either is; else Online if the mailbox is; else No recent news. A "declare Online" note makes it Online. Leaving Offline (and the end of an outage or maintenance note) starts waking; nothing ends waking yet. |
-| Relay pause | 3 relay tries of the kinds `host_key`, `unknown_host` or `protocol` (the front desk's answer not understood, or no common SSH algorithm) from 2 accounts within 60 minutes. Only an Admin resumes it; faults before the resume count no more. Today it is a state and a mail; nothing is held. |
+| Notes | An `outage` note ends when a counted relay return got in with its exact end after the note's start. A `maintenance` note ends at its end or by an Admin; a return that got in during it is mailed to staff, once per note. |
+| Failures in a row | 5 counted failures from 5 accounts (linked tries) with no return got in since: staff are mailed, once per run of failures, whatever the light says. |
+| Relay pause | Not in this release (nothing could resume it): when 3 relay tries of the kinds `host_key`, `unknown_host` or `protocol` (the front desk's answer not understood, or no common SSH algorithm) come from 2 accounts on 2 networks within 60 minutes, staff are mailed "the relay would pause: …", and again at most once a day while it holds. Nothing is held and `relay.paused` is never written true; a stored sign that says paused is read as not paused. The resume function stays for the later staff page. |
 
-Times of tries are read to the minute, as `bir_tries` keeps them. The
-thresholds are constants in `sign.rs`.
+The thresholds are constants in `sign.rs`.
 
 ### 15.2 Events and the stored sign
 
-Every change is a `bir_events` line: the scope (`dispatcher`, `upload`,
-`overall`, `relay`), the old and new state, the cause (`rule`, `scout`,
-`try_anyway`, `quiet`, `note_set`, `note_cleared`, `note_expired`,
-`note_return_got_in`, `relay_paused`, `relay_resumed`), a fixed sentence
-with counts ("3 accounts on 3 networks didn't get past the mailbox within
-15 min", "7 of the last 10 got in"), and for an Admin's action their id
-and email. The first start writes one line `none` to `no_recent_news`
+Every change is a `bir_events` line, its time to the minute: the scope
+(`dispatcher`, `upload`, `overall`, `relay`, `watch`), the old and new
+state, the cause (`rule`, `scout`, `try_anyway`, `quiet`, `note_set`,
+`note_cleared`, `note_expired`, `note_return_got_in`, `relay_paused`,
+`relay_resumed`, `not_watched`, `reset`), a sentence with counts ("3
+accounts on 3 networks didn't get past the mailbox within 15 min", "7 of
+the last 10 got in"; an Admin's note text or clearing reason where they
+gave one), and for an Admin's action their id and email. Each line carries
+the sign's `seq` and its place in that run (`sign_seq`, `ord`, unique): a
+run written again because its commit's acknowledgement was lost adds
+nothing twice. The first start writes one line `none` to `no_recent_news`
 ("Buwiz began keeping the sign"), where the day history begins.
 
-`bir_sign` holds the sign (`seq`, the overall state with `since` and
-`last_state`, each light's state, `since`, `last_ok_at`, last evidence and
-where its last 10 begin, the note in force, the relay, `last_success_at`,
-`last_news_at`, `waking_since`, the lost votes by key), written in the same
-transaction as the events. `seq` grows by one with every change and never
-goes back, across restarts and a rollback of migration 14 (whose down file
-keeps the sign; a stored sign that cannot be read starts again with a
-higher `seq`). On start the server reads `bir_sign`, the `live` tries of
-the last 3 hours from `bir_tries` (each with only the key it was recorded
-under, and no account id) and the open note, and goes on from there. If a
-write fails, the sign stays as it was and the next run makes the same
-change.
+`bir_sign` holds the sign: a `version`, `seq`, `revision`, the overall
+state with `since` and `last_state`, each light's state, `since`,
+`last_ok_at`, last evidence, where its last 10 begin and (while Offline) its
+quorum by key, the note in force, the relay, `last_success_at`,
+`last_news_at`, `waking_since`, the lost votes by key, and which run of
+failures and which maintenance note staff were told of; every time to the
+minute. Every field has a default, so a sign another release wrote, with a
+field fewer or more, reads whole (a missing time is its last write's). It
+is written in the same transaction as the events, at once for any change
+but the times of news and of the evaluation, which alone are written at
+most once a minute. `seq` grows by one with every change (a gap in
+watching is one) and never goes back, across restarts and a rollback of
+migration 14 (whose down file keeps the sign). `revision` grows whenever
+anything a reader can see changes (times to the minute), never below the
+Unix time in milliseconds of the change, so a revision handed out but not
+yet stored is never handed out again after a restart: it is what a later
+release's ETag uses. A stored sign that cannot be read at all starts
+again at No recent news (or what the note it held says) with a higher
+`seq`, keeps its note, and writes a `reset` line.
 
-### 15.3 Notes and resuming the relay
+No try is lost on the way to the rules: the recorder puts each try in the
+rules' inbox before it waits for their lock, and the try stays in memory
+whatever its run does. A timeout bounds only the database work (10 s for a
+run or the load, 5 s for a try's row); a try whose row could not be
+written still reaches the rules. If a write fails, the sign stays as it
+was and the next run (at most 30 seconds later) makes the same change.
+
+### 15.3 Starting and restarting
+
+The sign never claims what it has not seen. A start or restart is Buwiz's
+event, not the BIR's.
+
+- **The first start ever** (no stored sign): every light is No recent
+  news, which claims neither up nor down; apps send normally in it, so
+  nothing is held and nothing is assumed. The first real return that gets
+  in turns the light Online; the Offline rule turns it Offline. History
+  begins at that moment; nothing before it is shown as up or down.
+- **A restart** (a deploy or a crash): before the server takes requests,
+  the stored sign is restored as it was, with its original "since" times,
+  the `live` tries of the last 3 hours and the open note are read, and the
+  sign is aged by the clock with the ordinary quiet rules: Online or Busy
+  with no evidence for 60 minutes becomes No recent news; Offline stays
+  Offline until a return lands, or becomes No recent news after 3 quiet
+  hours; an expired note is ended. A restart never turns Offline into
+  Online or Online into Offline. Tries from before it carry only the key
+  they were recorded under, of a key period no longer in memory, so a
+  quorum needs fresh tries.
+- **Time Buwiz was not watching** (the server was stopped, or the sign was
+  not evaluated for more than 5 minutes) is written as a pair of `watch`
+  lines ("Buwiz stopped watching" at the last evaluation, "Buwiz was not
+  watching for N min" when it starts again) and is its own value in the
+  day history. It is never given to a BIR state, never extends the state
+  before it, counts in no duration, and splits any outage it falls in.
+- **`BIR_UPTIME=off` and on again** is the same as a restart after a gap.
+- **Online is never shown without a real return having got in; Offline
+  never without the accounts-and-networks rule or an Admin's note.** There
+  is no "assume running" and no "assume down".
+
+Until the first run after a start, the sign in memory is No recent news
+with `seq` 0; the server runs it before it binds its port.
+
+### 15.4 Notes and resuming the relay
 
 `src/uptime/notes.rs`: functions the staff screens will call. Admins only
-(`Power::SetBirStatus`, rechecked in the transaction); Support and
-everyone else are refused. Each writes its audit line (a `bir_events` line
-with the Admin's id and email) with the change.
+(`Power::SetBirStatus`): checked before the engine's lock is taken, so
+nobody else waits on it, and again inside the transaction, where the
+Admin's email is read again for the record; Support and everyone else are
+refused, and an Admin demoted while their request waited does nothing.
+Each writes its audit line (a `bir_events` line with the Admin's id and
+email) with the change.
 
 - **Set** an `outage`, `maintenance` or `online` ("ignore evidence until …,
-  declare Online") note: text 1 to 200 characters (public), an end in the
-  future and at most 72 hours ahead, refused while another is in force. A
-  note past its end has ended and never blocks a new one.
-- **Clear** the note in force.
-- A note also ends when its end passes (`note_expired`) and, for outage and
-  maintenance, when a counted relay return gets in after it began
+  declare Online", its text the reason) note: text 1 to 200 characters
+  (public), an end in the future and at most 72 hours ahead, refused while
+  another is in force. A note past its end has ended and never blocks a new
+  one; it is marked ended with a `note_expired` line.
+- **Clear** the note in force, with a reason (1 to 200 characters, staff
+  only, `bir_notes.cleared_reason`).
+- A note also ends when its end passes (`note_expired`) and, for an outage,
+  when a counted relay return gets in after it began
   (`note_return_got_in`).
-- **Resume sending** after the relay paused.
+- **Resume sending** after the relay paused: for the later staff page;
+  nothing in this release pauses it, so it answers "not paused".
 
-### 15.4 The day history
+### 15.5 The day history
 
 One `bir_days` line per Manila day (`src/uptime/days.rs`), kept forever:
 the worst state (Offline over Busy over Online over No recent news), the
 minutes in each state overall and per window (`windows`), the minutes a
-note was in force, the hours (`-` before the history began and for hours
-still to come), the outages (each window's Offline stretches, and hand-set
-outage or maintenance), counted tries that got in, failed and broke
-midway, `ours` and `user_network` tries, held requests, and the distinct
-accounts and networks of the day's counted tries. A day with no tries is
-No recent news. It is rewritten every 10 minutes and once more after the
-day ends, then marked final and never computed again. Running it twice
-gives the same line.
+note was in force, the minutes Buwiz was not watching
+(`unwatched_minutes`, in no other count), the hours (`w` for an hour not
+watched at all, `-` before the history began and for hours still to come),
+the outages to the minute (each window's Offline stretches, and hand-set
+outage or maintenance, split where Buwiz was not watching), counted tries
+that got in, failed and broke midway, `ours` and `user_network` tries, held
+requests, and the distinct accounts and networks of the day's counted
+tries. A day with no tries is No recent news; a day Buwiz did not watch at
+all is `w` every hour, worst `none`. The lines not final yet are rewritten
+every 10 minutes and at start: every day from the one after the last final
+line, so a day the server was down for still gets its line; each is
+marked final 10 minutes after the day ends and never computed again.
+Running it twice gives the same line.
 
 Distinct accounts and networks come from the raw sets held in memory
 (yesterday's kept until its last roll-up). A restart empties them, so the
@@ -998,22 +1073,25 @@ line keeps the largest of what was counted before the restart, what is
 counted after it, and the distinct keys within one key period: never more
 than the truth, possibly less.
 
-### 15.5 Retention
+### 15.6 Retention
 
 `bir_tries` 90 days; `bir_held` 90 days; queue reports when they expire;
 turns a day after they were given. `bir_days`, `bir_events`, `bir_notes`,
 `bir_host_keys` and `bir_proofs` are kept.
 
-### 15.6 Staff mail
+### 15.7 Staff mail
 
 `src/uptime/alerts.rs`, through the existing mailer (`Mailer::send_notice`,
 plain text; logged with `MAIL_TRANSPORT=log`), to every Admin and Support
-not banned and every address in `ADMIN_EMAILS`. What is mailed:
+not banned and every address in `ADMIN_EMAILS`. This release mails them.
+What is mailed:
 
-- every change of the overall sign (with the windows' reasons), and every
-  note set, cleared or ended;
-- the relay pausing and resuming, and a reminder every 2 hours while it is
-  paused;
+- every change of the overall sign (with the windows' reasons), a window
+  going Offline or coming back when the overall sign does not change (a
+  "declare Online" note in force, say), every note set, cleared or ended,
+  and a reset of the stored sign;
+- 5 failures in a row, and a return that got in during maintenance;
+- "the relay would pause" (at most once a day while it holds);
 - a missing `CF-Connecting-IP` in production (at most once an hour);
 - a fault on Buwiz's side that needs a person: an upload-server host key
   that is not pinned (its fingerprint marked "relay-reported, unverified:
@@ -1022,12 +1100,23 @@ not banned and every address in `ADMIN_EMAILS`. What is mailed:
   reached (each at most once an hour).
 
 The first alert mails at once; alerts in the next 10 minutes go together
-at the end of them; at most 24 mails a Manila day, the 24th saying that
-more are not mailed (the event log keeps them). `bir_events.mailed_at`
-says which changes went out. The queue is in memory: alerts not yet mailed
-when the server stops are lost. With `BIR_UPTIME=off` nothing is mailed.
+at the end of them. Each kind has its own budget a Manila day, so one
+cannot use up another's: the sign, windows and notes 48 alerts, host keys
+3 across every fingerprint, everything else 8; the mail that reaches a
+budget says so. An alert past its budget is not mailed and not counted as
+told, so the same alert the next day is mailed (the event log keeps every
+change). An alert counts as told, spends its budget and marks its events'
+`bir_events.mailed_at` only once its mail reached at least one address; a
+mail that reached nobody stays queued and is tried a minute later. Each
+request to the mail provider has a 10 s connect and 30 s overall timeout,
+and a round of mail at most 60 s, so the ticker never hangs on it. The
+queue is in memory: alerts not yet mailed when the server stops are lost.
+With `BIR_UPTIME=off` nothing is mailed.
 
 What a recorded try sends: nothing to the app beyond what §14 says, and,
-when it changes the overall sign or the relay or is one of the faults
-above, at most one line in the next staff mail.
+when it changes the sign or is one of the alerts above, at most one line
+in the next staff mail.
 
+The ticker runs each part (the rules, the mail, the day history) on its
+own: a panic in one is logged and the next part, and the next tick, go
+on.

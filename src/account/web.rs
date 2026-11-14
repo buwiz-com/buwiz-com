@@ -58,6 +58,39 @@ fn signed(state: &AppState, route: MethodRouter<AppState>) -> MethodRouter<AppSt
     }
 }
 
+/// How long a client is asked to wait when the server is stopping: a
+/// restart takes a few seconds.
+const STOPPING_RETRY_S: u32 = 30;
+
+/// A route that starts a send (a ticket, a submission, the relay): while
+/// the server is stopping it answers `503 restarting` with `Retry-After`
+/// before anything starts, so a send never begins on a server about to
+/// exit. Every other time, and every other method on the route, as it was.
+fn starts_send(state: &AppState, route: MethodRouter<AppState>) -> MethodRouter<AppState> {
+    route.layer(axum::middleware::from_fn_with_state(state.clone(), refuse_while_stopping))
+}
+
+async fn refuse_while_stopping(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let send = request.method() == Method::POST || request.uri().path().ends_with("/relay");
+    if !(send && state.stopping.is_on()) {
+        return next.run(request).await;
+    }
+    let refused = crate::base::error::ApiError::Client {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "restarting",
+        message: "Buwiz is restarting. Nothing was sent; try again in a moment.",
+    };
+    let mut response = refused.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from(STOPPING_RETRY_S));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
     let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -90,20 +123,26 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         // Submission relay.
         .route(
             "/api/submissions",
-            signed(&state, post(submissions::create))
-                .get(submissions::list)
-                .layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+            starts_send(
+                &state,
+                signed(&state, post(submissions::create))
+                    .get(submissions::list)
+                    .layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+            ),
         )
         .route("/api/submissions/{id}", get(submissions::show))
-        .route("/api/submissions/{id}/relay", get(submissions::relay))
+        .route("/api/submissions/{id}/relay", starts_send(&state, get(submissions::relay)))
         .route("/.well-known/jwks.json", get(submissions::jwks))
         // Submission v2: device keys, tickets, sealed returns.
         .route("/api/devices", post(devices::register).get(devices::list))
         .route("/api/devices/{id}/revoke", post(devices::revoke_api))
-        .route("/api/tickets", signed(&state, post(tickets::issue)))
+        .route("/api/tickets", starts_send(&state, signed(&state, post(tickets::issue))))
         .route(
             "/api/v2/submissions",
-            signed(&state, post(submissions::create_v2)).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+            starts_send(
+                &state,
+                signed(&state, post(submissions::create_v2)).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+            ),
         )
         .route("/.well-known/buwiz-hpke.json", signed(&state, get(submissions::hpke_key)))
         // `public, max-age=300` as before: a cached copy carries an older

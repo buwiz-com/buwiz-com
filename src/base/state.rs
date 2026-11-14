@@ -44,6 +44,25 @@ pub struct Inner {
     /// BIR uptime (`BIR_UPTIME`, [`crate::uptime`]): day keys, rate
     /// limiters, the record's settings.
     pub uptime: Arc<Uptime>,
+    /// Set when the server is told to stop: a request that would start a
+    /// send is refused from then on ([`crate::account::web`]).
+    pub stopping: Stopping,
+}
+
+/// Whether the server is stopping (SIGTERM came): from then on a request
+/// that would start a send is answered `503` before anything starts, while
+/// those already under way finish and their records are written.
+#[derive(Default)]
+pub struct Stopping(std::sync::atomic::AtomicBool);
+
+impl Stopping {
+    pub fn begin(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl AppState {
@@ -72,6 +91,7 @@ impl AppState {
             bot_downloads,
             stars,
             uptime,
+            stopping: Stopping::default(),
         }))
     }
 }

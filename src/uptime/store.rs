@@ -109,12 +109,14 @@ impl Recorder {
         }
     }
 
-    /// At shutdown: takes no new record and waits up to `limit` for those
-    /// being written. `false` (and logged) if some were still being written,
-    /// which end with the process.
+    /// At shutdown, once no new send can start: waits up to `limit` for the
+    /// records being written, and for those of tries that end meanwhile
+    /// (they are still taken), then takes no new one. `false` (and logged)
+    /// if some were still being written, which end with the process.
     pub async fn drain(&self, limit: std::time::Duration) -> bool {
+        let settled = tokio::time::timeout(limit, self.settled()).await.is_ok();
         self.closed.store(true, Ordering::SeqCst);
-        if tokio::time::timeout(limit, self.settled()).await.is_ok() {
+        if settled {
             return true;
         }
         tracing::error!(pending = self.pending(), "BIR uptime: stopping before every try was recorded");
@@ -398,6 +400,27 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// At shutdown the records of tries that end while it waits are still
+    /// taken; only after the wait is none.
+    #[tokio::test]
+    async fn the_drain_takes_records_until_it_ends() {
+        let uptime = Arc::new(crate::uptime::Uptime::new(crate::uptime::Level::Record, vec![22], false, OffsetDateTime::now_utc()));
+        let first = Recorder::slot(&uptime).unwrap();
+        let drain = {
+            let uptime = uptime.clone();
+            tokio::spawn(async move { uptime.recorder.drain(std::time::Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // A try that ends during the drain is recorded.
+        let late = Recorder::slot(&uptime).expect("taken while draining");
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!drain.is_finished(), "it waits for the late one too");
+        drop(late);
+        assert!(drain.await.unwrap());
+        assert!(Recorder::slot(&uptime).is_none(), "none after the drain");
+    }
 
     #[test]
     fn sightings_count_only_within_one_key_period() {

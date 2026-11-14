@@ -38,10 +38,13 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Reads settings, migrates the database and serves until SIGTERM (what
-/// systemd sends to stop it) or Ctrl-C. Then it stops taking connections,
-/// gives the BIR uptime records still being written up to 10 seconds, and
-/// exits; connections still open (a relay send under way) end with the
-/// process, as they did when SIGTERM simply killed it.
+/// systemd sends to stop it) or Ctrl-C. Then it is stopping: a request that
+/// would start a send (a ticket, a submission, the relay) is answered `503
+/// restarting` with `Retry-After`, while requests already under way go on
+/// and the BIR uptime records of tries that end get written, for at most 10
+/// seconds; then the process exits at once, so blocking work (a document
+/// reading) cannot hold the restart. Connections still open (a relay send
+/// under way) end with the process, as they did when SIGTERM killed it.
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -88,13 +91,20 @@ pub async fn run() -> anyhow::Result<()> {
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");
     tokio::spawn(uptime::run_ticker(state.clone()));
-    let app = app(state);
+    let serve = axum::serve(listener, app(state.clone())).into_future();
+    tokio::pin!(serve);
     tokio::select! {
-        served = axum::serve(listener, app).into_future() => served?,
-        () = shutdown() => tracing::info!("stopping: no new connections; open ones end with the process"),
+        served = &mut serve => return Ok(served?),
+        () = shutdown() => state.stopping.begin(),
     }
-    uptime.recorder.drain(DRAIN).await;
-    Ok(())
+    tracing::info!("stopping: sends not started are refused; the records of tries that end are written");
+    // Still serving: what is under way finishes, new sends are refused.
+    tokio::select! {
+        served = &mut serve => served?,
+        _ = uptime.recorder.drain(DRAIN) => {}
+    }
+    tracing::info!("stopped");
+    std::process::exit(0)
 }
 
 /// The whole site: the routes and pages, behind the host rules of

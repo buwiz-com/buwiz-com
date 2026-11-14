@@ -249,3 +249,25 @@ async fn the_gate_refuses_a_test_tin_with_its_own_code(db: PgPool) {
         RelayStart::Send(_) => panic!("the relay would have sent a test TIN's return"),
     }
 }
+
+/// A paused test TIN still answers as a test TIN: never sendable, paused
+/// or not, so the gate and the apps' list say test_only first.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_paused_test_tin_still_answers_test_only(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = test_account(&site, "ana@example.test").await;
+    site.post(&format!("/staff/users/{ana}/test-tin"), &staff, FORM).await;
+    let claim = test_tins(&site.db, ana).await[0].0;
+    let response = site.post(&format!("/staff/claims/{claim}/pause"), &staff, "reason=Check").await;
+    assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=tin_paused"));
+
+    let device = TestDevice::new(&site.db, ana).await;
+    let refused = (403, "tin_test_only".to_owned(), TEST_ONLY.to_owned());
+    assert_eq!(refusal(device.post(&site, "/api/tickets", &ticket_body("p1")).await).await, refused);
+    let tin = buwiz_cloud::tin::Tin::parse_any("000000000", "").unwrap();
+    assert_eq!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::TestOnly);
+    let token = app_token(&site.db, ana).await;
+    let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;
+    assert_eq!((&all[0]["status"], &all[0]["message"]), (&json!("test_only"), &json!(TEST_ONLY)), "{all}");
+}

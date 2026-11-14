@@ -587,9 +587,9 @@ async fn the_sql_and_the_rust_forms_of_the_gate_agree(db: PgPool) {
             assert!(!sendable && !standing.can_send(), "{status} paused={paused}");
             let tin = buwiz_cloud::tin::Tin::parse_any("000000000", &format!("{branch:05}")).unwrap();
             let own = gate::own(db, ana, &tin).await.unwrap();
-            let expected = match (status, paused) {
-                ("approved", true) => gate::Standing::Paused,
-                ("approved", false) => gate::Standing::TestOnly,
+            // Paused or not, an active test TIN answers tin_test_only.
+            let expected = match status {
+                "approved" => gate::Standing::TestOnly,
                 _ => gate::Standing::NotActive,
             };
             assert_eq!((&standing, &own), (&expected, &expected), "{status} paused={paused}");

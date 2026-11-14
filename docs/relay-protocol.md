@@ -89,7 +89,7 @@ not know a code yet treats it as `tin_not_active`.
 | `tin_pending` | Papers waiting for review | This TIN's papers are still being checked, usually within one business day. You can send once it is active. |
 | `tin_needs_fix` | Sent back for a fix | `Sent back for a fix: ` and the fixed reason sentences (never the staff's own note), or `Sent back for a fix. See what to change on My TINs at account.buwiz.com.` |
 | `tin_paused` | Active, but sending is paused | Sending is paused for this TIN. Write to support@buwiz.com. |
-| `tin_test_only` | Active, but a test TIN (root `000-000-000`, which staff add to test accounts only): it never sends, in any relay mode | This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR. |
+| `tin_test_only` | Active, but a test TIN (root `000-000-000`, which staff add to test accounts only): it never sends, in any relay mode, and a paused one answers this code too | This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR. |
 | `tin_not_active` | Anything else | this TIN is not active on your account |
 | `account_banned` | The account is banned (every bearer call but `POST /api/auth/logout`; the token refresh still works) | This Buwiz account is banned: it can't send returns. Write to support@buwiz.com. |
 

@@ -1146,3 +1146,41 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     MIGRATOR.run(&db).await.unwrap();
     assert_eq!(uptime_kept(&db).await, (1, 3, 1, 1, Some(41)));
 }
+
+/// Migration 14 changes two existing tables, `tickets` and `devices`: a
+/// transaction left open on either makes start-up fail within seconds
+/// instead of hanging, and once it ends the migration goes in. The new
+/// check on `tickets` is added without scanning the table (every existing
+/// row is NULL), so it holds no lock longer than adding the column does.
+async fn a_stray_open_transaction_fails_migration_14(db: PgPool, table: &str) {
+    release_13().run(&db).await.unwrap();
+    let mut stray = db.begin().await.unwrap();
+    sqlx::query(&format!("SELECT count(*) FROM {table}")).execute(&mut *stray).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), MIGRATOR.run(&db))
+        .await
+        .expect("the migration waited for the lock without end");
+    let error = outcome.expect_err("the migration ran past an open transaction").to_string();
+    assert!(error.contains("lock timeout"), "{table}: {error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{table}");
+    assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>(), "{table}");
+    stray.rollback().await.unwrap();
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    let validated: bool =
+        sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tickets_bir_admission_check'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(!validated, "the check was added without a scan");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stray_open_transaction_on_tickets_fails_migration_14(db: PgPool) {
+    a_stray_open_transaction_fails_migration_14(db, "tickets").await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stray_open_transaction_on_devices_fails_migration_14(db: PgPool) {
+    a_stray_open_transaction_fails_migration_14(db, "devices").await;
+}

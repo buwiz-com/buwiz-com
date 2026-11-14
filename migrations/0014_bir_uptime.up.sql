@@ -2,14 +2,17 @@
 -- sign and its events, hand-set notes, queue reports and turns, held ticket
 -- requests, upload-server host keys, the day history and proofs of outage.
 -- New tables, and two new nullable columns (`tickets.bir_admission`,
--- `devices.bir_reported_at`): no existing row changes.
+-- `devices.bir_reported_at`): no existing row changes, and no existing
+-- table is scanned under its lock.
 --
--- No uptime table holds a TIN, a name, an email, an IP address or a
--- submission id. Tries keep 8-byte keyed hashes of the account and the
--- network under a day key that lives only in the server's memory, and
--- their times to the minute. Queue reports and turns keep the account id
--- for at most a day; held requests keep it, with the claim (not the TIN),
--- for 90 days, for proofs.
+-- No uptime table holds a TIN, a name, an IP address or a submission id.
+-- Four columns hold an Admin's email, for the audit:
+-- `bir_events.actor_email`, `bir_notes.set_by_email` and
+-- `cleared_by_email`, and `bir_host_keys.confirmed_email`. Tries keep
+-- 8-byte keyed hashes of the account and the network under a day key that
+-- lives only in the server's memory, and their times to the minute. Queue
+-- reports and turns keep the account id for at most a day; held requests
+-- keep it, with the claim (not the TIN), for 90 days, for proofs.
 --
 -- After a rollback and an upgrade again, what the rollback kept in
 -- `rollback_archive` (the day history, events, notes, proofs and the sign)
@@ -213,9 +216,12 @@ CREATE TABLE bir_proofs (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- How a ticket got through the doorman; NULL for tickets from before.
-ALTER TABLE tickets ADD COLUMN bir_admission text
-    CHECK (bir_admission IN ('open', 'admit', 'scout', 'legacy_scout', 'try_anyway'));
+-- How a ticket got through the doorman; NULL for tickets from before. The
+-- check is added NOT VALID: every existing row is NULL, so it holds, and
+-- new rows are checked; validating it would scan the table under the lock.
+ALTER TABLE tickets ADD COLUMN bir_admission text;
+ALTER TABLE tickets ADD CONSTRAINT tickets_bir_admission_check
+    CHECK (bir_admission IN ('open', 'admit', 'scout', 'legacy_scout', 'try_anyway')) NOT VALID;
 -- The first queue report from this device: NULL means an app version that
 -- sends none.
 ALTER TABLE devices ADD COLUMN bir_reported_at timestamptz;

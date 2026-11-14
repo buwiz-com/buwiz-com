@@ -457,7 +457,10 @@ async fn only_an_admin_sets_or_clears_a_note_and_each_is_audited(db: PgPool) {
     let banned = staff(&site, banned, Role::Admin).await;
     for actor in [&support, &forged, &banned] {
         assert!(matches!(notes::set(&uptime, &db, config, actor, outage, t(1)).await, Err(NoteError::AdminOnly)));
-        assert!(matches!(notes::clear(&uptime, &db, config, actor, t(1)).await, Err(NoteError::AdminOnly)));
+        assert!(matches!(
+            notes::clear(&uptime, &db, config, actor, "Made-up reason", t(1)).await,
+            Err(NoteError::AdminOnly)
+        ));
     }
     assert!(note_rows(&db).await.is_empty());
 
@@ -497,12 +500,16 @@ async fn only_an_admin_sets_or_clears_a_note_and_each_is_audited(db: PgPool) {
     // Cleared by an Admin (here the one through ADMIN_EMAILS): audited,
     // and waking starts.
     let other = self::admin(&site).await;
-    notes::clear(&uptime, &db, config, &other, t(3)).await.unwrap();
+    assert!(matches!(notes::clear(&uptime, &db, config, &other, " ", t(3)).await, Err(NoteError::TextMissing)));
+    notes::clear(&uptime, &db, config, &other, "The BIR says it is back", t(3)).await.unwrap();
     let audit = events(&db).await.pop().unwrap();
     assert_eq!((audit.3.as_str(), audit.5.as_deref()), ("note_cleared", Some(STAFF)));
+    assert_eq!(audit.4, "An Admin cleared the note: The BIR says it is back");
+    let why: Option<String> = sqlx::query_scalar("SELECT cleared_reason FROM bir_notes").fetch_one(&db).await.unwrap();
+    assert_eq!(why.as_deref(), Some("The BIR says it is back"));
     assert_eq!(uptime.live.sign().waking_since, Some(t(3)));
     assert_eq!(uptime.live.sign().note, None);
-    assert!(matches!(notes::clear(&uptime, &db, config, &admin, t(4)).await, Err(NoteError::NoNote)));
+    assert!(matches!(notes::clear(&uptime, &db, config, &admin, "Again", t(4)).await, Err(NoteError::NoNote)));
     assert_eq!(
         note_rows(&db).await,
         [(
@@ -525,6 +532,54 @@ async fn only_an_admin_sets_or_clears_a_note_and_each_is_audited(db: PgPool) {
     assert_eq!(uptime.live.sign().upload.state, Light::Offline);
     let audit = events(&db).await.pop().unwrap();
     assert_eq!((audit.3.as_str(), audit.5.as_deref()), ("note_set", Some("admin@example.test")));
+    assert_eq!(audit.4, "An Admin declared the BIR online, ignoring evidence: Ignore the evidence: made-up reason");
+}
+
+/// The role is checked before the engine's lock (nobody else waits on it)
+/// and again in the transaction: an Admin demoted while their request
+/// waited does nothing. The email written is the one the database has then.
+#[sqlx::test]
+async fn an_admin_demoted_mid_request_does_nothing(db: PgPool) {
+    let site = Site::new(db.clone());
+    let config = &site.state.config;
+    let uptime = uptime(t(0));
+    let (admin_id, _) = site.staff_with_role("admin@example.test", "admin").await;
+    let admin = staff(&site, admin_id, Role::Admin).await;
+    let (support, _) = site.staff_with_role("support@example.test", "support").await;
+    let support = staff(&site, support, Role::Support).await;
+    let outage = NewNote { kind: NoteKind::Outage, text: "From the news", until: t(60) };
+
+    // The engine is busy: Support is refused at once, without waiting.
+    let held = live::lock(&uptime, &db, t(1)).await.unwrap();
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        notes::set(&uptime, &db, config, &support, outage, t(1)),
+    )
+    .await
+    .expect("refused without waiting for the engine");
+    assert!(matches!(refused, Err(NoteError::AdminOnly)));
+
+    // The Admin passes the first check and waits; meanwhile they are
+    // demoted. Inside the transaction they are refused.
+    let request = notes::set(&uptime, &db, config, &admin, outage, t(1));
+    let demote = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("UPDATE accounts SET role = NULL WHERE id = $1").bind(admin_id).execute(&db).await.unwrap();
+        drop(held);
+    };
+    let (got, ()) = tokio::join!(request, demote);
+    assert!(matches!(got, Err(NoteError::AdminOnly)), "{got:?}");
+    assert!(note_rows(&db).await.is_empty());
+
+    // Promoted again under a new address: the address written is today's.
+    sqlx::query("UPDATE accounts SET role = 'admin', email = 'renamed-admin@example.test' WHERE id = $1")
+        .bind(admin_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    notes::set(&uptime, &db, config, &admin, outage, t(2)).await.unwrap();
+    assert_eq!(note_rows(&db).await[0].3, "renamed-admin@example.test");
+    assert_eq!(events(&db).await.pop().unwrap().5.as_deref(), Some("renamed-admin@example.test"));
 }
 
 #[sqlx::test]
@@ -552,6 +607,16 @@ async fn an_expired_note_never_blocks_a_new_one(db: PgPool) {
     assert_eq!(rows[1].2.as_deref(), Some("expired"));
     assert_eq!(rows[2].2, None);
     assert_eq!(other.live.sign().state, Light::Offline);
+    // Its end has its line in the log, before the new note's.
+    let last: Vec<(String, String)> =
+        events(&db).await.into_iter().rev().take(2).map(|(.., cause, reason, _)| (cause, reason)).collect();
+    assert_eq!(
+        last,
+        [
+            ("note_set".into(), "An Admin set a planned maintenance note".into()),
+            ("note_expired".into(), "A note ran out before Buwiz saw it end".into())
+        ]
+    );
 }
 
 #[sqlx::test]

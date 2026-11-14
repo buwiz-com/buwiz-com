@@ -295,3 +295,44 @@ async fn a_test_tin_alone_is_no_verified_id(db: PgPool) {
     let verified = text(site.get("/staff/users?filter=verified", &staff).await).await;
     assert!(verified.contains("ana@example.test"), "{verified}");
 }
+
+/// An Admin another Admin labelled a test account adds a test TIN to their
+/// own account, as to anyone's: the line names them as the actor, the
+/// History says it was their own, and the claim is flagged as activated
+/// by its owner.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_admin_adds_a_test_tin_to_their_own_test_account(db: PgPool) {
+    let site = Site::with_admins(db, &[]);
+    let (_, boss) = site.staff_with_role("boss@example.test", "admin").await;
+    let (ana, ana_cookie) = site.staff_with_role("ana@example.test", "admin").await;
+    let user = format!("/staff/users/{ana}");
+    let response = site.post(&format!("{user}/test"), &boss, "test=on&reason=QA+admin").await;
+    assert_eq!(location(&response), format!("{user}?notice=test_marked"));
+    let page = text(site.get(&user, &ana_cookie).await).await;
+    assert!(page.contains(&format!("action=\"{user}/test-tin\"")), "{page}");
+
+    let response = site.post(&format!("{user}/test-tin"), &ana_cookie, FORM).await;
+    assert_eq!(location(&response), format!("{user}?notice=test_tin_added"));
+    let rows = test_tins(&site.db, ana).await;
+    assert_eq!((rows.len(), rows[0].2.as_str(), rows[0].4), (1, "approved", Some(ana)));
+    assert_eq!(
+        claim_audit_lines(&site.db, ana).await,
+        [("activated".into(), "new".into(), "ana@example.test".into(), "web".into(), Some("Trying the app".into()))]
+    );
+    for viewer in [&ana_cookie, &boss] {
+        let history = text(site.get(&user, viewer).await).await;
+        assert!(
+            history.contains(
+                "Staff ana@example.test activated their own TIN ***-***-000-00000 without papers: Trying the app"
+            ),
+            "{history}"
+        );
+        assert!(history.contains("Test TIN 000-000-000-00000 added, active"), "{history}");
+    }
+    let review = text(site.get(&format!("/staff/claims/{}", rows[0].0), &boss).await).await;
+    assert!(review.contains("Activated by its owner, an admin"), "{review}");
+    // The label stays theirs to keep: another Admin takes it off, once the
+    // test TIN is revoked.
+    let response = site.post(&format!("{user}/test"), &ana_cookie, "test=off&reason=Done").await;
+    assert_eq!(location(&response), format!("{user}?notice=own_account"));
+}

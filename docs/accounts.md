@@ -97,7 +97,10 @@ on the staff page of an account with the test label ("Add a test TIN":
 the TIN, its name and kind, a reason), active at once and without papers
 (`verified_by = 'admin'`, an `activated` line with the reason). A real TIN
 is refused there (it is added the usual way, and verified), and so is any
-account without the label. It never sends, whatever `BIR_RELAY_MODE` says:
+account without the label. An Admin whose own account another Admin
+labelled adds one to it as to anyone's; its line names them as the actor
+("Staff … activated their own TIN …"), and the claim is flagged
+"Activated by its owner, an admin". It never sends, whatever `BIR_RELAY_MODE` says:
 the send gate refuses it with `tin_test_only` (tickets, both submission
 calls, the relay), and the Sender refuses one too. It shows as a test TIN
 on My TINs, on the staff pages and in the apps' TIN list (`status:

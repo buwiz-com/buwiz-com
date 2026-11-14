@@ -26,7 +26,12 @@ impl Tin {
     /// `00` in front; an empty branch means head office. A test TIN is
     /// refused ([`Notice::TinZero`]).
     pub fn parse(root: &str, branch: &str) -> Result<Self, Notice> {
-        Self::parse_any(root, branch).and_then(Self::not_test)
+        // Before the branch, as it always was: a zero root with a bad
+        // branch says the root is the problem.
+        if digits(root) == TEST_ROOT {
+            return Err(Notice::TinZero);
+        }
+        Self::parse_any(root, branch)
     }
 
     /// [`Tin::parse`], a test TIN too: for stored rows, the gate (which
@@ -64,7 +69,11 @@ impl Tin {
     /// The TIN and branch code fields of a form. The TIN field may carry the
     /// branch too, as printed on Form 2303; then the branch field is ignored.
     pub fn parse_fields(tin: &str, branch: &str) -> Result<Self, Notice> {
-        Self::parse_fields_any(tin, branch).and_then(Self::not_test)
+        if digits(tin).len() > 9 || digits(branch).is_empty() {
+            Self::parse_combined(tin)
+        } else {
+            Self::parse(tin, branch)
+        }
     }
 
     /// [`Tin::parse_fields`], a test TIN too.
@@ -159,6 +168,11 @@ mod tests {
         // The shape is still checked, and a real TIN is no test TIN.
         assert_eq!(Tin::parse_any("00000000", ""), Err(Notice::TinDigits));
         assert_eq!(Tin::parse_any("000000000", "12"), Err(Notice::TinBranch));
+        // The strict readers name the zero root first, before a bad branch,
+        // as people's forms always did.
+        assert_eq!(Tin::parse("000000000", "12"), Err(Notice::TinZero));
+        assert_eq!(Tin::parse_fields("000-000-000", "12"), Err(Notice::TinZero));
+        assert_eq!(Tin::parse("00000000", "12"), Err(Notice::TinDigits));
         assert!(!Tin::parse_any("000123453", "").unwrap().is_test());
     }
 

@@ -31,7 +31,8 @@
 //! - `--as` that is not an Admin (on a server without `ADMIN_EMAILS` and a
 //!   database with no Admin at all, the file may make `--as` the first
 //!   one), and a change of `--as`'s own role;
-//! - a change of roles that leaves no Admin.
+//! - a change of roles that leaves no Admin, or that leaves only Admins who
+//!   never signed in where one who had was left before.
 //!
 //! A TIN that is not valid (000-000-000, or not 9 digits) is refused on its
 //! own: it is reported and left out, and its login is still made. A test
@@ -525,6 +526,8 @@ pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &
     sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")).execute(&mut *tx).await?;
     roles::lock(&mut tx).await?;
     let admin_emails = options.admin_emails.as_deref().unwrap_or_default();
+    // Admins who have signed in, before the file's roles change anything.
+    let signed_in_admins = roles::other_admins(&mut *tx, admin_emails, None).await?;
     let mut seed = Seed {
         tx,
         run_id,
@@ -544,8 +547,12 @@ pub async fn prepare(db: &PgPool, store: &DocumentStore, file: &[u8], options: &
     for login in &logins {
         ids.push(seed.login(&actor, login).await?);
     }
-    if roles::other_admins(&mut *seed.tx, admin_emails, None).await? == 0 {
+    if roles::admins_on_record(&mut *seed.tx, admin_emails, None).await? == 0 {
         seed.problems.push("the roles in the file leave Buwiz with no Admin".to_owned());
+    } else if signed_in_admins > 0 && roles::other_admins(&mut *seed.tx, admin_emails, None).await? == 0 {
+        // Only Admins nobody signed in as yet are left: one mistyped
+        // address and nobody can sign in as an Admin.
+        seed.problems.push("the roles in the file leave Buwiz with no Admin who has signed in".to_owned());
     }
     for (login, account_id) in logins.iter().zip(&ids) {
         for tin in &login.tins {
@@ -725,7 +732,7 @@ impl Seed<'_> {
         let bootstrap = !admin_now
             && !banned
             && !self.server_list
-            && roles::other_admins(&mut *self.tx, self.admin_emails, None).await? == 0
+            && roles::admins_on_record(&mut *self.tx, self.admin_emails, None).await? == 0
             && logins.iter().any(|login| login.email == email && login.role == Some(Some(Role::Admin)));
         if !admin_now && !bootstrap {
             let why = if banned {
@@ -736,7 +743,7 @@ impl Seed<'_> {
                      the server's ADMIN_EMAILS for a start (the file makes the first Admin only on a server without \
                      that list)"
                 )
-            } else if roles::other_admins(&mut *self.tx, self.admin_emails, None).await? > 0 {
+            } else if roles::admins_on_record(&mut *self.tx, self.admin_emails, None).await? > 0 {
                 format!("--as {email} is not an Admin on this database")
             } else {
                 format!(

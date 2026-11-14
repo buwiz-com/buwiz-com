@@ -174,7 +174,11 @@ async fn tin_card(claim: ClaimRow) -> Result<impl View> {
                         if let Some(note) = claim.removal_note.clone() {
                             <p>(note)</p>
                         }
-                        <p>"You can add the TIN again with new papers."</p>
+                        if test_tin {
+                            <p>"It was a test TIN: our staff add one again if you need it."</p>
+                        } else {
+                            <p>"You can add the TIN again with new papers."</p>
+                        }
                     </div>
                 },
                 _ => {

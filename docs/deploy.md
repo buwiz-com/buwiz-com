@@ -196,6 +196,8 @@ systemctl is-active buwiz-sender.service buwiz.service   # active, active
 
 Use this when the new release runs (the database is at 12) and you need
 the one before. It keeps every account, TIN, ticket, return and receipt.
+From a release with migration 13, it goes **step by step** instead: see
+[below](#rolling-back-from-13).
 
 **What it destroys:** TINs saved without papers (`unverified`) and their
 rows; every stored role (only `ADMIN_EMAILS` makes admins again); the test
@@ -211,8 +213,10 @@ decisions), the whole `account_audit` (bans, roles, labels, sign-outs) and
 the old release does not read. They are the only record of why a TIN that
 stays active was activated without papers. Rolling back twice adds to them.
 
-**What makes it refuse** (it then changes nothing and the database stays at
-12; the newer down file makes every check of the older one first):
+**What makes it refuse** (the file that refuses changes nothing and the
+database stays at 12; the newer down file makes every check of the older
+one first, so from 12 a rollback goes all the way to 10 or changes
+nothing):
 - an account is banned (the old release would let it sign in and send):
   lift each ban;
 - a TIN is paused (the old release would send for it): resume or revoke it;
@@ -240,7 +244,8 @@ The order:
    `sudo systemctl stop buwiz.service`.
 3. From the release's checkout, run the newer down file, then the older,
    each in one transaction (from a release with migration 13, run
-   [its down file](#migration-13-test-tins) first):
+   [its down file](#migration-13-test-tins) first; it commits on its own,
+   [below](#rolling-back-from-13)):
    ```sh
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0012_staff_roles.down.sql
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql
@@ -253,17 +258,34 @@ The order:
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
      -c "SET LOCAL buwiz.rollback_drop_roles = 'yes'" -f migrations/0012_staff_roles.down.sql
    ```
-   If the first file refuses for anything else, nothing changed and the
+   If the first file refuses for anything else, it changed nothing and the
    database is at 12: start the app, resolve it on the staff pages, and go
-   back to step 2. The second file makes no check the first did not make
-   on the same stopped database, so it refuses only if something changed
-   in between; then the database is at 11 and nothing of 11 changed: fix
-   what it names and run the second again.
+   back to step 2 (from 13, the app that runs at 12 is the previous
+   release: [below](#rolling-back-from-13)). The second file makes no
+   check the first did not make on the same stopped database, so it
+   refuses only if something changed in between; then the database is at
+   11 and nothing of 11 changed: fix what it names and run the second
+   again.
 4. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back).
 
 `tests/migrations.rs` runs this whole rollback, by sqlx and by hand, on a
 database with a row in every state.
+
+#### Rolling back from 13
+
+From a release with migration 13 the rollback is **step by step, not all
+the way or nothing**. Each down file commits on its own, and 13's down
+commits before 12's checks run: 13's has none of 12's checks, and 12's
+none of 13's. So:
+- if 13's down file refuses (a test TIN has a row), nothing changed and
+  the database is at 13: this release still runs on it;
+- once 13's down file has run, the database is at 12, whatever 12's down
+  file does next. A refusal by 12's down file leaves it there, at 12,
+  which the previous release (the one before test TINs) runs on: put that
+  release's binaries back and start it, resolve the refusal on its staff
+  pages, and run 12's and 11's down files from there. Starting this
+  release again instead runs migration 13 again.
 
 ### The seed tool
 
@@ -449,7 +471,8 @@ checking the tab daily.
 The release with test TINs ([accounts.md](accounts.md#bans-and-test-accounts))
 runs migration 13 when it starts. It adds one check to `tin_claims`: a row
 whose TIN root is `000000000` (a test TIN) is one an Admin or the seed tool
-made active (`verified_by` `admin` or `seed`). No column changes. The
+made active (`verified_by` `admin` or `seed`), and it is active or ended
+from there (`approved`, `removed` or `revoked`). No column changes. The
 release before it (at 12) refuses to start on a database at 13, as with
 any newer migration.
 
@@ -474,7 +497,9 @@ psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 
 ```
 and put the previous binaries back. Their audit lines stay (the TIN masked,
 `***-***-000-…`). Going further back, to 10, runs 13's down file first,
-then 12's and 11's as [above](#rolling-back).
+then 12's and 11's as [above](#rolling-back), step by step: 13's commits
+before 12's checks run, and a refusal by 12's leaves the database at 12
+([Rolling back from 13](#rolling-back-from-13)).
 
 ## OCR of claim documents
 

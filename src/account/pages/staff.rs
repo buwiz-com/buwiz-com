@@ -812,6 +812,20 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
                                 danger: false
                             )
                         </div>
+                    } else if can_confirm && own_claim {
+                        <div class="sx-acts">
+                            reason_act(
+                                id: format!("act-confirm-{claim_id}"),
+                                label: "Looks right: confirm",
+                                sym: "check",
+                                tone: "pri",
+                                action: confirm.clone(),
+                                question: format!("Confirm your own TIN {tin}?"),
+                                detail: "You checked the papers and they match. They are deleted now. This is your own TIN: write why; it goes in your history.",
+                                confirm: "Confirm",
+                                danger: false
+                            )
+                        </div>
                     } else if can_confirm {
                         <form class="sx-acts" method="post" action=(confirm.clone()) data-confirm=(format!("Confirm {tin} for {}?", claim.email)) data-confirm-detail="You checked the papers and they match. They are deleted now." data-confirm-label="Confirm" data-confirm-tone="danger">
                             <button class="sx-btn pri" type="submit">(ic("check")) "Looks right: confirm"</button>
@@ -849,7 +863,7 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
             <form class="sx-sub sx-form" id="decision" method="post" action=(decide)>
                 <h3>"Decision"</h3>
                 if own_claim {
-                    <p class="sx-text">"This is your own claim. Your decision goes in your history as one on your own account."</p>
+                    <p class="sx-text">"This is your own claim. Your decision goes in your history as one on your own account; to approve it, write why in the note."</p>
                 }
                 if admin_must_approve {
                     <p class="sx-text">"Sending for this TIN was paused before: an admin must approve it. You can still send it back or reject it."</p>
@@ -1258,7 +1272,9 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 })
                 .collect();
             let role = user_role(config, &user);
-            let id_status = IdStatus::of(role.is_some(), own.iter().map(|claim| claim.status.as_str()));
+            // A test TIN proves no identity.
+            let real = own.iter().filter(|claim| claim.tin_root != crate::account::tin::TEST_ROOT);
+            let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
             let badge = role_badge(role);
             let open = list_params(&user.id.to_string());
             let selected = Some(user.id) == selected;
@@ -1409,7 +1425,9 @@ async fn user_summary_data(cx: &Cx, account_id: Uuid, claims: &[queries::UserCla
     let claims: Vec<queries::UserClaim> =
         claims.iter().filter(|claim| claim.account_id == account_id).cloned().collect();
     let role = user_role(&state(cx).config, &user);
-    let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
+    // A test TIN proves no identity.
+    let real = claims.iter().filter(|claim| claim.tin_root != crate::account::tin::TEST_ROOT);
+    let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
     let live_sessions = queries::sessions(db, account_id).await?.iter().filter(|(_, live)| *live).count();
     let apps = queries::apps(db, account_id).await?.into_iter().filter(|app| app.signed_in).collect();
     Ok(Some(UserSummary { badge: role_badge(role), user, claims, id_status, live_sessions, apps }))
@@ -1534,15 +1552,7 @@ async fn new_login_form(open: bool, close: String) -> Result<impl View> {
                     <label class="sx-field">
                         <span>"Email"</span>
                         <input type="email" name="email" required=(true) maxlength="254" autocomplete="off" placeholder="name@example.com">
-                        <span class="sx-hint">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now."</span>
-                    </label>
-                    <label class="sx-field">
-                        <span>"Role"</span>
-                        <select name="role">
-                            <option value="none" selected=(true)>"No staff role"</option>
-                            <option value="support">"Support"</option>
-                            <option value="admin">"Admin"</option>
-                        </select>
+                        <span class="sx-hint">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now. A staff role can be given on their page after their first sign-in."</span>
                     </label>
                     <label class="sx-check-in">
                         <input type="checkbox" name="test" value="on">
@@ -1587,7 +1597,9 @@ pub mod account_id {
         let audit = queries::audit(db, account_id).await?;
         let account_audit = queries::account_audit(db, account_id).await?;
         let role = user_role(config, &user);
-        let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
+        // A test TIN proves no identity.
+        let real = claims.iter().filter(|claim| !claim.tin().is_test());
+        let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
         let (id_label, id_icon, _) = id_status.look();
         let badge = role_badge(role);
         let is_admin = role.is_some_and(|(role, _)| role == Role::Admin);
@@ -1627,6 +1639,8 @@ pub mod account_id {
             })
             .collect();
         let live_sessions = sessions.iter().filter(|(_, live)| *live).count();
+        // A role waits for a first sign-in (`admin::change_role`).
+        let never_signed_in = sessions.is_empty();
         let signed_in: Vec<AppRow> = apps.iter().filter(|app| app.signed_in).cloned().collect();
         let history = history(&user, &claims, &apps, &sessions, &audit, &account_audit);
         let subtitle = {
@@ -1721,7 +1735,12 @@ pub mod account_id {
                                     </div>
                                     <div class="sx-fact">
                                         <span class="k">"Role"</span>
-                                        <span class="v">(badge.map_or("No staff role", |(label, _)| label))</span>
+                                        <span class="v">
+                                            (badge.map_or("No staff role", |(label, _)| label))
+                                            if acts && never_signed_in {
+                                                <span class="sx-text">" They have not signed in yet: a staff role can be given after their first sign-in."</span>
+                                            }
+                                        </span>
                                         if acts {
                                             act(id: "act-role".to_owned(), label: "Change", small: true, question: format!("Change {email}'s role?"), detail: "It takes effect on their next page.".to_owned(),
                                                 <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/role"))>
@@ -1833,7 +1852,8 @@ pub mod account_id {
                             <div class="sx-stack">
                                 <div class="sx-subh">
                                     <span class="sx-faint">(format!("{} TIN{}", claims.len(), if claims.len() == 1 { "" } else { "s" }))</span>
-                                    if admin_viewer && user.test_account && user.banned_at.is_none() {
+                                    // Not for ADMIN_EMAILS: their page cannot take the label off.
+                                    if admin_viewer && user.test_account && user.banned_at.is_none() && !from_server {
                                         test_tin_form(account_id: account_id)
                                     }
                                 </div>
@@ -2021,7 +2041,12 @@ fn history(
     audit: &[AuditRow],
     account_audit: &[AccountAuditRow],
 ) -> Vec<(OffsetDateTime, &'static str, String)> {
-    let mut events = vec![(user.created_at, "person_add", "Created the account".to_owned())];
+    // A login staff or the seed tool made has a `created` line saying who
+    // made it, and why; any other account was made at its first sign-in.
+    let mut events = Vec::new();
+    if !account_audit.iter().any(|line| line.action == "created") {
+        events.push((user.created_at, "person_add", "Made the account at their first sign-in".to_owned()));
+    }
     for (at, _) in sessions {
         events.push((*at, "login", "Signed in on the website".to_owned()));
     }

@@ -645,13 +645,15 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
 
-    // 13 goes back on its own: the release before this one runs at 12.
+    // 13 goes back on its own, and stays back: from 13 the rollback is step
+    // by step. Each refusal below leaves the database at 12, which the
+    // release before test TINs runs on.
     MIGRATOR.undo(&db, 12).await.unwrap();
     assert_eq!(versions(&db).await, (1..=12).collect::<Vec<_>>());
 
-    // A rollback either goes all the way or changes nothing. 0012's down
-    // file refuses first for every reason 0011's would, so each refusal
-    // leaves the database at 12 with nothing dropped.
+    // From 12, a rollback goes all the way to 10 or changes nothing. 0012's
+    // down file refuses first for every reason 0011's would, so each
+    // refusal leaves the database at 12 with nothing dropped.
     let untouched = at_12(&db).await;
     let refuses = |words: &'static str| {
         let db = db.clone();
@@ -903,7 +905,8 @@ async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgP
 }
 
 /// Migration 13: a test TIN (root 000-000-000) is only ever one an Admin or
-/// the seed tool made active, and going back to 12 refuses while any row
+/// the seed tool made active, active or ended (removed, revoked), and going
+/// back to 12 refuses while any row
 /// holds one, then drops the check.
 #[sqlx::test(migrations = false)]
 async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
@@ -920,10 +923,34 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
         ("pending", "", ""),
         ("approved", ", decided_at, verified_by", ", now(), 'staff'"),
         ("approved", ", decided_at, verified_by", ", now(), 'auto'"),
+        // An Admin's or the seed's, but not active or ended from active.
+        ("unverified", ", verified_by", ", 'admin'"),
+        ("pending", ", verified_by", ", 'admin'"),
+        ("needs_fix", ", verified_by", ", 'seed'"),
+        ("rejected", ", verified_by", ", 'admin'"),
+        ("withdrawn", ", verified_by", ", 'seed'"),
     ] {
         fails_with(&db, &insert(status, extra, values), "tin_claims_test_tin_check").await;
     }
+    // Active or ended from active, an Admin's or the seed's.
+    let mut branch = 0;
+    for (status, by) in [("approved", "seed"), ("removed", "admin"), ("revoked", "seed")] {
+        branch += 1;
+        let row = insert(status, ", decided_at, verified_by", &format!(", now(), '{by}'"))
+            .replace("'00000'", &format!("'{branch:05}'"));
+        id(&db, &row).await;
+    }
+    exec(&db, "DELETE FROM tin_claims WHERE tin_root = '000000000'").await;
     let test_tin = id(&db, &insert("approved", ", decided_at, verified_by", ", now(), 'admin'")).await;
+    // Nor can a test TIN's row be moved to another status.
+    for status in ["pending", "unverified", "needs_fix", "rejected", "withdrawn"] {
+        fails_with(
+            &db,
+            &format!("UPDATE tin_claims SET status = '{status}' WHERE id = '{test_tin}'"),
+            "tin_claims_test_tin_check",
+        )
+        .await;
+    }
     // A real TIN is as before.
     exec(
         &db,

@@ -627,6 +627,8 @@ pub struct ClaimRow {
     pub auto_confirmed_at: Option<OffsetDateTime>,
     /// Who decided it: the reviewer, or the Admin who activated it.
     pub decided_by: Option<Uuid>,
+    /// Who confirmed its automatic activation.
+    pub auto_confirmed_by: Option<Uuid>,
 }
 
 impl ClaimRow {
@@ -645,10 +647,13 @@ impl ClaimRow {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
-    /// An Admin activated their own TIN without papers, on the staff pages
-    /// or as the `--as` of a seed run.
+    /// It became active on its owner's own say: an Admin activated it
+    /// without papers (on the staff pages, or as the `--as` of a seed run),
+    /// approved it, or confirmed its automatic activation, on their own
+    /// account.
     pub fn self_activated(&self) -> bool {
-        matches!(self.verified_by.as_deref(), Some("admin" | "seed")) && self.decided_by == Some(self.account_id)
+        self.verified_by.is_some()
+            && (self.decided_by == Some(self.account_id) || self.auto_confirmed_by == Some(self.account_id))
     }
 
     /// When it last went into the review queue: resent, or its papers sent.
@@ -666,7 +671,7 @@ impl ClaimRow {
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
      c.decided_at, c.removed_at, c.removal_note, c.files_changed_at, c.submitted_at, c.verified_by, c.paused_at, \
-     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by";
+     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by, c.auto_confirmed_by";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -822,8 +827,9 @@ pub enum Decision {
 /// so neither a later send-back nor the claimant deleting the claim erases
 /// who decided. Approving a TIN that was ever paused, on any account, is an
 /// Admin's call, and so is deciding one's own claim (its audit line names
-/// the owner as the actor). The reviewer's role is checked again inside the
-/// transaction.
+/// the owner as the actor); approving one's own takes a written reason
+/// (`note`), kept on that line. The reviewer's role is checked again inside
+/// the transaction.
 pub async fn decide(
     db: &PgPool,
     config: &Config,
@@ -893,6 +899,10 @@ pub async fn decide(
     let approve = *decision == Decision::Approve;
     if !approve && note.is_empty() {
         return Err(DecideError::Refused(Notice::RejectNeedsNote));
+    }
+    // As visible as activating it without papers: the reason is on record.
+    if approve && claim.account_id == reviewer.id && note.is_empty() {
+        return Err(DecideError::Refused(Notice::OwnNeedsReason));
     }
     let status = if approve { "approved" } else { "rejected" };
     let updated = sqlx::query(
@@ -1021,7 +1031,8 @@ pub struct NewTestTin<'a> {
 /// 'admin'`), with a reason in its audit line. It never sends: the gate
 /// refuses it (`tin_test_only`). Refused for a TIN that is not a test TIN
 /// (that one is added the usual way, and verified), for an account without
-/// the label or banned, and for a test TIN already active anywhere. Locks
+/// the label or banned, one in `ADMIN_EMAILS`, and for a test TIN already
+/// active anywhere. Locks
 /// as the test label does (the roles lock, the actor, then the account), so
 /// the label cannot come off while one is being added.
 pub async fn add_test_tin(
@@ -1045,15 +1056,20 @@ pub async fn add_test_tin(
     if !roles::may(&mut tx, config, actor.id, Power::ActivateWithoutPapers).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
-    let account: Option<(bool, bool)> =
-        sqlx::query_as("SELECT test_account, banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE")
+    let account: Option<(String, bool, bool)> =
+        sqlx::query_as("SELECT email, test_account, banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE")
             .bind(account_id)
             .fetch_optional(&mut *tx)
             .await?;
     match account {
         None => return Err(DecideError::Refused(Notice::AccountMissing)),
-        Some((false, _)) => return Err(DecideError::Refused(Notice::NotTestAccount)),
-        Some((_, true)) => return Err(DecideError::Refused(Notice::ClaimantBanned)),
+        Some((_, false, _)) => return Err(DecideError::Refused(Notice::NotTestAccount)),
+        Some((_, _, true)) => return Err(DecideError::Refused(Notice::ClaimantBanned)),
+        // Their page has no test-label controls: the label, held in place
+        // by the test TIN, could not come off.
+        Some((email, _, _)) if roles::in_server_setting(config, &email) => {
+            return Err(DecideError::Refused(Notice::TestLabelFromServer));
+        }
         Some(_) => {}
     }
     let there: bool = sqlx::query_scalar(&format!(
@@ -1084,7 +1100,7 @@ pub async fn add_test_tin(
     .await;
     let claim_id = match inserted {
         Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_owner") => {
-            return Err(DecideError::Refused(Notice::TinOwnedElsewhere));
+            return Err(DecideError::Refused(Notice::TestTinOwnedElsewhere));
         }
         // Added at the same moment by another Admin.
         Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_live") => {

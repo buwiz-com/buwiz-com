@@ -72,7 +72,7 @@ pub enum Standing {
     NeedsFix { reasons: Vec<&'static str> },
     /// Active, but staff paused sending.
     Paused,
-    /// Active, but a test TIN: it never sends.
+    /// Active, but a test TIN: it never sends (paused or not).
     TestOnly,
     /// Anything else: no row, ended, someone else's.
     NotActive,
@@ -83,8 +83,9 @@ pub enum Standing {
 /// TIN ([`Tin::is_test`]).
 pub fn classify(claim_id: Uuid, status: &str, paused: bool, fix_reasons: &[String], test_tin: bool) -> Standing {
     match status {
-        "approved" if paused => Standing::Paused,
+        // A test TIN never sends, paused or not: it says so first.
         "approved" if test_tin => Standing::TestOnly,
+        "approved" if paused => Standing::Paused,
         "approved" => Standing::Sendable { claim_id },
         "unverified" => Standing::Unverified,
         "pending" => Standing::Pending,
@@ -238,7 +239,7 @@ mod tests {
     fn an_active_test_tin_never_sends() {
         let id = Uuid::new_v4();
         assert_eq!(classify(id, "approved", false, &[], true), Standing::TestOnly);
-        assert_eq!(classify(id, "approved", true, &[], true), Standing::Paused);
+        assert_eq!(classify(id, "approved", true, &[], true), Standing::TestOnly);
         assert_eq!(classify(id, "removed", false, &[], true), Standing::NotActive);
         let refused = Standing::TestOnly.sendable().unwrap_err();
         assert!(

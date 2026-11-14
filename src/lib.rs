@@ -34,7 +34,14 @@ use crate::filing::link::SenderLink;
 /// The database migrations, for tools and tests that set up their own.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
-/// Reads settings, migrates the database and serves until Ctrl-C.
+/// How long, at shutdown, the BIR uptime records still being written get.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reads settings, migrates the database and serves until SIGTERM (what
+/// systemd sends to stop it) or Ctrl-C. Then it stops taking connections,
+/// gives the BIR uptime records still being written up to 10 seconds, and
+/// exits; connections still open (a relay send under way) end with the
+/// process, as they did when SIGTERM simply killed it.
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -80,9 +87,11 @@ pub async fn run() -> anyhow::Result<()> {
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");
-    axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
-    // The BIR uptime records still being written get a few seconds.
-    uptime.recorder.drain(std::time::Duration::from_secs(10)).await;
+    tokio::select! {
+        served = axum::serve(listener, app).into_future() => served?,
+        () = shutdown() => tracing::info!("stopping: no new connections; open ones end with the process"),
+    }
+    uptime.recorder.drain(DRAIN).await;
     Ok(())
 }
 
@@ -116,6 +125,26 @@ async fn embedded_sender(ticket_key: &ed25519_dalek::SigningKey, issuer: &str) -
     Ok(SenderLink::new(&url, secret))
 }
 
+/// SIGTERM or Ctrl-C.
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "SIGTERM cannot be caught; stopping on Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

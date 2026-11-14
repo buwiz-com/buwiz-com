@@ -262,29 +262,72 @@ pub async fn run_ticker(state: AppState) {
     let mut rolled: Option<(OffsetDateTime, time::Date)> = None;
     loop {
         let now = OffsetDateTime::now_utc();
-        if let Err(error) = live::tick(&uptime, &state.db, now).await {
-            tracing::error!(%error, "BIR uptime: the rules could not run");
-        }
-        let flush = alerts::flush(&uptime, &state.db, &state.mailer, &state.config, now);
-        match tokio::time::timeout(FLUSH_TIMEOUT, flush).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::error!(%error, "BIR uptime: staff mail could not be sent"),
-            Err(_) => tracing::error!("BIR uptime: staff mail took too long; it is sent again"),
-        }
+        guarded("the rules", async {
+            if let Err(error) = live::tick(&uptime, &state.db, now).await {
+                tracing::error!(%error, "BIR uptime: the rules could not run");
+            }
+        })
+        .await;
+        guarded("staff mail", async {
+            let flush = alerts::flush(&uptime, &state.db, &state.mailer, &state.config, now);
+            match tokio::time::timeout(FLUSH_TIMEOUT, flush).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "BIR uptime: staff mail could not be sent"),
+                Err(_) => tracing::error!("BIR uptime: staff mail took too long; it is sent again"),
+            }
+        })
+        .await;
         let day = keys::manila_day(now);
         if rolled.is_none_or(|(at, rolled_day)| now - at >= ROLL_UP_EVERY || rolled_day != day) {
-            match days::roll_up_recent(&uptime, &state.db, now).await {
-                Ok(()) => rolled = Some((now, day)),
-                Err(error) => tracing::error!(%error, "BIR uptime: the day history could not be written"),
-            }
+            guarded("the day history", async {
+                match days::roll_up_recent(&uptime, &state.db, now).await {
+                    Ok(()) => rolled = Some((now, day)),
+                    Err(error) => tracing::error!(%error, "BIR uptime: the day history could not be written"),
+                }
+            })
+            .await;
         }
         tokio::time::sleep(live::TICK).await;
+    }
+}
+
+/// Runs one part of a tick: a panic inside it is logged and the ticker goes
+/// on with the next. `false` if it panicked.
+pub async fn guarded(what: &str, work: impl Future<Output = ()>) -> bool {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        Ok(()) => true,
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            tracing::error!(what, message, "BIR uptime: part of a tick panicked; the ticker goes on");
+            false
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_panic_in_a_tick_is_logged_and_the_ticker_goes_on() {
+        let mut ran = 0;
+        for round in 0..3 {
+            let survived = guarded("a made-up part", async {
+                ran += 1;
+                if round == 1 {
+                    panic!("made-up panic");
+                }
+            })
+            .await;
+            assert_eq!(survived, round != 1);
+        }
+        assert_eq!(ran, 3, "the round after the panic ran");
+    }
 
     #[test]
     fn the_level_reads_four_words_and_defaults_to_record() {

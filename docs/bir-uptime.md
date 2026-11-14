@@ -1,0 +1,805 @@
+# BIR uptime and the smart send queue
+
+How Buwiz learns whether the BIR's servers take returns, and how every app
+(the website, the mini app, the desktop app and the direct-to-BIR app)
+hears it. One contract, v1. It is additive to
+[relay-protocol.md](relay-protocol.md): no existing field, route, frame or
+code changes meaning, and an app that knows nothing of this page keeps
+working ([Compatibility](#12-compatibility)).
+
+**What runs today.** The server's `BIR_UPTIME` setting decides how much of
+this is switched on ([Settings](#13-server-settings)). This release
+records: every real send through the relay leaves one classified row per
+try ([The per-try record](#14-the-per-try-record)). The routes of sections
+4 to 8 answer `404` until a later release switches them on at `public`.
+
+## 0. Ground rules
+
+- **No probing, ever.** Nothing here opens a connection to the BIR to learn
+  its state: not the server, not an app, not a script. The sign is learned
+  only from real returns that people are sending anyway. A "scout" is one
+  real queued return, sent within its owner's own schedule when the server
+  gives it the turn; it is never a test connection.
+- **Every queue rule sends less.** The server can make apps wait longer,
+  never send more, and no user's connection ever carries more tries than its
+  own schedule would. Apps clamp every number the server tunes (section 9).
+- **`unknown` is never resent automatically**, by any app, in any state.
+- **No TIN, no name, no IP address** in any uptime record, header or
+  response (section 11). The proof of outage (section 8) names a return by
+  its masked TIN only.
+- **Randomness only spreads load.** The spread in section 9 exists so a
+  thousand queues that failed together do not come back together. Nothing
+  here hides, disguises or shapes traffic toward the BIR.
+- **All of this goes to Buwiz.** The sign rides on calls apps already make,
+  plus one small queue report every 5 minutes while something is waiting.
+  None of it goes to the BIR.
+
+## 1. Words
+
+| Word | Meaning |
+|---|---|
+| **Try** | One real send of one return: the relay's `open` frames through to its `result`, or one direct-app send. Only `live` tries can count. |
+| **Window** | One of the BIR's two servers in a send. `dispatcher` ("front desk"): says which upload server to use. `upload` ("mailbox"): takes the return over SFTP. |
+| **Light** | The state of one window. |
+| **Sign** | Both lights, the overall state, the times, the note, the relay state and the waits. |
+| **Class** | Whose side a failed try failed on: `bir`, `user_network` (the user's own connection) or `ours` (Buwiz's). |
+| **Counted try** | A `live` try that got in or failed with class `bir` (and not `no_service`). Only counted tries move the sign. |
+| **Turn** | Permission from the server for one queued return to try now. Kind `scout` (while Offline) or `admit` (while Busy or waking). Given only in the answer to a queue report (§6). |
+| **Admission** | How a ticket got through: `open`, `admit`, `scout`, `legacy_scout` or `try_anyway`. |
+| **Slot** | An opaque random id an app gives one queued return in its queue report. Never derived from the TIN, form or period. |
+
+## 2. The sign
+
+### 2.1 States
+
+`state` is one of four values. An app that reads any other value treats it
+as `no_recent_news`.
+
+| `state` | Shown as | Meaning |
+|---|---|---|
+| `online` | Online | Returns land: of the last 10 counted tries, at most 1 failed, and the newest got in. |
+| `busy` | Busy | Some get in, some don't: at least one got in and at least 3 failed, from at least 2 accounts on at least 2 networks, among the last 10. |
+| `offline` | Offline | Nothing gets in: 3 accounts on 3 networks failed within 15 minutes and none got in since. Or an Admin set an outage or maintenance by hand. |
+| `no_recent_news` | No recent news | Nobody filed in the last 60 minutes, so we don't know. |
+
+Busy and Online change with hysteresis: Busy needs 3 failures to enter and
+at most 1 to leave, and a change that lets more through (`busy` to `online`
+or `no_recent_news`) waits until `busy` is 10 minutes old; a change that
+lets less through happens at once. Offline ends only when a relay return
+lands, or after 3 hours with no try at all.
+
+Each window has its own light with the same four values. The overall
+`state` is `offline` if either light is (or a hand-set outage or
+maintenance note is in force), else `busy` if either is, else `online` if
+the upload light is `online`, else `no_recent_news`. An Admin's "declare
+Online" note (`note.kind = online`) makes it `online` until the note ends.
+
+### 2.2 The sign object
+
+All times are UTC, RFC 3339. In the public document, times of past events
+(`since`, `last_*`, `evaluated_at`) are rounded down to 5 minutes, so a
+quiet day's single filing cannot be read off it; future times
+(`scout_at`, `wait_until`) are exact. Words (`words.*`) are English, in
+Manila time.
+
+```json
+{
+  "v": 1,
+  "seq": 4182,
+  "state": "offline",
+  "since": "2026-11-11T07:10:00Z",
+  "evaluated_at": "2026-11-11T09:00:00Z",
+  "source": "tries",
+  "relay": "ok",
+  "windows": {
+    "dispatcher": { "state": "online",  "since": "2026-11-11T01:00:00Z", "last_ok_at": "2026-11-11T08:55:00Z" },
+    "upload":     { "state": "offline", "since": "2026-11-11T07:10:00Z", "last_ok_at": "2026-11-11T07:00:00Z" }
+  },
+  "last_success_at": "2026-11-11T07:00:00Z",
+  "last_news_at": "2026-11-11T08:55:00Z",
+  "last_state": null,
+  "scout_at": "2026-11-11T09:13:41Z",
+  "wait_until": "2026-11-11T09:13:41Z",
+  "admission": false,
+  "note": null,
+  "words": {
+    "title": "BIR is offline",
+    "line": "The BIR's mailbox is offline since 3:10 PM. Buwiz holds returns until it is back."
+  },
+  "queue": { "...": "section 9" },
+  "links": {
+    "status_page": "https://ebirforms.buwiz.com/bir-status",
+    "manual_filing": "https://ebirforms.buwiz.com/bir-status#another-way"
+  }
+}
+```
+
+| Field | |
+|---|---|
+| `v` | Contract version, `1`. |
+| `seq` | Grows by one with every change to the sign and survives server restarts. A client keeps the sign with the highest `seq` it has seen and ignores an older one (a cached response can carry an old sign, §3). |
+| `state`, `since` | Overall state and when it began. |
+| `evaluated_at` | When the server last ran its rules (on every recorded try and every 30 s). |
+| `source` | `tries` (evidence) or `staff` (a hand-set note is in force). |
+| `relay` | `ok`, or `paused`: Buwiz stopped sending because of a fault on its own side that would still touch the BIR (a changed upload-server key, an unknown upload server, front-desk answers it cannot read). While `paused`, new apps send nothing and, under `enforce`, tickets are held with `relay_paused`. |
+| `windows.dispatcher`, `windows.upload` | Each light: `state`, `since`, `last_ok_at` (the last counted try that passed this window; `null` if none in 90 days). |
+| `last_success_at` | The last `live` return that got in. |
+| `last_news_at` | The last counted try of any outcome. |
+| `last_state` | With `no_recent_news` only: the state before the quiet began (`"offline"` after an outage nobody retried for 3 hours). Otherwise `null`. |
+| `scout_at` | With `offline` only: the earliest time the next scout may go. `null` when no scout is planned (nobody eligible is waiting, or a maintenance note is in force). Scouts are at least 15 minutes apart and happen less often when few accounts wait (§6.4). |
+| `wait_until` | While `offline`: the next `scout_at` (or the note's `until`). While `busy` or waking: the earliest time a ticket without a turn can expect a place. Otherwise `null`. Exact, never rounded onto shared marks. |
+| `admission` | `true` while tickets need a turn: Busy, and waking (§6.3). |
+| `note` | A hand-set note in force, or `null`: `{"kind": "outage" \| "maintenance" \| "online", "text": "…", "set_at": "…", "until": "…"}`. `text` is the Admin's words, at most 200 characters, and is public. |
+| `words.title`, `words.line` | The server's sentence for the state, true for every app version. A client may show its own words instead. |
+| `queue` | The queue numbers the server tunes (section 9). |
+| `links` | The public status page and the "Another way to file" steps (§8). |
+
+### 2.3 The compact sign (header)
+
+Where a full object does not fit (section 3), the sign rides as one HTTP
+header, an RFC 8941 dictionary:
+
+```
+buwiz-bir: v=1, seq=4182, state=offline, dispatcher=online, upload=offline, relay=ok, since=1762845000, until=1762852421, scout=1762852421, admit=?0, note=?0
+```
+
+Times are Unix seconds (`since` rounded as in §2.2). `until` is
+`wait_until`; `scout` is `scout_at`; absent members are `null`. A client
+that sees a higher `seq` and wants the note text or the words reads the
+full object (§4.1).
+
+## 3. How apps hear the sign
+
+The sign rides on calls apps already make. The only new request is the
+queue report while something is waiting (§6.1), and its answer carries the
+sign too. A sleeping queue makes no other request.
+
+| Response | Carries |
+|---|---|
+| `GET /.well-known/buwiz-trust.json` | header `buwiz-bir`. This response is `Cache-Control: public, max-age=300`, so its sign can be up to 5 minutes old; `seq` tells. |
+| `GET /.well-known/buwiz-hpke.json` | header `buwiz-bir` |
+| `POST /api/tickets` (every answer, 2xx or not) | header `buwiz-bir`; on a hold also body `bir` (full object) |
+| `POST /api/v2/submissions`, `POST /api/submissions` | header `buwiz-bir` |
+| relay `result` frame | fields `bir` (full object, right after this try was recorded) and `class` |
+| `GET /api/tax-profiles` | header `buwiz-bir` |
+| `POST /api/bir/queue`, `POST /api/bir/reports` | body (full object) |
+| `GET /api/bir/status`, `GET /api/bir/status/mine` | body (full object) |
+
+**Before its first send decision** every app process reads the sign once
+(`GET /api/bir/status`, or a queue report if something waits). It stores
+the last sign and any turn in its settings table, so a restarted process,
+or a one-shot sender on the same database, starts from them.
+
+**How late can it be?**
+
+| Where | Worst case |
+|---|---|
+| A ticket | None: the server holds or admits it at that instant. |
+| The sign as computed | 30 s for changes that come from the clock alone (quiet hours, a note expiring); none for changes caused by a try. |
+| A sleeping queue | 5 minutes (`report_s`): it learns from its next queue report. |
+| A screen (cached read, §4.2) | About 60 s (`sign_read_s`); up to 5 minutes if its newest sign came from the cached trust list. |
+| An app that cannot reach Buwiz | Shows the last sign with its age for `stale_after_s` (10 minutes, wall-clock time, so a sign read before the computer slept is not taken as fresh); after that "Can't reach Buwiz", treated as `no_recent_news`. |
+
+## 4. Reading the sign
+
+### 4.1 Public summary: `GET /api/bir/status`
+
+- No sign-in. The same document for everyone. Served on every host.
+- Answer `200` with the sign object (§2.2), `ETag: "b-{seq}"`, and
+  `Cache-Control: public, max-age=15, stale-while-revalidate=30`.
+  `If-None-Match` with the current `ETag` answers `304`.
+- Rate limit: 120 requests a minute per IP address, held in memory only
+  and never stored. Over it: `429 rate_limited` with `Retry-After`.
+- Safe to expose: no counts, no account, no TIN, no host name, no IP; past
+  times rounded to 5 minutes.
+- `404` while the server's `BIR_UPTIME` setting is below `public`: apps
+  treat that as "this server has no sign".
+
+### 4.2 Signed-in detail: `GET /api/bir/status/mine`
+
+`Authorization: Bearer` (any app scope) or a web session. Rate limit: 60 a
+minute per account. `Cache-Control: private, no-cache`. The sign object
+with exact times, plus:
+
+```json
+"detail": {
+  "last_10": { "got_in": 7, "of": 10 },
+  "today": { "tries": 214, "got_in": 190, "accounts": 61 },
+  "yours": { "waiting": 3, "paused": false, "turn": null }
+}
+```
+
+`yours` comes from this account's own queue reports (§6.1): its waiting
+count across its devices, and a turn if one of its devices holds one.
+
+**The small cached read** (for screens): each client keeps one in memory:
+one request shared by concurrent callers; answered from memory when younger
+than `sign_read_s`; a failure kept 30 s; the last good sign answered for
+`stale_after_s` when offline, marked stale. Ages are wall-clock time. Every
+sign seen on any response (§3) replaces it when its `seq` is higher.
+
+### 4.3 History: `GET /api/bir/history` and `GET /api/bir/history/mine`
+
+`?from=YYYY-MM-DD&to=YYYY-MM-DD` (Manila days, at most 400; default the
+last 90). The public path is the same for everyone, cacheable 5 minutes,
+limited per IP as in §4.1; `/mine` (signed in, limited per account) adds
+counts.
+
+```json
+{
+  "v": 1,
+  "days": [
+    { "day": "2026-11-11", "state": "offline", "hours": "oooooooooooooooxxxxxxxxx", "offline_minutes": 530, "note": "outage" }
+  ],
+  "last_24h": "oooo…96 characters…xxxx"
+}
+```
+
+- `hours`: 24 characters, one per Manila hour, the worst state in that
+  hour: `o` online, `b` busy, `x` offline, `m` hand-set outage or
+  maintenance, `n` no recent news, `-` no data.
+- `last_24h`: 96 characters, one per 15 minutes, oldest first, ending at
+  the current 15-minute mark.
+- `day.state`: the worst state of the day, spelled out. `note`:
+  `"outage"`, `"maintenance"`, `"online"` or absent.
+- `/mine` adds per day `tries`, `got_in`, `failed` (counted tries).
+
+Days come from the one-line-per-day history kept forever; today's line is
+computed live.
+
+### 4.4 Pages
+
+| Address | Who |
+|---|---|
+| `https://ebirforms.buwiz.com/bir-status` | Public status page: the sign, the 24-hour bar and the month calendar (the same calendar view staff see, without counts), and "Another way to file" (§8). |
+| `https://account.buwiz.com/tins` | A banner at the top of My TINs while the state is `busy` or `offline`, or a hand-set note is in force. Not for `no_recent_news`. |
+| `/staff/bir` | The staff "BIR status" page. |
+
+## 5. Holds on tickets
+
+Holds are switched on with `BIR_UPTIME=enforce`, and only once no mini app
+0.3.2 install remains ([Compatibility](#12-compatibility)). Until then the
+server runs at `public` at most: the sign, queue reports, turns and scouts
+all work, new apps follow them by themselves, and no ticket is ever refused
+for the BIR's state.
+
+### 5.1 When a ticket is held (under `enforce`)
+
+| Sign | A ticket without a turn | With a valid turn (§6.2) | With `bir_try_anyway` (§5.3) |
+|---|---|---|---|
+| `online` without admission; `no_recent_news` | admitted (`open`) | admitted (`admit` or `scout`) | admitted (the flag is ignored) |
+| `busy`, or `online` with `admission: true` (waking) | admitted (`open`) only into a free place of its share of the doorman's limit (§6.3); else held `bir_busy` | admitted | admitted, within its limits |
+| `offline` | held `bir_offline`, except the legacy scout (§6.4) | admitted | admitted, within its limits |
+| any, with `relay: paused` | held `relay_paused` | held `relay_paused` | held `relay_paused` |
+
+A hold creates no ticket, so it never counts toward the ticket quotas
+(30/hour per account and device, 50/day per TIN). The server keeps a record
+of each held request for the account (so a proof of outage can show the
+person tried, §8).
+
+### 5.2 The hold answer
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 841
+buwiz-bir: v=1, seq=4182, state=offline, …
+
+{"error": {"code": "bir_offline",
+           "message": "The BIR is offline, so Buwiz held this return. Nothing reached the BIR. Wait until about 5:15 PM.",
+           "wait_until": "2026-11-11T09:13:41Z",
+           "retry_after": 841,
+           "try_anyway": {"allowed": true, "next_at": null}},
+ "bir": { …the sign object… }}
+```
+
+The words are true for every app version, including old ones that retry on
+their own clock and the ones that put the return back to Draft (§12): no
+hold message promises that the return "goes by itself".
+
+Why `503` with a new code: every app version that can send treats a ticket
+error whose code is not a TIN refusal as "not sent". What each version then
+does is in §12.
+
+A v1 submission (no ticket) is held when its relay opens: the `result` is
+`failed` with the same message and **no code in brackets** (so v1 clients
+may retry it), plus `"hold": {"code": "bir_offline", "wait_until": "…"}`,
+`class: "ours"` and `bir`.
+
+### 5.3 "Try anyway" for one return
+
+A person, in the app, may push one return while it is held or asleep:
+
+```json
+POST /api/tickets   (signed)
+{ …the usual fields…, "bir_try_anyway": true }
+```
+
+- **Only a person's own press in the app.** Never the queue, never an AI
+  agent: no MCP or assistant tool can set it. The app refuses it for a
+  return that is claimed (being sent) or has an `unknown` outcome.
+- The app never repeats it: after one Try anyway, the button stays off for
+  that return until the sign changes or 30 minutes pass.
+- Server limits: one per account per 30 minutes, three per account per
+  day, 30 across Buwiz per 15 minutes. Over a limit: `429
+  try_anyway_limited` with `try_anyway.next_at`.
+- It does not lift `relay: paused`.
+- It is a real try: it counts as evidence and, if it lands, ends Offline
+  like a scout. If it fails, it counts on that return's own schedule like
+  any try.
+
+## 6. Turns, queue reports and scouts
+
+The server does not know what is waiting in apps. Apps tell it, with no TIN
+or name, so it can hand out turns: scouts while Offline, and "a few at a
+time, due soonest first" while Busy or waking.
+
+### 6.1 The queue report: `POST /api/bir/queue`
+
+Signed like `/api/tickets` (device key) for the desktop and mini app. The
+direct app, which has no device key, sends it with its Bearer token
+(client `buwiz-direct`).
+
+```json
+{
+  "v": 1,
+  "client": "desktop",
+  "paused": false,
+  "sending": null,
+  "waiting": [
+    { "slot": "q_3kV9Yq2n4m1ZbCwQx8sQ", "due": "2026-11-10", "queued_at": "2026-11-09T02:15:00Z", "next_try_at": "2026-11-11T09:30:00Z" },
+    { "slot": "q_Hc0pT7wR2aZy1M9eVn4k", "due": "2026-11-25", "queued_at": "2026-11-10T03:00:00Z", "next_try_at": null }
+  ]
+}
+```
+
+| Field | |
+|---|---|
+| `client` | `desktop`, `mini` or `direct`. |
+| `paused` | The person switched the queue to Pause. A paused queue is never a scout and gets no turns; its returns count as waiting (paused). |
+| `sending` | The slot being sent right now, or `null`. |
+| `waiting[].slot` | 16 random bytes, base64url, prefixed `q_`. Made when the return is queued, new on every requeue. |
+| `waiting[].due` | The return's BIR due date (Manila date). Refused if more than a day before today. |
+| `waiting[].queued_at` | When it was queued. |
+| `waiting[].next_try_at` | When this return may next try on its own schedule, or `null` if now. A return is eligible for a turn only once this has passed. |
+
+At most 20 slots per device. Send it when the queue changes (a return
+queued, sent, cancelled, paused, resumed), and otherwise every `report_s`
+(at most 300 s) while anything waits, or sooner when the last answer's
+`next_report_by` says so. When the queue empties, send one final report
+with `"waiting": []`. Nothing is sent while nothing waits. A report
+replaces this device's earlier one; the server forgets a report 20 minutes
+after it arrives.
+
+Answer `200`:
+
+```json
+{
+  "bir": { …the sign object… },
+  "turn": { "id": "t_9QnZ…", "slot": "q_3kV9Yq2n4m1ZbCwQx8sQ", "kind": "scout",
+            "not_before": "2026-11-11T09:13:41Z", "expires_at": "2026-11-11T09:18:41Z" },
+  "next_report_by": "2026-11-11T09:10:00Z"
+}
+```
+
+- `turn` is `null` or one turn for one of this device's eligible slots.
+  Turns are given only here.
+- `next_report_by`: report again by then. The server shortens it (down to
+  60 s) while it plans to give this device a turn; apps clamp it to
+  60–300 s.
+- Errors: `400 bad_queue_report`; `401`/`403` as for any signed call.
+
+### 6.2 Using a turn
+
+Ask for the ticket with the turn's id, at or after `not_before`, before
+`expires_at`:
+
+```json
+POST /api/tickets   (signed)
+{ …the usual fields…, "bir_turn": "t_9QnZ…" }
+```
+
+The turn is spent on that ticket. An expired, spent or unknown turn is
+ignored and the request is treated as one without a turn. The 201 answer
+adds `"admission"` (§1). A turn always wins over a stored `wait_until`.
+Once a ticket is admitted, the app completes the send whatever the sign
+does meanwhile.
+
+The direct app, which takes no tickets, uses a turn by trying at the turn's
+time and naming it in its report (§7).
+
+### 6.3 Admission: a few at a time, due soonest first
+
+While `admission` is `true`:
+
+- The server keeps a limit L of returns in flight: turns granted and not
+  yet expired or used, plus tickets admitted in the last 3 minutes (the
+  longest a failing try can take) whose send has no result. L starts at 3,
+  goes up by 1 for every return that lands (at most 20), and halves (at
+  least 1) for a BIR-side failure from an account or network that got a
+  return in within the last hour. Failures from accounts and networks with
+  no recent success do not shrink it.
+- Of L, a share (a third, at least 1) is reserved for tickets from devices
+  that have never sent a queue report, so old app versions are not starved.
+  The rest goes to reported slots, due soonest first (earliest `due`, then
+  earliest `queued_at`), one turn per device at a time, only to slots whose
+  `next_try_at` has passed.
+- A ticket without a turn is admitted only into a free place of the
+  reserved share; otherwise it is held `bir_busy` (under `enforce`).
+- `admission` turns on when the sign enters `busy`, when Offline ends, and
+  when a hand-set outage or maintenance note ends ("waking"). Waking ends
+  when fewer than L slots are waiting.
+
+### 6.4 Scouts (while Offline)
+
+- At most one scout in flight, and scouts at least 15 minutes apart
+  (`scout_at`), the first 15 minutes after Offline began.
+- **Who:** a slot from a device whose report is under 10 minutes old, not
+  paused, whose own `next_try_at` has passed. An account scouts at most
+  once per its own current wait (a failed scout counts on that return's own
+  schedule, so its `next_try_at` moves on). Among those: an account other
+  than the previous scout's; then the account scouted fewest times in this
+  outage; then the slot due soonest; then the earliest report. The previous
+  scout's account may go again only when it is the only eligible one.
+  Relay apps come before the direct app.
+- **Few accounts waiting:** scouts simply happen less often than every 15
+  minutes, because nobody is eligible sooner. No user's connection ever
+  carries more tries than its own schedule would.
+- **How:** the server picks 5 minutes before `scout_at` and gives the turn
+  in that device's next report answer (shortening its `next_report_by` to
+  60 s). If the turn is not used by `expires_at`, the next eligible
+  candidate gets one at its next report.
+- **Legacy scout** (old apps send no reports): if no reported device is
+  eligible, the first ticket request at or after `scout_at` is admitted as
+  the scout (`legacy_scout`), from an account other than the previous
+  scout's unless it is the only one. Ticket requests held in the last 30
+  minutes count as "someone waiting", so `scout_at` stays set for them.
+- **Nobody waiting:** no scout, `scout_at` is `null`, and the sign stays
+  `offline` until a try lands. After 3 hours with no try at all, it reads
+  `no_recent_news` with `last_state: "offline"` and holds stop.
+- **Maintenance note:** no scouts until its `until`. An outage note keeps
+  scouting.
+- A scout that lands ends Offline at once and starts waking (§6.3).
+
+### 6.5 "Tell me when it is back"
+
+No server endpoint: the app remembers the request locally and tells the
+person when the sign it reads turns from `offline` to anything else. The
+server keeps no list of who asked.
+
+## 7. The direct app's reports: `POST /api/bir/reports`
+
+The direct-to-BIR app talks to the BIR itself, so the server sees none of
+its traffic. It reads the sign before every front-desk request (§4.1),
+follows sleep, waits and turns itself, and reports its tries.
+
+```json
+POST /api/bir/reports
+Authorization: Bearer <access token of the buwiz-direct client, app scope>
+buwiz-client: buwiz-forms/1.5.0
+
+{
+  "v": 1,
+  "tries": [
+    {
+      "id": "0b8f6e6c-1e4d-4b9a-8f2d-6c1e8f0b11aa",
+      "started_at": "2026-11-11T07:12:00Z",
+      "ended_at": "2026-11-11T07:12:31Z",
+      "outcome": "failed",
+      "dispatcher": "ok",
+      "dispatcher_tls": true,
+      "upload": "fail",
+      "failure_kind": "timeout",
+      "turn": null,
+      "try_anyway": false
+    }
+  ]
+}
+```
+
+| Field | Values |
+|---|---|
+| `id` | A random UUID per try (dedupe). |
+| `outcome` | `sent`, `failed` (nothing reached the BIR), `unknown` (the upload broke midway). |
+| `dispatcher` | `ok`, `fail`, `none` (not reached). |
+| `dispatcher_tls` | Whether the front-desk answer (or the last front-desk failure) was over HTTPS. Only HTTPS counts as front-desk evidence. |
+| `upload` | `ok`, `fail`, `maybe` (the `unknown` case), `none`. |
+| `failure_kind` | The kinds of relay tries ([Kinds](#142-classes-and-kinds)): `dns`, `refused`, `timeout`, `reset`, `tls`, `http`, `ssh`, `login`, `cut`, `no_service`, `host_key`, `unknown_host`, `protocol`, `local`, `other`. The server maps them to the same three classes. |
+| `turn` | The turn id this try used, if any. |
+
+- The server stamps each try with the network of the request. A try sent
+  more than 2 minutes after it ended is marked late, and a late try's
+  network does not count toward "3 networks".
+- At most 50 tries per request, one request a minute, 60 tries an hour per
+  account; tries older than 24 hours or in the future are ignored.
+- Counted only for accounts with an approved, real (not test) TIN; others
+  get `200` and are ignored.
+- Answer `200 {"accepted": n, "ignored": m, "bir": { …sign… }}`. Errors:
+  `400 bad_report`, `429 report_limited`.
+
+**Why the server trusts it only partly.** A report is the app's word: the
+server cannot see the connection. So a direct-app try:
+
+- is at most one of the three accounts that turn the sign Offline;
+- never counts as "a return got in since" (it cannot hold Offline off) and
+  never ends Offline;
+- counts in Busy and Online like any try, at most 2 per account in the
+  last 10.
+
+## 8. Due dates: the alarm and the proof of outage
+
+**The alarm** is the app's: it knows its returns' due dates. When a waiting
+return is due today or earlier (Manila) and the sign is `offline`, or
+`busy` for more than an hour, the app shows "N returns are due today and
+the BIR is down" with **Filing steps** (opens `links.manual_filing`) and
+**Proof of outage**. Until the steps are approved, that part of the status
+page is a placeholder that says so.
+
+**The proof:** `POST /api/bir/proofs` (Bearer, app scope, or web session):
+
+```json
+{ "day": "2026-11-10", "tin": "123-456-789-00000", "form": "1601C", "period": "102026",
+  "queued_at": "2026-11-09T02:15:00Z" }
+```
+
+- The TIN must be one the caller holds or held (a claim on the account);
+  it is used only to find the return's records and is never stored in the
+  proof record or any uptime table.
+- `201` with a signed record:
+  `{"id": "p_…", "url": "https://ebirforms.buwiz.com/bir-status/proof/p_…", "jws": "<compact JWS>"}`.
+- The JWS (`alg: EdDSA`, `typ: buwiz-outage-proof+jwt`, header `kid`; keys
+  at `GET /.well-known/buwiz-outage-keys.json`) carries `iss`, `jti`,
+  `iat`, `day`, and:
+  - `return`: `tin_masked` (`***-***-789-00000`), `form` and `period` as
+    stored;
+  - `observed`: what Buwiz observed that day: the outages (`{from, to,
+    window, source}`), Buwiz-wide counted tries (`tries`, `failed`,
+    `accounts`, `networks`), this account's own tries of that return
+    (times and outcomes, from its submissions) and its held requests for it
+    (times and codes);
+  - `reported_by_app`: `queued_at` as the app gave it, marked as the app's
+    word.
+- Every claim on the page reads "Buwiz observed …" or "Your app reported
+  …". The `url` page is `noindex`, shows the same facts for printing, and
+  lets anyone with the link check the signature.
+- `409 no_outage_on_day` when Buwiz observed no outage that day; `403
+  tin_not_active` for a TIN that is not the caller's; `429 proof_limited`
+  after 10 proofs per account per day.
+
+## 9. The queue numbers
+
+The sign's `queue` object. The server may change these without an app
+release (`BIR_QUEUE_POLICY`), only toward sending less. Apps clamp every
+value and use the default when a value is missing or outside its range.
+
+```json
+"queue": { "waits_s": [300, 1800, 3600, 7200], "repeat_s": 7200, "spread": 0.5,
+           "notice_after_s": 86400, "sign_read_s": 60, "report_s": 300, "stale_after_s": 600 }
+```
+
+| Key | Default | Client clamp | Meaning |
+|---|---|---|---|
+| `waits_s` | 300, 1800, 3600, 7200 | exactly 4 entries; each at least its default and at most 21600 | The wait after a return's 1st, 2nd, 3rd and 4th failed try. |
+| `repeat_s` | 7200 | 7200–21600 | Every wait after that. |
+| `spread` | 0.5 | 0.2–0.5 | Each wait is multiplied by a random factor, uniform between `1 − spread` and `1 + spread`. With 0.5: 5 minutes becomes anywhere from 2.5 to 7.5. |
+| `notice_after_s` | 86400 | 3600–604800 | Tell the person a return is still waiting after this long, and again each time this long passes. |
+| `sign_read_s` | 60 | 30–600 | Screens' cached sign read. Not used by a sleeping queue. |
+| `report_s` | 300 | 60–300 | Queue report interval while anything waits. |
+| `stale_after_s` | 600 | at least 2 × `sign_read_s`, at most 3600 | How long an unreachable server's last sign is still believed. |
+
+**Fixed in every app** (not tunable):
+
+- One return in flight at a time, per database.
+- A return's wait starts when its try ends. If a `wait_until` is later,
+  the try goes at `wait_until` plus a random share (0 to `spread`) of the
+  time that was left until it, so held queues do not all return at once.
+- A try counts on the return's schedule when it failed with class `bir` or
+  `user_network`. A hold, a sign-out, Buwiz being unreachable, a TIN
+  refusal or a failure of class `ours` is never a try.
+- `unknown` is never resent by itself.
+- While the sign is `offline` or `relay` is `paused`, no try except with a
+  scout turn or a person's Try anyway; the sleep is not counted.
+- Never before `wait_until`, unless a turn says so.
+- When Offline ends, every return's back-off from before the outage resets.
+- Try anyway only from a person; Pause stops everything.
+
+## 10. Codes
+
+New codes. The `message` is what every app version shows, so it is true
+for all of them.
+
+| HTTP | `code` | Where | `message` |
+|---|---|---|---|
+| 503 | `bir_offline` | tickets; v1 relay `hold` | The BIR is offline, so Buwiz held this return. Nothing reached the BIR. Wait until about {h:mm AM}. |
+| 503 | `bir_offline` (maintenance note) | same | The BIR has planned maintenance until about {h:mm AM}, so Buwiz held this return. Nothing reached the BIR. |
+| 503 | `bir_busy` | tickets; v1 relay `hold` | The BIR is busy, so Buwiz lets returns in a few at a time. Nothing reached the BIR. Wait until about {h:mm AM}. |
+| 503 | `relay_paused` | tickets; v1 relay `hold` | Buwiz has paused sending because of a problem on our side. Nothing reached the BIR. We are fixing it. |
+| 429 | `try_anyway_limited` | tickets | You used Try anyway a moment ago. You can use it again at {h:mm AM}. |
+| 429 | `rate_limited` | `/api/bir/status`, `/api/bir/history` (and `/mine`) | Too many requests. Try again in a minute. |
+| 429 | `report_limited` | `/api/bir/reports` | Too many reports. Send them again in a minute. |
+| 429 | `proof_limited` | `/api/bir/proofs` | Too many proofs today. Try again tomorrow. |
+| 400 | `bad_queue_report` | `/api/bir/queue` | The queue report is not valid: {what}. |
+| 400 | `bad_report` | `/api/bir/reports` | The report is not valid: {what}. |
+| 409 | `no_outage_on_day` | `/api/bir/proofs` | Buwiz observed no BIR outage on {day}. A proof is only made for a day it did. |
+
+Times in messages are Manila time, rounded to the next 5 minutes for
+reading; the `wait_until` field is exact. None of these codes is a TIN
+refusal.
+
+**`class`** appears on the relay `result` (`bir`, `user_network` or
+`ours`; absent for `sent` and `dry_run`, and for a try in `lab` mode) and
+on `500 internal` and `relay_paused` error bodies (`ours`). Apps do not
+count an `ours` failure as a try.
+
+App-side words (shared by the desktop and mini app):
+
+| Situation | Queue line |
+|---|---|
+| Offline, asleep | BIR is offline · goes by itself when it's back |
+| Busy, waiting for a turn | BIR is busy · tries again in about 6 min |
+| Waiting behind another | Goes right after the one above |
+| Failed on the BIR's side | The BIR's mailbox didn't answer. Tries again in about 30 min. |
+| Others get in, this device does not | Returns are getting in for others. The problem may be your own connection. Tries again in about 2 h. |
+| No upload service for this TIN | The BIR has no upload service for this TIN right now. It tries again later; you can file another way. |
+| Buwiz paused sending | Buwiz paused sending · nothing was sent |
+| Paused | Your queue is paused · press Auto to send |
+| Still waiting after 24 h | Still waiting after 24 hours. It keeps trying by itself; you can cancel it or file another way. |
+
+## 11. Privacy
+
+- No uptime record (`bir_tries`, `bir_days`, `bir_events`,
+  `bir_queue_reports`, `bir_turns`, `bir_held`, `bir_host_keys`) holds a
+  TIN, a name, an email or an IP address. `bir_tries` times are kept to
+  the minute.
+- **Network key.** The server sees the caller's address only in the
+  Cloudflare tunnel's `CF-Connecting-IP` header (nothing on the instance
+  listens publicly, [deploy.md](deploy.md)). It reduces the address to its
+  network (IPv4 /24, IPv6 /48) and keeps `HMAC-SHA256(day_key, network)`
+  cut to 8 bytes. `day_key` is random, held only in memory, and replaced at
+  Manila midnight and on restart; the previous key is kept in memory for 3
+  hours after, so a new try can be compared with recent ones. After that,
+  no one can tell which network a key was. The address and the network are
+  never written anywhere.
+- **Account key.** Uptime tries keep `HMAC-SHA256(day_key, account_id)`
+  (8 bytes), never the account id. Live turns and queue reports keep the
+  account id for at most a day (scouts rotate between accounts); held
+  requests keep it, with the claim they were for, for 90 days, for proofs.
+- Rate limits per IP and the day's distinct-account and distinct-network
+  counts are kept in memory only.
+- Public answers carry no counts, and their past times are rounded to 5
+  minutes. A hand-set note's text is public; the form says so and asks for
+  no personal data.
+- The proof of outage is made only by the person, for their own return,
+  and names it by its masked TIN.
+
+## 12. Compatibility
+
+**What each released version does with a hold**:
+
+| Version | With a `503 bir_*` on the ticket |
+|---|---|
+| Desktop v0.1.0 | Cannot send at all (it has no trust key, so no trust list verifies), so it never meets a hold. |
+| Mini 0.3.0, 0.3.1 | Cannot send at all (no trust key). |
+| Mini 0.3.2 | A queued **1601C or 2551Q** is stranded: an error after the claim keeps the claim, so the return shows "BIR may already have this return" and never retries. Other forms back off and retry. |
+| Mini 0.3.3 | A plain failed try: retries after 1, 2, 4, 8 minutes, and after the fifth goes back to Draft with the message (about 15 minutes of holds), in Busy and waking too. |
+| Mini 0.4.0 | Same as 0.3.3. |
+
+So `enforce` waits until no mini 0.3.2 install remains, and its release
+gate runs 0.3.2, 0.3.3 and 0.4.0 against a local server. New builds send
+`buwiz-client: <app>/<version>` on every request.
+
+**New apps on an old server** (no sign; `/api/bir/*` answer `404`): the
+smart queue without the sign: the waits of section 9, the spread, one at a
+time, stay queued, no sleeping. No queue reports for an hour after a
+`404`. **At `record`:** the same. **At `public` and `enforce`:** the full
+behaviour.
+
+**Versioning:** fields and codes may be added to v1. A client ignores
+fields it does not know and treats an unknown `state` as `no_recent_news`,
+an unknown turn `kind` as no turn, an unknown `class` as `bir`, and an
+unknown error code as a plain failed try. A change that would break this
+goes to `/api/bir/v2/…` and `v=2`.
+
+**Relay frames:** the relay `Control` type does not change. The `result`
+frame's new `bir`, `class` and `hold` fields, and an app's `refused.kind`
+(`"dns" | "refused" | "timeout" | "unreachable" | "denied" | "not_listed"`),
+are extra JSON keys that every `Control` reader in use ignores (none denies
+unknown fields; an extra key on `refused` and `result` parses, an unknown
+`type` fails and is ignored). The server reads them from the raw JSON with
+its own types. The Sender's `sender` frame stops at the Gatekeeper and
+never reaches an app ([relay-protocol.md](relay-protocol.md#6-the-sender)).
+
+## 13. Server settings
+
+Gatekeeper (`buwiz-cloud`):
+
+| Setting | Default | |
+|---|---|---|
+| `BIR_UPTIME` | `record` | `off`: nothing new runs (the Sender's `sender` frame is still dropped). `record`: every relay try is recorded and classified (§14); clients see no change. `public`: plus `class` on the relay `result` and `mode` on failed and unknown submissions; later releases add the routes of §4 to §8, the `buwiz-bir` header and `bir` on results here. `enforce`: plus holds on tickets and the v1 relay, the legacy scout and Try anyway. Below `public` the public routes answer `404`. A value it does not know is logged and read as `record`; it never stops the server from starting. |
+| `BIR_UPTIME_UPLOAD_PORTS` | `22` | Comma-separated ports whose relay streams are the upload window; every other stream is the front desk. A value it cannot read is logged and the default is used. |
+
+Going down a level is a setting and a restart.
+
+## 14. The per-try record
+
+The Gatekeeper sees every frame of a relay send (it bridges the app to the
+Sender, [relay-protocol.md](relay-protocol.md) §6), so it records each try
+without touching the BIR or the private relay code: `src/uptime/observe.rs`
+watches the frames, `src/uptime/classify.rs` names the outcome,
+`src/uptime/sshkex.rs` reads the upload server's host key from the SSH
+handshake, which passes in clear before encryption starts, and
+`src/uptime/store.rs` writes one row. Recording never fails a send: an
+error is logged without the try's details and the try is lost.
+
+### 14.1 What the observer reads
+
+| Frame (in the Gatekeeper's bridge) | Read as |
+|---|---|
+| The Sender's first text frame `{"type":"sender","mode":"live"}` | The relay mode (`live`, `lab`, `dry_run`). Dropped there, never forwarded to the app. A try without it is `mode: unknown` and never counted. |
+| Sender `open{stream,port}` | A stream: `upload` if its port is in `BIR_UPTIME_UPLOAD_PORTS`, else `dispatcher` (front desk), which is TLS on port 443. In `lab` every stream is the upload. Host names are not kept. |
+| App `opened` / `refused{reason[,kind]}` | The stream's answer. Forwarded unchanged. |
+| App binary data | Bytes from the far end; on an upload stream, the SSH handshake (the first 64 KB at most). |
+| Neither answer before the Sender's next `open` or its `result` | The stream had no answer (the Sender's 20 s timeout). |
+| The app's socket closing before `result` | The app went away. |
+| Sender `result` | The outcome and its error text. |
+
+### 14.2 Classes and kinds
+
+Precedence: `sent` wins; then an `unknown` result from the Sender (even
+when the app also went away); then the Sender being lost; then the app
+going away; then the table.
+
+| Seen | `stage` | `dispatcher` | `upload` | class / kind |
+|---|---|---|---|---|
+| `sent` | `uploaded` | `ok` if the front-desk stream that answered was TLS, else `none` (lab: `none`) | `ok` | none |
+| `unknown` from the Sender | `upload` | as reached | `maybe` | `bir` / `cut`: counts toward Busy, never toward Offline |
+| The Sender stopped without a result | as reached | `none` | `maybe` if the upload was opened, else `none` | `ours` / `sender_down` |
+| The app went away before `result` | as reached | `none` | `none` | `user_network` / `app_gone` |
+| No `open` at all | `none` | `none` | `none` | `ours` / `sender_down` (Sender unreachable), `not_built_in`, `refusal` (a TIN refusal), `mismatch` (`return_mismatch`), `ticket` (ticket or envelope), `other` |
+| A `refused` "is not on the signed trust list" or "is not a BIR server" (or `kind: not_listed`) | as reached | `none` | `none` | `ours` / `trust_list` |
+| A `refused` with `kind: denied` or `unreachable`, or "permission denied" / "network is unreachable" (or a reason it cannot read) | as reached | `none` | `none` | `user_network` / `local` |
+| Every front-desk stream refused, unanswered or failed; no upload `open` | `dispatcher` | `fail` if a TLS stream was tried, else `none` | `none` | `bir` / `dns`, `refused`, `timeout`, `reset`, `tls`, `http`: the first TLS stream's, else the first stream's. "No route to host" is `refused`. |
+| The front desk said "no upload server for this TIN (mode 0)" | `dispatcher` | `none` | `none` | `bir` / `no_service`: evidence for no light |
+| The front desk's answer "was not understood" or "did not unwrap" | `dispatcher` | `none` | `none` | `ours` / `protocol`: touched the BIR |
+| An upload `open` happened | `upload` | `ok` if the front-desk stream that answered (the last with bytes before it) was TLS, else `none` | the rows below | |
+| Upload `refused` or unanswered | `upload` | | `fail` | `bir` / `refused`, `timeout`, `dns` |
+| Upload opened; "host key is not pinned" | `upload` | | `none` | `ours` / `host_key`: touched the BIR; the key offered is recorded |
+| The front desk named an upload server not on the Sender's list ("unknown upload server"; nothing is opened to it) | `dispatcher` | `ok` if the stream that answered was TLS, else `none` | `none` | `ours` / `unknown_host`: touched the BIR |
+| Upload opened; any other failure (SSH failed, login refused, before the upload, timed out) | `upload` | | `fail` | `bir` / `ssh`, `login`, `timeout` |
+| "could not encrypt", "no lab SFTP server set" | any | | | `ours` / `other` |
+
+`counted = mode = 'live' AND (outcome = 'sent' OR class = 'bir') AND kind <> 'no_service'`.
+A DNS failure is `bir`: the user reached Buwiz, so their own resolver
+works; only the 3-networks rule separates "the BIR's name broke" from "one
+ISP's DNS broke". Front-desk evidence comes only from TLS (port 443)
+streams: a plain-HTTP answer can come from a middlebox.
+
+Tries in `lab` and `dry_run` are recorded with their mode and stages, no
+class or kind, and never counted. A return for a test TIN is never
+recorded.
+
+### 14.3 The table
+
+`bir_tries` (migration 14), one row per try, kept 90 days:
+
+| Column | |
+|---|---|
+| `started_at`, `ended_at` | To the minute. |
+| `source` | `relay`; `direct` for the direct app's reports (§7). |
+| `mode` | `live`, `lab`, `dry_run` or `unknown`. |
+| `outcome` | `sent`, `dry_run`, `failed` or `unknown`. |
+| `stage` | `none`, `dispatcher`, `upload` or `uploaded`. |
+| `dispatcher`, `upload` | The windows: `ok`, `fail`, `none`; the upload also `maybe`. |
+| `failure_class`, `failure_kind` | §14.2; both null for a try that got in, and for `lab` and `dry_run`. |
+| `touched_bir` | A stream was opened (never in `lab`). |
+| `opens` | How many streams the Sender asked for. |
+| `admission` | The ticket's admission (§1); `open` for v1. |
+| `counted` | §14.2. |
+| `key_epoch`, `account_key`, `network_key` | The day key's id and the 8-byte keys of section 11. |
+| `late`, `report_id` | The direct app's (§7). |
+| `client` | The `buwiz-client` header (`desktop/0.2.0`), if it reads as `<app>/<version>`. |
+
+`bir_host_keys` keeps each upload-server host key a `live` try was offered:
+its `SHA256:` fingerprint, when it was first and last seen, and the
+`{epoch, account_key, network_key}` of the tries that saw it (the newest
+50). A key that is not pinned is a candidate; staff may confirm one only
+once 3 accounts on 3 networks saw it ([relay-protocol.md](relay-protocol.md#7-server-settings)).

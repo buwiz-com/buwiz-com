@@ -285,7 +285,7 @@ async fn save(
     .await?;
     let Some((root, branch, registered_name)) = typed else { return Ok(()) };
     let (fields, confidence) = extract::extract(&text.lines);
-    let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+    let tin = Tin::parse_any(&root, &branch).expect("stored TINs have the shape of one");
     let tin_match = fields.tin.as_deref().map(|read| extract::compare_tin(&tin, read).as_str());
     let name_match = fields.name.as_deref().map(|read| extract::compare_names(&registered_name, read).as_str());
     sqlx::query(

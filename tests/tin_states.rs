@@ -167,6 +167,10 @@ async fn a_tin_added_without_papers_is_not_verified(db: PgPool) {
         location(&site.upload("/tins/claims", &cookie, &skipped("000-000-000")).await),
         "/tins/new?notice=tin_zero"
     );
+    // With a bad branch too, it is still the zero root that is named.
+    let mut bad_branch = skipped("000-000-000");
+    bad_branch[2] = ("branch", Text("12"));
+    assert_eq!(location(&site.upload("/tins/claims", &cookie, &bad_branch).await), "/tins/new?notice=tin_zero");
     let mut nameless = skipped("000123452");
     nameless[3] = ("registered_name", Text(" "));
     assert_eq!(location(&site.upload("/tins/claims", &cookie, &nameless).await), "/tins/new?notice=name_missing");

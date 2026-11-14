@@ -24,23 +24,61 @@ reads the list.
 | | Support | Admin |
 |---|---|---|
 | See the queue, claims, their files, and every account | ✓ | ✓ |
-| Approve, reject, send back (never one's own claim) | ✓ (approving a TIN that was ever paused is an Admin's) | ✓ |
-| Confirm a TIN activated automatically (never one's own) | ✓ (not while it is paused) | ✓ (lifting Buwiz's pause takes a reason) |
+| Approve, reject, send back | ✓ (not one's own claim; approving a TIN that was ever paused is an Admin's) | ✓ (one's own too) |
+| Confirm a TIN activated automatically | ✓ (not one's own, nor while it is paused) | ✓ (one's own too; lifting Buwiz's pause takes a reason) |
 | Sign an account out everywhere, or out of one app (never an Admin) | ✓ | ✓ |
-| Delete a claim, revoke an ownership, activate without papers (one's own too), pause and resume, ban and lift a ban, the test label, change a role | – | ✓ |
+| Revoke an ownership, activate without papers, pause and resume (one's own TINs too) | – | ✓ |
+| Delete a claim (one's own: as its owner, on My TINs), ban and lift a ban, the test label, change a role (never on one's own account) | – | ✓ |
+| Make a login ("New user" on `/staff/users`) | – | ✓ |
 
 Staff without a power are sent back with "Only an admin can do this";
 everyone who is not staff gets a 404. Each action checks its actor's role
 again inside its own transaction, so one whose page check passed just
 before the actor was demoted or banned does nothing. Role changes refuse
 one's own account, an `ADMIN_EMAILS` person, and a change that would leave
-no Admin; a change to the role the account has says nothing changed. Every
+no Admin who has signed in; a change to the role the account has says
+nothing changed. A role (Support or Admin) goes only to an account that
+has signed in: sign-in is by a code mailed to the address, so until then
+nobody has shown the address is theirs, and a mistyped one would hand staff
+powers to whoever has it ("They must sign in once first, so the address is
+proven"). What counts is a website session on record, ended ones too
+(`web_sessions`, never deleted; every sign-in starts one). Taking a role
+away is not held up by it. For the same reason an Admin who never signed
+in, by stored role or `ADMIN_EMAILS`, does not count as the Admin who
+stays when another is demoted. The seed tool still gives roles to logins
+it makes, as before (it is an operator's run, with its dry run), and it
+refuses a file that leaves only such Admins where one who had signed in
+was left before. Every
 staff action takes a reason (500 characters at most, like the review
 notes), signing one app out included, but two: approving a claim and
 confirming an automatic activation (unless the confirmation lifts the
-pause Buwiz put on it). Rejecting a claim needs a note to the
-person, and sending it back needs a fix reason or a note. Nobody pauses or
-resumes their own TIN, nor labels their own account a test account.
+pause Buwiz put on it, or the claim is the Admin's own: below). Rejecting a claim needs a note to the
+person, and sending it back needs a fix reason or a note. Nobody bans
+themselves, changes their own role or labels their own account a test
+account; their own page says so instead of showing those forms.
+
+"New user" makes a login the way the seed tool does: the account, the
+test label if asked, and a `created` line (and a `test_marked` one) with
+the reason. It gives no staff role: an Admin gives one on the person's
+page after their first sign-in. It refuses an address that already has an
+account, and the test label for an address in `ADMIN_EMAILS` (whose page
+has no test-label controls, so the label could not come off), and it mails
+nothing: the person signs in with a code sent to the address when they
+ask, so it must be able to receive mail. The History of such a login
+starts with who made it.
+
+Staff open their own page under `/staff/users` and read it in full,
+History and every reason included, and their own claims' pages too. An
+Admin acts on their own TINs as on anyone's, with the usual reason: each
+of those audit lines names the account itself as the actor, and the
+History reads "Staff … paused their own TIN …". Approving their own claim
+or confirming the automatic activation of their own TIN takes a written
+reason too (`own_needs_reason`; for an approval it is the note), kept on
+that audit line. A TIN that became active on its owner's own say (an
+Admin activating it without papers, approving it or confirming its
+automatic activation, on their own account: `decided_by` or
+`auto_confirmed_by` is the account itself) is flagged "Activated by its
+owner, an admin" in the queue and on the claim.
 
 ### Bans and test accounts
 
@@ -51,6 +89,29 @@ can't be used on Buwiz…"). App sign-ins stay but every API call answers
 app can say why. Lifting the ban restores everything. An Admin can't be
 banned. The **test label** is for staff only: they see and filter it, and
 sends work as usual.
+
+A **test TIN** is a made-up one: its root is `000-000-000`, at any branch,
+which is exactly what the TIN check refuses on every form (a TIN must have
+9 digits, not all zeros, and a branch of 3 or 5 digits). An Admin adds one
+on the staff page of an account with the test label ("Add a test TIN":
+the TIN, its name and kind, a reason), active at once and without papers
+(`verified_by = 'admin'`, an `activated` line with the reason). A real TIN
+is refused there (it is added the usual way, and verified), and so is any
+account without the label, and one in `ADMIN_EMAILS` (their page has no
+test-label controls, so the label a test TIN holds in place could not come
+off; the form is not shown there). An Admin whose own account another Admin
+labelled adds one to it as to anyone's; its line names them as the actor
+("Staff … activated their own TIN …"), and the claim is flagged
+"Activated by its owner, an admin". It never sends, whatever `BIR_RELAY_MODE` says:
+the send gate refuses it with `tin_test_only` (tickets, both submission
+calls, the relay), and the Sender refuses one too. It shows as a test TIN
+on My TINs, on the staff pages, in the apps' TIN list and in an AI
+agent's list of TIN claims (`status: test_only`, paused or not, and
+`test_only: true`); the plain licence list leaves it out. The
+label cannot come off an account while it holds one that has not ended
+(`test_tins_held`): revoke it first. Migration 13 keeps it so in the
+database: such a row is only ever an Admin's or the seed tool's, active
+or ended (`approved`, `removed`, `revoked`).
 
 A ban that commits while a request for the account is under way wins:
 activation, approval, an app's sign-in approval and an agent's consent
@@ -63,9 +124,8 @@ a working sign-in, and every call it makes with them answers
 Every staff action on an account goes to `account_audit` with who, when and
 why; actions on claims go to `claim_audit`, review decisions (approved,
 rejected, sent back) included, so who decided outlives the claim. Both are
-on the user's page under History, which staff never see for their own
-account (`/staff/users/{self}` sends them back to the list: another staff
-member looks), so nobody reads the reasons written about them.
+on the user's page under History, which staff read on their own page
+too.
 
 ## TIN activation
 
@@ -110,7 +170,8 @@ An Admin can also:
   or sent back, their own too (refused while another account owns it, or
   for a banned account). The reason stays in the audit only. Their own
   reads as "Staff … activated their own TIN …" and is flagged "Activated
-  by its owner, an admin" in the queue and on the claim;
+  by its owner, an admin" in the queue and on the claim, as is one they
+  approved or confirmed on their own account (above);
 - **pause** an active TIN, with a reason the owner reads: it stays owned
   but nothing sends (`tin_paused`) until resumed. The owner cannot remove a
   paused TIN. A "Paused before" card shows every pause of the TIN, on any
@@ -221,15 +282,15 @@ The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 ## Licence gate
 
 `GET /api/tax-profiles` lists the account's active TINs that can send (a
-paused one is left out). The apps unlock their BIR tools when any profile
+paused one and a test TIN are left out). The apps unlock their BIR tools when any profile
 has permissions. With `?include=pending`, it also lists TINs that are still
 being checked or were sent back. Each of those has a `status` and no
 `filing.submit` permission.
 
 With `?include=all` (also in a comma list) the answer is
 `{"include":"all","profiles":[…]}`: every TIN on the account that has not
-ended, with `status` (`approved`, `paused`, `unverified`, `pending`,
-`needs_fix`), `can_send`, `message` and `action` (the id-based Verify or Fix
+ended, with `status` (`approved`, `paused`, `test_only`, `unverified`,
+`pending`, `needs_fix`), `can_send`, `message` and `action` (the id-based Verify or Fix
 link). `approved` means it can send. Sent-back rows add `reasons`,
 `reason_codes` and the staff `note`. Only the BIR app's token gets the full
 TIN, filing permissions, links and the note. The golden example is

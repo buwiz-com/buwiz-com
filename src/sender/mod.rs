@@ -49,6 +49,7 @@ use zeroize::Zeroizing;
 use crate::account::tin::Tin;
 use crate::base::{config, crypto};
 use crate::filing::envelope::{Envelope, SealingKey};
+use crate::filing::gate::Standing;
 use crate::filing::jws;
 use crate::filing::tickets;
 use crate::relay::{self, Control, Pipe};
@@ -202,9 +203,12 @@ impl Sender {
                 let Ok(xml) = STANDARD.decode(xml) else {
                     return failed("the job's XML is not base64".into());
                 };
-                let Ok(tin) = Tin::parse(&tin_root, &branch_code) else {
+                let Ok(tin) = Tin::parse_any(&tin_root, &branch_code) else {
                     return failed("the job's TIN is not valid".into());
                 };
+                if tin.is_test() {
+                    return failed(Standing::TestOnly.failure());
+                }
                 let named = format!("{}{}", tin.root(), tin.branch());
                 let expected =
                     identity::Expected { tin: &named, form: &form_type, period: &period, named_by: "file name" };
@@ -236,9 +240,14 @@ impl Sender {
                 if let Err(reason) = identity::check(&xml, &claims) {
                     return mismatch("ticket", &reason);
                 }
-                let Ok(tin) = Tin::parse(&claims.tin[..9], &claims.tin[9..]) else {
+                let Ok(tin) = Tin::parse_any(&claims.tin[..9], &claims.tin[9..]) else {
                     return failed("the ticket's TIN is not valid".into());
                 };
+                // The Gatekeeper never issues a ticket for one; whatever
+                // the mode, nothing is sent for it here either.
+                if tin.is_test() {
+                    return failed(Standing::TestOnly.failure());
+                }
                 let send = Send {
                     submission_id,
                     account_id,
@@ -450,6 +459,48 @@ mod tests {
             Control::Result { status: "failed".into(), error: Some(NOT_BUILT_IN.into()), receipt: None }
         );
         assert!(!opened, "nothing was opened through the pipe");
+    }
+
+    /// A test TIN never sends, here in `live`: not a v1 job, and not a v2
+    /// one whose ticket names it (which the Gatekeeper never issues).
+    #[tokio::test]
+    async fn a_test_tin_is_refused_in_live_mode() {
+        let refused =
+            Control::Result { status: "failed".into(), error: Some(Standing::TestOnly.failure()), receipt: None };
+        let xml = return_1601c(["000", "000", "000", "00000"]);
+        let mut job = v1_job(&xml);
+        if let Job::V1 { tin_root, filename, .. } = &mut job {
+            *tin_root = "000000000".into();
+            *filename = "00000000000000-1601Cv2018-062025#juan@example.com#.xml".into();
+        }
+        let (result, opened) = answer(job).await;
+        assert_eq!((result, opened), (refused.clone(), false));
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let jti = Uuid::new_v4();
+        let claims = tickets::TicketClaims {
+            iss: "http://localhost:3008".into(),
+            aud: tickets::AUDIENCE.into(),
+            sub: Uuid::nil(),
+            account_id: Uuid::nil(),
+            device_id: Uuid::nil(),
+            tin: "00000000000000".into(),
+            form: "1601Cv2018".into(),
+            period: "062025".into(),
+            payload_sha256: crypto::hex(&crypto::sha256(xml.as_bytes())),
+            email: "juan@example.com".into(),
+            jti,
+            iat: now,
+            exp: now + 60,
+        };
+        let ticket = tickets::sign(&SigningKey::from_bytes(&[9; 32]), &claims);
+        let sealing = SealingKey::from_bytes(&[7; 32]).unwrap();
+        let envelope =
+            crate::filing::envelope::seal(&sealing.public_bytes(), &sealing.kid(), &jti.to_string(), xml.as_bytes())
+                .unwrap();
+        let job = Job::V2 { submission_id: Uuid::nil(), account_id: Uuid::nil(), ticket, envelope };
+        let (result, opened) = answer(job).await;
+        assert_eq!((result, opened), (refused, false));
     }
 
     #[tokio::test]

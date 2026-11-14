@@ -1,6 +1,6 @@
-//! What staff do to accounts: change a role, ban and lift a ban, label a
-//! test account, and sign
-//! an account out everywhere or out of one app. Each runs in one transaction (lock, check,
+//! What staff do to accounts: make a login, change a role, ban and lift a
+//! ban, label a test account, and sign an account out everywhere or out of
+//! one app. Each runs in one transaction (lock, check,
 //! change, a line in `account_audit` with who, when and why). The routes
 //! check the power first ([`crate::account::roles`]); the checks here are
 //! the ones that depend on the account acted on.
@@ -102,9 +102,84 @@ pub(crate) async fn audit(tx: &mut Transaction<'_, Postgres>, actor: &Account, l
     Ok(())
 }
 
+/// The account for `email`, made if there is none: (id, made now). The
+/// staff pages and the seed tool make logins this way; each writes its own
+/// `created` line.
+pub(crate) async fn create_account(tx: &mut Transaction<'_, Postgres>, email: &str) -> sqlx::Result<(Uuid, bool)> {
+    let made: Option<Uuid> =
+        sqlx::query_scalar("INSERT INTO accounts (email) VALUES ($1) ON CONFLICT (email) DO NOTHING RETURNING id")
+            .bind(email)
+            .fetch_optional(&mut **tx)
+            .await?;
+    match made {
+        Some(id) => Ok((id, true)),
+        None => {
+            let id =
+                sqlx::query_scalar("SELECT id FROM accounts WHERE email = $1").bind(email).fetch_one(&mut **tx).await?;
+            Ok((id, false))
+        }
+    }
+}
+
+/// A login an Admin makes on the staff pages. It has no staff role: a role
+/// waits until its person signs in ([`change_role`]).
+pub struct NewLogin<'a> {
+    pub email: &'a str,
+    pub test: bool,
+    pub reason: &'a str,
+}
+
+/// An Admin makes a login: the account, with the test label if asked, and
+/// a line for each in `account_audit`, both with the one reason. Refused
+/// for an address that already has an account, and the label for an
+/// address in `ADMIN_EMAILS` (whose page cannot take it off). No mail goes
+/// out: the person signs in with a code sent to the address when they ask
+/// for one. Locks as a role change does: the roles lock, then the actor.
+pub async fn create_login(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    login: &NewLogin<'_>,
+) -> Result<(Uuid, Notice), DecideError> {
+    let reason = required_reason(login.reason)?;
+    let email = accounts::normalize_email(login.email).map_err(DecideError::Refused)?;
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::CreateLogin).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if login.test && roles::in_server_setting(config, &email) {
+        return Err(DecideError::Refused(Notice::TestLabelFromServer));
+    }
+    let (id, made) = create_account(&mut tx, &email).await?;
+    if !made {
+        return Err(DecideError::Refused(Notice::AccountExists));
+    }
+    let line = |action| Line {
+        account_id: id,
+        action,
+        old_value: None,
+        new_value: None,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line("created")).await?;
+    if login.test {
+        sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1").bind(id).execute(&mut *tx).await?;
+        audit(&mut tx, &actor.account, line("test_marked")).await?;
+    }
+    tx.commit().await?;
+    tracing::info!(account_id = %id, actor = %actor.account.id, test = login.test, "login created");
+    Ok((id, Notice::LoginCreated))
+}
+
 /// An Admin gives an account a role, or takes it away (`None`). Refused for
 /// one's own account, for a person who is an Admin through `ADMIN_EMAILS`,
-/// and when it would leave Buwiz without an Admin.
+/// when it would leave Buwiz without an Admin who has signed in, and a
+/// role for an account that never signed in: sign-in is by a code mailed
+/// to the address, so until then nobody has shown the address is theirs (a
+/// mistyped one would hand staff powers to whoever has it). Taking a role
+/// away is never held up by that.
 pub async fn change_role(
     db: &PgPool,
     config: &Config,
@@ -126,6 +201,9 @@ pub async fn change_role(
     let old = target.role.as_deref().and_then(Role::parse);
     if old == role {
         return Ok(Notice::RoleUnchanged);
+    }
+    if role.is_some() && !roles::has_signed_in(&mut *tx, target.id).await? {
+        return Err(DecideError::Refused(Notice::NotSignedInYet));
     }
     // Under the lock, so a demotion running at the same time has committed
     // and is counted.
@@ -333,9 +411,22 @@ pub async fn unban(
     Ok(Notice::BanLifted)
 }
 
-/// An Admin labels an account as a test account, or takes the label off.
-/// Only staff see it; sends work as usual. Not one's own account. Locks as
-/// a ban does: the roles lock, the actor, then the account.
+/// Whether the account holds a test TIN that has not ended.
+pub(crate) async fn holds_test_tins(tx: &mut Transaction<'_, Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND {})",
+        crate::filing::gate::LIVE_SQL
+    ))
+    .bind(account_id)
+    .bind(crate::account::tin::TEST_ROOT)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// An Admin labels an account as a test account, or takes the label off
+/// (refused while it holds a test TIN: revoke those first). Only staff see
+/// it; sends work as usual. Not one's own account. Locks as a ban does: the
+/// roles lock, the actor, then the account.
 pub async fn mark_test(
     db: &PgPool,
     config: &Config,
@@ -361,6 +452,12 @@ pub async fn mark_test(
         .await?;
     if labelled == test {
         return Ok(notice);
+    }
+    // A test TIN lives on a test account only: the label stays while one
+    // is on it. Its own add takes the roles lock too, so none comes in
+    // meanwhile.
+    if !test && holds_test_tins(&mut tx, target.id).await? {
+        return Err(DecideError::Refused(Notice::TestTinsHeld));
     }
     sqlx::query("UPDATE accounts SET test_account = $2 WHERE id = $1")
         .bind(target.id)

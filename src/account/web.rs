@@ -126,12 +126,14 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/claims/{claim_id}/resume", post(resume_claim))
         .route("/staff/claims/{claim_id}/confirm", post(confirm_auto))
         .route("/staff/documents/{document_id}", get(staff_document))
+        .route("/staff/users/new", post(create_login))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
         .route("/staff/users/{account_id}/role", post(change_role))
         .route("/staff/users/{account_id}/ban", post(ban_user))
         .route("/staff/users/{account_id}/unban", post(unban_user))
         .route("/staff/users/{account_id}/test", post(mark_test))
+        .route("/staff/users/{account_id}/test-tin", post(add_test_tin))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
         .route("/devices/{device_id}/revoke", post(revoke_device))
@@ -1213,6 +1215,72 @@ async fn mark_test(
         _ => return (StatusCode::BAD_REQUEST, "test must be on or off").into_response(),
     };
     staff_outcome(&back_to, admin::mark_test(&state.db, &state.config, &staff, account_id, test, &form.reason).await)
+}
+
+#[derive(Deserialize)]
+struct TestTinForm {
+    #[serde(default)]
+    tin: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    registered_name: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// An Admin adds a made-up test TIN to a test account, active at once.
+async fn add_test_tin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<TestTinForm>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = format!("/staff/users/{account_id}");
+    let staff = match require_staff(&state, &headers, &back_to, Power::ActivateWithoutPapers).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let Some(kind) = ClaimKind::parse(&form.kind) else {
+        return see_other(link(&back_to, Some(Notice::KindMissing), &[]));
+    };
+    let entry =
+        claims::NewTestTin { tin: &form.tin, kind, registered_name: &form.registered_name, reason: &form.reason };
+    staff_outcome(&back_to, claims::add_test_tin(&state.db, &state.config, &staff.account, account_id, &entry).await)
+}
+
+#[derive(Deserialize)]
+struct NewLoginForm {
+    #[serde(default)]
+    email: String,
+    /// `on` when the box is ticked.
+    #[serde(default)]
+    test: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// An Admin makes a login: an email, maybe the test label, and a reason (no
+/// role: one is given after the person's first sign-in). It opens the new
+/// account's page.
+async fn create_login(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<NewLoginForm>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = "/staff/users";
+    let staff = match require_staff(&state, &headers, back_to, Power::CreateLogin).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let login = admin::NewLogin { email: &form.email, test: form.test == "on", reason: &form.reason };
+    match admin::create_login(&state.db, &state.config, &staff, &login).await {
+        Ok((id, notice)) => see_other(link(&format!("/staff/users/{id}"), Some(notice), &[])),
+        Err(DecideError::Refused(notice)) => see_other(link(back_to, Some(notice), &[])),
+        Err(DecideError::Internal(error)) => internal(error),
+    }
 }
 
 #[derive(Deserialize)]

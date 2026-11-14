@@ -507,7 +507,15 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
     // TIN masked (its last three digits and branch), so they are matched
     // on that: another TIN with the same last digits only leaves more
     // claims for staff. `$5` matches any branch of the root, `$6` this one.
+    // A test TIN's lines (root 000-000-000, masked ***-***-000-…) are left
+    // out by their claim, whose row stays (it was active, so only the
+    // rollback of migration 13 deletes it): they would cast doubt on every
+    // real TIN ending in 000.
     let any_branch = format!("***-***-{}-%", &tin.root()[6..]);
+    let not_test = format!(
+        "NOT EXISTS (SELECT 1 FROM tin_claims t WHERE t.id = claim_audit.claim_id AND t.tin_root = '{}')",
+        crate::account::tin::TEST_ROOT
+    );
     let (other_account, refused_before, sent_back_elsewhere, business_before, another_unconfirmed, today): (
         bool,
         bool,
@@ -515,10 +523,10 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
         bool,
         bool,
         i64,
-    ) = sqlx::query_as(
+    ) = sqlx::query_as(&format!(
         "SELECT
              EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND account_id <> $3)
-               OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id <> $3 AND tin_masked LIKE $5),
+               OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id <> $3 AND tin_masked LIKE $5 AND {not_test}),
              EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND account_id = $3
                        AND (status IN ('rejected', 'revoked') OR (status = 'removed' AND verified_by = 'auto')))
                OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $3 AND claim_id <> $4 AND tin_masked = $6
@@ -527,11 +535,11 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
                        AND action = 'sent_back'),
              EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND kind = 'business' AND id <> $4)
                OR EXISTS (SELECT 1 FROM claim_audit WHERE claim_id <> $4 AND claim_kind = 'business'
-                            AND tin_masked LIKE $5),
+                            AND tin_masked LIKE $5 AND {not_test}),
              EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $3 AND id <> $4
                        AND verified_by = 'auto' AND auto_confirmed_at IS NULL),
-             (SELECT count(*) FROM claim_audit WHERE action = 'auto_activated' AND created_at > now() - interval '24 hours')",
-    )
+             (SELECT count(*) FROM claim_audit WHERE action = 'auto_activated' AND created_at > now() - interval '24 hours')"
+    ))
     .bind(tin.root())
     .bind(tin.branch())
     .bind(account_id)
@@ -618,8 +626,9 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
 
 /// Staff confirm an automatic activation after looking at its papers (also
 /// one the owner removed or staff revoked since): the papers are deleted,
-/// and a pause Buwiz put on it for waiting too long is lifted. Not on one's
-/// own TIN. Only an Admin reopens a paused TIN: Support confirms only one
+/// and a pause Buwiz put on it for waiting too long is lifted. On one's own
+/// TIN only as an Admin, with `reason` (kept on the `auto_confirmed` line).
+/// Only an Admin reopens a paused TIN: Support confirms only one
 /// that is not paused, and an Admin lifting Buwiz's pause gives `reason`
 /// (a staff pause stays, and needs none). The actor's role is checked
 /// again inside the transaction; the route checks the power first
@@ -674,12 +683,19 @@ pub async fn confirm(
     if verified_by.as_deref() != Some("auto") || confirmed {
         return Err(DecideError::Refused(Notice::NotAuto));
     }
-    if owner == actor.id {
+    // Like a decision: on one's own TIN, an Admin's alone.
+    if owner == actor.id && role != Some(Role::Admin) {
         return Err(DecideError::Refused(Notice::OwnClaim));
     }
     if paused && role != Some(Role::Admin) {
         return Err(DecideError::Refused(Notice::AdminMustConfirm));
     }
+    // As visible as activating it without papers: the reason is on record.
+    let own = if owner == actor.id {
+        Some(crate::account::admin::reason_text(reason).map_err(|_| DecideError::Refused(Notice::OwnNeedsReason))?)
+    } else {
+        None
+    };
     let resumed = if paused_by_buwiz {
         let reason = crate::account::admin::required_reason(reason)?;
         Some(format!("Confirmed after Buwiz paused it for waiting too long: {reason}"))
@@ -705,8 +721,8 @@ pub async fn confirm(
     .bind(claim_id)
     .fetch_all(&mut *tx)
     .await?;
-    let masked = Tin::parse(&root, &branch).map_err(|_| anyhow::anyhow!("stored TIN"))?.masked();
-    let mut lines = vec![("auto_confirmed", None)];
+    let masked = Tin::parse_any(&root, &branch).map_err(|_| anyhow::anyhow!("stored TIN"))?.masked();
+    let mut lines = vec![("auto_confirmed", own.as_deref())];
     if let Some(reason) = resumed.as_deref() {
         lines.push(("resumed", Some(reason)));
     }
@@ -754,7 +770,7 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
     .fetch_all(&mut *tx)
     .await?;
     for (claim_id, account_id, email, root, branch, kind) in &paused {
-        let masked = Tin::parse(root, branch).map(|tin| tin.masked()).unwrap_or_default();
+        let masked = Tin::parse_any(root, branch).map(|tin| tin.masked()).unwrap_or_default();
         sqlx::query(
             "INSERT INTO claim_audit
                  (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source,

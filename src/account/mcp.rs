@@ -172,8 +172,15 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                     // Staff's own words reach an agent only as the reason
                     // for a rejection, which the claimant reads on My TINs
                     // too; a claim sent back shows its fixed reasons.
-                    let status =
-                        if claim.status == "approved" && claim.paused_at.is_some() { "paused" } else { &claim.status };
+                    // As the apps' list (`include=all`) says it: an active
+                    // test TIN is `test_only`, paused or not.
+                    let status = if claim.status == "approved" && claim.tin().is_test() {
+                        "test_only"
+                    } else if claim.status == "approved" && claim.paused_at.is_some() {
+                        "paused"
+                    } else {
+                        &claim.status
+                    };
                     let mut row = json!({
                         "tin_masked": claim.tin().masked(),
                         "registered_name": claim.registered_name,
@@ -183,6 +190,10 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                         // without them (or activated without them).
                         "sent_at": claim.submitted_at.map(OffsetDateTime::unix_timestamp),
                     });
+                    // A made-up TIN staff put on a test account: it never sends.
+                    if claim.tin().is_test() {
+                        row["test_only"] = json!(true);
+                    }
                     if claim.status == "needs_fix" {
                         let reasons: Vec<&str> = claim
                             .fix_reasons

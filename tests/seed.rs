@@ -652,6 +652,25 @@ async fn the_first_admin_comes_from_the_file_only_when_the_server_has_no_list(db
     );
 }
 
+/// The file may not leave only Admins nobody signed in as, where an Admin
+/// who had signed in was left before: one mistyped address would leave
+/// nobody able to sign in as an Admin. A first Admin made on a database
+/// with none (above) is no such change.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_file_cannot_leave_only_admins_who_never_signed_in(db: PgPool) {
+    let site = Site::with_admins(db, &[]);
+    site.staff_with_role("ana@example.test", "admin").await;
+    let root = listing("root@example.test", false, &["root@example.test"]);
+    let demote = "[[login]]\nemail = \"ana@example.test\"\nrole = \"none\"\n";
+    let problem = refused(seed(&site.db, demote, &root).await);
+    assert!(problem.contains("the roles in the file leave Buwiz with no Admin who has signed in"), "{problem}");
+    assert_eq!(account(&site.db, "ana@example.test").await.1.as_deref(), Some("admin"));
+    // Once the server's Admin has signed in, the same file runs.
+    site.person("root@example.test").await;
+    seed(&site.db, demote, &root).await.unwrap();
+    assert_eq!(account(&site.db, "ana@example.test").await.1, None);
+}
+
 /// The command refuses to guess the list from the shell it runs in.
 #[sqlx::test(migrations = "./migrations")]
 async fn the_seed_command_needs_admin_emails_or_says_there_is_none(db: PgPool) {
@@ -1104,4 +1123,57 @@ async fn the_seed_activating_its_own_admins_tin_is_flagged(db: PgPool) {
     assert!(!page.contains("Activated by its owner, an admin"), "{page}");
     let queue = text(site.get("/staff?status=approved", &other_admin).await).await;
     assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+}
+
+/// A test TIN goes in only when its entry says `test_tin = true`, active,
+/// on a login with the test label; the label then stays on.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_test_tin_goes_in_only_on_purpose_on_a_test_login(db: PgPool) {
+    let site = Site::with_admins(db, &[]);
+    let db = &site.db;
+    let admin = "[[login]]\nemail = \"admin@example.test\"\nrole = \"admin\"\n";
+    seed(db, admin, &options("admin@example.test", false)).await.unwrap();
+    let entry = |test: &str, tin: &str, extra: &str| {
+        format!(
+            "[[login]]\nemail = \"jane@example.test\"\n{test}[[login.tin]]\ntin = \"{tin}\"\nkind = \"personal\"\n\
+             name = \"JANE TEST\"\nstate = \"active\"\nreason = \"Trying the app\"\n{extra}"
+        )
+    };
+    let run = |file: String| async move { seed(db, &file, &options("admin@example.test", false)).await };
+    for (file, words) in [
+        (entry("test = true\n", "000-123-453", "test_tin = true\n"), "test_tin = true is only for a made-up TIN"),
+        (entry("", "000-000-000-00001", "test_tin = true\n"), "a test TIN goes on a test account only"),
+        (
+            entry("test = true\n", "000-000-000-00001", "test_tin = true\n").replace("\"active\"", "\"not_verified\""),
+            "a test TIN is only ever active",
+        ),
+    ] {
+        let problem = refused(run(file).await);
+        assert!(problem.contains(words), "{words}: {problem}");
+    }
+    let none: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE tin_root = '000000000'").fetch_one(db).await.unwrap();
+    assert_eq!(none, 0);
+    // Without test_tin, it is refused on its own as any TIN that is not
+    // valid; the login is still made.
+    let report = run(entry("test = true\n", "000-000-000-00001", "")).await.unwrap();
+    assert!(report.lines.iter().any(|line| line.contains("refused TIN")), "{:?}", report.lines);
+
+    let report = run(entry("test = true\n", "000-000-000-00001", "test_tin = true\n")).await.unwrap();
+    assert!(
+        report.lines.iter().any(|line| line.contains("TIN ***-***-000-00001 active on jane@example.test")),
+        "{:?}",
+        report.lines
+    );
+    let (jane, _, labelled) = account(db, "jane@example.test").await;
+    assert!(labelled);
+    let (status, verified_by, ..) = claim_of(db, jane, "000000000").await;
+    assert_eq!((status.as_str(), verified_by.as_deref()), ("approved", Some("seed")));
+    let lines = claim_audit_lines(db, jane).await;
+    assert_eq!((lines[0].0.as_str(), lines[0].3.as_str()), ("activated", "seed"));
+
+    // The label stays while jane holds it.
+    let problem = refused(run(entry("test = false\n", "000-000-000-00001", "test_tin = true\n")).await);
+    assert!(problem.contains("login jane@example.test: it holds a test TIN, so the test label stays"), "{problem}");
+    assert!(account(db, "jane@example.test").await.2);
 }

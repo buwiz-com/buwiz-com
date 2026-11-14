@@ -685,3 +685,33 @@ async fn only_an_admin_confirms_a_paused_activation(db: PgPool) {
     let tin = Tin::parse("000123572", "").unwrap();
     assert_eq!(gate::own(&site.db, bob, &tin).await.unwrap(), gate::Standing::Paused);
 }
+
+/// A test TIN's audit lines mask it as ***-***-000-…, as a real TIN ending
+/// in 000 is masked: they are no other account on that TIN, and no
+/// business before it.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_test_tins_lines_cast_no_doubt_on_a_real_tin_ending_in_000(db: PgPool) {
+    let site = Site::with_auto(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (tester, _) = site.person("tester@example.test").await;
+    sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1").bind(tester).execute(&site.db).await.unwrap();
+    let form = "tin=000-000-000-00000&kind=business&registered_name=Test+Shop&reason=Trying+the+app";
+    let response = site.post(&format!("/staff/users/{tester}/test-tin"), &staff, form).await;
+    assert_eq!(location(&response), format!("/staff/users/{tester}?notice=test_tin_added"));
+    let test_claim: Uuid = sqlx::query_scalar("SELECT id FROM tin_claims WHERE account_id = $1")
+        .bind(tester)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    site.post(&format!("/staff/claims/{test_claim}/revoke"), &staff, "reason=Done").await;
+    let masked: Vec<String> = sqlx::query_scalar("SELECT tin_masked FROM claim_audit WHERE account_id = $1")
+        .bind(tester)
+        .fetch_all(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(masked, ["***-***-000-00000", "***-***-000-00000"]);
+
+    let (_, _, claim, document) = sent(&site, "ana@example.test", "123456000").await;
+    read_clearly(&site.db, document, "123456000").await;
+    assert_eq!(consider(&site, document).await, Outcome::Activated(claim));
+}

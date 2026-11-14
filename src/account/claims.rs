@@ -34,7 +34,7 @@ use crate::account::accounts::Account;
 use crate::account::notice::Notice;
 use crate::account::oauth::Bearer;
 use crate::account::roles::{self, Power, Role};
-use crate::account::tin::Tin;
+use crate::account::tin::{TEST_ROOT, Tin};
 use crate::base::config::Config;
 use crate::base::crypto;
 use crate::base::error::ApiError;
@@ -627,11 +627,13 @@ pub struct ClaimRow {
     pub auto_confirmed_at: Option<OffsetDateTime>,
     /// Who decided it: the reviewer, or the Admin who activated it.
     pub decided_by: Option<Uuid>,
+    /// Who confirmed its automatic activation.
+    pub auto_confirmed_by: Option<Uuid>,
 }
 
 impl ClaimRow {
     pub fn tin(&self) -> Tin {
-        Tin::parse(&self.tin_root, &self.branch_code).expect("stored TINs are valid")
+        Tin::parse_any(&self.tin_root, &self.branch_code).expect("stored TINs have the shape of one")
     }
 
     /// The status as people read it: an active TIN staff paused is
@@ -645,10 +647,13 @@ impl ClaimRow {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
-    /// An Admin activated their own TIN without papers, on the staff pages
-    /// or as the `--as` of a seed run.
+    /// It became active on its owner's own say: an Admin activated it
+    /// without papers (on the staff pages, or as the `--as` of a seed run),
+    /// approved it, or confirmed its automatic activation, on their own
+    /// account.
     pub fn self_activated(&self) -> bool {
-        matches!(self.verified_by.as_deref(), Some("admin" | "seed")) && self.decided_by == Some(self.account_id)
+        self.verified_by.is_some()
+            && (self.decided_by == Some(self.account_id) || self.auto_confirmed_by == Some(self.account_id))
     }
 
     /// When it last went into the review queue: resent, or its papers sent.
@@ -666,7 +671,7 @@ impl ClaimRow {
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
      c.decided_at, c.removed_at, c.removal_note, c.files_changed_at, c.submitted_at, c.verified_by, c.paused_at, \
-     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by";
+     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by, c.auto_confirmed_by";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -821,8 +826,10 @@ pub enum Decision {
 /// `claim_audit` in the same transaction (who, the decision, the reasons),
 /// so neither a later send-back nor the claimant deleting the claim erases
 /// who decided. Approving a TIN that was ever paused, on any account, is an
-/// Admin's call. The reviewer's role is checked again inside the
-/// transaction.
+/// Admin's call, and so is deciding one's own claim (its audit line names
+/// the owner as the actor); approving one's own takes a written reason
+/// (`note`), kept on that line. The reviewer's role is checked again inside
+/// the transaction.
 pub async fn decide(
     db: &PgPool,
     config: &Config,
@@ -836,15 +843,15 @@ pub async fn decide(
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    if claim.account_id == reviewer.id {
-        return Err(DecideError::Refused(Notice::OwnClaim));
-    }
     if note.trim().chars().count() > crate::account::admin::MAX_REASON_CHARS {
         return Err(DecideError::Refused(Notice::ReasonTooLong));
     }
     let role = roles::recheck(&mut tx, config, reviewer.id).await?;
     if !role.is_some_and(|role| role.can(Power::Review)) {
         return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    if claim.account_id == reviewer.id && role != Some(Role::Admin) {
+        return Err(DecideError::Refused(Notice::OwnClaim));
     }
     if *decision == Decision::Approve && is_banned(&mut tx, claim.account_id).await? {
         return Err(DecideError::Refused(Notice::ClaimantBanned));
@@ -892,6 +899,10 @@ pub async fn decide(
     let approve = *decision == Decision::Approve;
     if !approve && note.is_empty() {
         return Err(DecideError::Refused(Notice::RejectNeedsNote));
+    }
+    // As visible as activating it without papers: the reason is on record.
+    if approve && claim.account_id == reviewer.id && note.is_empty() {
+        return Err(DecideError::Refused(Notice::OwnNeedsReason));
     }
     let status = if approve { "approved" } else { "rejected" };
     let updated = sqlx::query(
@@ -1006,6 +1017,112 @@ pub async fn activate_without_papers(
     Ok(Notice::TinActivated)
 }
 
+/// A test TIN an Admin adds to a test account.
+pub struct NewTestTin<'a> {
+    /// As typed: `000-000-000`, or with its branch.
+    pub tin: &'a str,
+    pub kind: ClaimKind,
+    pub registered_name: &'a str,
+    pub reason: &'a str,
+}
+
+/// An Admin adds a test TIN ([`Tin::is_test`]) to an account that carries
+/// the test label, active at once and without papers (`verified_by =
+/// 'admin'`), with a reason in its audit line. It never sends: the gate
+/// refuses it (`tin_test_only`). Refused for a TIN that is not a test TIN
+/// (that one is added the usual way, and verified), for an account without
+/// the label or banned, one in `ADMIN_EMAILS`, and for a test TIN already
+/// active anywhere. Locks
+/// as the test label does (the roles lock, the actor, then the account), so
+/// the label cannot come off while one is being added.
+pub async fn add_test_tin(
+    db: &PgPool,
+    config: &Config,
+    actor: &Account,
+    account_id: Uuid,
+    entry: &NewTestTin<'_>,
+) -> Result<Notice, DecideError> {
+    let reason = crate::account::admin::required_reason(entry.reason)?;
+    let tin = Tin::parse_fields_any(entry.tin, "").map_err(DecideError::Refused)?;
+    if !tin.is_test() {
+        return Err(DecideError::Refused(Notice::NotTestTin));
+    }
+    let name = entry.registered_name.trim();
+    if name.is_empty() || name.len() > 200 {
+        return Err(DecideError::Refused(Notice::NameMissing));
+    }
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.id, Power::ActivateWithoutPapers).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    let account: Option<(String, bool, bool)> =
+        sqlx::query_as("SELECT email, test_account, banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match account {
+        None => return Err(DecideError::Refused(Notice::AccountMissing)),
+        Some((_, false, _)) => return Err(DecideError::Refused(Notice::NotTestAccount)),
+        Some((_, _, true)) => return Err(DecideError::Refused(Notice::ClaimantBanned)),
+        // Their page has no test-label controls: the label, held in place
+        // by the test TIN, could not come off.
+        Some((email, _, _)) if roles::in_server_setting(config, &email) => {
+            return Err(DecideError::Refused(Notice::TestLabelFromServer));
+        }
+        Some(_) => {}
+    }
+    let there: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND branch_code = $3 AND {})",
+        gate::LIVE_SQL
+    ))
+    .bind(account_id)
+    .bind(tin.root())
+    .bind(tin.branch())
+    .fetch_one(&mut *tx)
+    .await?;
+    if there {
+        return Err(DecideError::Refused(Notice::TestTinThere));
+    }
+    let inserted: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
+        "INSERT INTO tin_claims
+             (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, decided_by, verified_by)
+         VALUES ($1, $2, $3, $4, $5, 'approved', now(), $6, 'admin')
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(entry.kind.as_str())
+    .bind(tin.root())
+    .bind(tin.branch())
+    .bind(name)
+    .bind(actor.id)
+    .fetch_one(&mut *tx)
+    .await;
+    let claim_id = match inserted {
+        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_owner") => {
+            return Err(DecideError::Refused(Notice::TestTinOwnedElsewhere));
+        }
+        // Added at the same moment by another Admin.
+        Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_live") => {
+            return Err(DecideError::Refused(Notice::TestTinThere));
+        }
+        other => other?,
+    };
+    // A row this action made had no status before.
+    let claim = Locked {
+        id: claim_id,
+        account_id,
+        kind: entry.kind.as_str().to_owned(),
+        status: "new".to_owned(),
+        tin_masked: tin.masked(),
+        tin,
+    };
+    audit(&mut tx, &claim, actor, "activated", None, Some(&reason)).await?;
+    tx.commit().await?;
+    tracing::info!(%claim_id, actor = %actor.id, "test tin added");
+    Ok(Notice::TestTinAdded)
+}
+
 /// The claimant gives up a claim that is still open.
 pub async fn withdraw(db: &PgPool, store: &DocumentStore, claim_id: Uuid, account_id: Uuid) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
@@ -1081,18 +1198,20 @@ async fn lock_claim(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uu
     .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(|(account_id, kind, status, root, branch)| {
-        let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+        let tin = Tin::parse_any(&root, &branch).expect("stored TINs have the shape of one");
         Locked { id: claim_id, account_id, kind, status, tin_masked: tin.masked(), tin }
     }))
 }
 
-/// The owner acts on their own claim; staff on someone else's, with a
-/// reason. Returns the trimmed reason.
-fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>) -> Result<Option<String>, Notice> {
+/// The owner acts on their own claim; staff with a reason, on their own
+/// claim too when `own` is the notice to refuse it with (`None`: allowed;
+/// the Admin-only actions, whose audit line names the owner as the actor).
+/// Returns the trimmed reason.
+fn check_actor(claim: &Locked, actor: &Account, by: &By<'_>, own: Option<Notice>) -> Result<Option<String>, Notice> {
     match by {
         By::Owner if claim.account_id != actor.id => Err(Notice::ClaimMissing),
         By::Owner => Ok(None),
-        By::Staff { .. } if claim.account_id == actor.id => Err(Notice::OwnClaim),
+        By::Staff { .. } if claim.account_id == actor.id && own.is_some() => Err(own.expect("checked")),
         By::Staff { reason, .. } => crate::account::admin::reason_text(reason).map(Some),
     }
 }
@@ -1139,7 +1258,8 @@ pub async fn delete(
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    // Their own claim, staff delete as its owner, on My TINs.
+    let reason = check_actor(&claim, actor, &by, Some(Notice::OwnClaimDelete)).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::DeleteClaim).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1171,7 +1291,7 @@ pub async fn end_ownership(db: &PgPool, claim_id: Uuid, actor: &Account, by: By<
     let Some(claim) = lock_claim(&mut tx, claim_id).await? else {
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
-    let reason = check_actor(&claim, actor, &by).map_err(DecideError::Refused)?;
+    let reason = check_actor(&claim, actor, &by, None).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::EndOwnership).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1213,7 +1333,7 @@ async fn is_paused(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, claim_id: Uui
 
 /// An Admin pauses an active TIN: it stays owned (nobody else can be
 /// approved for it) but nothing sends until it is resumed. The owner reads
-/// the reason on My TINs. Not on one's own TIN, like ending an ownership.
+/// the reason on My TINs. An Admin may pause their own TIN too.
 pub async fn pause(
     db: &PgPool,
     config: &Config,
@@ -1226,10 +1346,7 @@ pub async fn pause(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let by = By::Staff { reason, config };
-    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
-        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
-        notice => DecideError::Refused(notice),
-    })?;
+    let reason = check_actor(&claim, actor, &by, None).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::Pause).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1261,10 +1378,7 @@ pub async fn resume(
         return Err(DecideError::Refused(Notice::ClaimMissing));
     };
     let by = By::Staff { reason, config };
-    let reason = check_actor(&claim, actor, &by).map_err(|notice| match notice {
-        Notice::OwnClaim => DecideError::Refused(Notice::OwnTinPause),
-        notice => DecideError::Refused(notice),
-    })?;
+    let reason = check_actor(&claim, actor, &by, None).map_err(DecideError::Refused)?;
     if !by.may(&mut tx, actor, Power::Pause).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
@@ -1480,19 +1594,21 @@ async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -
     .bind(account_id)
     .fetch_all(db)
     .await?;
-    let mut listed: Vec<(gate::Standing, ListedClaim)> =
-        rows.into_iter().map(|row| (gate::classify(row.id, &row.status, row.paused, &row.fix_reasons), row)).collect();
+    let mut listed: Vec<(gate::Standing, ListedClaim)> = rows
+        .into_iter()
+        .map(|row| (gate::classify(row.id, &row.status, row.paused, &row.fix_reasons, row.tin_root == TEST_ROOT), row))
+        .collect();
     // A stable sort keeps the oldest-first order within each group.
     listed.sort_by_key(|(standing, row)| match standing {
         gate::Standing::Sendable { .. } => (0, row.decided_at),
-        gate::Standing::Paused => (1, row.decided_at),
+        gate::Standing::Paused | gate::Standing::TestOnly => (1, row.decided_at),
         _ => (2, None),
     });
     Ok(listed.into_iter().map(|(standing, row)| listed_json(&standing, &row, full, origin)).collect())
 }
 
 fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin: &str) -> Value {
-    let tin = Tin::parse(&row.tin_root, &row.branch_code).expect("stored TINs are valid");
+    let tin = Tin::parse_any(&row.tin_root, &row.branch_code).expect("stored TINs have the shape of one");
     let active = row.status == "approved";
     let action = match standing {
         gate::Standing::Unverified => Some(("Verify to send", "verify")),
@@ -1520,6 +1636,10 @@ fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin:
     if full {
         profile["tin"] = json!(tin.to_string());
     }
+    // Only on a test TIN, so every other row reads as before.
+    if tin.is_test() {
+        profile["test_only"] = json!(true);
+    }
     if let gate::Standing::NeedsFix { reasons } = standing {
         profile["reasons"] = json!(reasons);
         profile["reason_codes"] = json!(row.fix_reasons);
@@ -1534,7 +1654,8 @@ fn shown_note(note: &str) -> String {
     note.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(SHOWN_NOTE_CHARS).collect()
 }
 
-/// The account's active TINs that can send: a paused one is left out.
+/// The account's active TINs that can send: a paused one and a test TIN
+/// are left out.
 /// `full` adds the raw TIN and filing permissions, for the Buwiz BIR app
 /// only.
 pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::Result<Vec<Value>> {
@@ -1549,7 +1670,7 @@ pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx:
     Ok(rows
         .into_iter()
         .map(|(id, root, branch, registered_name, activated_at)| {
-            let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+            let tin = Tin::parse_any(&root, &branch).expect("stored TINs have the shape of one");
             profile_json(id, &tin, &registered_name, activated_at, full)
         })
         .collect())
@@ -1569,7 +1690,7 @@ async fn profiles_with_open(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::
     .fetch_all(db)
     .await?;
     profiles.extend(open.into_iter().map(|(id, root, branch, registered_name, status)| {
-        let tin = Tin::parse(&root, &branch).expect("stored TINs are valid");
+        let tin = Tin::parse_any(&root, &branch).expect("stored TINs have the shape of one");
         open_profile_json(id, &tin, &registered_name, &status, full)
     }));
     Ok(profiles)

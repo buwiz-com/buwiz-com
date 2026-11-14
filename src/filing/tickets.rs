@@ -111,7 +111,8 @@ struct Previous {
 /// `POST /api/tickets`.
 pub async fn issue(State(state): State<AppState>, signed: Signed<TicketRequest>) -> Result<Response, ApiError> {
     let Signed { bearer, device, body: request } = signed;
-    let tin = Tin::parse_combined(&request.tin)
+    // A test TIN too: the gate refuses it with its own code.
+    let tin = Tin::parse_combined_any(&request.tin)
         .map_err(|_| ApiError::bad_request("bad_tin", "tin must be the 9-digit root and the branch code"))?;
     let tin_digits = format!("{}{}", tin.root(), tin.branch());
     let filename = format!("{tin_digits}-{}-{}#{}#.xml", request.form, request.period, request.email);

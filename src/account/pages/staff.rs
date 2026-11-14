@@ -33,6 +33,9 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     if row.test_account {
         flags.push(("info", "science", "Test".to_owned()));
     }
+    if claim.tin().is_test() {
+        flags.push(("info", "science", "Test TIN: never sends".to_owned()));
+    }
     if row.rivals > 0 {
         flags.push(("bad", "group", "Another account claims this TIN".to_owned()));
     } else if claim.is_open() {
@@ -352,6 +355,8 @@ async fn typed_vs_document(comparison: Comparison) -> Result<impl View> {
 pub mod claim_id {
     use super::*;
 
+    /// Staff decide on their own claim only as an Admin (the audit line
+    /// shows it was their own); Support leave it to someone else.
     fn own_claim_of(claim: &ClaimRow, reviewer: &Staff) -> bool {
         claim.account_id == reviewer.account.id
     }
@@ -388,6 +393,9 @@ pub mod claim_id {
         }
         if claim.self_activated() {
             checks.push(("warn", "how_to_reg", SELF_ACTIVATED.to_owned()));
+        }
+        if claim.tin().is_test() {
+            checks.push(("info", "science", "Test TIN: Buwiz never sends returns for it".to_owned()));
         }
         if claim.is_open() {
             for required in kind.required() {
@@ -444,17 +452,16 @@ pub mod claim_id {
         // takes a reason.
         let paused_by_buwiz = claim.paused_at.is_some() && paused_by == "Buwiz";
         let confirm_needs_admin = claim.paused_at.is_some() && !reviewer.can(Power::Pause);
-        let can_confirm = auto_waiting
-            && reviewer.can(Power::ConfirmAuto)
-            && !own_claim_of(&claim, &reviewer)
-            && !confirm_needs_admin;
+        let own_claim = own_claim_of(&claim, &reviewer);
+        let own_withheld = own_claim && reviewer.role != Role::Admin;
+        let can_confirm = auto_waiting && reviewer.can(Power::ConfirmAuto) && !own_withheld && !confirm_needs_admin;
         let confirm = format!("/staff/claims/{claim_id}/confirm");
         let auto_sure = claim.auto_check.as_ref().map(|check| {
             let percent = |field: &str| format!("{:.0}%", check["confidence"][field].as_f64().unwrap_or(0.0) * 100.0);
             (percent("tin"), percent("name"))
         });
         let auto_doubts = crate::account::verify::doubt_words(claim.auto_check.as_ref());
-        let can_pause = reviewer.can(Power::Pause) && claim.status == "approved" && !own_claim_of(&claim, &reviewer);
+        let can_pause = reviewer.can(Power::Pause) && claim.status == "approved";
         let pause = format!("/staff/claims/{claim_id}/pause");
         let resume = format!("/staff/claims/{claim_id}/resume");
         let age = match claim.status.as_str() {
@@ -465,7 +472,6 @@ pub mod claim_id {
             claim.status == "pending" && OffsetDateTime::now_utc() - claim.waiting_since() > time::Duration::days(1);
         let fix_reasons: Vec<&str> =
             claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(label, _)| label).collect();
-        let own_claim = claim.account_id == reviewer.account.id;
         let decide = format!("/staff/claims/{claim_id}/decision");
         let delete = format!("/staff/claims/{claim_id}/delete");
         let revoke = format!("/staff/claims/{claim_id}/revoke");
@@ -586,6 +592,15 @@ pub mod claim_id {
                                                 confirm: "Confirm",
                                                 reason: true
                                             )
+                                        } else if can_confirm && own_claim {
+                                            confirm_form(
+                                                label: "Looks right: confirm",
+                                                action: confirm.clone(),
+                                                question: format!("Confirm your own TIN {tin}?"),
+                                                detail: "You checked the papers and they match. They are deleted now. This is your own TIN: write why; it goes in your history.".to_owned(),
+                                                confirm: "Confirm",
+                                                reason: true
+                                            )
                                         } else if can_confirm {
                                             confirm_form(
                                                 label: "Looks right: confirm",
@@ -594,7 +609,7 @@ pub mod claim_id {
                                                 detail: "You checked the papers and they match. They are deleted now.".to_owned(),
                                                 confirm: "Confirm"
                                             )
-                                        } else if own_claim_of(&claim, &reviewer) {
+                                        } else if own_withheld {
                                             <p class="side-text">"This is your own TIN. Another staff member confirms it."</p>
                                         } else if confirm_needs_admin {
                                             <p class="side-text">"Sending for this TIN is paused, so an admin confirms it."</p>
@@ -621,13 +636,14 @@ pub mod claim_id {
                                     }
                                 </section>
                             }
-                            if own_claim && claim.is_open() && can_activate {
-                                <p class="panel side-card side-text">"This is your own claim. Another staff member reviews its papers, or you can activate it without papers; the reason goes in your history."</p>
-                            } else if own_claim && claim.is_open() {
+                            if own_withheld && claim.is_open() {
                                 <p class="panel side-card side-text">"This is your own claim. Another staff member decides it."</p>
                             } else if claim.is_open() {
                                 <form class="panel side-card decision" method="post" action=(decide)>
                                     <h2>"Decision"</h2>
+                                    if own_claim {
+                                        <p class="side-text">"This is your own claim. Your decision goes in your history as one on your own account; to approve it, write why in the note."</p>
+                                    }
                                     if admin_must_approve {
                                         <p class="side-text">"Sending for this TIN was paused before: an admin must approve it. You can still send it back or reject it."</p>
                                     } else {
@@ -677,15 +693,12 @@ pub mod claim_id {
                                 <section class="panel side-card">
                                     <h2>"Decided"</h2>
                                     <p class="side-text">(status_label) " · " (claim.decided_at.map(date_time).unwrap_or_default())</p>
-                                    // The reviewer's note is for staff, not for the claimant.
-                                    if let Some(note) = claim.decision_note.clone().filter(|_| !own_claim) {
+                                    if let Some(note) = claim.decision_note.clone() {
                                         <p class="side-text quote">(note)</p>
                                     }
                                 </section>
                             }
-                            // Why staff paused and resumed it is theirs to read, not
-                            // the claimant's, staff or not.
-                            if !pauses.is_empty() && !own_claim {
+                            if !pauses.is_empty() {
                                 <section class="panel side-card">
                                     <h2>"Paused before"</h2>
                                     for line in pauses {
@@ -744,7 +757,9 @@ pub mod claim_id {
                                     }
                                 </section>
                             }
-                            if !own_claim && (show_delete || show_revoke) {
+                            if show_delete && own_claim {
+                                <p class="panel side-card side-text">"This is your own claim: delete it from My TINs."</p>
+                            } else if show_delete || show_revoke {
                                 <section class="panel side-card end-claim">
                                     if show_revoke {
                                         <p class="side-text">"Ends this account's ownership. The TIN stops being active at once, its sent returns stay, and it can be claimed again."</p>
@@ -840,7 +855,8 @@ async fn document_viewer(documents: Vec<(usize, DocumentRow)>, empty: String) ->
 
 #[page("/staff/users")]
 pub async fn users_page(cx: &Cx) -> Result<impl View> {
-    staff_member(cx, Power::SeeUsers).await?;
+    let viewer = staff_member(cx, Power::SeeUsers).await?;
+    let can_create = viewer.can(Power::CreateLogin);
     let filter = UserFilter::parse(query(cx, "filter").as_deref());
     let search = query(cx, "q").unwrap_or_default();
     let config = &state(cx).config;
@@ -864,13 +880,16 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 // `paused` is an approved row as the list shows it.
                 .filter(|claim| claim.status == "paused" || crate::filing::gate::is_live(&claim.status))
                 .map(|claim| {
-                    let tin = crate::account::tin::Tin::parse(&claim.tin_root, &claim.branch_code)
-                        .expect("stored TINs are valid");
-                    (tin.to_string(), claim.status.clone())
+                    let tin = crate::account::tin::Tin::parse_any(&claim.tin_root, &claim.branch_code)
+                        .expect("stored TINs have the shape of one");
+                    let shown = if tin.is_test() { format!("{tin} · test") } else { tin.to_string() };
+                    (shown, claim.status.clone())
                 })
                 .collect();
             let role = user_role(config, &user);
-            let id_status = IdStatus::of(role.is_some(), own.iter().map(|claim| claim.status.as_str()));
+            // A test TIN proves no identity.
+            let real = own.iter().filter(|claim| claim.tin_root != crate::account::tin::TEST_ROOT);
+            let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
             // The list says "Support"; Admins already read "Staff".
             let badge = role_badge(role).filter(|(_, tone)| *tone == "support");
             let (test, banned) = (user.test_account, user.banned_at.is_some());
@@ -889,6 +908,9 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                     search_box(action: "/staff/users", label: "Search users", placeholder: "Search email, TIN or registered name", value: search.clone(), keep: vec![("filter", filter.code())])
                 </div>
                 page_notice(notice: notice(cx))
+                if can_create {
+                    new_login_form()
+                }
                 <nav class="filters" aria-label="Filter users">
                     for (chip, href) in chips {
                         <a href=(href) class=(if chip == filter { "on" } else { "" }) aria-current=(if chip == filter { "page" } else { "false" })>
@@ -915,6 +937,60 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 <p class="fine left">"Active is the newest website sign-in or app token. Up to " (queries::LIST_LIMIT.to_string()) " accounts show; search to narrow."</p>
             </div>
         </main>
+    })
+}
+
+/// An Admin adds a made-up TIN to a test account: active at once, it never
+/// sends.
+#[component]
+async fn test_tin_form(account_id: Uuid) -> Result<impl View> {
+    Ok(view! {
+        <details>
+            <summary>"Add a test TIN"</summary>
+            <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test-tin"))>
+                <p class="side-text">"A made-up TIN, 000-000-000 at any branch, active at once for trying the apps. Buwiz never sends its returns to the BIR."</p>
+                <label class="decision-label">
+                    "TIN"
+                    <input type="text" name="tin" required=(true) value="000-000-000-00000" inputmode="numeric">
+                </label>
+                <label class="decision-label">
+                    "Registered name"
+                    <input type="text" name="registered_name" required=(true) maxlength="200">
+                </label>
+                <label class="decision-label">
+                    "Kind"
+                    <select name="kind">
+                        <option value="personal" selected=(true)>"Personal"</option>
+                        <option value="business">"Business"</option>
+                    </select>
+                </label>
+                reason_field()
+                <button class="btn btn-ghost" type="submit">"Add the test TIN"</button>
+            </form>
+        </details>
+    })
+}
+
+/// "New user": an Admin makes a login. Nothing is mailed.
+#[component]
+async fn new_login_form() -> Result<impl View> {
+    Ok(view! {
+        <details class="panel side-card">
+            <summary>"New user"</summary>
+            <form class="end-form" method="post" action="/staff/users/new">
+                <label class="decision-label">
+                    "Email"
+                    <input type="email" name="email" required=(true) maxlength="254" autocomplete="off">
+                </label>
+                <p class="side-text">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now. A staff role can be given on their page after their first sign-in."</p>
+                <label class="reason">
+                    <input type="checkbox" name="test" value="on">
+                    <span>"Test account"</span>
+                </label>
+                reason_field()
+                <button class="btn btn-ghost" type="submit">"Make the login"</button>
+            </form>
+        </details>
     })
 }
 
@@ -988,11 +1064,9 @@ pub mod account_id {
     pub async fn user_page(cx: &Cx) -> Result<impl View> {
         let viewer = staff_member(cx, Power::SeeUsers).await?;
         let account_id = path_id(cx, 0)?;
-        // An account's page carries what staff wrote about it (why a TIN
-        // was activated, where one went): never for its own eyes.
-        if viewer.account.id == account_id {
-            return Err(redirect(link("/staff/users", Some(Notice::OwnPage), &[])).into());
-        }
+        // Staff read their own page in full, history and reasons too; the
+        // changes that could lock them out are left to another Admin.
+        let own_page = viewer.account.id == account_id;
         let config = &state(cx).config;
         let db = &state(cx).db;
         let Some(user) = queries::user(db, account_id).await? else {
@@ -1005,7 +1079,9 @@ pub mod account_id {
         let audit = queries::audit(db, account_id).await?;
         let account_audit = queries::account_audit(db, account_id).await?;
         let role = user_role(config, &user);
-        let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
+        // A test TIN proves no identity.
+        let real = claims.iter().filter(|claim| !claim.tin().is_test());
+        let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
         let (id_label, id_icon, id_tone) = id_status.look();
         let badge = role_badge(role);
         let is_admin = role.is_some_and(|(role, _)| role == Role::Admin);
@@ -1022,6 +1098,8 @@ pub mod account_id {
         .into_iter()
         .map(|(value, label)| (value, label, value == stored_role))
         .collect();
+        let holds_test_tins =
+            claims.iter().any(|claim| claim.tin().is_test() && crate::filing::gate::is_live(&claim.status));
         let mut names: Vec<String> = Vec::new();
         for claim in claims.iter().filter(|claim| claim.status != "withdrawn") {
             if !names.contains(&claim.registered_name) {
@@ -1043,6 +1121,8 @@ pub mod account_id {
             })
             .collect();
         let live_sessions = sessions.iter().filter(|(_, live)| *live).count();
+        // A role waits for a first sign-in (`admin::change_role`).
+        let never_signed_in = sessions.is_empty();
         let signed_in: Vec<AppRow> = apps.iter().filter(|app| app.signed_in).cloned().collect();
         let history = history(&user, &claims, &apps, &sessions, &audit, &account_audit);
         let subtitle = {
@@ -1104,6 +1184,9 @@ pub mod account_id {
                                     <div class="user-tin">
                                         kind_pill(kind: claim.kind.clone())
                                         tin_text(tin: claim.tin().to_string())
+                                        if claim.tin().is_test() {
+                                            pill(label: "Test TIN".to_owned(), icon_name: "science", tone: "status-unverified".to_owned())
+                                        }
                                         <span class="user-tin-name">(claim.registered_name.clone())</span>
                                         <span class=(format!("user-tin-status {tone}"))>
                                             icon(name: status_icon)
@@ -1115,6 +1198,10 @@ pub mod account_id {
                                         </span>
                                         <a href=(format!("/staff/claims/{}", claim.id))>"Open claim"</a>
                                     </div>
+                                }
+                                // Not for ADMIN_EMAILS: their page cannot take the label off.
+                                if admin_viewer && user.test_account && user.banned_at.is_none() && !from_server {
+                                    test_tin_form(account_id: account_id)
                                 }
                             </section>
                         </div>
@@ -1133,10 +1220,14 @@ pub mod account_id {
                                 }
                                 if !admin_viewer {
                                     <p class="side-text">"Only an admin can change roles, bans and test labels."</p>
+                                } else if own_page {
+                                    <p class="side-text">"This is your own account: another admin changes its role, ban or test label."</p>
                                 } else if from_server {
                                     <p class="side-text">"Admin through the server setting ADMIN_EMAILS. Change it there."</p>
                                 } else {
-                                    if user.test_account {
+                                    if holds_test_tins {
+                                        <p class="side-text">"It holds test TINs: revoke them before you remove the test label."</p>
+                                    } else if user.test_account {
                                         <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Remove the test label from {}?", user.email)) data-confirm-detail="Staff no longer see it as a test account." data-confirm-label="Remove">
                                             <input type="hidden" name="test" value="off">
                                             reason_field()
@@ -1173,6 +1264,9 @@ pub mod account_id {
                                             confirm: "Ban",
                                             reason: true
                                         )
+                                    }
+                                    if never_signed_in {
+                                        <p class="side-text">"They have not signed in yet: a staff role can be given after their first sign-in."</p>
                                     }
                                     <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/role")) data-confirm=(format!("Change {}'s role?", user.email)) data-confirm-detail="It takes effect on their next page." data-confirm-label="Change role">
                                         <label class="decision-label">
@@ -1299,7 +1393,12 @@ fn history(
     audit: &[AuditRow],
     account_audit: &[AccountAuditRow],
 ) -> Vec<(OffsetDateTime, &'static str, String)> {
-    let mut events = vec![(user.created_at, "person_add", "Created the account".to_owned())];
+    // A login staff or the seed tool made has a `created` line saying who
+    // made it, and why; any other account was made at its first sign-in.
+    let mut events = Vec::new();
+    if !account_audit.iter().any(|line| line.action == "created") {
+        events.push((user.created_at, "person_add", "Made the account at their first sign-in".to_owned()));
+    }
     for (at, _) in sessions {
         events.push((*at, "login", "Signed in on the website".to_owned()));
     }
@@ -1323,6 +1422,8 @@ fn history(
         let tin = claim.tin().to_string();
         let kind = ClaimKind::label(&claim.kind);
         match claim.submitted_at {
+            // Staff added it, active at once: its activation says so.
+            _ if claim.tin().is_test() => {}
             Some(at) if at == claim.created_at => {
                 events.push((claim.created_at, "upload_file", format!("Sent {kind} TIN {tin}")));
             }
@@ -1342,6 +1443,7 @@ fn history(
         if let Some(at) = claim.decided_at {
             let (icon_name, what) = match claim.status.as_str() {
                 "approved" | "removed" | "revoked" => match claim.verified_by.as_deref() {
+                    Some("admin") if claim.tin().is_test() => ("science", format!("Test TIN {tin} added, active")),
                     Some("admin") => ("verified", format!("{tin} activated without papers")),
                     Some("seed") => ("verified", format!("{tin} activated by the seed tool")),
                     Some("auto") => ("bolt", format!("{tin} activated automatically from its TIN ID")),
@@ -1424,11 +1526,24 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "resumed" => format!("resumed {tin}"),
         _ => format!("removed the {file} from {tin}"),
     };
-    // An Admin activating their own TIN acts as staff, not as its owner.
-    let (who, what) = if line.action == "activated" && line.source == "web" && line.actor_id == account_id {
-        (format!("Staff {}", line.actor_email), format!("activated their own TIN {tin} without papers"))
-    } else {
-        (actor_text(line.actor_id, &line.actor_email, &line.source, Some(account_id)), what)
+    // Staff acting on their own TIN act as staff, not as its owner: these
+    // actions are staff's alone, so the line's actor being the account
+    // itself says it was their own.
+    let own = match line.action.as_str() {
+        "activated" => Some(format!("activated their own TIN {tin} without papers")),
+        "approved" => Some(format!("approved their own claim on {tin}")),
+        "rejected" => Some(format!("rejected their own claim on {tin}")),
+        "sent_back" => Some(format!("sent their own claim on {tin} back for a fix")),
+        "paused" => Some(format!("paused their own TIN {tin}")),
+        "resumed" => Some(format!("resumed their own TIN {tin}")),
+        "revoked" => Some(format!("revoked their own ownership of {tin}")),
+        "auto_confirmed" => Some(format!("confirmed the automatic activation of their own TIN {tin}")),
+        _ => None,
+    }
+    .filter(|_| line.source == "web" && line.actor_id == account_id);
+    let (who, what) = match own {
+        Some(own) => (format!("Staff {}", line.actor_email), own),
+        None => (actor_text(line.actor_id, &line.actor_email, &line.source, Some(account_id)), what),
     };
     match &line.reason {
         Some(reason) => format!("{who} {what}: {reason}"),

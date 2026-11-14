@@ -776,6 +776,22 @@ async fn refresh(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx:
     Ok(())
 }
 
+/// The `live` tries of the last 3 hours, at most [`MAX_EVIDENCE`] (the
+/// newest), oldest first: what the engine can hold, and no more is read.
+async fn recent_tries(db: &mut sqlx::PgConnection, now: OffsetDateTime) -> sqlx::Result<Vec<TryRow>> {
+    let mut rows: Vec<TryRow> = sqlx::query_as(
+        "SELECT id, ended_at, source, outcome, stage, dispatcher, upload, failure_kind, counted, late, admission,
+                key_epoch, account_key, network_key
+           FROM bir_tries WHERE mode = 'live' AND ended_at >= $1 ORDER BY ended_at DESC, id DESC LIMIT $2",
+    )
+    .bind(to_minute(now - sign::EVIDENCE_KEPT))
+    .bind(i64::try_from(MAX_EVIDENCE).unwrap_or(i64::MAX))
+    .fetch_all(db)
+    .await?;
+    rows.reverse();
+    Ok(rows)
+}
+
 /// Loads the engine at a start (or after a reset): the stored sign as it
 /// was, the `live` tries of the last 3 hours and the open note. Under the
 /// sign's lock, in one transaction: the reset or first-start line, and the
@@ -784,14 +800,7 @@ async fn refresh(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx:
 /// stored evaluation within [`RESTART_SLACK`] of a gap writes none.
 async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
     let mut tx = begin(db).await?;
-    let rows: Vec<TryRow> = sqlx::query_as(
-        "SELECT id, ended_at, source, outcome, stage, dispatcher, upload, failure_kind, counted, late, admission,
-                key_epoch, account_key, network_key
-           FROM bir_tries WHERE mode = 'live' AND ended_at >= $1 ORDER BY ended_at, id",
-    )
-    .bind(to_minute(now - sign::EVIDENCE_KEPT))
-    .fetch_all(&mut *tx)
-    .await?;
+    let rows = recent_tries(&mut tx, now).await?;
     lock_sign(&mut tx).await?;
     let row: Option<(i64, Value, OffsetDateTime)> =
         sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(&mut *tx).await?;
@@ -1020,5 +1029,44 @@ mod tests {
         let (state, _) = restore(3, serde_json::to_value(&ahead).unwrap(), now + Duration::days(30), now);
         assert_eq!((state.evaluated_at, state.since, state.upload.since), (now, now, now));
         assert_eq!((state.upload.last_ok_at, state.last_success_at), (Some(now), Some(now)));
+    }
+
+    /// The start-up read of recent tries is bounded: the newest
+    /// [`MAX_EVIDENCE`] of the last 3 hours, oldest first.
+    #[sqlx::test]
+    async fn the_start_reads_at_most_max_evidence_tries(db: PgPool) {
+        let now = datetime!(2026-11-11 05:00 UTC);
+        let extra = 25;
+        sqlx::query(
+            "INSERT INTO bir_tries (started_at, ended_at, source, mode, outcome, stage, dispatcher, upload,
+                 failure_class, failure_kind, touched_bir, counted, admission, key_epoch, account_key)
+             SELECT at, at, 'relay', 'live', 'failed', 'none', 'none', 'none', 'ours', 'other', false, false,
+                    'open', 1, decode('0102030405060708', 'hex')
+               FROM (SELECT $1 - make_interval(mins => (n % 170)::int) AS at
+                       FROM generate_series(1, $2) AS n) AS tries",
+        )
+        .bind(now)
+        .bind(i64::try_from(MAX_EVIDENCE + extra).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut connection = db.acquire().await.unwrap();
+        let rows = recent_tries(&mut connection, now).await.unwrap();
+        assert_eq!(rows.len(), MAX_EVIDENCE);
+        assert!(rows.windows(2).all(|pair| (pair[0].1, pair[0].0) <= (pair[1].1, pair[1].0)), "oldest first");
+        // The ones left out are the oldest.
+        let oldest_kept = rows[0].1;
+        let older: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_tries WHERE ended_at < $1")
+            .bind(oldest_kept)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let at_oldest: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_tries WHERE ended_at = $1")
+            .bind(oldest_kept)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let kept_at_oldest = rows.iter().filter(|row| row.1 == oldest_kept).count() as i64;
+        assert_eq!(older + at_oldest - kept_at_oldest, extra as i64);
     }
 }

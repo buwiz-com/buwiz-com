@@ -188,7 +188,8 @@ fn text(body: &'static str, content_type: &'static str) -> Response {
 /// share card (also at /favicon.ico and in /site.webmanifest), and for the
 /// home page's AI
 /// agent demos the two printed 1601-C documents their Computer screen shows
-/// and the font those use. (path under /assets, content type, bytes)
+/// and the font those use; and the staff pages' fonts. (path under /assets,
+/// content type, bytes)
 pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
     ("brand/buwiz_logo_light.webp", "image/webp", include_bytes!("../assets/brand/buwiz_logo_light.webp")),
     ("brand/buwiz_logo_dark.webp", "image/webp", include_bytes!("../assets/brand/buwiz_logo_dark.webp")),
@@ -218,6 +219,25 @@ pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
         "fonts/tinos-latin-400-normal.woff2",
         "font/woff2",
         include_bytes!("../assets/fonts/tinos-latin-400-normal.woff2"),
+    ),
+    // The staff pages' type (staff.css): Inter, variable, from rsms/inter
+    // v4.1, and IBM Plex Mono's Latin-1 cut for TINs, from IBM/plex
+    // (@ibm/plex-mono 2.5.0). Both are OFL; the licences sit beside them.
+    ("fonts/inter-variable.woff2", "font/woff2", include_bytes!("../assets/fonts/inter-variable.woff2")),
+    (
+        "fonts/ibm-plex-mono-regular-latin1.woff2",
+        "font/woff2",
+        include_bytes!("../assets/fonts/ibm-plex-mono-regular-latin1.woff2"),
+    ),
+    (
+        "fonts/ibm-plex-mono-medium-latin1.woff2",
+        "font/woff2",
+        include_bytes!("../assets/fonts/ibm-plex-mono-medium-latin1.woff2"),
+    ),
+    (
+        "fonts/ibm-plex-mono-semibold-latin1.woff2",
+        "font/woff2",
+        include_bytes!("../assets/fonts/ibm-plex-mono-semibold-latin1.woff2"),
     ),
 ];
 

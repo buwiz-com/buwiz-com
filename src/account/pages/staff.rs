@@ -205,6 +205,11 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
     };
     let selected = review.as_ref().map(|view| view.claim.id);
     let explicit = opened.is_some();
+    // The first row, shown because nobody chose one, comes without its
+    // decision: the way to it is "Review this claim", to `?open=`.
+    let preview = selected.filter(|_| !explicit).map(|claim_id| {
+        href("/staff/queue", &[("status", filter.code()), ("q", &search), ("open", &claim_id.to_string())])
+    });
     let lines: Vec<(QueueRow, String, bool)> = rows
         .into_iter()
         .map(|row| {
@@ -282,7 +287,7 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
         </main>
         inspector(title: "Claim", open: opened.is_some() && review.is_some(), close: close,
             if let Some(view) = review {
-                claim_body(view: view, wide: false)
+                claim_body(view: view, wide: false, review: preview)
             } else {
                 <div class="sx-insp-b"><p class="sx-empty">"Nothing to review in this tab."</p></div>
             }
@@ -673,8 +678,14 @@ async fn load_claim(cx: &Cx, reviewer: &Staff, claim_id: Uuid) -> Result<Option<
 /// thumb bar a phone's sheet shows) or on its own page (`wide: true`, the
 /// papers beside the review). Every decision and action form posts to the
 /// claim's routes, as before.
+///
+/// `review` is set when nobody chose the claim (the queue's first row in
+/// the inspector): it shows the facts and the papers but no decision or
+/// other action, so no click lands on Approve for a claim the reviewer did
+/// not pick; in their place one button, "Review this claim", goes to
+/// `review` (the list with `?open=`), where the controls are.
 #[component]
-async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
+async fn claim_body(view: ClaimView, wide: bool, #[default] review: Option<String>) -> Result<impl View> {
     let ClaimView {
         claim,
         documents,
@@ -715,7 +726,18 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
     let files = viewer_files(documents);
     let kind = claim.kind.clone();
     let (email, account_id) = (claim.email.clone(), claim.account_id);
-    let decides = claim.is_open() && !own_withheld;
+    let preview = review.is_some();
+    let review = review.unwrap_or_default();
+    let decides = claim.is_open() && !own_withheld && !preview;
+    // In a preview the button stands where the decision would; for a claim
+    // with no decision to make, at the end of the review.
+    let review_inline = preview && claim.is_open() && !own_withheld;
+    let review_at_end = preview && !review_inline;
+    let can_confirm = can_confirm && !preview;
+    let can_activate = can_activate && !preview;
+    let show_revoke = show_revoke && !preview;
+    let show_delete = show_delete && !preview;
+
     let tin_head = tin.clone();
     let pills = view! {
         <div class="sx-pills">
@@ -859,6 +881,8 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
         }
         if own_withheld && claim.is_open() {
             <p class="sx-notice info">(ic("info")) <span>"This is your own claim. Another staff member decides it."</span></p>
+        } else if review_inline {
+            review_this_claim(review: review.clone(), open: true)
         } else if claim.is_open() {
             <form class="sx-sub sx-form" id="decision" method="post" action=(decide)>
                 <h3>"Decision"</h3>
@@ -937,23 +961,25 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
                 }
             </section>
         }
-        if can_pause {
+        if can_pause && (claim.paused_at.is_some() || !preview) {
             <section class="sx-sub">
                 if let Some(at) = claim.paused_at {
                     <h3>"Paused"</h3>
                     <p class="sx-text">"Paused by " (paused_by.clone()) " on " (date(at)) ": " (claim.pause_reason.clone().unwrap_or_default())</p>
-                    <div class="sx-acts">
-                        reason_act(
-                            id: format!("act-resume-{claim_id}"),
-                            label: "Resume sending",
-                            sym: "play",
-                            action: format!("/staff/claims/{claim_id}/resume"),
-                            question: format!("Resume sending for {tin}?"),
-                            detail: "The owner can send returns again at once.",
-                            confirm: "Resume",
-                            danger: false
-                        )
-                    </div>
+                    if !preview {
+                        <div class="sx-acts">
+                            reason_act(
+                                id: format!("act-resume-{claim_id}"),
+                                label: "Resume sending",
+                                sym: "play",
+                                action: format!("/staff/claims/{claim_id}/resume"),
+                                question: format!("Resume sending for {tin}?"),
+                                detail: "The owner can send returns again at once.",
+                                confirm: "Resume",
+                                danger: false
+                            )
+                        </div>
+                    }
                 } else {
                     <h3>"Pause sending"</h3>
                     <p class="sx-text">"Keeps the TIN on this account but stops every send at once. The owner sees your reason on My TINs."</p>
@@ -1030,6 +1056,9 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
                 </div>
             </section>
         }
+        if review_at_end {
+            review_this_claim(review: review, open: false)
+        }
     }
     .boxed();
     let has_files = !files.is_empty();
@@ -1093,6 +1122,19 @@ async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
                 </div>
             }
         }
+    })
+}
+
+/// In place of the decision and the actions of a claim nobody chose: the
+/// one way to them.
+#[component]
+async fn review_this_claim(review: String, open: bool) -> Result<impl View> {
+    Ok(view! {
+        <section class="sx-sub sx-preview" aria-labelledby="sx-preview">
+            <h3 id="sx-preview">(if open { "Decision" } else { "Actions" })</h3>
+            <p class="sx-text">"The first claim in the list, shown until you choose one. Its decision and actions are on the claim itself."</p>
+            <a class="sx-btn pri block" href=(review)>(ic("arrow-right")) "Review this claim"</a>
+        </section>
     })
 }
 

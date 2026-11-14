@@ -70,7 +70,12 @@ rail's icons, the phone's Queue tab) on `/staff/queue` and on a claim's page.
 ## State in the URL
 
 Everything works without script. The row in the inspector is `?open=<id>` (on `/staff/queue`)
-(desktop shows the list's first row when none is chosen); the user page's
+(desktop shows the list's first row when none is chosen, as a preview: its
+facts and papers, but no decision, no action and no thumb bar, only "Review
+this claim" to its `?open=`, so the claim the queue reloads with after a
+decision is never one stray click from being decided; decisions and actions
+are on a chosen claim and on its own page; the users inspector has no
+actions, only links to the account's page); the user page's
 tab is `?tab=account|tins|sign|history`; the New user dialog is
 `/staff/users?new=1`. `staff.js` then swaps the inspector in place (and
 keeps the URL), opens and closes the phone sheet and the tablet's names,

@@ -410,12 +410,13 @@ async fn the_inspector_shows_the_row_in_the_link(db: PgPool) {
         .await
         .unwrap();
 
-    // Nothing chosen: the oldest claim, closed on tablets and phones.
+    // Nothing chosen: the oldest claim, closed on tablets and phones, and
+    // without its decision (see the test below).
     let page = text(site.get("/staff/queue", &staff).await).await;
     let side = inspector(&page);
     assert!(side.starts_with("id=\"inspector\" class=\"sx-insp\""), "{side}");
     assert!(side.contains("000-123-451-00000") && !side.contains("000-123-452-00000"), "{side}");
-    assert!(side.contains(&format!("action=\"/staff/claims/{first}/decision\"")), "{side}");
+    assert!(!side.contains(&format!("action=\"/staff/claims/{first}/decision\"")), "{side}");
     assert!(page.contains(&format!("<tr data-id=\"{first}\" class=\"sel auto\">")), "{page}");
     // `?open=` chooses the row and opens the panel, wherever it is in the list.
     let page = text(site.get(&format!("/staff/queue?status=waiting&open={second}"), &staff).await).await;
@@ -523,6 +524,103 @@ async fn the_viewer_takes_any_number_of_files_and_lists_each(db: PgPool) {
     // staff.css has no rule per position left.
     let css = text(site.get("/assets/staff.css", "").await).await;
     assert!(!css.contains("nth-of-type") && css.contains(".sx-viewer-radio:checked + .sx-viewer-pane"));
+}
+
+/// The opening `<a …>` of the link whose text holds `words`.
+fn link_with<'a>(page: &'a str, words: &str) -> &'a str {
+    let at = page.find(words).unwrap_or_else(|| panic!("no {words}"));
+    let start = page[..at].rfind("<a ").unwrap();
+    &page[start..start + page[start..].find('>').unwrap() + 1]
+}
+
+/// The `<form …>…</form>` on `page` that holds `needle`.
+fn form_with<'a>(page: &'a str, needle: &str) -> &'a str {
+    let at = page.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+    let start = page[..at].rfind("<form").unwrap();
+    &page[start..start + page[start..].find("</form>").unwrap() + "</form>".len()]
+}
+
+/// After a decision the queue reloads with the next claim in the inspector:
+/// nobody chose it, so it shows its facts and papers but no decision, no
+/// action and no thumb bar, only "Review this claim" to `?open=`. Chosen,
+/// it has the decision as on its own page, field for field.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_claim_nobody_chose_has_no_decision_in_the_inspector(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (bob, _) = site.person("bob@example.test").await;
+    let first = add_claim(&site.db, ana, "000123451", "pending").await;
+    add_claim(&site.db, bob, "000123452", "pending").await;
+    sqlx::query("UPDATE tin_claims SET created_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(first)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    add_files(&site.db, first, 2, 0).await;
+    let decision = format!("action=\"/staff/claims/{first}/decision\"");
+
+    for path in ["/staff/queue?notice=claim_decided", "/staff/queue?status=waiting&q=000123451"] {
+        let page = text(site.get(path, &staff).await).await;
+        let side = inspector(&page);
+        // Its facts and papers are there.
+        assert!(side.contains("000-123-451-00000") && side.contains("ana@example.test"), "{path}: {side}");
+        assert!(side.contains("class=\"sx-viewer viewer\"") && side.contains("Typed vs. on the document"), "{side}");
+        assert!(side.contains("Checks"), "{side}");
+        // No decision, no thumb bar, no action form of any kind.
+        assert!(!side.contains(&decision) && !side.contains("name=\"decision\""), "{path}: {side}");
+        assert!(!side.contains("sx-thumbbar") && !side.contains("<form"), "{path}: {side}");
+        assert!(!side.contains("Approve") && !side.contains("Ask for a fix") && !side.contains(">Reject<"), "{side}");
+        // One way on: "Review this claim", to the same list with ?open=.
+        assert_eq!(side.matches("Review this claim").count(), 1, "{side}");
+        let open = if path.contains("q=") {
+            format!("/staff/queue?status=waiting&amp;q=000123451&amp;open={first}")
+        } else {
+            format!("/staff/queue?status=waiting&amp;open={first}")
+        };
+        assert!(link_with(side, "Review this claim").contains(&format!("href=\"{open}\"")), "{side}");
+    }
+
+    // Chosen with ?open=: the decision, its thumb bar, and the very form of
+    // the claim's own page.
+    let page = text(site.get(&format!("/staff/queue?status=waiting&open={first}"), &staff).await).await;
+    let side = inspector(&page);
+    assert!(!side.contains("Review this claim"), "{side}");
+    assert!(side.contains("class=\"sx-thumbbar\""), "{side}");
+    let chosen = form_with(side, &decision);
+    let own_page = text(site.get(&format!("/staff/claims/{first}"), &staff).await).await;
+    assert_eq!(chosen, form_with(&own_page, &decision));
+    for field in [
+        "name=\"decision\" value=\"approve\"",
+        "name=\"decision\" value=\"fix\"",
+        "name=\"decision\" value=\"reject\"",
+        "name=\"reasons\"",
+        "<textarea name=\"note\"",
+    ] {
+        assert!(chosen.contains(field), "{field}: {chosen}");
+    }
+    let thumb = &side[side.find("class=\"sx-thumbbar\"").unwrap()..];
+    assert_eq!(thumb.matches("form=\"decision\"").count(), 3, "{thumb}");
+}
+
+/// An approved claim nobody chose shows no pause, revoke or activate either.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_claim_nobody_chose_has_no_actions_in_the_inspector(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "000123451", "approved").await;
+    let page = text(site.get("/staff/queue?status=approved", &staff).await).await;
+    let side = inspector(&page);
+    assert!(side.contains("000-123-451-00000"), "{side}");
+    assert!(!side.contains("<form") && !side.contains("sx-act"), "{side}");
+    assert!(link_with(side, "Review this claim").contains(&format!("open={claim}")), "{side}");
+    let page = text(site.get(&format!("/staff/queue?status=approved&open={claim}"), &staff).await).await;
+    let side = inspector(&page);
+    for action in ["pause", "revoke"] {
+        assert!(side.contains(&format!("action=\"/staff/claims/{claim}/{action}\"")), "{action}: {side}");
+    }
+    assert!(!side.contains("Review this claim"), "{side}");
 }
 
 #[sqlx::test(migrations = "./migrations")]

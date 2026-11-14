@@ -1,9 +1,9 @@
 //! The staff console's frame around every /staff page: the left sidebar
-//! (an icon rail on tablets), the phone's top bar and tab bar, and the
-//! document head that loads staff.css and staff.js. The page itself renders
+//! (an icon rail on tablets), the phone's top bar and tab bar, the document
+//! head that loads staff.css and staff.js, and the icons inline. The page itself renders
 //! `<main id="main">` and, where it has one, the inspector beside it.
 
-use super::ui::{avatar, ic};
+use super::ui::{avatar, ic, sprite};
 use super::*;
 use crate::account::staff::Counts;
 use topcoat::view::Child;
@@ -73,6 +73,8 @@ pub(crate) async fn document(
                 <script src="/assets/staff.js"></script>
             </head>
             <body class="sx">
+                // Every icon on the page points into this one copy.
+                (sprite())
                 <a class="sx-skip" href="#main">"Skip to content"</a>
                 <div class="sx-app">
                     <aside class="sx-side" id="sx-side" aria-label="Staff">

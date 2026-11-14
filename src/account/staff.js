@@ -294,7 +294,8 @@ document.documentElement.classList.add("js");
       button.setAttribute("aria-expanded", String(want));
       button.setAttribute("aria-label", want ? "Hide names" : "Show names");
       const use = button.querySelector("use");
-      if (use) use.setAttribute("href", `/assets/staff-icons.svg#${want ? "chevrons-left" : "chevrons-right"}`);
+      // The icons are the page's own (the inline sprite), named by id.
+      if (use) use.setAttribute("href", want ? "#chevrons-left" : "#chevrons-right");
     }
     let veil = document.querySelector(".sx-rail-veil");
     if (want && !veil) {

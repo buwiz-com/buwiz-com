@@ -1,6 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg">
-<!-- The staff console's icons, one <symbol> each, used as
-     <svg class="ic"><use href="/assets/staff-icons.svg#name"/></svg>.
+<!-- The staff console's icons, one <symbol> each. The shell puts this
+     file inline once in every staff page (`ui::sprite`), and icons use it
+     from the page itself: <svg class="ic"><use href="#name"/></svg>.
      Stroke, width and caps come from `.ic` in staff.css.
      Paths from Lucide (https://lucide.dev), ISC License,
      Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022
@@ -21,6 +22,7 @@
 <symbol id="person" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 0 0-16 0"/></symbol>
 <symbol id="chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
 <symbol id="chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+<symbol id="chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
 <symbol id="chevrons-right" viewBox="0 0 24 24"><path d="m6 17 5-5-5-5"/><path d="m13 17 5-5-5-5"/></symbol>
 <symbol id="chevrons-left" viewBox="0 0 24 24"><path d="m11 17-5-5 5-5"/><path d="m18 17-5-5 5-5"/></symbol>
 <symbol id="x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>

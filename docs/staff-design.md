@@ -3,8 +3,10 @@
 The staff pages under `/staff` have their own look, separate from the
 owner-facing pages: their own document head (`src/account/pages/staff/shell.rs`),
 stylesheet (`src/account/staff.css`), script (`src/account/staff.js`) and
-icons (`src/account/staff-icons.svg`). Owner pages (sign-in, My TINs, home,
-downloads) never load them, and the console loads none of theirs.
+icons (`src/account/staff-icons.svg`, put inline once in every staff page by
+`ui::sprite`, so `<use href="#name">` loads nothing). Owner pages (sign-in,
+My TINs, home, downloads) never load them, and the console loads none of
+theirs.
 
 ## Tokens
 
@@ -74,13 +76,15 @@ tab is `?tab=account|tins|sign|history`; the New user dialog is
 keeps the URL), opens and closes the phone sheet and the tablet's names,
 moves actions that need a reason into a modal dialog, and switches tabs.
 Pages send a Content-Security-Policy that allows only this site's own
-files: no inline script, no inline style.
+files, each kind only where a page uses it (`STAFF_CSP` in `web.rs`): no
+inline script, no inline style, no frames.
 
 ## Components
 
 `staff.css` sections, with their Rust helpers in `pages/staff/ui.rs`:
 buttons (`.sx-btn`, `pri`, `dan`, `sm`, `block`) and icon buttons
-(`.sx-ib`); icons (`ic()`, symbols in `staff-icons.svg`); pills
+(`.sx-ib`); icons (`ic()`, symbols in `staff-icons.svg`; a test checks that
+every name the source uses is there); pills
 (`sx_pill`, `status_pill`, `flag_pill`) and counts (`.sx-count`, `hot`);
 tabs (`.sx-tabs`) and filter chips (`.sx-chips`); the page head
 (`page_head`); notices (`sx_notice`, `.sx-notice error|info|warn`); compact

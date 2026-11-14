@@ -2,10 +2,12 @@
 //! dialogs. The look is staff.css's; docs/staff-design.md lists them.
 
 use super::*;
+use std::sync::LazyLock;
 use topcoat::view::{Child, Unescaped};
 
-/// An icon of /assets/staff-icons.svg. `name` is one of its symbols, a
-/// constant, so the markup is ours.
+/// An icon of staff-icons.svg. `name` is one of its symbols, a constant, so
+/// the markup is ours. It points into the page's own copy of the icons
+/// ([`sprite`]), so it loads no other file.
 pub(crate) fn ic(name: &'static str) -> Unescaped<String> {
     icon_with(name, "ic")
 }
@@ -13,8 +15,24 @@ pub(crate) fn ic(name: &'static str) -> Unescaped<String> {
 /// [`ic`] with other classes (`ic sm`, `ic lg`).
 pub(crate) fn icon_with(name: &'static str, class: &'static str) -> Unescaped<String> {
     Unescaped::new_unchecked(format!(
-        r#"<svg class="{class}" aria-hidden="true" focusable="false"><use href="/assets/staff-icons.svg#{name}"></use></svg>"#
+        r##"<svg class="{class}" aria-hidden="true" focusable="false"><use href="#{name}"></use></svg>"##
     ))
+}
+
+/// staff-icons.svg, inline once at the top of every staff page's body
+/// (`shell::document`), so every [`ic`] finds its symbol in the same
+/// document: an external `<use>` file is one more load the policy's
+/// `default-src 'none'` may refuse (Firefox does). It takes no space and is
+/// hidden from screen readers; the file itself has no style or script.
+pub(crate) fn sprite() -> Unescaped<&'static str> {
+    static SPRITE: LazyLock<String> = LazyLock::new(|| {
+        include_str!("../../staff-icons.svg").replacen(
+            r#"<svg xmlns="http://www.w3.org/2000/svg">"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" class="sx-sprite" width="0" height="0" aria-hidden="true" focusable="false">"#,
+            1,
+        )
+    });
+    Unescaped::new_unchecked(SPRITE.as_str())
 }
 
 /// The console's icon for one of the Material Symbols names the rest of
@@ -339,5 +357,113 @@ mod tests {
             let id = glyph(name);
             assert!(sprite.contains(&format!("<symbol id=\"{id}\"")), "{name} -> {id}");
         }
+    }
+
+    /// The source of the staff pages without their tests.
+    fn page_sources() -> Vec<(&'static str, &'static str)> {
+        let code = |source: &'static str| source.split("#[cfg(test)]").next().unwrap();
+        vec![
+            ("staff.rs", code(include_str!("../staff.rs"))),
+            ("overview.rs", code(include_str!("overview.rs"))),
+            ("search.rs", code(include_str!("search.rs"))),
+            ("shell.rs", code(include_str!("shell.rs"))),
+            ("ui.rs", code(include_str!("ui.rs"))),
+        ]
+    }
+
+    /// The text of the argument that starts at `from` (just after its
+    /// opening bracket, or after `sym:`), up to the comma or bracket that
+    /// ends it at its own depth.
+    fn argument(source: &str, from: usize) -> &str {
+        let mut depth = 0;
+        let mut in_text = false;
+        for (at, ch) in source[from..].char_indices() {
+            match ch {
+                '"' => in_text = !in_text,
+                _ if in_text => {}
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' if depth == 0 => return &source[from..from + at],
+                ')' | '}' | ']' => depth -= 1,
+                ',' if depth == 0 => return &source[from..from + at],
+                _ => {}
+            }
+        }
+        &source[from..]
+    }
+
+    /// The icon names an argument can be: a string literal, each branch of
+    /// an `if` (`{ "a" } else { "b" }`), or `glyph("…")` mapped through
+    /// [`glyph`]. A variable names none.
+    fn names_in(argument: &str) -> Vec<String> {
+        let argument = argument.trim();
+        let literals = |text: &str| -> Vec<String> { text.split('"').skip(1).step_by(2).map(str::to_owned).collect() };
+        if let Some(inner) = argument.strip_prefix("glyph(") {
+            return literals(inner).iter().map(|name| glyph(name).to_owned()).collect();
+        }
+        if argument.starts_with('"') {
+            return literals(argument).into_iter().take(1).collect();
+        }
+        if argument.starts_with("if ") {
+            return argument
+                .split('{')
+                .skip(1)
+                .filter_map(|branch| branch.trim_start().strip_prefix('"'))
+                .filter_map(|rest| rest.split('"').next())
+                .map(str::to_owned)
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Every icon the staff pages name in their source: in `ic(…)`, as the
+    /// first argument of `icon_with(…)`, as a `sym:` given to a pill or an
+    /// action, and the ones staff.js swaps in (`"#name"`).
+    fn named_icons() -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        for (_, source) in page_sources() {
+            for marker in ["ic(", "icon_with(", "sym: "] {
+                for (at, _) in source.match_indices(marker) {
+                    let before = source[..at].chars().next_back().unwrap_or(' ');
+                    if before.is_alphanumeric() || before == '_' {
+                        continue;
+                    }
+                    found.extend(names_in(argument(source, at + marker.len())));
+                }
+            }
+        }
+        let script = include_str!("../../staff.js");
+        for piece in script.split("\"#").skip(1) {
+            found.insert(piece[..piece.find('"').unwrap()].to_owned());
+        }
+        found.remove("");
+        found
+    }
+
+    #[test]
+    fn every_icon_named_in_the_source_is_in_the_sprite() {
+        let sprite = include_str!("../../staff-icons.svg");
+        let names = named_icons();
+        // The scan finds them: the More menu's chevron, both branches of an
+        // `if`, a pill's `sym:`, a `glyph("…")` and staff.js's swap.
+        for expected in ["chevron-down", "bot", "monitor", "flask", "chevrons-left", "chevrons-right", "check-circle"] {
+            assert!(names.contains(expected), "{expected} not found in {names:?}");
+        }
+        assert!(names.len() > 40, "{names:?}");
+        for name in &names {
+            assert!(sprite.contains(&format!("<symbol id=\"{name}\"")), "{name} is not in staff-icons.svg");
+        }
+    }
+
+    #[test]
+    fn the_sprite_is_inline_and_hidden() {
+        let inline = sprite().to_string();
+        assert!(inline.starts_with(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" class="sx-sprite" width="0" height="0" aria-hidden="true" focusable="false">"#
+        ));
+        assert!(!inline.contains("style") && !inline.contains("<script"), "{inline}");
+        assert_eq!(
+            ic("search").to_string(),
+            r##"<svg class="ic" aria-hidden="true" focusable="false"><use href="#search"></use></svg>"##
+        );
     }
 }

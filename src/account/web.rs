@@ -56,7 +56,6 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/account.js", get(account_script))
         .route("/assets/staff.css", get(staff_stylesheet))
         .route("/assets/staff.js", get(staff_script))
-        .route("/assets/staff-icons.svg", get(staff_icons))
         .route("/assets/screens/{name}", get(screenshot))
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
@@ -172,10 +171,6 @@ async fn staff_stylesheet() -> Response {
 
 async fn staff_script() -> Response {
     text(include_str!("staff.js"), "text/javascript; charset=utf-8")
-}
-
-async fn staff_icons() -> Response {
-    text(include_str!("staff-icons.svg"), "image/svg+xml")
 }
 
 async fn demo_script() -> Response {
@@ -296,10 +291,14 @@ async fn screenshot(Path(name): Path<String>) -> Response {
     response
 }
 
-/// What the staff pages may load: only this site's own files (staff.css,
-/// staff.js, the icons, the fonts, the brand marks, claim documents), no
-/// inline script or style, and nothing from another host. Not sent with the
-/// 404 that everyone else gets there, which is the site's own page.
+/// What the staff pages may load: only this site's own files, each for
+/// what uses it: staff.js (`script-src`), staff.css (`style-src`), claim
+/// documents, the favicon and the brand marks staff.css masks with
+/// (`img-src`), the fonts (`font-src`), staff.js swapping the inspector in
+/// (`connect-src`) and the staff forms (`form-action`). No inline script
+/// or style, nothing from another host, no frames. The icons are inline SVG
+/// in the page (`ui::sprite`), so they load nothing. Not sent with the 404
+/// that everyone else gets there, which is the site's own page.
 const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
      font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 

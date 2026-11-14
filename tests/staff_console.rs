@@ -458,6 +458,18 @@ async fn the_console_loads_only_its_own_files(db: PgPool) {
         }
         // No inline script or style for the policy to refuse.
         assert!(!page.contains("<script>") && !page.contains(" style=\""), "{path}");
+        // The icons are in the page once, and every icon uses that copy: no
+        // other file for the policy to refuse.
+        assert_eq!(page.matches("<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"sx-sprite\"").count(), 1, "{path}");
+        assert!(page.contains("<use href=\"#search\"></use>"), "{path}");
+        assert!(!page.contains("<use href=\"/") && !page.contains("staff-icons.svg"), "{path}");
+        // The policy is exactly this: each kind of file from this site only.
+        assert_eq!(
+            csp,
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; \
+             connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            "{path}"
+        );
     }
     // The owner's pages keep their own look and no new policy, the 404
     // that people get under /staff included.
@@ -471,7 +483,6 @@ async fn the_console_loads_only_its_own_files(db: PgPool) {
     for (path, kind) in [
         ("/assets/staff.css", "text/css; charset=utf-8"),
         ("/assets/staff.js", "text/javascript; charset=utf-8"),
-        ("/assets/staff-icons.svg", "image/svg+xml"),
         ("/assets/fonts/inter-variable.woff2", "font/woff2"),
         ("/assets/fonts/ibm-plex-mono-regular-latin1.woff2", "font/woff2"),
         ("/assets/fonts/ibm-plex-mono-medium-latin1.woff2", "font/woff2"),
@@ -481,6 +492,8 @@ async fn the_console_loads_only_its_own_files(db: PgPool) {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert_eq!(content_type(&response), kind, "{path}");
     }
+    // The icons are no separate file any more.
+    assert_eq!(site.get("/assets/staff-icons.svg", "").await.status(), StatusCode::NOT_FOUND);
     // Every file staff.css names is served.
     let css = text(site.get("/assets/staff.css", "").await).await;
     for url in css.split("url(\"").skip(1).filter_map(|rest| rest.split('"').next()) {

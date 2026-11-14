@@ -196,6 +196,8 @@ body.sx {
   fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round;
   vertical-align: -3px;
 }
+/* The icons' symbols, inline once per page (ui::sprite): no box at all. */
+.sx-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 .ic.lg { width: 20px; height: 20px; }
 .ic.sm { width: 13px; height: 13px; stroke-width: 2.2; }
 .sx-mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: 0.01em; }

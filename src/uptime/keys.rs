@@ -315,9 +315,10 @@ pub const MAX_KEYS: usize = 100_000;
 /// A fixed-window rate limiter held in memory: at most `limit` hits per key
 /// in each `window`. Windows are shared: when one ends, every count starts
 /// again, so nothing is ever scanned. A key new in a window that already
-/// holds `cap` keys is refused until the window ends, so the map never
-/// grows past `cap`. Keys (an IP address, an account id) are never stored
-/// anywhere else.
+/// holds `cap` keys is counted in one shared overflow bucket (with the same
+/// limit) until the window ends, so the map never grows past `cap` and a
+/// flood of new addresses cannot lock out everyone who comes after it. Keys
+/// (an IP address, an account id) are never stored anywhere else.
 pub struct RateLimiter<K> {
     limit: u32,
     window: Duration,
@@ -329,6 +330,8 @@ struct Hits<K> {
     /// When the current window began; `None` before the first hit.
     since: Option<OffsetDateTime>,
     by_key: HashMap<K, u32>,
+    /// The hits of the keys that came once the map was full.
+    overflow: u32,
 }
 
 impl<K: Eq + Hash> RateLimiter<K> {
@@ -337,7 +340,7 @@ impl<K: Eq + Hash> RateLimiter<K> {
     }
 
     pub fn with_cap(limit: u32, window: Duration, cap: usize) -> Self {
-        Self { limit, window, cap, hits: Mutex::new(Hits { since: None, by_key: HashMap::new() }) }
+        Self { limit, window, cap, hits: Mutex::new(Hits { since: None, by_key: HashMap::new(), overflow: 0 }) }
     }
 
     /// Counts a hit for `key`: `Ok`, or how long until it may go again.
@@ -350,21 +353,27 @@ impl<K: Eq + Hash> RateLimiter<K> {
                 Some(since) if now >= since && now - since < self.window => None,
                 _ => {
                     hits.since = Some(now);
+                    hits.overflow = 0;
                     Some(std::mem::take(&mut hits.by_key))
                 }
             };
             let since = hits.since.unwrap_or(now);
             let wait = self.window - (now - since);
             let full = hits.by_key.len() >= self.cap;
-            let verdict = match hits.by_key.get_mut(&key) {
+            let Hits { by_key, overflow, .. } = &mut *hits;
+            let verdict = match by_key.get_mut(&key) {
                 Some(count) if *count >= self.limit => Err(wait),
                 Some(count) => {
                     *count += 1;
                     Ok(())
                 }
-                None if full => Err(wait),
+                None if full && *overflow >= self.limit => Err(wait),
+                None if full => {
+                    *overflow += 1;
+                    Ok(())
+                }
                 None => {
-                    hits.by_key.insert(key, 1);
+                    by_key.insert(key, 1);
                     Ok(())
                 }
             };
@@ -606,11 +615,16 @@ mod tests {
         for key in 0..100u32 {
             limiter.check(key, now).unwrap();
         }
-        // Full: a known key goes on, a new one waits for the next window.
+        // Full: a known key goes on, and new ones share one overflow bucket
+        // with the same limit instead of being locked out.
         assert_eq!(limiter.check(7, now + Duration::seconds(10)), Ok(()));
+        for key in 100..105u32 {
+            assert_eq!(limiter.check(key, now + Duration::seconds(10)), Ok(()), "{key}");
+        }
+        assert_eq!(limiter.check(105, now + Duration::seconds(10)), Err(Duration::seconds(50)));
         assert_eq!(limiter.check(100, now + Duration::seconds(10)), Err(Duration::seconds(50)));
-        assert_eq!(limiter.len(), 100);
-        // The next window starts empty.
+        assert_eq!(limiter.len(), 100, "the map never grows past its cap");
+        // The next window starts empty, its overflow too.
         limiter.check(100, now + Duration::minutes(1)).unwrap();
         assert_eq!(limiter.len(), 1);
         assert!(!limiter.is_empty());

@@ -15,12 +15,12 @@
 //!   cacheable 5 minutes, limited per IP with the status.
 
 use axum::Json;
-use axum::extract::{FromRequestParts, Query, Request, State};
+use axum::extract::{FromRequestParts, RawQuery, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http::request::Parts;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use time::{Duration, OffsetDateTime};
 
 use super::history::{self, RangeError};
@@ -176,19 +176,34 @@ async fn today(state: &AppState, now: OffsetDateTime) -> sqlx::Result<Today> {
     Ok(Today { tries, got_in, accounts })
 }
 
-#[derive(Deserialize)]
-pub struct Range {
-    from: Option<String>,
-    to: Option<String>,
+/// `from` and `to` of a query, each at most once (a second is refused, as
+/// `bad_range`); other parameters are ignored.
+fn range_query(query: Option<&str>) -> Result<(Option<String>, Option<String>), RangeError> {
+    let (mut from, mut to) = (None, None);
+    for (name, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        let slot = match &*name {
+            "from" => &mut from,
+            "to" => &mut to,
+            _ => continue,
+        };
+        if slot.replace(value.into_owned()).is_some() {
+            return Err(RangeError::Repeated);
+        }
+    }
+    Ok((from, to))
 }
 
 /// `GET /api/bir/history?from=YYYY-MM-DD&to=YYYY-MM-DD`.
-pub async fn history(State(state): State<AppState>, headers: HeaderMap, Query(range): Query<Range>) -> Response {
+pub async fn history(State(state): State<AppState>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
     let now = OffsetDateTime::now_utc();
     if let Err(wait) = check_ip(&state, &headers, now) {
         return rate_limited(wait);
     }
-    let (from, to) = match history::range(range.from.as_deref(), range.to.as_deref(), now) {
+    let (from, to) = match range_query(query.as_deref()) {
+        Ok(asked) => asked,
+        Err(error) => return bad_range(error),
+    };
+    let (from, to) = match history::range(from.as_deref(), to.as_deref(), now) {
         Ok(range) => range,
         Err(error) => return bad_range(error),
     };

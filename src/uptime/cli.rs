@@ -72,10 +72,15 @@ pub enum Until {
 }
 
 impl Until {
-    fn at(self, now: OffsetDateTime) -> OffsetDateTime {
+    /// When it ends; `None` past what a clock can hold. `--hours` ends on
+    /// the 5-minute mark before, so the note's end does not tell when the
+    /// command ran.
+    fn at(self, now: OffsetDateTime) -> Option<OffsetDateTime> {
         match self {
-            Self::At(at) => at,
-            Self::Hours(hours) => now + Duration::hours(hours),
+            Self::At(at) => Some(at),
+            Self::Hours(hours) => {
+                now.checked_add(Duration::seconds(hours.checked_mul(3600)?)).map(public::round_down)
+            }
         }
     }
 }
@@ -130,6 +135,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             "--hours" if kind.is_some() => {
                 let raw = value()?;
                 let hours = raw.parse::<i64>().map_err(|_| format!("--hours {raw} is not a whole number"))?;
+                if !(1..=MAX_AHEAD.whole_hours()).contains(&hours) {
+                    return Err(format!("--hours must be 1 to 72, not {raw}"));
+                }
                 until = Some(Until::Hours(hours));
             }
             other => return Err(format!("unexpected `{other}`")),
@@ -329,7 +337,9 @@ pub async fn run(
     let text;
     let change = match &command {
         Command::Declare { kind, until, text: wanted, .. } => {
-            let until = until.at(now);
+            let Some(until) = until.at(now) else {
+                return Err(CliError::Refused("a note may end at most 72 hours ahead".into()));
+            };
             if until <= now {
                 return Err(CliError::Refused("the note must end in the future".into()));
             }
@@ -498,6 +508,10 @@ mod tests {
             "declare offline --as a --reason x",
             "declare offline --as a --reason x --hours 1 --until 2026-11-14T18:00",
             "declare offline --as a --reason x --hours six",
+            "declare offline --as a --reason x --hours 0",
+            "declare offline --as a --reason x --hours -3",
+            "declare offline --as a --reason x --hours 73",
+            "declare offline --as a --reason x --hours 9223372036854775807",
             "declare offline --as a --reason x --until tomorrow",
             "declare offline --as a --reason",
             "clear --as a",

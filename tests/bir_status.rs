@@ -399,6 +399,13 @@ async fn the_history_gives_states_not_counts(db: PgPool) {
         format!("?to={}", iso(today + Duration::days(1))),
         format!("?from={}&to={from}", iso(today)),
         "?from=yesterday".to_owned(),
+        // No arithmetic on a year out of range, and a parameter given twice
+        // is refused in the same shape.
+        "?to=-9999-01-01".to_owned(),
+        "?from=-9999-01-01".to_owned(),
+        "?to=%2B99999-12-31".to_owned(),
+        format!("?from={from}&from={from}"),
+        format!("?to={0}&to={0}", iso(today)),
     ] {
         let response = get(&site, &format!("/api/bir/history{bad}"), &[]).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");

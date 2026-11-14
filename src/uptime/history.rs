@@ -67,10 +67,13 @@ pub fn iso(day: Date) -> String {
     format!("{:04}-{:02}-{:02}", day.year(), u8::from(day.month()), day.day())
 }
 
-/// Reads `YYYY-MM-DD`.
+/// The years a day asked for may fall in; any other is not a date here.
+pub const YEARS: std::ops::RangeInclusive<i32> = 2000..=2100;
+
+/// Reads `YYYY-MM-DD`, a year of [`YEARS`].
 pub fn parse_day(raw: &str) -> Option<Date> {
     let format = time::macros::format_description!("[year]-[month]-[day]");
-    Date::parse(raw.trim(), &format).ok()
+    Date::parse(raw.trim(), &format).ok().filter(|day| YEARS.contains(&day.year()))
 }
 
 impl DayLine {
@@ -101,6 +104,8 @@ pub enum RangeError {
     Backwards,
     InTheFuture,
     TooLong,
+    /// `from` or `to` given twice.
+    Repeated,
 }
 
 impl RangeError {
@@ -110,6 +115,7 @@ impl RangeError {
             Self::Backwards => "from must not be after to",
             Self::InTheFuture => "to must not be after today (Manila)",
             Self::TooLong => "at most 90 days at a time",
+            Self::Repeated => "give from and to at most once each",
         }
     }
 }
@@ -121,7 +127,10 @@ pub fn range(from: Option<&str>, to: Option<&str>, now: OffsetDateTime) -> Resul
     let read = |raw: Option<&str>| raw.map(|raw| parse_day(raw).ok_or(RangeError::NotADate)).transpose();
     let (from, to) = (read(from)?, read(to)?);
     let to = to.unwrap_or(today);
-    let from = from.unwrap_or(to - Duration::days(MAX_DAYS - 1));
+    let from = match from {
+        Some(from) => from,
+        None => to.checked_sub(Duration::days(MAX_DAYS - 1)).ok_or(RangeError::NotADate)?,
+    };
     if to > today {
         return Err(RangeError::InTheFuture);
     }
@@ -281,6 +290,12 @@ mod tests {
         assert_eq!(range(Some("2026-11-10"), Some("2026-11-01"), now), Err(RangeError::Backwards));
         assert_eq!(range(None, Some("2026-11-15"), now), Err(RangeError::InTheFuture));
         assert_eq!(range(Some("yesterday"), None, now), Err(RangeError::NotADate));
+        // Years outside a sane range are no date: no arithmetic can overflow.
+        for bad in ["-9999-01-01", "+9999-12-31", "0000-01-01", "1999-12-31", "2101-01-01", "99999-01-01"] {
+            assert_eq!(range(None, Some(bad), now), Err(RangeError::NotADate), "{bad}");
+            assert_eq!(range(Some(bad), None, now), Err(RangeError::NotADate), "{bad}");
+        }
+        assert_eq!(range(Some("2000-01-01"), Some("2000-03-01"), now), Ok((date!(2000 - 01 - 01), date!(2000 - 03 - 01))));
         // Manila's day: 16:30 UTC on the 14th is already the 15th there.
         assert_eq!(range(None, Some("2026-11-15"), datetime!(2026-11-14 16:30 UTC)).unwrap().1, date!(2026 - 11 - 15));
     }

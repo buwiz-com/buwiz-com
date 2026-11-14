@@ -557,7 +557,7 @@ async fn each_try_leaves_one_classified_row(db: PgPool) {
         assert_eq!(rows.len(), index + 1, "{name}: one row per try");
         let row = rows.last().unwrap();
         assert_eq!(row.summary(), expected, "{name}");
-        assert_eq!((row.admission.as_str(), row.client.as_deref()), ("open", Some("desktop/0.2.0")), "{name}");
+        assert_eq!((row.admission.as_str(), row.client.as_deref()), ("open", Some("desktop/0.2")), "{name}");
         assert!(row.started_at <= row.ended_at && row.ended_at.second() == 0 && row.started_at.second() == 0);
         assert_eq!((row.account_key.len(), row.network_key.as_ref().map(Vec::len)), (8, Some(8)));
         // The app never sees the sender frame, nor a field it did not

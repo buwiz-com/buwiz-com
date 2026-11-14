@@ -48,8 +48,9 @@ CREATE TABLE bir_tries (
     -- NULL for a late direct report.
     network_key   bytea CHECK (length(network_key) = 8),
     late          boolean NOT NULL DEFAULT false,
-    -- The `buwiz-client` header, e.g. `desktop/0.2.0`.
-    client        text CHECK (length(client) <= 40),
+    -- The `buwiz-client` header as a known app name (or `other`) and the
+    -- version's major.minor only, e.g. `desktop/0.2`.
+    client        text CHECK (client ~ '^(desktop|mini|direct|buwiz-forms|buwiz-desktop|buwiz-ebirforms|buwiz-direct|other)/[0-9]{1,4}\.[0-9]{1,4}$'),
     -- The direct app's try id; NULL for the relay.
     report_id     uuid UNIQUE,
     CHECK (ended_at >= started_at),

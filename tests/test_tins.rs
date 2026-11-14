@@ -62,7 +62,12 @@ async fn an_admin_adds_a_test_tin_to_a_test_account_and_every_list_marks_it(db: 
 
     // Staff pages: the account, the users list, the queue, the claim.
     let page = text(site.get(&user, &staff).await).await;
-    assert!(page.contains("Test TIN") && page.contains("000-000-000-00000"), "{page}");
+    // In the TINs section itself, on the TIN's own row (not the History
+    // line, nor the add form's default value).
+    let tins = page.split("<h2>TINs</h2>").nth(1).and_then(|rest| rest.split("</section>").next()).unwrap();
+    let row = tins.split("class=\"user-tin\"").find(|row| row.contains("000-000-000-00000")).unwrap();
+    let row = row.split("Open claim").next().unwrap();
+    assert!(row.contains("tagpill status-unverified") && row.contains("Test TIN"), "{row}");
     assert!(page.contains("Test TIN 000-000-000-00000 added, active"), "{page}");
     let list = text(site.get("/staff/users", &staff).await).await;
     assert!(list.contains("000-000-000-00000 · test"), "{list}");
@@ -361,4 +366,41 @@ async fn an_admin_emails_address_gets_no_test_tin(db: PgPool) {
     let response = site.post(&format!("{user}/test-tin"), &staff, FORM).await;
     assert_eq!(location(&response), format!("{user}?notice=test_label_from_server"));
     assert!(test_tins(&site.db, boss).await.is_empty());
+}
+
+/// The sealed-return call refuses a test TIN's claim itself: a ticket for
+/// one (which the Gatekeeper never issues; here the claim became one after
+/// its ticket) is refused with tin_test_only, and not spent.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sealed_return_for_a_test_tins_claim_is_refused(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = test_account(&site, "ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "000123453", "approved").await;
+    let device = TestDevice::new(&site.db, ana).await;
+    let body = json!({
+        "tin": "00012345300000",
+        "form": "1701Qv2018",
+        "period": "2026Q1",
+        "payload_sha256": "ab".repeat(32),
+        "email": "ana@example.test",
+        "idempotency_key": "v2",
+    });
+    let response = device.post(&site, "/api/tickets", &body).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let issued: Value = serde_json::from_str(&text(response).await).unwrap();
+    sqlx::query("UPDATE tin_claims SET tin_root = '000000000', verified_by = 'admin' WHERE id = $1")
+        .bind(claim)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let envelope = json!({ "kid": "k", "enc": "e", "ct": "c" });
+    let sealed = json!({ "ticket": issued["ticket"], "envelope": envelope });
+    let refused = refusal(device.post(&site, "/api/v2/submissions", &sealed).await).await;
+    assert_eq!(refused, (403, "tin_test_only".to_owned(), TEST_ONLY.to_owned()));
+    let (used, submissions): (bool, i64) =
+        sqlx::query_as("SELECT (SELECT bool_or(used_at IS NOT NULL) FROM tickets), (SELECT count(*) FROM submissions)")
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+    assert_eq!((used, submissions), (false, 0));
 }

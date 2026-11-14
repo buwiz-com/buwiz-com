@@ -104,7 +104,8 @@ on My TINs, on the staff pages and in the apps' TIN list (`status:
 test_only`, `test_only: true`); the plain licence list leaves it out. The
 label cannot come off an account while it holds one that has not ended
 (`test_tins_held`): revoke it first. Migration 13 keeps it so in the
-database: such a row is only ever an Admin's or the seed tool's.
+database: such a row is only ever an Admin's or the seed tool's, active
+or ended (`approved`, `removed`, `revoked`).
 
 A ban that commits while a request for the account is under way wins:
 activation, approval, an app's sign-in approval and an agent's consent

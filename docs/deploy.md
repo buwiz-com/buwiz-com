@@ -449,7 +449,8 @@ checking the tab daily.
 The release with test TINs ([accounts.md](accounts.md#bans-and-test-accounts))
 runs migration 13 when it starts. It adds one check to `tin_claims`: a row
 whose TIN root is `000000000` (a test TIN) is one an Admin or the seed tool
-made active (`verified_by` `admin` or `seed`). No column changes. The
+made active (`verified_by` `admin` or `seed`), and it is active or ended
+from there (`approved`, `removed` or `revoked`). No column changes. The
 release before it (at 12) refuses to start on a database at 13, as with
 any newer migration.
 

@@ -103,8 +103,9 @@ labelled adds one to it as to anyone's; its line names them as the actor
 "Activated by its owner, an admin". It never sends, whatever `BIR_RELAY_MODE` says:
 the send gate refuses it with `tin_test_only` (tickets, both submission
 calls, the relay), and the Sender refuses one too. It shows as a test TIN
-on My TINs, on the staff pages and in the apps' TIN list (`status:
-test_only`, `test_only: true`); the plain licence list leaves it out. The
+on My TINs, on the staff pages, in the apps' TIN list and in an AI
+agent's list of TIN claims (`status: test_only`, paused or not, and
+`test_only: true`); the plain licence list leaves it out. The
 label cannot come off an account while it holds one that has not ended
 (`test_tins_held`): revoke it first. Migration 13 keeps it so in the
 database: such a row is only ever an Admin's or the seed tool's, active

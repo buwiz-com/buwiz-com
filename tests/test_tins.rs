@@ -97,8 +97,11 @@ async fn an_admin_adds_a_test_tin_to_a_test_account_and_every_list_marks_it(db: 
         .header(header::AUTHORIZATION, format!("Bearer {agent}"))
         .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tin_claims"}}"#))
         .unwrap();
-    let listed = text(site.send(request).await).await;
-    assert!(listed.contains(r#"\"test_only\":true"#) || listed.contains(r#""test_only":true"#), "{listed}");
+    let listed: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+    let content: Value = serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let row = &content["claims"][0];
+    // The same status the apps' list gives it.
+    assert_eq!((&row["status"], &row["test_only"]), (&json!("test_only"), &json!(true)), "{content}");
     // Other rows read as before: no `test_only` on them.
     add_claim(&site.db, ana, "000123453", "approved").await;
     let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;

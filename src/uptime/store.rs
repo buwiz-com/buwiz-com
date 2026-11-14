@@ -405,7 +405,12 @@ mod tests {
     /// taken; only after the wait is none.
     #[tokio::test]
     async fn the_drain_takes_records_until_it_ends() {
-        let uptime = Arc::new(crate::uptime::Uptime::new(crate::uptime::Level::Record, vec![22], false, OffsetDateTime::now_utc()));
+        let uptime = Arc::new(crate::uptime::Uptime::new(
+            crate::uptime::Level::Record,
+            vec![22],
+            false,
+            OffsetDateTime::now_utc(),
+        ));
         let first = Recorder::slot(&uptime).unwrap();
         let drain = {
             let uptime = uptime.clone();

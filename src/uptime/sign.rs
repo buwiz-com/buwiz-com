@@ -1147,9 +1147,8 @@ fn step(side: Side, lamp: &Lamp, reading: &Reading, evidence: &[Evidence], now: 
     // Online and Busy both need a return that got past the window within
     // the hour; failures alone never keep either.
     let nothing_in = reading.newest_ok_at.is_none_or(|at| now - at >= QUIET);
-    let nothing_got_in = || {
-        change(Light::NoRecentNews, Cause::Rule, format!("Nothing got past the {} in the last 60 min", side.word()))
-    };
+    let nothing_got_in =
+        || change(Light::NoRecentNews, Cause::Rule, format!("Nothing got past the {} in the last 60 min", side.word()));
     match lamp.state {
         Light::Offline => {
             let landing = reading.newest_landing.map(|index| &evidence[index]);

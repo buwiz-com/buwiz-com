@@ -4,8 +4,13 @@
 //!
 //! Nothing here can single out one person on a quiet day: no count of
 //! tries, accounts or networks, only how long each state lasted (rounded to
-//! 5 minutes) and its share of the time Buwiz was watching (whole percent).
+//! 5 minutes) and its share of the time Buwiz was watching (whole percent,
+//! from the rounded minutes, and none for a day watched less than an hour).
 //! Exact counts are for a later, staff-only variant.
+//!
+//! The public history is computed as at the last 5-minute mark, like the
+//! public sign, and kept in memory ([`Cache`]): made once a mark (a failure
+//! tried again at most once a minute), so a view costs no query.
 
 use serde::Serialize;
 use sqlx::PgPool;
@@ -151,11 +156,19 @@ fn rounded(minutes: i32) -> i32 {
 /// note, not watched.
 type Minutes = [i32; 6];
 
+/// A day watched less than this has no shares: on so little a share would
+/// say more than it knows.
+pub const MIN_WATCHED_MINUTES: i64 = 60;
+
 fn line(day: Date, worst: &str, hours: String, minutes: Minutes, note: Option<&'static str>) -> DayLine {
-    let [online, busy, offline, quiet, note_minutes, unwatched] = minutes;
+    // Shares from the rounded minutes, the ones shown: the shares then
+    // tell nothing the minutes do not.
+    let [online, busy, offline, quiet, note_minutes, unwatched] = minutes.map(rounded);
     let watched = i64::from(online) + i64::from(busy) + i64::from(offline) + i64::from(quiet);
-    let percent =
-        |part: i32| (watched > 0).then(|| u8::try_from((i64::from(part) * 100 + watched / 2) / watched).unwrap_or(100));
+    let percent = |part: i32| {
+        (watched >= MIN_WATCHED_MINUTES)
+            .then(|| u8::try_from((i64::from(part) * 100 + watched / 2) / watched).unwrap_or(100))
+    };
     let state = match worst {
         "online" => "online",
         "busy" => "busy",
@@ -168,12 +181,12 @@ fn line(day: Date, worst: &str, hours: String, minutes: Minutes, note: Option<&'
         day,
         state,
         hours,
-        online_minutes: rounded(online),
-        busy_minutes: rounded(busy),
-        offline_minutes: rounded(offline),
-        no_recent_news_minutes: rounded(quiet),
-        note_minutes: rounded(note_minutes),
-        not_watched_minutes: rounded(unwatched),
+        online_minutes: online,
+        busy_minutes: busy,
+        offline_minutes: offline,
+        no_recent_news_minutes: quiet,
+        note_minutes,
+        not_watched_minutes: unwatched,
         online_percent: percent(online),
         busy_percent: percent(busy),
         offline_percent: percent(offline),
@@ -192,9 +205,29 @@ fn strongest(kinds: impl Iterator<Item = NoteKind>) -> Option<&'static str> {
     kinds.max_by_key(rank).map(NoteKind::as_str)
 }
 
+/// The notes that touch `start` to `end`: (kind, from, to).
+async fn notes(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Vec<days::NoteSpan>> {
+    let rows: Vec<(String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
+        "SELECT kind, starts_at, LEAST(until, COALESCE(cleared_at, until)) FROM bir_notes
+          WHERE starts_at < $2 AND LEAST(until, COALESCE(cleared_at, until)) > $1",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().filter_map(|(kind, from, to)| Some((NoteKind::parse(&kind)?, from, to))).collect())
+}
+
 /// The history of `from` to `to` (Manila days, today at most), with today
-/// computed live, and the last 24 hours, at `now`.
-pub async fn history(db: &PgPool, from: Date, to: Date, now: OffsetDateTime) -> sqlx::Result<History> {
+/// computed live, and the last 24 hours, at `now`. `last_24h` when it is
+/// known already (it does not depend on the range).
+pub async fn history(
+    db: &PgPool,
+    from: Date,
+    to: Date,
+    now: OffsetDateTime,
+    last_24h: Option<String>,
+) -> sqlx::Result<History> {
     type Row = (Date, String, String, i32, i32, i32, i32, i32, i32);
     let today = manila_day(now);
     let rows: Vec<Row> = sqlx::query_as(
@@ -209,7 +242,7 @@ pub async fn history(db: &PgPool, from: Date, to: Date, now: OffsetDateTime) -> 
     .await?;
     let start = manila_midnight(from);
     let end = manila_midnight(to) + Duration::DAY;
-    let notes = days::record(db, start, end.min(now).max(start)).await?.notes;
+    let notes = notes(db, start, end.min(now).max(start)).await?;
     let note_of = |day: Date| {
         let (begin, finish) = (manila_midnight(day), manila_midnight(day) + Duration::DAY);
         strongest(notes.iter().filter(|(_, from, to)| *from < finish && *to > begin).map(|(kind, ..)| *kind))
@@ -242,14 +275,81 @@ pub async fn history(db: &PgPool, from: Date, to: Date, now: OffsetDateTime) -> 
             _ => break,
         }
     }
-    Ok(History { v: VERSION, from, to, days: lines, last_24h: last_24h(db, now).await? })
+    let last_24h = match last_24h {
+        Some(letters) => letters,
+        None => self::last_24h(db, now).await?,
+    };
+    Ok(History { v: VERSION, from, to, days: lines, last_24h })
 }
 
-/// The quarter hour now running ends here.
+/// How often a public history that could not be made is tried again.
+pub const RETRY_EVERY: Duration = Duration::minutes(1);
+
+/// The public history (the default range, the last 90 days) as at the last
+/// 5-minute mark, in memory: made once a mark, and when that fails tried
+/// again at most once a minute, the last one made served meanwhile.
+#[derive(Default)]
+pub struct Cache {
+    inner: tokio::sync::Mutex<CacheInner>,
+}
+
+#[derive(Default)]
+struct CacheInner {
+    made: Option<(OffsetDateTime, std::sync::Arc<History>)>,
+    tried: Option<OffsetDateTime>,
+}
+
+impl Cache {
+    /// The public history at `now`'s mark. Concurrent callers share one
+    /// making of it.
+    pub async fn get(&self, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<std::sync::Arc<History>> {
+        let mark = super::public::round_down(now);
+        let mut inner = self.inner.lock().await;
+        if let Some((made_at, history)) = &inner.made {
+            let tried_lately = inner.tried.is_some_and(|tried| now >= tried && now - tried < RETRY_EVERY);
+            if *made_at == mark || tried_lately {
+                return Ok(history.clone());
+            }
+        }
+        inner.tried = Some(now);
+        let (from, to) = range(None, None, mark).map_err(|error| sqlx::Error::Protocol(error.message().into()))?;
+        match history(db, from, to, mark, None).await {
+            Ok(history) => {
+                let history = std::sync::Arc::new(history);
+                inner.made = Some((mark, history.clone()));
+                Ok(history)
+            }
+            Err(error) => match &inner.made {
+                Some((_, history)) => {
+                    tracing::error!(%error, "BIR uptime: the public history could not be made; the last one is served");
+                    Ok(history.clone())
+                }
+                None => Err(error),
+            },
+        }
+    }
+}
+
+/// `from` to `to` of `cached` (the public history), if it holds them.
+pub fn slice(cached: &History, from: Date, to: Date) -> Option<History> {
+    (from >= cached.from && to <= cached.to).then(|| History {
+        v: cached.v,
+        from,
+        to,
+        days: cached.days.iter().filter(|line| line.day >= from && line.day <= to).cloned().collect(),
+        last_24h: cached.last_24h.clone(),
+    })
+}
+
+/// The quarter hour now running ends here; at a quarter-hour mark, that
+/// mark (so the last letter is the quarter hour just past, never an empty
+/// one).
 pub fn quarter_end(now: OffsetDateTime) -> OffsetDateTime {
     let seconds = now.unix_timestamp();
     let step = SLOT.whole_seconds();
-    OffsetDateTime::from_unix_timestamp(seconds - seconds.rem_euclid(step) + step).unwrap_or(now)
+    let into = seconds.rem_euclid(step);
+    let end = if into == 0 && now.nanosecond() == 0 { seconds } else { seconds - into + step };
+    OffsetDateTime::from_unix_timestamp(end).unwrap_or(now)
 }
 
 /// 96 letters of 15 minutes, oldest first, the last the quarter hour now
@@ -295,7 +395,10 @@ mod tests {
             assert_eq!(range(None, Some(bad), now), Err(RangeError::NotADate), "{bad}");
             assert_eq!(range(Some(bad), None, now), Err(RangeError::NotADate), "{bad}");
         }
-        assert_eq!(range(Some("2000-01-01"), Some("2000-03-01"), now), Ok((date!(2000 - 01 - 01), date!(2000 - 03 - 01))));
+        assert_eq!(
+            range(Some("2000-01-01"), Some("2000-03-01"), now),
+            Ok((date!(2000 - 01 - 01), date!(2000 - 03 - 01)))
+        );
         // Manila's day: 16:30 UTC on the 14th is already the 15th there.
         assert_eq!(range(None, Some("2026-11-15"), datetime!(2026-11-14 16:30 UTC)).unwrap().1, date!(2026 - 11 - 15));
     }
@@ -308,6 +411,14 @@ mod tests {
             (shown.offline_percent, shown.no_recent_news_percent, shown.online_percent),
             (Some(47), Some(53), Some(0))
         );
+        // Shares from the minutes shown: 2 and 3 minutes round to 0 and 5,
+        // so their shares are those of 0 and 5.
+        let small = line(date!(2026 - 11 - 11), "online", "o".repeat(24), [57, 3, 0, 0, 0, 0], None);
+        assert_eq!((small.online_minutes, small.busy_minutes), (55, 5));
+        assert_eq!((small.online_percent, small.busy_percent), (Some(92), Some(8)));
+        // Less than an hour watched: no shares at all.
+        let short = line(date!(2026 - 11 - 11), "online", "o".repeat(24), [52, 0, 0, 0, 0, 1388], None);
+        assert_eq!((short.online_minutes, short.online_percent), (50, None));
         let unwatched = line(date!(2026 - 11 - 12), "none", "w".repeat(24), [0, 0, 0, 0, 0, 1440], None);
         assert_eq!((unwatched.state, unwatched.online_percent), ("not_watched", None));
         let none = line(date!(2026 - 11 - 13), "none", "-".repeat(24), [0; 6], None);
@@ -317,5 +428,8 @@ mod tests {
         assert_eq!(value["note"], "outage");
         assert!(serde_json::to_value(&none).unwrap().get("note").is_none());
         assert_eq!(quarter_end(datetime!(2026-11-14 03:07:12 UTC)), datetime!(2026-11-14 03:15 UTC));
+        // Right on a mark the last letter is the quarter just past.
+        assert_eq!(quarter_end(datetime!(2026-11-14 03:15 UTC)), datetime!(2026-11-14 03:15 UTC));
+        assert_eq!(quarter_end(datetime!(2026-11-14 03:15:00.5 UTC)), datetime!(2026-11-14 03:30 UTC));
     }
 }

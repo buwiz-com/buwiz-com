@@ -465,7 +465,10 @@ impl Queue {
         let mail = Mail { subject, text, event_ids: items.iter().filter_map(|item| item.event_id).collect() };
         if self.outbox.len() >= MAX_OUTBOX {
             let gone = self.outbox.remove(0);
-            tracing::error!(subject = gone.mail.subject, "BIR uptime: too many staff mails on their way; the oldest is given up");
+            tracing::error!(
+                subject = gone.mail.subject,
+                "BIR uptime: too many staff mails on their way; the oldest is given up"
+            );
         }
         self.outbox.push(Outgoing {
             id: self.next,
@@ -668,7 +671,9 @@ pub async fn flush(
                     }
                     told.get_or_insert_with(|| round.mail.clone());
                 }
-                Err(error) => tracing::error!(error = ?error, "BIR uptime: a staff mail could not be sent to one address"),
+                Err(error) => {
+                    tracing::error!(error = ?error, "BIR uptime: a staff mail could not be sent to one address")
+                }
             }
         }
         if to.is_empty() {
@@ -813,7 +818,10 @@ mod tests {
         }
         assert_eq!(&tries[..7], [1, 3, 7, 15, 31, 63, 123], "1, 2, 4, 8, 16, 32, then 60 minutes");
         assert!(alerts.queue().outbox.is_empty(), "given up after a day");
-        assert_eq!((backoff(1), backoff(2), backoff(7), backoff(40)), (Duration::minutes(1), Duration::minutes(2), Duration::minutes(60), Duration::minutes(60)));
+        assert_eq!(
+            (backoff(1), backoff(2), backoff(7), backoff(40)),
+            (Duration::minutes(1), Duration::minutes(2), Duration::minutes(60), Duration::minutes(60))
+        );
 
         // Once c is back, it alone gets the mail.
         let alerts = Alerts::default();

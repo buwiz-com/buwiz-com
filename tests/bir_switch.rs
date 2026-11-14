@@ -5,14 +5,11 @@
 
 mod common;
 
-use axum::body::Body;
-use axum::http::Request;
-use axum::response::Response;
 use buwiz_cloud::uptime::cli::{self, Command, Until};
 use buwiz_cloud::uptime::live;
 use buwiz_cloud::uptime::sign::{Light, NoteKind, SignState};
 use buwiz_cloud::uptime::{Level, Uptime};
-use common::{STAFF, Site, text};
+use common::{STAFF, Site};
 use serde_json::Value;
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -45,12 +42,9 @@ async fn sign_in(site: &Site, light: Light) {
     assert_eq!(site.state.uptime.live.sign().state, light);
 }
 
-async fn get(site: &Site, path: &str, _headers: &[(&str, &str)]) -> Response {
-    site.send(Request::get(path).body(Body::empty()).unwrap()).await
-}
-
-async fn json(response: Response) -> Value {
-    serde_json::from_str(&text(response).await).unwrap()
+/// The public document as everything public serves it at `at`.
+fn public_status(site: &Site, at: OffsetDateTime) -> Value {
+    serde_json::from_slice(&site.state.uptime.published("https://ebirforms.buwiz.com", at).body).unwrap()
 }
 
 async fn admin(site: &Site) -> buwiz_cloud::account::roles::Staff {
@@ -128,7 +122,10 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     assert_eq!(server.state.uptime.live.sign().state, Light::Online);
     // ... its next tick (every 30 s) takes the note in, without a restart.
     live::tick(&server.state.uptime, &db, OffsetDateTime::now_utc()).await.unwrap();
-    let status = json(get(&server, "/api/bir/status", &[]).await).await;
+    // (Read as at the next 5-minute mark: the public sign moves only on
+    // marks.)
+    let next = buwiz_cloud::uptime::public::round_down(OffsetDateTime::now_utc()) + Duration::minutes(5);
+    let status = public_status(&server, next);
     assert_eq!((status["state"].as_str(), status["source"].as_str()), (Some("offline"), Some("staff")));
     assert_eq!(status["note"]["text"], "The BIR says its eFPS is down.");
     // The server made the change and mails it, with the Admin's reason.
@@ -141,12 +138,17 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     .unwrap();
     assert_eq!(change, ("online".into(), "offline".into(), "note_set".into()));
     let mailer = buwiz_cloud::account::mail::Mailer::recording("http://localhost:3008");
-    let mail = buwiz_cloud::uptime::alerts::flush(&server.state.uptime, &db, &mailer, &config, OffsetDateTime::now_utc())
-        .await
-        .unwrap()
-        .unwrap();
+    let mail =
+        buwiz_cloud::uptime::alerts::flush(&server.state.uptime, &db, &mailer, &config, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(mail.subject, "BIR: an Admin set a note");
-    assert!(mail.text.contains("Offline: An Admin set an outage note (why: Made-up: the BIR posted an advisory)"), "{}", mail.text);
+    assert!(
+        mail.text.contains("Offline: An Admin set an outage note (why: Made-up: the BIR posted an advisory)"),
+        "{}",
+        mail.text
+    );
     // Its own next write does not overwrite the note, nor lose an event.
     let events: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
     live::tick(&server.state.uptime, &db, OffsetDateTime::now_utc() + Duration::minutes(2)).await.unwrap();
@@ -168,7 +170,7 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     result.unwrap();
     assert!(out.contains("Will: clear the outage note"), "{out}");
     live::tick(&server.state.uptime, &db, OffsetDateTime::now_utc() + Duration::minutes(3)).await.unwrap();
-    let status = json(get(&server, "/api/bir/status", &[]).await).await;
+    let status = public_status(&server, next + Duration::minutes(5));
     assert_eq!(status["source"], "tries");
     assert!(status["note"].is_null());
     let cleared: (String, Option<String>) =

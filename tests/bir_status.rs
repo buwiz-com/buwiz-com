@@ -184,15 +184,54 @@ async fn the_public_sign_is_the_same_for_everyone(db: PgPool) {
         assert!(text(again).await.is_empty());
     }
     assert_eq!(get(&site, "/api/bir/status", &[("if-none-match", "\"b-1-1\"")]).await.status(), StatusCode::OK);
+    // The tag is a hash of the bytes: no seq, no revision, no time in it.
+    assert_eq!(etag.len(), 26, "{etag}");
+    for part in [document["seq"].to_string(), site.state.uptime.live.sign().revision.to_string()] {
+        assert!(!etag.contains(&part), "{etag}");
+    }
+    assert!(document.get("last_news_at").is_none(), "never public");
 }
 
-/// The signed-in detail: a Bearer token of any scope or the website
-/// session; private, never 304, never to the anonymous.
+/// A made-up live try that got in, or that the mailbox refused.
+fn observed(landed: bool) -> buwiz_cloud::uptime::observe::Observed {
+    let mut observer = buwiz_cloud::uptime::observe::TryObserver::new(&[22]);
+    observer.sender_text(r#"{"type":"sender","mode":"live"}"#);
+    observer.sender_text(r#"{"type":"open","stream":1,"host":"dispatcher.test","port":443}"#);
+    observer.app_text(r#"{"type":"opened","stream":1}"#);
+    observer.app_binary(&[1, b'H', b'T', b'T', b'P']);
+    observer.sender_text(r#"{"type":"open","stream":2,"host":"upload.test","port":22}"#);
+    if landed {
+        observer.app_text(r#"{"type":"opened","stream":2}"#);
+        observer.app_binary(&[2, b'S', b'S', b'H']);
+        observer.finish("sent", None)
+    } else {
+        observer.app_text(r#"{"type":"refused","stream":2,"reason":"Connection refused (os error 61)"}"#);
+        observer.finish("failed", Some("could not reach BIR's upload server: refused"))
+    }
+}
+
+/// The signed-in read: a Bearer token of any scope or the website session;
+/// the live sign for everyone signed in, the counts for staff only; a
+/// banned account refused; never kept by any cache, never 304.
 #[sqlx::test]
-async fn the_signed_in_detail_adds_counts_and_is_never_shared(db: PgPool) {
+async fn the_signed_in_detail_is_for_staff_and_never_shared(db: PgPool) {
     let site = site(&db, Level::Public);
     sign_in(&site, Light::Busy).await;
+    // Real tries: three accounts get in, one is refused.
+    let now = OffsetDateTime::now_utc();
+    for (account, landed) in [(1u128, true), (2, true), (3, true), (4, false)] {
+        let relay = buwiz_cloud::uptime::store::RelayTry {
+            account_id: Uuid::from_u128(account),
+            network: buwiz_cloud::uptime::keys::Network::V4([198, 51, account as u8]),
+            client: None,
+            admission: "open".into(),
+            started_at: now - Duration::seconds(20),
+        };
+        buwiz_cloud::uptime::store::record(&site.state.uptime, &db, &relay, &observed(landed), now).await;
+    }
     let (account, cookie) = site.person(FILER).await;
+    let (_, staff_cookie) = site.staff_with_role("support@example.test", "support").await;
+    let (_, admin_cookie) = site.person(STAFF).await;
     let etag = header(&get(&site, "/api/bir/status", &[]).await, "etag").unwrap().to_owned();
     // Anonymous, with the public validator: 401, not 304.
     let anonymous = get(&site, "/api/bir/status/mine", &[("if-none-match", etag.as_str())]).await;
@@ -200,24 +239,60 @@ async fn the_signed_in_detail_adds_counts_and_is_never_shared(db: PgPool) {
     assert_eq!(header(&anonymous, "cache-control"), Some("no-store"));
     let bad = get(&site, "/api/bir/status/mine", &[("authorization", "Bearer bwa_made-up")]).await;
     assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    let mine = |headers: Vec<(String, String)>| {
+        let site = &site;
+        let etag = etag.clone();
+        async move {
+            let mut all: Vec<(&str, &str)> =
+                headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+            all.push(("if-none-match", etag.as_str()));
+            let response = get(site, "/api/bir/status/mine", &all).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(header(&response, "cache-control"), Some("no-store"));
+            assert_eq!(header(&response, "etag"), None);
+            text(response).await
+        }
+    };
+    // Anyone signed in: the live sign (Online now, after the landings),
+    // times on 5-minute marks, no counts.
     let mut auth = vec![("cookie".to_owned(), cookie.clone())];
     for (client, scope) in [("buwiz-desktop", "app"), ("buwiz-books", "books"), ("made-up-agent", "mcp")] {
         auth.push(("authorization".to_owned(), format!("Bearer {}", token(&db, account, client, scope).await)));
     }
     for (name, value) in &auth {
-        let response =
-            get(&site, "/api/bir/status/mine", &[(name.as_str(), value.as_str()), ("if-none-match", etag.as_str())])
-                .await;
-        assert_eq!(response.status(), StatusCode::OK, "{name}");
-        assert_eq!(header(&response, "cache-control"), Some("private, no-cache"));
-        assert_eq!(header(&response, "etag"), None);
-        let body = text(response).await;
-        let mine: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(mine["state"], "busy");
-        assert_eq!(mine["detail"]["last_10"]["of"], 0);
-        assert_eq!(mine["detail"]["today"]["tries"], 0);
-        assert!(mine["detail"].get("yours").is_none(), "nothing else personal in this release");
+        let body = mine(vec![(name.clone(), value.clone())]).await;
+        let read: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(read["state"], site.state.uptime.live.sign().state.as_str(), "{name}: the live sign");
+        assert!(read.get("detail").is_none(), "{name}: no counts for a filer");
+        assert!(read.get("last_news_at").is_none(), "{name}");
+        let at = OffsetDateTime::parse(read["since"].as_str().unwrap(), &time::format_description::well_known::Rfc3339)
+            .unwrap();
+        assert_eq!(at, round_down(at), "{name}: public times");
         assert!(!body.contains(&account.to_string()) && !body.contains(FILER));
+    }
+    // Staff, Support or Admin: times to the minute and the counts, real.
+    for staff in [&staff_cookie, &admin_cookie] {
+        let read: Value = serde_json::from_str(&mine(vec![("cookie".into(), staff.clone())]).await).unwrap();
+        assert_eq!(read["detail"]["today"]["tries"], 4);
+        assert_eq!(read["detail"]["today"]["got_in"], 3);
+        assert_eq!(read["detail"]["today"]["accounts"], 4);
+        assert_eq!(read["detail"]["last_10"]["of"], 4);
+        assert_eq!(read["detail"]["last_10"]["got_in"], 3);
+        assert!(read["last_news_at"].is_string());
+        assert!(read["detail"].get("yours").is_none(), "nothing else personal in this release");
+    }
+    // A banned account: 403, by its session as by its token.
+    let banned_token = format!("Bearer {}", app_token(&db, account).await);
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Made-up' WHERE id = $1")
+        .bind(account)
+        .execute(&db)
+        .await
+        .unwrap();
+    for (name, value) in [("cookie", cookie.as_str()), ("authorization", banned_token.as_str())] {
+        let response = get(&site, "/api/bir/status/mine", &[(name, value)]).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(header(&response, "cache-control"), Some("no-store"));
+        assert_eq!(json(response).await["error"]["code"], "account_banned");
     }
 }
 
@@ -307,10 +382,14 @@ async fn the_compact_sign_rides_on_existing_responses(db: PgPool) {
     let list = get(&public, "/api/submissions", &[("authorization", &bearer)]).await;
     assert_eq!(header(&list, "buwiz-bir"), None);
     // Newest wins: a change raises `seq`, so a client keeps the newer sign.
+    // Signed-in answers carry the live sign at once; those that need no
+    // sign-in carry the sign of the last 5-minute mark.
     let seq = |compact: &str| -> i64 {
         compact.split(", ").find_map(|part| part.strip_prefix("seq=")).unwrap().parse().unwrap()
     };
-    let first = seq(header(&get(&public, "/.well-known/buwiz-hpke.json", &[]).await, "buwiz-bir").unwrap());
+    let mark = round_down(OffsetDateTime::now_utc());
+    let first = header(&get(&public, "/.well-known/buwiz-hpke.json", &[]).await, "buwiz-bir").unwrap().to_owned();
+    let first_status = text(get(&public, "/api/bir/status", &[]).await).await;
     let admin = admin(&public).await;
     let note = buwiz_cloud::uptime::notes::NewNote {
         kind: NoteKind::Maintenance,
@@ -321,12 +400,21 @@ async fn the_compact_sign_rides_on_existing_responses(db: PgPool) {
     buwiz_cloud::uptime::notes::set(uptime, &db, &public.state.config, &admin, note, OffsetDateTime::now_utc())
         .await
         .unwrap();
-    let response = get(&public, "/.well-known/buwiz-hpke.json", &[]).await;
-    let compact = header(&response, "buwiz-bir").unwrap().to_owned();
-    assert!(seq(&compact) > first);
-    assert!(compact.contains("state=offline") && compact.ends_with("note=?1"), "{compact}");
-    let status = json(get(&public, "/api/bir/status", &[]).await).await;
-    assert_eq!(status["seq"].as_i64(), Some(seq(&compact)));
+    let live = header(&call(&public, "POST", "/api/tickets", &bearer).await, "buwiz-bir").unwrap().to_owned();
+    assert!(seq(&live) > seq(&first));
+    assert!(live.contains("state=offline") && live.ends_with("note=?1"), "{live}");
+    let open = header(&get(&public, "/.well-known/buwiz-hpke.json", &[]).await, "buwiz-bir").unwrap().to_owned();
+    let status = text(get(&public, "/api/bir/status", &[]).await).await;
+    if round_down(OffsetDateTime::now_utc()) == mark {
+        assert_eq!(open, first, "the public sign moves only on a 5-minute mark");
+        assert_eq!(status, first_status);
+    }
+    // At the next mark, everything public has it.
+    let next = mark + Duration::minutes(5);
+    let published = uptime.published("https://ebirforms.buwiz.com", next);
+    assert_eq!(published.compact, live);
+    let status: Value = serde_json::from_slice(&published.body).unwrap();
+    assert_eq!(status["seq"].as_i64(), Some(seq(&live)));
     assert_eq!(status["note"]["kind"], "maintenance");
     assert_eq!(status["source"], "staff");
 }
@@ -498,6 +586,90 @@ async fn the_my_tins_banner_follows_the_sign(db: PgPool) {
                 assert!(!page.contains("bir-banner"), "{level:?} {light:?} {note:?}");
                 assert!(!page.contains("bir-status.css"));
             }
+        }
+    }
+}
+
+/// The status page and the history come from memory, made once a 5-minute
+/// mark: a line written meanwhile shows from the next mark. The page is
+/// limited per address with the reads, and cached publicly for a minute
+/// when the request carries no cookie.
+#[sqlx::test]
+async fn the_page_and_the_history_cost_no_query_per_view(db: PgPool) {
+    let site = site(&db, Level::Public);
+    sign_in(&site, Light::Online).await;
+    let mark = round_down(OffsetDateTime::now_utc());
+    let first = text(get(&site, "/api/bir/history", &[]).await).await;
+    let page = site.on_host(FORMS_HOST, "/bir-status").await;
+    assert_eq!(header(&page, "cache-control"), Some("public, max-age=60"));
+    let first_page = text(page).await;
+    // A day line written now ...
+    let today = buwiz_cloud::uptime::keys::manila_day(OffsetDateTime::now_utc());
+    day_line(&db, today - Duration::days(5), "offline", &"x".repeat(24), [0, 0, 1440, 0, 0, 0]).await;
+    // ... is not in what is served within this mark.
+    let again = text(get(&site, "/api/bir/history", &[]).await).await;
+    let again_page = text(site.on_host(FORMS_HOST, "/bir-status").await).await;
+    if round_down(OffsetDateTime::now_utc()) == mark {
+        assert_eq!(again, first, "from memory");
+        assert_eq!(again_page, first_page, "from memory");
+    }
+    // The next mark's has it.
+    let next = site.state.uptime.history.get(&db, mark + Duration::minutes(5)).await.unwrap();
+    let line = next.days.iter().find(|line| line.day == today - Duration::days(5)).unwrap();
+    assert_eq!(line.state, "offline");
+    // With a cookie the page is the viewer's: never kept by a shared cache.
+    let (_, cookie) = site.person(FILER).await;
+    let mut request = Request::get("/bir-status").header("host", FORMS_HOST).header("cookie", cookie.as_str());
+    request = request.header("cf-connecting-ip", "198.51.100.77");
+    let viewer = site.send(request.body(Body::empty()).unwrap()).await;
+    assert_eq!(header(&viewer, "cache-control"), Some("no-store"));
+    // Limited per address, with the reads.
+    for _ in 0..120 {
+        let request = Request::get("/bir-status").header("host", FORMS_HOST).header("cf-connecting-ip", "203.0.113.9");
+        assert_eq!(site.send(request.body(Body::empty()).unwrap()).await.status(), StatusCode::OK);
+    }
+    let over = get(&site, "/api/bir/status", &[("cf-connecting-ip", "203.0.113.9")]).await;
+    assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+    let request = Request::get("/bir-status").header("host", FORMS_HOST).header("cf-connecting-ip", "203.0.113.9");
+    let limited = site.send(request.body(Body::empty()).unwrap()).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(header(&limited, "cache-control"), Some("no-store"));
+}
+
+/// At `record` (as at `off`) people and apps see nothing of the feature: My
+/// TINs, the home page and the download page are byte for byte what they
+/// are with the uptime module switched off, though the stored sign says
+/// Offline, and nothing in them or their headers names it.
+#[sqlx::test]
+async fn at_record_the_pages_are_those_of_off(db: PgPool) {
+    let record = site(&db, Level::Record);
+    sign_in(&record, Light::Offline).await;
+    let off = site(&db, Level::Off);
+    let (account, cookie) = record.person(FILER).await;
+    add_claim(&db, account, ROOT, "approved").await;
+    let request = |host: &str, path: &str, cookie: Option<&str>| {
+        let mut request = Request::get(path).header("host", host);
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        request.body(Body::empty()).unwrap()
+    };
+    for (host, path, cookie) in [
+        (common::ACCOUNT_HOST, "/tins", Some(cookie.as_str())),
+        (FORMS_HOST, "/", None),
+        (FORMS_HOST, "/download", None),
+        (FORMS_HOST, "/bir-status", None),
+        ("buwiz.com", "/", None),
+    ] {
+        let at_off = snapshot(off.send(request(host, path, cookie)).await).await;
+        let at_record = snapshot(record.send(request(host, path, cookie)).await).await;
+        assert_eq!(at_record, at_off, "{host}{path}");
+        let (_, headers, body) = at_record;
+        for (name, value) in &headers {
+            assert!(!name.contains("bir") && !value.contains("bir-status"), "{host}{path}: {name}: {value}");
+        }
+        for trace in ["class=\"bir", " bir-", "/bir-status", "bir-status.css", "buwiz-bir", "BIR status"] {
+            assert!(!body.contains(trace), "{host}{path}: {trace}");
         }
     }
 }

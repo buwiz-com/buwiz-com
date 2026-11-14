@@ -48,11 +48,21 @@ macro_rules! claim_total_mb {
 pub(crate) use claim_total_mb;
 const CLAIM_TOTAL_BYTES: usize = claim_total_mb!() * 1024 * 1024;
 
-/// From `BIR_UPTIME=public`, a route whose responses carry the compact BIR
-/// sign (`buwiz-bir`); below it, the route as it was.
+/// From `BIR_UPTIME=public`, a signed-in route whose responses carry the
+/// compact live BIR sign (`buwiz-bir`); below it, the route as it was.
 fn signed(state: &AppState, route: MethodRouter<AppState>) -> MethodRouter<AppState> {
     if state.uptime.level.is_public() {
         route.layer(axum::middleware::from_fn_with_state(state.clone(), uptime::api::sign_header))
+    } else {
+        route
+    }
+}
+
+/// As [`signed`], for a route that needs no sign-in: the sign of the last
+/// 5-minute mark, so polling it cannot time a try.
+fn signed_public(state: &AppState, route: MethodRouter<AppState>) -> MethodRouter<AppState> {
+    if state.uptime.level.is_public() {
+        route.layer(axum::middleware::from_fn_with_state(state.clone(), uptime::api::public_sign_header))
     } else {
         route
     }
@@ -144,10 +154,10 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
                 signed(&state, post(submissions::create_v2)).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
             ),
         )
-        .route("/.well-known/buwiz-hpke.json", signed(&state, get(submissions::hpke_key)))
+        .route("/.well-known/buwiz-hpke.json", signed_public(&state, get(submissions::hpke_key)))
         // `public, max-age=300` as before: a cached copy carries an older
         // sign, whose `seq` tells a client to keep the newer one it has.
-        .route("/.well-known/buwiz-trust.json", signed(&state, get(trust::list)))
+        .route("/.well-known/buwiz-trust.json", signed_public(&state, get(trust::list)))
         // MCP and OAuth for AI agents.
         .route("/mcp", post(mcp::handle))
         .route("/.well-known/oauth-protected-resource", get(agents::protected_resource))
@@ -204,10 +214,11 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
     } else {
         router
     };
+    let pages_state = state.clone();
     router
         .fallback(move |request: axum::extract::Request| {
-            let pages = pages.clone();
-            async move { render_page(&pages, request).await }
+            let (pages, state) = (pages.clone(), pages_state.clone());
+            async move { render_page(&pages, &state, request).await }
         })
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -371,13 +382,29 @@ async fn screenshot(Path(name): Path<String>) -> Response {
 const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
      font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
+/// How long a public BIR status page with nothing per viewer may be kept by
+/// any cache (the page itself changes only on 5-minute marks).
+const BIR_STATUS_CACHE: &str = "public, max-age=60";
+
 /// Hands a request to the Topcoat router and converts its response back.
-async fn render_page(pages: &topcoat::router::Router, request: axum::extract::Request) -> Response {
+/// From `BIR_UPTIME=public`, the BIR status page is limited per address
+/// with the BIR reads, and, when the request carries no cookie (so the page
+/// carries nothing per viewer), may be cached publicly for a minute.
+async fn render_page(pages: &topcoat::router::Router, state: &AppState, request: axum::extract::Request) -> Response {
     let (parts, body) = request.into_parts();
     let staff = parts.uri.path() == "/staff" || parts.uri.path().starts_with("/staff/");
+    let bir_status = state.uptime.level.is_public() && parts.uri.path() == crate::uptime::public::STATUS_PATH;
+    if bir_status && let Err(wait) = uptime::api::check_ip(state, &parts.headers, time::OffsetDateTime::now_utc()) {
+        return uptime::api::rate_limited(wait);
+    }
+    let shared = bir_status && !parts.headers.contains_key(header::COOKIE);
     let request = http::Request::from_parts(parts, topcoat::router::Body::new(body));
     let mut response = pages.handle(request).await.map(axum::body::Body::new);
+    let ok = response.status().is_success();
     let headers = response.headers_mut();
+    if shared && ok {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(BIR_STATUS_CACHE));
+    }
     headers.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));

@@ -273,15 +273,18 @@ pub async fn bir_status_page(cx: &Cx) -> Result<impl View> {
         return Err(topcoat::router::error::not_found().into());
     }
     let state = state(cx);
-    let now = OffsetDateTime::now_utc();
+    // As at the last 5-minute mark, like the public sign: the same sign and
+    // history every app reads, from memory, so a view costs no query.
+    let clock = OffsetDateTime::now_utc();
+    let now = round_down(clock);
     let today = manila_day(now);
-    let (from, to) = history::range(None, None, now).map_err(|error| fail(error.message()))?;
-    let history = history::history(&state.db, from, to, now).await.map_err(fail)?;
+    let history = state.uptime.history.get(&state.db, clock).await.map_err(fail)?;
+    let (from, to) = (history.from, history.to);
     let selected = query(cx, "day")
         .and_then(|raw| history::parse_day(&raw))
         .filter(|day| *day >= from && *day <= to)
         .unwrap_or(today);
-    let sign = state.uptime.live.sign();
+    let (_, sign) = state.uptime.live.public(now);
     let words = public::words(&sign, Times::Public);
     let shown = sign_look(&sign);
     let since = public::manila_when(round_down(sign.since));
@@ -306,8 +309,8 @@ pub async fn bir_status_page(cx: &Cx) -> Result<impl View> {
         Some(line) => {
             let hours: String = if selected == today {
                 // Hours still to come are not part of the day yet.
-                let now_hour = usize::try_from((now - manila_midnight(today)).whole_hours()).unwrap_or(0);
-                line.hours.chars().take(now_hour + 1).collect()
+                let begun = ((now - manila_midnight(today)).whole_seconds() + 3599) / 3600;
+                line.hours.chars().take(usize::try_from(begun).unwrap_or(0).max(1)).collect()
             } else {
                 line.hours.clone()
             };
@@ -334,7 +337,7 @@ pub async fn bir_status_page(cx: &Cx) -> Result<impl View> {
                 <div class="page-head">
                     <div>
                         <h1>"Is the BIR taking returns?"</h1>
-                        <p class="page-lead">"From the real returns people send through Buwiz. Buwiz never tests the BIR's servers. Manila time; times rounded to 5 minutes."</p>
+                        <p class="page-lead">"From the real returns people send through Buwiz. Buwiz never tests the BIR's servers. Manila time; times rounded to 5 minutes, and this page up to 5 minutes behind."</p>
                     </div>
                 </div>
                 <section class=(format!("bir-sign {}", shown.class)) aria-labelledby="bir-now">
@@ -503,18 +506,20 @@ async fn day_cell(cell: Cell) -> Result<impl View> {
 
 /// The line at the top of My TINs while the BIR is Busy or Offline or staff
 /// set an outage or maintenance; nothing otherwise, and nothing below
-/// `BIR_UPTIME=public`.
-pub(super) fn banner_for(cx: &Cx) -> Option<public::Banner> {
+/// `BIR_UPTIME=public`. My TINs is signed in, so the live sign; read once
+/// per request, so its stylesheet link and the banner always agree.
+#[memoize(as_ref)]
+pub(super) async fn banner_for(cx: &Cx) -> Result<Option<public::Banner>> {
     let state = state(cx);
     if !state.uptime.level.is_public() {
-        return None;
+        return Ok(None);
     }
-    public::banner(&state.uptime.live.sign())
+    Ok(public::banner(&state.uptime.live.sign()))
 }
 
 #[component]
 pub(super) async fn bir_banner(cx: &Cx) -> Result<impl View> {
-    let banner = banner_for(cx);
+    let banner = banner_for(cx).await?.clone();
     let link = format!("{}{}", state(cx).config.forms_origin, public::STATUS_PATH);
     Ok(view! {
         if let Some(banner) = banner {

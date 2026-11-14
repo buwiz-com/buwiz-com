@@ -109,6 +109,9 @@ pub fn moved(error: &sqlx::Error) -> bool {
 /// The live sign.
 pub struct Live {
     sign: RwLock<Arc<SignState>>,
+    /// The sign as it stood at the last 5-minute mark (Manila's marks are
+    /// UTC's): what everything public is made from.
+    snapshot: RwLock<(OffsetDateTime, Arc<SignState>)>,
     /// Each window's last 10 at the last run (front desk, mailbox).
     last_ten: RwLock<[Tally; 2]>,
     engine: Mutex<Engine>,
@@ -195,8 +198,10 @@ pub struct Written {
 
 impl Live {
     pub fn new(now: OffsetDateTime) -> Self {
+        let first = Arc::new(SignState::new(now));
         Self {
-            sign: RwLock::new(Arc::new(SignState::new(now))),
+            snapshot: RwLock::new((OffsetDateTime::UNIX_EPOCH, first.clone())),
+            sign: RwLock::new(first),
             last_ten: RwLock::new([Tally::default(); 2]),
             engine: Mutex::new(Engine::new(now)),
             inbox: std::sync::Mutex::new(Vec::new()),
@@ -209,8 +214,40 @@ impl Live {
         self.sign.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
-    fn show(&self, state: SignState) {
-        *self.sign.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(state);
+    /// The sign everything public is made from at `now`: as it stood at
+    /// the last 5-minute mark, so it changes only on those marks and nobody
+    /// polling it can time a single try. Signed-in reads use [`Live::sign`].
+    pub fn public(&self, now: OffsetDateTime) -> (OffsetDateTime, Arc<SignState>) {
+        let mark = super::public::round_down(now);
+        // Read before the snapshot is locked ([`Live::show`] takes the two
+        // the other way round).
+        let current = self.sign();
+        let mut snapshot = self.snapshot.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if snapshot.0 < mark {
+            // Nothing was shown since the mark: the sign now is the mark's.
+            *snapshot = (mark, current);
+        }
+        snapshot.clone()
+    }
+
+    /// Shows `state`, from a run at `now`. The sign it replaces is the one
+    /// that stood at `now`'s mark, if no snapshot holds that mark yet; the
+    /// first sign shown after a start (the one placeholder before it claims
+    /// nothing, `seq` 0) is the mark's itself, so a restart does not show No
+    /// recent news until the next mark.
+    fn show(&self, state: SignState, now: OffsetDateTime) {
+        let mut sign = self.sign.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mark = super::public::round_down(now);
+        let state = Arc::new(state);
+        {
+            let mut snapshot = self.snapshot.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if sign.seq == 0 {
+                *snapshot = (mark, state.clone());
+            } else if snapshot.0 < mark {
+                *snapshot = (mark, sign.clone());
+            }
+        }
+        *sign = state;
     }
 
     /// How many of the mailbox's last 10 got in, at the last run.
@@ -344,7 +381,9 @@ impl Locked<'_> {
             };
             let minutes = (to_minute(to) - to_minute(from)).whole_minutes();
             if to - from >= sign::MAX_GAP {
-                tracing::error!("BIR uptime: a gap in watching is 31 days or more (a clock that jumped?); written as 31 days");
+                tracing::error!(
+                    "BIR uptime: a gap in watching is 31 days or more (a clock that jumped?); written as 31 days"
+                );
             }
             rows.push((from, event("watched", "not_watched", "Buwiz stopped watching".into()), None));
             rows.push((to, event("not_watched", "watched", format!("Buwiz was not watching for {minutes} min")), None));
@@ -389,7 +428,7 @@ impl Locked<'_> {
         }
         *self.uptime.live.last_ten.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = evaluation.last_ten;
         self.engine.sign = evaluation.state.clone();
-        self.uptime.live.show(evaluation.state);
+        self.uptime.live.show(evaluation.state, self.now);
     }
 
     /// One run with the open note as the record has it: written when
@@ -442,7 +481,7 @@ impl Locked<'_> {
             self.engine.sign.evaluated_at = evaluation.state.evaluated_at;
         }
         *self.uptime.live.last_ten.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = evaluation.last_ten;
-        self.uptime.live.show(evaluation.state);
+        self.uptime.live.show(evaluation.state, self.now);
     }
 }
 
@@ -624,7 +663,9 @@ fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTi
                 }
             }
             if state.clamp_to(now) {
-                tracing::error!("BIR uptime: the stored sign has times after now (a clock that was ahead?); read as now");
+                tracing::error!(
+                    "BIR uptime: the stored sign has times after now (a clock that was ahead?); read as now"
+                );
             }
             if state.relay.paused {
                 // Nothing in this release resumes it.
@@ -819,7 +860,22 @@ mod tests {
     fn the_newest_row_is_the_largest_id_not_the_last_to_end() {
         let row = |id: i64, at: OffsetDateTime| -> TryRow {
             let text = || "none".to_owned();
-            (id, at, "relay".into(), "failed".into(), text(), text(), text(), None, true, false, "open".into(), 1, vec![0; 8], None)
+            (
+                id,
+                at,
+                "relay".into(),
+                "failed".into(),
+                text(),
+                text(),
+                text(),
+                None,
+                true,
+                false,
+                "open".into(),
+                1,
+                vec![0; 8],
+                None,
+            )
         };
         let now = datetime!(2026-11-11 05:00 UTC);
         // By end time: row 9 ended first, row 4 (written earlier) after it.
@@ -846,6 +902,32 @@ mod tests {
         assert!(engine.evidence.iter().all(|item| item.at <= back));
         // And then forward with it.
         assert_eq!(engine.clock(back + Duration::seconds(30)), back + Duration::seconds(30));
+    }
+
+    /// Everything public is the sign as it stood at the last 5-minute mark:
+    /// a change shows there only from the next mark.
+    #[test]
+    fn the_public_sign_moves_only_on_5_minute_marks() {
+        let at = |minute: i64, second: i64| datetime!(2026-11-11 05:00 UTC) + Duration::seconds(minute * 60 + second);
+        let live = Live::new(at(0, 0));
+        let sign = |seq: i64| SignState { seq, ..SignState::new(at(0, 0)) };
+        // The first sign after a start is the mark's at once.
+        live.show(sign(10), at(1, 0));
+        assert_eq!(live.public(at(1, 1)).1.seq, 10);
+        // A change at 5:03:20 is not public before 5:05.
+        live.show(sign(11), at(3, 20));
+        assert_eq!(live.public(at(4, 59)).1.seq, 10);
+        assert_eq!(live.sign().seq, 11, "the live sign has it");
+        assert_eq!(live.public(at(5, 0)), (at(5, 0), live.sign()));
+        // Two changes within one mark: the mark's is the one before both.
+        live.show(sign(12), at(11, 10));
+        live.show(sign(13), at(12, 10));
+        assert_eq!(live.public(at(12, 20)).1.seq, 11);
+        assert_eq!(live.public(at(14, 59)).1.seq, 11);
+        assert_eq!(live.public(at(15, 0)).1.seq, 13);
+        // No reader for a while: the sign at the mark is the one standing.
+        live.show(sign(14), at(16, 0));
+        assert_eq!(live.public(at(40, 1)), (at(40, 0), live.sign()));
     }
 
     #[test]

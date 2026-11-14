@@ -187,7 +187,8 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     if public_bir && path == "/bir-status" {
         head = Head { title: bir_status::TITLE, description: bir_status::DESCRIPTION, index: true };
     }
-    let bir_styles = public_bir && (path == "/bir-status" || path == "/tins" && bir_status::banner_for(cx).is_some());
+    let bir_styles =
+        public_bir && (path == "/bir-status" || path == "/tins" && bir_status::banner_for(cx).await?.is_some());
     let url = format!("{}{path}", crate::sites::seo::public_origin(&state(cx).config, host(cx)));
     let forms_origin = state(cx).config.forms_origin.clone();
     let (sign_in, sign_up) = (account_url(cx, "/login"), account_url(cx, "/signup"));

@@ -2,13 +2,15 @@
 //! the sign object, its words, the compact `buwiz-bir` header and the My
 //! TINs banner. Pure: built from the sign in memory.
 //!
-//! The public document is the same for everyone. Its past times (`since`,
-//! `last_*`, `evaluated_at`, a note's `set_at`) are rounded down to 5
-//! minutes, so a quiet day's single filing cannot be read off it; a note's
-//! end is a future time and exact. It carries no count, account, TIN, host
-//! name or address. Only what is built is sent: the scout time, the waits,
-//! admission and the queue numbers are planned and left out, not sent as
-//! nulls an app might act on.
+//! The public document is the same for everyone, and made from the sign as
+//! it stood at the last 5-minute mark ([`super::live::Live::public`]), so
+//! nobody polling it can time a single try. Its times (`since`,
+//! `last_success_at`, `evaluated_at`, a note's `set_at` and `until`) are on
+//! 5-minute marks too (past ones rounded down, a note's end up), and it has
+//! no `last_news_at`. It carries no count, account, TIN, host name or
+//! address, and its `ETag` is an opaque hash of its bytes. Only what is
+//! built is sent: the scout time, the waits, admission and the queue
+//! numbers are planned and left out, not sent as nulls an app might act on.
 
 use serde::Serialize;
 use time::{Duration, OffsetDateTime, UtcOffset};
@@ -43,8 +45,8 @@ pub fn round_up(at: OffsetDateTime) -> OffsetDateTime {
     if down == at.to_offset(UtcOffset::UTC) { down } else { down + ROUND }
 }
 
-/// How times are given: rounded for everyone, or to the minute for a
-/// signed-in reader.
+/// How times are given: on 5-minute marks for everyone, or to the minute
+/// (with `last_news_at`) for staff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Times {
     Public,
@@ -56,6 +58,13 @@ impl Times {
         match self {
             Self::Public => round_down(at),
             Self::Exact => to_minute(at).to_offset(UtcOffset::UTC),
+        }
+    }
+
+    fn future(self, at: OffsetDateTime) -> OffsetDateTime {
+        match self {
+            Self::Public => round_up(at),
+            Self::Exact => at.to_offset(UtcOffset::UTC),
         }
     }
 }
@@ -184,7 +193,7 @@ pub struct NoteDoc {
     pub text: String,
     #[serde(with = "time::serde::rfc3339")]
     pub set_at: OffsetDateTime,
-    /// A future time: exact.
+    /// A future time: rounded up to 5 minutes in the public document.
     #[serde(with = "time::serde::rfc3339")]
     pub until: OffsetDateTime,
 }
@@ -217,7 +226,9 @@ pub struct Document {
     pub windows: Windows,
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_success_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    /// The last counted try of any outcome: for staff only, never public
+    /// (it would time a quiet day's single try).
+    #[serde(with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
     pub last_news_at: Option<OffsetDateTime>,
     pub last_state: Option<&'static str>,
     pub note: Option<NoteDoc>,
@@ -246,26 +257,44 @@ pub fn document(sign: &SignState, forms_origin: &str, times: Times) -> Document 
         relay: if sign.relay.paused { "paused" } else { "ok" },
         windows: Windows { dispatcher: window(&sign.dispatcher, times), upload: window(&sign.upload, times) },
         last_success_at: sign.last_success_at.map(|at| times.past(at)),
-        last_news_at: sign.last_news_at.map(|at| times.past(at)),
+        last_news_at: sign.last_news_at.filter(|_| times == Times::Exact).map(|at| times.past(at)),
         last_state: sign.last_state.filter(|_| sign.state == Light::NoRecentNews).map(Light::as_str),
         note: sign.note.as_ref().map(|note| NoteDoc {
             kind: note.kind.as_str(),
             text: note.text.clone(),
             set_at: times.past(note.starts_at),
-            until: note.until.to_offset(UtcOffset::UTC),
+            until: times.future(note.until),
         }),
         words: words(sign, times),
         links: Links { status_page: format!("{forms_origin}{STATUS_PATH}") },
     }
 }
 
-/// The public document's `ETag`: the sign's `revision` (which moves with
-/// everything a reader sees but the evaluation time) and the 5 minutes its
-/// `evaluated_at` is rounded to, so a cached copy is never kept past a
-/// change of either.
-pub fn etag(sign: &SignState) -> String {
-    let bucket = round_down(sign.evaluated_at).unix_timestamp() / ROUND.whole_seconds();
-    format!("\"b-{}-{bucket}\"", sign.revision)
+/// An `ETag` for `body`: an opaque hash of its bytes, so it tells nothing
+/// the body does not.
+pub fn etag(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body);
+    format!("\"{}\"", crate::base::crypto::hex(&digest[..12]))
+}
+
+/// What everything public is made from, for one 5-minute mark: the sign as
+/// it stood at the mark, the public document's bytes and `ETag`, and the
+/// compact header.
+#[derive(Debug)]
+pub struct Published {
+    pub mark: OffsetDateTime,
+    pub sign: std::sync::Arc<SignState>,
+    pub body: Vec<u8>,
+    pub etag: String,
+    pub compact: String,
+}
+
+impl Published {
+    pub fn of(mark: OffsetDateTime, sign: std::sync::Arc<SignState>, forms_origin: &str) -> Self {
+        let body = serde_json::to_vec(&document(&sign, forms_origin, Times::Public)).unwrap_or_default();
+        Self { mark, etag: etag(&body), compact: compact(&sign), body, sign }
+    }
 }
 
 /// The compact sign (docs §2.3), an RFC 8941 dictionary: `v`, `seq`, the
@@ -348,6 +377,8 @@ pub fn today(now: OffsetDateTime) -> time::Date {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use time::macros::datetime;
     use uuid::Uuid;
 
@@ -390,13 +421,16 @@ mod tests {
         assert_eq!(public.since, datetime!(2026-11-11 07:10 UTC));
         assert_eq!(public.evaluated_at, datetime!(2026-11-11 09:00 UTC));
         assert_eq!(public.last_success_at, Some(datetime!(2026-11-11 07:00 UTC)));
-        assert_eq!(public.last_news_at, Some(datetime!(2026-11-11 08:55 UTC)));
+        assert_eq!(public.last_news_at, None, "never public");
+        assert!(serde_json::to_value(&public).unwrap().get("last_news_at").is_none());
         assert_eq!(public.windows.dispatcher.since, datetime!(2026-11-11 01:00 UTC));
         let note = public.note.unwrap();
-        assert_eq!((note.set_at, note.until), (datetime!(2026-11-11 07:10 UTC), until));
+        assert_eq!((note.set_at, note.until), (datetime!(2026-11-11 07:10 UTC), datetime!(2026-11-11 10:15 UTC)));
         let exact = document(&offline, "https://ebirforms.buwiz.com", Times::Exact);
         assert_eq!(exact.since, datetime!(2026-11-11 07:13 UTC));
         assert_eq!(exact.last_success_at, Some(datetime!(2026-11-11 07:04 UTC)));
+        assert_eq!(exact.last_news_at, Some(datetime!(2026-11-11 08:58 UTC)));
+        assert_eq!(exact.note.unwrap().until, until);
     }
 
     #[test]
@@ -438,7 +472,21 @@ mod tests {
             until: offline.since + Duration::hours(2),
         });
         assert!(compact(&offline).ends_with("note=?1"));
-        assert_eq!(etag(&offline), "\"b-1762851821000-5981292\"");
+        // The tag is a hash of the bytes: no revision, no time in it.
+        let published =
+            Published::of(round_down(offline.evaluated_at), Arc::new(offline.clone()), "https://ebirforms.buwiz.com");
+        assert_eq!(published.etag, etag(&published.body));
+        assert_eq!(published.etag.len(), 26);
+        assert!(!published.etag.contains(&offline.revision.to_string()));
+        assert!(!published.etag.contains(&offline.seq.to_string()));
+        let mut later = offline.clone();
+        later.revision += 1;
+        later.evaluated_at += Duration::seconds(40);
+        assert_eq!(
+            Published::of(published.mark, Arc::new(later), "https://ebirforms.buwiz.com").etag,
+            published.etag,
+            "the same bytes, the same tag"
+        );
     }
 
     #[test]

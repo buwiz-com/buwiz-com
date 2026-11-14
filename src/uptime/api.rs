@@ -3,16 +3,28 @@
 //! below it they are not routed at all, so every one answers the site's own
 //! 404 and nothing else changes (`crate::account::web::router`).
 //!
+//! Everything public here is made from the sign as it stood at the last
+//! 5-minute mark ([`super::live::Live::public`]), so it can be up to 5
+//! minutes behind and nobody polling it can time a single try:
+//!
 //! - `GET /api/bir/status`: the public document, the same bytes for
-//!   everyone, with an `ETag` and `Cache-Control: public, max-age=15,
-//!   stale-while-revalidate=30`. 120 a minute per IP address (an IPv6
-//!   address by its /64), held in memory only.
+//!   everyone, with an `ETag` (a hash of the bytes) and `Cache-Control:
+//!   public, max-age=15, stale-while-revalidate=30`. 120 a minute per IP
+//!   address (an IPv6 address by its /64), held in memory only.
+//! - `GET /api/bir/history`: the day lines and the last 24 hours, as at the
+//!   mark, from memory ([`super::history::Cache`]), public, cacheable 5
+//!   minutes, limited per IP with the status.
+//! - The `buwiz-bir` header on responses that need no sign-in (the trust
+//!   list, the sealing key).
+//!
+//! Signed-in reads carry the live sign:
+//!
 //! - `GET /api/bir/status/mine`: a Bearer token of any scope, or the website
-//!   session. The document with times to the minute, plus the last 10's
-//!   tally and today's counts. 60 a minute per account. `private, no-cache`,
-//!   no `ETag`, never `304`.
-//! - `GET /api/bir/history`: the day lines and the last 24 hours, public,
-//!   cacheable 5 minutes, limited per IP with the status.
+//!   session (a banned account `403`). The live sign with public times; for
+//!   staff (Admin or Support) times to the minute, `last_news_at`, and
+//!   `detail` (the last 10's tally and today's counts). 60 a minute per
+//!   account. `no-store`, no `ETag`, never `304`.
+//! - The `buwiz-bir` header on tickets, submissions and tax profiles.
 
 use axum::Json;
 use axum::extract::{FromRequestParts, RawQuery, Request, State};
@@ -22,13 +34,15 @@ use http::request::Parts;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::Serialize;
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 
 use super::history::{self, RangeError};
 use super::keys::{client_ip, manila_day, manila_midnight};
 use super::public::{self, Document, HEADER, Times};
-use crate::account::accounts::Account;
-use crate::account::oauth::Bearer;
-use crate::account::web::session_account;
+use crate::account::accounts::{self, Account};
+use crate::account::oauth::{BANNED_MESSAGE, Bearer};
+use crate::account::roles;
+use crate::base::crypto;
 use crate::base::error::ApiError;
 use crate::base::state::AppState;
 
@@ -36,13 +50,13 @@ use crate::base::state::AppState;
 pub const PUBLIC_CACHE: &str = "public, max-age=15, stale-while-revalidate=30";
 /// The history's.
 pub const HISTORY_CACHE: &str = "public, max-age=300";
-/// The signed-in detail's: never a shared cache.
-pub const PRIVATE_CACHE: &str = "private, no-cache";
+/// The signed-in reads': never kept anywhere.
+pub const PRIVATE_CACHE: &str = "no-store";
 
 const RATE_LIMITED: &str = "Too many requests. Try again in a minute.";
 
 /// `429 rate_limited` with `Retry-After`, never cached.
-fn rate_limited(wait: Duration) -> Response {
+pub fn rate_limited(wait: Duration) -> Response {
     let seconds = wait.whole_seconds().max(1);
     let body = serde_json::json!({ "error": { "code": "rate_limited", "message": RATE_LIMITED } });
     let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
@@ -55,7 +69,7 @@ fn rate_limited(wait: Duration) -> Response {
 /// Counts a public read from the caller's address (`CF-Connecting-IP`; a
 /// request without it, which only a local server sees, counts as one
 /// address).
-fn check_ip(state: &AppState, headers: &HeaderMap, now: OffsetDateTime) -> Result<(), Duration> {
+pub fn check_ip(state: &AppState, headers: &HeaderMap, now: OffsetDateTime) -> Result<(), Duration> {
     let address = client_ip(headers).unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     state.uptime.check_read_from(address, now)
 }
@@ -75,26 +89,44 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if let Err(wait) = check_ip(&state, &headers, now) {
         return rate_limited(wait);
     }
-    let sign = state.uptime.live.sign();
-    let etag = public::etag(&sign);
-    let mut response = if matches(&headers, &etag) {
+    let published = state.uptime.published(&state.config.forms_origin, now);
+    let mut response = if matches(&headers, &published.etag) {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
-        Json(public::document(&sign, &state.config.forms_origin, Times::Public)).into_response()
+        let mut response = published.body.clone().into_response();
+        response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
     };
     let headers = response.headers_mut();
-    headers.insert(header::ETAG, HeaderValue::from_str(&etag).expect("an ETag is ASCII"));
+    headers.insert(header::ETAG, HeaderValue::from_str(&published.etag).expect("an ETag is ASCII"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(PUBLIC_CACHE));
     response
 }
 
 /// The signed-in reader: a Bearer token of any scope when the request has
-/// one, else the website session.
+/// one, else the website session. A banned account is refused `403
+/// account_banned` either way (a ban ends its sessions, so a session it
+/// ended still says why).
 async fn reader(state: &AppState, parts: &mut Parts) -> Result<Account, ApiError> {
     if parts.headers.contains_key(header::AUTHORIZATION) {
         return Ok(Bearer::from_request_parts(parts, state).await?.account);
     }
-    session_account(state, &parts.headers).await?.ok_or(ApiError::InvalidToken)
+    let Some(token) = accounts::cookie(&parts.headers, state.config.session_cookie()) else {
+        return Err(ApiError::InvalidToken);
+    };
+    let row: Option<(Uuid, String, bool, bool)> = sqlx::query_as(
+        "SELECT a.id, a.email, a.banned_at IS NOT NULL, s.revoked_at IS NULL
+           FROM web_sessions s JOIN accounts a ON a.id = s.account_id
+          WHERE s.token_hash = $1 AND s.expires_at > now()",
+    )
+    .bind(crypto::hash(token))
+    .fetch_optional(&state.db)
+    .await?;
+    match row {
+        Some((_, _, true, _)) => Err(ApiError::forbidden("account_banned", BANNED_MESSAGE)),
+        Some((id, email, false, true)) => Ok(Account { id, email }),
+        _ => Err(ApiError::InvalidToken),
+    }
 }
 
 /// The mailbox's last 10.
@@ -123,10 +155,14 @@ pub struct Detail {
 pub struct Mine {
     #[serde(flatten)]
     pub sign: Document,
-    pub detail: Detail,
+    /// Staff only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Detail>,
 }
 
-/// `GET /api/bir/status/mine`.
+/// `GET /api/bir/status/mine`: the live sign. Everyone signed in gets it
+/// with public times (5-minute marks) and no counts; staff (Admin or
+/// Support) get times to the minute and the counts.
 pub async fn status_mine(State(state): State<AppState>, mut parts: Parts) -> Response {
     let account = match reader(&state, &mut parts).await {
         Ok(account) => account,
@@ -136,19 +172,24 @@ pub async fn status_mine(State(state): State<AppState>, mut parts: Parts) -> Res
     if let Err(wait) = state.uptime.reads_per_account.check(account.id, now) {
         return rate_limited(wait);
     }
-    let sign = state.uptime.live.sign();
-    let tally = state.uptime.live.last_ten();
-    let today = match today(&state, now).await {
-        Ok(today) => today,
+    let staff = match roles::staff(&state.db, &state.config, &account).await {
+        Ok(staff) => staff.is_some(),
         Err(error) => return no_store(ApiError::from(error).into_response()),
     };
-    let mine = Mine {
-        sign: public::document(&sign, &state.config.forms_origin, Times::Exact),
-        detail: Detail { last_10: LastTen { got_in: tally.got_in, of: tally.of }, today },
+    let sign = state.uptime.live.sign();
+    let times = if staff { Times::Exact } else { Times::Public };
+    let detail = if staff {
+        let tally = state.uptime.live.last_ten();
+        let today = match today(&state, now).await {
+            Ok(today) => today,
+            Err(error) => return no_store(ApiError::from(error).into_response()),
+        };
+        Some(Detail { last_10: LastTen { got_in: tally.got_in, of: tally.of }, today })
+    } else {
+        None
     };
-    let mut response = Json(mine).into_response();
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
-    response
+    let mine = Mine { sign: public::document(&sign, &state.config.forms_origin, times), detail };
+    no_store(Json(mine).into_response())
 }
 
 fn no_store(mut response: Response) -> Response {
@@ -207,7 +248,16 @@ pub async fn history(State(state): State<AppState>, headers: HeaderMap, RawQuery
         Ok(range) => range,
         Err(error) => return bad_range(error),
     };
-    match history::history(&state.db, from, to, now).await {
+    // From the history in memory, as at the last 5-minute mark; a range
+    // older than it (no today in it) reads only the day lines.
+    let answer = match state.uptime.history.get(&state.db, now).await {
+        Ok(cached) => match history::slice(&cached, from, to) {
+            Some(history) => Ok(history),
+            None => history::history(&state.db, from, to, public::round_down(now), Some(cached.last_24h.clone())).await,
+        },
+        Err(error) => Err(error),
+    };
+    match answer {
         Ok(history) => {
             let mut response = Json(history).into_response();
             response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(HISTORY_CACHE));
@@ -222,12 +272,24 @@ fn bad_range(error: RangeError) -> Response {
     no_store(refused.into_response())
 }
 
-/// Adds the compact sign, from memory, to a response apps already get
-/// (whatever its status). Its body and its caching stay as they were.
+/// Adds the compact live sign to a signed-in response apps already get (a
+/// ticket, a submission, tax profiles), whatever its status. Its body and
+/// its caching stay as they were.
 pub async fn sign_header(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let compact = public::compact(&state.uptime.live.sign());
     if let Ok(value) = HeaderValue::from_str(&compact) {
+        response.headers_mut().insert(HEADER, value);
+    }
+    response
+}
+
+/// Adds the compact sign of the last 5-minute mark to a response that needs
+/// no sign-in (the trust list, the sealing key), as [`sign_header`] does.
+pub async fn public_sign_header(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let published = state.uptime.published(&state.config.forms_origin, OffsetDateTime::now_utc());
+    if let Ok(value) = HeaderValue::from_str(&published.compact) {
         response.headers_mut().insert(HEADER, value);
     }
     response

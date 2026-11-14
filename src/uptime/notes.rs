@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use super::Uptime;
 use super::live::{self, Locked};
-use super::store::to_minute;
 use super::sign::{self, Cause, Evaluation, Event, Note, NoteKind, Scope};
+use super::store::to_minute;
 use crate::account::accounts::Account;
 use crate::account::roles::{self, Power, Staff};
 use crate::base::config::Config;
@@ -69,7 +69,6 @@ pub struct NewNote<'a> {
     pub text: &'a str,
     pub until: OffsetDateTime,
 }
-
 
 /// The actor as the database stands now, if an Admin: their account with
 /// the email read now (a share lock holds it to the end of `tx`).

@@ -191,6 +191,10 @@ pub struct Uptime {
     pub live: Live,
     /// Staff mail not sent yet ([`alerts`]).
     pub alerts: Alerts,
+    /// The public document of the current 5-minute mark, made once.
+    pub published: std::sync::Mutex<Option<std::sync::Arc<public::Published>>>,
+    /// The public history, made at most once a mark.
+    pub history: history::Cache,
     /// How often the ticker runs ([`live::TICK`]; tests run it faster).
     pub tick_every: std::time::Duration,
     /// Tests only: how many runs of the ticker's rules panic, to prove the
@@ -215,6 +219,8 @@ impl Uptime {
             sightings: Sightings::default(),
             live: Live::new(now),
             alerts: Alerts::default(),
+            published: std::sync::Mutex::new(None),
+            history: history::Cache::default(),
             tick_every: live::TICK,
             panics: std::sync::atomic::AtomicU32::new(0),
         }
@@ -223,6 +229,22 @@ impl Uptime {
     /// Counts a public read from `address` (an IPv6 address by its /64).
     pub fn check_read_from(&self, address: IpAddr, now: OffsetDateTime) -> Result<(), Duration> {
         self.reads_per_ip.check(keys::ip_key(address), now)
+    }
+
+    /// The public document of `now`'s 5-minute mark (and its `ETag` and
+    /// compact header), made once a mark: everything public is made from
+    /// it.
+    pub fn published(&self, forms_origin: &str, now: OffsetDateTime) -> std::sync::Arc<public::Published> {
+        let (mark, sign) = self.live.public(now);
+        let mut published = self.published.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(made) =
+            published.as_ref().filter(|made| made.mark == mark && std::sync::Arc::ptr_eq(&made.sign, &sign))
+        {
+            return made.clone();
+        }
+        let made = std::sync::Arc::new(public::Published::of(mark, sign, forms_origin));
+        *published = Some(made.clone());
+        made
     }
 
     /// From `BIR_UPTIME` and `BIR_UPTIME_UPLOAD_PORTS`. Neither stops the
@@ -267,7 +289,9 @@ pub async fn start(state: &AppState) {
         Ok(Err(error)) => {
             tracing::error!(%error, "BIR uptime: the sign could not be loaded at start; No recent news until the ticker can")
         }
-        Err(_) => tracing::error!("BIR uptime: loading the sign took too long at start; No recent news until the ticker can"),
+        Err(_) => {
+            tracing::error!("BIR uptime: loading the sign took too long at start; No recent news until the ticker can")
+        }
     }
 }
 

@@ -1347,8 +1347,11 @@ async fn a_day_is_final_only_once_its_end_was_watched(db: PgPool) {
     days::roll_up(&db, &uptime.day_sets, day, t(900)).await.unwrap();
     let row = day_row(&db, day).await;
     assert!(row.is_final);
-    let unwatched: i32 =
-        sqlx::query_scalar("SELECT unwatched_minutes FROM bir_days WHERE day = $1").bind(day).fetch_one(&db).await.unwrap();
+    let unwatched: i32 = sqlx::query_scalar("SELECT unwatched_minutes FROM bir_days WHERE day = $1")
+        .bind(day)
+        .fetch_one(&db)
+        .await
+        .unwrap();
     assert_eq!(unwatched, 40, "23:20 to midnight");
 }
 
@@ -1361,15 +1364,19 @@ async fn the_ticker_goes_on_through_a_panicking_tick(db: PgPool) {
     uptime.tick_every = std::time::Duration::from_millis(20);
     uptime.panics.store(1, std::sync::atomic::Ordering::SeqCst);
     uptime.alerts.push(Alert::missing_header(OffsetDateTime::now_utc()));
-    let site = Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up Sender secret, 32 characters or more", uptime);
+    let site =
+        Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up Sender secret, 32 characters or more", uptime);
     site.staff_with_role("admin@example.test", "admin").await;
     let ticker = tokio::spawn(buwiz_cloud::uptime::run_ticker(site.state.clone()));
     let uptime = &site.state.uptime;
     let today = manila_day(OffsetDateTime::now_utc());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let days: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM bir_days WHERE day = $1").bind(today).fetch_one(&db).await.unwrap();
+        let days: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_days WHERE day = $1")
+            .bind(today)
+            .fetch_one(&db)
+            .await
+            .unwrap();
         if uptime.live.sign().seq > 0 && uptime.alerts.queued() == 0 && days == 1 {
             break;
         }

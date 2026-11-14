@@ -34,12 +34,12 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
+use super::Level;
 use super::keys::MANILA;
 use super::live;
 use super::notes::{self, MAX_AHEAD, NewNote, NoteError};
 use super::public::{self, Times};
 use super::sign::{Note, NoteKind, SignState};
-use super::Level;
 use crate::account::accounts::{self, Account};
 use crate::account::roles::{self, Power, Staff};
 use crate::base::config::Config;
@@ -83,9 +83,7 @@ impl Until {
     fn at(self, now: OffsetDateTime) -> Option<OffsetDateTime> {
         match self {
             Self::At(at) => Some(at),
-            Self::Hours(hours) => {
-                now.checked_add(Duration::seconds(hours.checked_mul(3600)?)).map(public::round_down)
-            }
+            Self::Hours(hours) => now.checked_add(Duration::seconds(hours.checked_mul(3600)?)).map(public::round_down),
         }
     }
 }

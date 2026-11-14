@@ -1,5 +1,7 @@
 -- Back to migration 12. docs/deploy.md has the whole rollback; run this
--- file before 0012's and 0011's:
+-- file before 0012's and 0011's. It commits on its own, before their
+-- checks run: a refusal by 0012's leaves the database at 12, which the
+-- release before this one runs on.
 --
 --   psql -v ON_ERROR_STOP=1 -1 -f 0013_test_tins.down.sql
 --

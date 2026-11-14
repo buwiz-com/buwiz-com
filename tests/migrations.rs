@@ -645,13 +645,15 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
 
-    // 13 goes back on its own: the release before this one runs at 12.
+    // 13 goes back on its own, and stays back: from 13 the rollback is step
+    // by step. Each refusal below leaves the database at 12, which the
+    // release before test TINs runs on.
     MIGRATOR.undo(&db, 12).await.unwrap();
     assert_eq!(versions(&db).await, (1..=12).collect::<Vec<_>>());
 
-    // A rollback either goes all the way or changes nothing. 0012's down
-    // file refuses first for every reason 0011's would, so each refusal
-    // leaves the database at 12 with nothing dropped.
+    // From 12, a rollback goes all the way to 10 or changes nothing. 0012's
+    // down file refuses first for every reason 0011's would, so each
+    // refusal leaves the database at 12 with nothing dropped.
     let untouched = at_12(&db).await;
     let refuses = |words: &'static str| {
         let db = db.clone();

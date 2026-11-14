@@ -237,6 +237,18 @@ pub(crate) async fn act_buttons(label: &'static str, #[default] danger: bool) ->
     })
 }
 
+/// On a user page, the tab a form goes back to after its action (`tab`
+/// in the form; nothing when empty). staff.js keeps the one of a form
+/// outside every tab, the page head's, on the tab shown.
+#[component]
+pub(crate) async fn tab_field(tab: &'static str) -> Result<impl View> {
+    Ok(view! {
+        if !tab.is_empty() {
+            <input type="hidden" name="tab" value=(tab)>
+        }
+    })
+}
+
 /// The required reason of a staff form, kept in the account's history.
 #[component]
 pub(crate) async fn reason_field() -> Result<impl View> {
@@ -262,10 +274,12 @@ pub(crate) async fn reason_act(
     #[into] detail: String,
     confirm: &'static str,
     #[default(true)] danger: bool,
+    #[default] tab: &'static str,
 ) -> Result<impl View> {
     Ok(view! {
         act(id: id, label: label, sym: sym, tone: tone, small: small, question: question, detail: detail,
             <form class="sx-form end-form" method="post" action=(action)>
+                tab_field(tab: tab)
                 reason_field()
                 act_buttons(label: confirm, danger: danger)
             </form>

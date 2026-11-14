@@ -17,7 +17,7 @@ use crate::ocr::{self, Reading};
 use topcoat::view::{Unescaped, ViewExt};
 use ui::{
     act, act_buttons, avatar, flag_pill, glyph, href, ic, icon_with, kind_icon, page_head, reason_act, reason_field,
-    short_span, status_pill, sx_notice, sx_pill,
+    short_span, status_pill, sx_notice, sx_pill, tab_field,
 };
 
 mod overview;
@@ -1717,8 +1717,12 @@ async fn new_login_form(open: bool, close: String) -> Result<impl View> {
 // ---------------------------------------------------------------- one user
 
 /// The user page's tabs: (key, label).
-const USER_TABS: [(&str, &str); 4] =
-    [("account", "Account"), ("tins", "TINs"), ("sign", "Sign-ins and apps"), ("history", "History")];
+const USER_TABS: [(&str, &str); 4] = [
+    (queries::USER_TABS[0], "Account"),
+    (queries::USER_TABS[1], "TINs"),
+    (queries::USER_TABS[2], "Sign-ins and apps"),
+    (queries::USER_TABS[3], "History"),
+];
 
 pub mod account_id {
     use super::*;
@@ -1796,8 +1800,7 @@ pub mod account_id {
             }
             parts.join(" · ")
         };
-        let tab = query(cx, "tab").filter(|tab| USER_TABS.iter().any(|(key, _)| key == tab)).unwrap_or_default();
-        let tab = if tab.is_empty() { "account".to_owned() } else { tab };
+        let tab = queries::user_tab(&query(cx, "tab").unwrap_or_default());
         let page = format!("/staff/users/{account_id}");
         let tabs: Vec<(&'static str, &'static str, String, bool, Option<usize>)> = USER_TABS
             .iter()
@@ -1842,7 +1845,9 @@ pub mod account_id {
                                         action: format!("/staff/users/{account_id}/sign-out"),
                                         question: "Sign out everywhere?",
                                         detail: "This account is signed out of every browser, the desktop app and every AI agent. They can sign in again.",
-                                        confirm: "Sign out everywhere"
+                                        confirm: "Sign out everywhere",
+                                        // Outside the tabs: back to the one shown.
+                                        tab: tab
                                     )
                                 </div>
                             }
@@ -1897,6 +1902,7 @@ pub mod account_id {
                                                             }
                                                         </select>
                                                     </label>
+                                                    tab_field(tab: "account")
                                                     reason_field()
                                                     act_buttons(label: "Change role")
                                                 </form>
@@ -1921,6 +1927,7 @@ pub mod account_id {
                                             act(id: "act-test".to_owned(), label: "Remove", small: true, question: format!("Remove the test label from {email}?"), detail: "Staff no longer see it as a test account.".to_owned(),
                                                 <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test"))>
                                                     <input type="hidden" name="test" value="off">
+                                                    tab_field(tab: "account")
                                                     reason_field()
                                                     act_buttons(label: "Remove the test label")
                                                 </form>
@@ -1929,6 +1936,7 @@ pub mod account_id {
                                             act(id: "act-test".to_owned(), label: "Mark as test", small: true, question: format!("Mark {email} as a test account?"), detail: "A label for staff only. Sends work as usual.".to_owned(),
                                                 <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test"))>
                                                     <input type="hidden" name="test" value="on">
+                                                    tab_field(tab: "account")
                                                     reason_field()
                                                     act_buttons(label: "Mark as test account")
                                                 </form>
@@ -1962,7 +1970,8 @@ pub mod account_id {
                                                 question: format!("Lift the ban on {email}?"),
                                                 detail: "They can sign in and send again.",
                                                 confirm: "Lift ban",
-                                                danger: false
+                                                danger: false,
+                                                tab: "account"
                                             )
                                         } else if acts && !is_admin {
                                             reason_act(
@@ -1974,7 +1983,8 @@ pub mod account_id {
                                                 action: format!("/staff/users/{account_id}/ban"),
                                                 question: format!("Ban {email}?"),
                                                 detail: "They can't sign in or send returns until you lift the ban. Their TINs stay on the account.",
-                                                confirm: "Ban"
+                                                confirm: "Ban",
+                                                tab: "account"
                                             )
                                         } else {
                                             <span></span>
@@ -2105,6 +2115,7 @@ async fn test_tin_form(account_id: Uuid) -> Result<impl View> {
                         <option value="business">"Business"</option>
                     </select>
                 </label>
+                tab_field(tab: "tins")
                 reason_field()
                 act_buttons(label: "Add the test TIN")
             </form>
@@ -2169,7 +2180,8 @@ async fn connected_app(account_id: Uuid, app: AppRow, may_sign_out: bool) -> Res
                     action: action,
                     question: format!("Sign {name} out?"),
                     detail: "It loses access to this account until the person connects it again.",
-                    confirm: label
+                    confirm: label,
+                    tab: "sign"
                 )
             }
         </div>

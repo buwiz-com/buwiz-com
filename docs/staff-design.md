@@ -76,7 +76,9 @@ this claim" to its `?open=`, so the claim the queue reloads with after a
 decision is never one stray click from being decided; decisions and actions
 are on a chosen claim and on its own page; the users inspector has no
 actions, only links to the account's page); the user page's
-tab is `?tab=account|tins|sign|history`; the New user dialog is
+tab is `?tab=account|tins|sign|history` (anything else is Account), and an
+action on that page goes back to the tab it came from (its form's hidden
+`tab`; the head's Sign out everywhere follows the tab shown); the New user dialog is
 `/staff/users?new=1`. `staff.js` then swaps the inspector in place (and
 keeps the URL), opens and closes the phone sheet and the tablet's names,
 moves actions that need a reason into a modal dialog, and switches tabs.

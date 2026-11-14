@@ -39,6 +39,15 @@ fn tin_digits(text: &str) -> Option<String> {
     if digits.is_empty() { None } else { Some(format!("%{digits}%")) }
 }
 
+/// The tabs of a user page (`?tab=`), the first the one shown without one.
+pub const USER_TABS: [&str; 4] = ["account", "tins", "sign", "history"];
+
+/// `raw` as one of [`USER_TABS`], or `account` for anything else: the
+/// page's `?tab=` and the tab an action on the page goes back to.
+pub fn user_tab(raw: &str) -> &'static str {
+    USER_TABS.into_iter().find(|tab| *tab == raw).unwrap_or(USER_TABS[0])
+}
+
 /// The tabs of the claims queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueFilter {
@@ -779,6 +788,15 @@ mod tests {
         assert_eq!(QueueFilter::parse(Some("sent_back")), QueueFilter::SentBack);
         assert_eq!(QueueFilter::parse(Some("<x>")), QueueFilter::Waiting);
         assert_eq!(UserFilter::parse(None), UserFilter::Everyone);
+    }
+
+    #[test]
+    fn only_known_user_tabs_are_kept() {
+        assert_eq!(user_tab("tins"), "tins");
+        assert_eq!(user_tab("history"), "history");
+        for raw in ["", "Tins", "tins ", "<b>", "account"] {
+            assert_eq!(user_tab(raw), "account", "{raw}");
+        }
     }
 
     #[test]

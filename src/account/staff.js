@@ -321,6 +321,10 @@ document.documentElement.classList.add("js");
         if (panel) panel.hidden = !on;
       }
       if (focus) tab.focus();
+      // A form outside every tab (the page head's) goes back to the tab shown.
+      for (const field of document.querySelectorAll('input[type="hidden"][name="tab"]')) {
+        if (!field.closest('[role="tabpanel"]')) field.value = tab.dataset.tab;
+      }
       const url = new URL(window.location.href);
       url.searchParams.set("tab", tab.dataset.tab);
       history.replaceState(history.state, "", url);

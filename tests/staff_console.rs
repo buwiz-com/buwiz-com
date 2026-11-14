@@ -534,6 +534,52 @@ async fn the_inspector_shows_the_row_in_the_link(db: PgPool) {
     }
 }
 
+/// An action on a user page goes back to the tab it came from: the form
+/// says which (the head's, outside the tabs, the one shown), and only the
+/// page's own tab names are kept; anything else is the Account tab.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_action_on_a_user_page_goes_back_to_its_tab(db: PgPool) {
+    let site = Site::new(db);
+    let (_, admin) = site.person(STAFF).await;
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let user = format!("/staff/users/{ana}");
+
+    // The forms carry their tab.
+    let response = site.post(&format!("{user}/test"), &admin, "test=on&reason=Trial&tab=account").await;
+    assert_eq!(location(&response), format!("{user}?notice=test_marked"));
+    let page = text(site.get(&format!("{user}?tab=history"), &admin).await).await;
+    let field = |action: &str| {
+        let form = form_with(&page, &format!("action=\"{user}/{action}\""));
+        form.split("name=\"tab\" value=\"").nth(1).map(|rest| rest[..rest.find('"').unwrap()].to_owned())
+    };
+    assert_eq!(field("sign-out").as_deref(), Some("history"));
+    assert_eq!(field("ban").as_deref(), Some("account"));
+    assert_eq!(field("role").as_deref(), Some("account"));
+    assert_eq!(field("test-tin").as_deref(), Some("tins"));
+
+    // Back to that tab, the notice after it.
+    let response = site
+        .post(
+            &format!("{user}/test-tin"),
+            &admin,
+            "tin=000-000-000-00000&kind=personal&registered_name=Ana&reason=Trial&tab=tins",
+        )
+        .await;
+    assert_eq!(location(&response), format!("{user}?tab=tins&notice=test_tin_added"));
+    let response = site.post(&format!("{user}/sign-out"), &support, "reason=Lost+phone&tab=sign").await;
+    assert!(location(&response).starts_with(&format!("{user}?tab=sign&notice=")), "{}", location(&response));
+    // A refusal goes back there too.
+    let response = site.post(&format!("{user}/ban"), &support, "reason=Spam&tab=history").await;
+    assert_eq!(location(&response), format!("{user}?tab=history&notice=admin_only"));
+    // Only the page's tabs: anything else is the Account tab.
+    for tab in ["evil", "TINS", "%3Cb%3E", "account", ""] {
+        let response = site.post(&format!("{user}/sign-out"), &admin, &format!("reason=Again&tab={tab}")).await;
+        let to = location(&response);
+        assert!(to.starts_with(&format!("{user}?notice=")), "{tab}: {to}");
+    }
+}
+
 /// An unknown `?tab=` on a user page shows the Account tab, as no `?tab=`
 /// does, and is never written back into the page.
 #[sqlx::test(migrations = "./migrations")]

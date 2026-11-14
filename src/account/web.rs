@@ -355,7 +355,22 @@ pub fn link(path: &str, notice: Option<Notice>, params: &[(&str, &str)]) -> Stri
         query.append_pair("notice", notice.code());
     }
     let query = query.finish();
-    if query.is_empty() { path.to_owned() } else { format!("{path}?{query}") }
+    match (query.is_empty(), path.contains('?')) {
+        (true, _) => path.to_owned(),
+        // `path` has a query already (a user page's `?tab=`): add to it.
+        (false, true) => format!("{path}&{query}"),
+        (false, false) => format!("{path}?{query}"),
+    }
+}
+
+/// A user page to go back to after an action, on the tab the action came
+/// from: one of the page's tabs, or none (the Account tab) for anything
+/// else.
+fn user_page(account_id: Uuid, tab: &str) -> String {
+    match crate::account::staff::user_tab(tab) {
+        "account" => format!("/staff/users/{account_id}"),
+        tab => format!("/staff/users/{account_id}?tab={tab}"),
+    }
 }
 
 fn see_other(location: String) -> Response {
@@ -999,6 +1014,9 @@ async fn decide_claim(
 struct StaffReason {
     #[serde(default)]
     reason: String,
+    /// On a user page, the tab the form is on ([`user_page`]).
+    #[serde(default)]
+    tab: String,
 }
 
 /// Staff delete a claim that never became active.
@@ -1170,7 +1188,7 @@ async fn sign_out_user(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1188,7 +1206,7 @@ async fn sign_out_user_app(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1207,7 +1225,7 @@ async fn ban_user(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::Ban).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1225,7 +1243,7 @@ async fn unban_user(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::Ban).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1239,6 +1257,8 @@ struct TestForm {
     test: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    tab: String,
 }
 
 /// An Admin puts the test-account label on (`test=on`) or takes it off.
@@ -1251,7 +1271,7 @@ async fn mark_test(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::MarkTest).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1274,6 +1294,8 @@ struct TestTinForm {
     registered_name: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    tab: String,
 }
 
 /// An Admin adds a made-up test TIN to a test account, active at once.
@@ -1286,7 +1308,7 @@ async fn add_test_tin(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::ActivateWithoutPapers).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1336,6 +1358,8 @@ struct RoleForm {
     role: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    tab: String,
 }
 
 /// An Admin changes an account's staff role: `admin`, `support` or `none`.
@@ -1348,7 +1372,7 @@ async fn change_role(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::ChangeRole).await {
         Ok(staff) => staff,
         Err(response) => return response,

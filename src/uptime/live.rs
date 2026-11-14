@@ -5,40 +5,45 @@
 //! for the changes the clock alone makes ([`tick`]). One Gatekeeper
 //! process is assumed: two would each keep their own sign.
 //!
-//! No try is lost on the way in: a recorded try is put in [`Live`]'s inbox
-//! before the engine's lock is waited for, the next run takes it in, and it
-//! stays in memory (3 hours, [`MAX_EVIDENCE`] at most) whatever happens to
-//! that run. A run reads all of it again, so one that failed is simply run
-//! again. Only the database work is bounded by a timeout.
+//! No try is lost on the way in: a recorded try is put in [`Live`]'s inbox,
+//! and the rules run with it only if their lock is free (a try never waits
+//! for them; the run holding them or the next takes it in), and it stays in
+//! memory (3 hours, [`MAX_EVIDENCE`] at most) whatever happens to that run.
+//! A run reads all of it again, so one that failed is simply run again.
+//! Only the database work is bounded by a timeout.
 //!
 //! On start (D4 of the plan's amendments): the very first start is No
 //! recent news everywhere. A restart restores the stored sign as it was,
-//! with its "since" times, the dwell timers and the lost votes, reads the
-//! `live` tries of the last 3 hours and the open note, and ages it by the
-//! clock with the ordinary rules before anything can read it. Tries read
-//! back carry only the key they were recorded under, of a key period no
-//! longer in memory: they keep the times of news and can end an Offline,
-//! but count in no last 10 and no quorum, so a restart never turns Offline
-//! into Online or Online into Offline, and a quorum needs fresh tries. Time
-//! Buwiz was not watching (stopped, or the sign not evaluated for more than
-//! 5 minutes) is written as its own pair of `watch` events.
+//! with its "since" times and the dwell timers, reads the `live` tries of
+//! the last 3 hours and the open note, writes it back with `seq` moved on
+//! once (under the sign's lock), and ages it by the clock with the ordinary
+//! rules before anything can read it. Tries read back carry only the key
+//! they were recorded under, of a key period no longer in memory: they keep
+//! the times of news and can end an Offline, but count in no last 10 and no
+//! quorum, so a restart never turns Offline into Online or Online into
+//! Offline, a quorum needs fresh tries, and lost votes do not outlast it.
+//! Time Buwiz was not watching (stopped, or the sign not evaluated for more
+//! than 5 minutes) is written as its own pair of `watch` events; a restart
+//! of under 5 minutes writes none. Stored times after now are read as now,
+//! and a clock that steps back does not hold the rules.
 //!
-//! Another process may change the sign too: the `buwiz-cloud bir` command
-//! sets and clears notes through [`super::notes`] with an engine of its
-//! own. Every run first reads the stored `seq`; one higher than this
-//! engine's means another process wrote, and its sign, its open note and
-//! its events (for the staff mail) are taken in before the rules run, the
-//! tries in memory and the account ids of the lost votes kept. Every write
-//! holds a lock on the sign and checks the stored `seq` again, so two
-//! processes never write over each other: the one that finds it moved
-//! writes nothing ([`Moved`]) and its next run takes the other's in.
+//! The `buwiz-cloud bir` command writes a note with its audit line and a
+//! higher stored `seq`, and nothing else ([`super::notes::record_set`]).
+//! Every run first reads the stored `seq`; a higher one makes it read the
+//! open note and take that `seq`, keeping its own sign whole, and the run
+//! then makes the note's change, writes it and mails staff. Every write
+//! holds the sign's lock and checks the stored `seq` again, so two writers
+//! never write over each other: one that finds it moved writes nothing
+//! ([`Moved`]) and its next run takes the change in.
 //!
-//! A change is written first and shown after: if the write fails, the
-//! sign stays as it was, and the next run makes the same change. Events are
-//! keyed by the sign's `seq` and their place in the run, so a run whose
+//! A change is written and then shown; a run that cannot be written is
+//! shown all the same, so the sign keeps aging while the database is down,
+//! and the next run that can write makes and writes the same change. Events
+//! are keyed by the sign's `seq` and their place in the run, so a run whose
 //! commit landed but whose acknowledgement was lost adds nothing twice. The
 //! times of news and of the evaluation alone are written at most once a
-//! minute.
+//! minute. Everything public reads the sign as it stood at the last
+//! 5-minute mark ([`Live::public`]).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};

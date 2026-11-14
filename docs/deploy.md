@@ -552,31 +552,65 @@ recorded with mode `unknown` and not counted.
 Support account not banned, and `ADMIN_EMAILS`, through the existing mail
 transport): the BIR sign going Offline and coming back from it, notes, five failures in a row, "the
 relay would pause" (nothing pauses yet), host keys that are not pinned and
-other faults on Buwiz's side, at most 48, 3 and 8 alerts a Manila day by
-kind, batched every 10 minutes ([bir-uptime.md](bir-uptime.md#157-staff-mail)).
+other faults on Buwiz's side, at most 48 (the sign and notes), 3 (host
+keys) and 8 (everything else) alerts a Manila day, batched every 10
+minutes ([bir-uptime.md](bir-uptime.md#157-staff-mail)). Each address gets
+each mail once; one the provider cannot reach is tried again after 1, 2,
+4 … minutes (at most an hour apart) and given up after a day, logged.
 Tell them before the deploy. A request that reaches the server without
 `CF-Connecting-IP` is logged as an error and mailed, at most once an hour
 ("BIR uptime: a request reached the server without CF-Connecting-IP"):
 every such try would count as one network.
 
-**The first start** writes the first line of the history ("Buwiz began
-keeping the sign") and shows No recent news everywhere; the first return
-that gets in turns it Online. **Every later start** (a deploy, a crash, or
-`BIR_UPTIME` set to `off` and back) restores the stored sign as it was and
-ages it by the clock before the server takes requests: it never turns
-Offline into Online or Online into Offline, and the time the server was
-not running (or the sign not evaluated for more than 5 minutes) is written
-as "not watched" and shown as a gap in the day history, never as the BIR's
-state. A quick deploy (under 5 minutes, which a restart is) leaves no gap.
+**What a deploy does at stop.** `systemctl stop` and `restart` send
+SIGTERM. The server is first marked stopping: from then on a request that
+would start a send (`POST /api/tickets`, `POST /api/submissions`, `POST
+/api/v2/submissions`, the relay upgrade `GET /api/submissions/{id}/relay`)
+is answered `503` with code `restarting`, `Retry-After: 30` and `no-store`
+before anything starts, so no app begins a send on a process about to
+exit (every app reads that code as "not sent" and tries again later; it is
+no TIN refusal, and never an `unknown`). Everything else, and every
+request already under way, is still served, and the BIR uptime records of
+tries that end meanwhile are still written. The server waits for those
+records at most 10 seconds (usually none are pending, so it goes on at
+once), then exits with status 0 without waiting for anything else, so a
+document reading (OCR) still running cannot hold the restart. A relay send
+still open at that moment is cut when the process exits, as it was before,
+when SIGTERM killed it; the app records it from its own side. Ctrl-C
+(SIGINT) does the same. A deploy takes no longer than before.
 
-**Stopping.** The server now handles SIGTERM, which `systemctl stop` and
-`restart` send: it stops taking new connections, gives the BIR uptime
-records still being written up to 10 seconds (usually none, so it exits at
-once), and exits with status 0. Connections still open (a relay send under
-way) are cut when it exits, as they were before, when SIGTERM simply killed
-the process; it does not wait for them. Before, the records being written
-at that moment were lost. Ctrl-C (SIGINT) does the same, and no longer
-waits for open connections either.
+**What a deploy does at start.** After the migrations, the server loads
+the BIR sign before it binds its port, waiting at most 10 seconds: the
+stored sign as it was, the `live` tries of the last 3 hours and the open
+note, aged by the clock (it never turns Offline into Online or Online into
+Offline), with its `seq` moved on once (every start does that, so a
+database restored from an older backup still passes any `seq` an app
+holds). If the database is slow or down, it starts at No recent news with
+`seq` 0, which claims nothing, logs `BIR uptime: the sign could not be
+loaded at start`, and the ticker tries again every 30 seconds. Then it
+binds, serves, and starts the ticker, which writes the day history in the
+background once its first run of the rules worked. The time the server
+was not running is written as "not watched" and shown as a gap in the day
+history, never as the BIR's state; a stop of under 5 minutes (a deploy)
+leaves no gap, one of 5 to 7 minutes may not either (the stored time of
+the last run is to the minute and at most a minute old). The first start
+ever writes the history's first line ("Buwiz began keeping the sign") and
+shows No recent news everywhere; the first return that gets in turns it
+Online. A note set with `buwiz-cloud bir` while the server was stopped
+takes effect, and is mailed to staff, at this start.
+
+**From `public`, the public sign can be up to 5 minutes behind.** The
+public document, the history, the status page and the `buwiz-bir` header
+on the trust list and the sealing key are made from the sign as it stood
+at the last 5-minute mark; signed-in answers carry the live sign. So
+after `public` is switched on, a change shows on `/bir-status` at the next
+mark.
+
+**Cloudflare.** The per-address limits count `CF-Connecting-IP`, an IPv6
+address by its /64. Keep the zone's Pseudo IPv4 setting at "Off" (or "Add
+header"): with "Overwrite headers", IPv6 visitors arrive as made-up IPv4
+addresses, one per IPv6 address, so a household's /64 would no longer
+count once, and every network key of the uptime record would be wrong.
 
 Check the record after the first real sends:
 ```sql
@@ -619,8 +653,10 @@ usage: buwiz-cloud bir declare online|offline|maintenance --as <admin email> --r
   Online whatever the tries say (the windows are still kept, and staff are
   mailed if one goes Offline under it).
 - `--until` is a Manila time (`2026-11-14T18:00`) or RFC 3339; `--hours` a
-  whole number. More than 72 hours ahead is refused, as is a second note
-  while one is in force (clear it first).
+  whole number from 1 to 72 (anything else is refused), the end then on the
+  5-minute mark before. More than 72 hours ahead is refused, as is a second
+  note while one is in force (clear it first). The public document shows
+  the end rounded up to 5 minutes.
 - `--text` is public: every app and the status page show it. No personal
   data. Without it the note reads a plain sentence for its kind. `--reason`
   is for staff: it goes into the audit line (`bir_events`, with the Admin's
@@ -628,19 +664,26 @@ usage: buwiz-cloud bir declare online|offline|maintenance --as <admin email> --r
 - `--as` must be an Admin, by the same check the staff pages use (the
   stored role or the server's `ADMIN_EMAILS`), with a Buwiz account. Support
   and everyone else are refused.
+- `--as` names the Admin for the audit line; it is not authentication.
+  Whoever can run the command on the instance, with the service's
+  settings, is trusted as that Admin (as with the seed tool).
 - It runs on the instance with the service's own settings, like the seed
   tool, runs no migration and refuses a database whose migrations are not
-  this release's. It refuses at `BIR_UPTIME=off`. Before it writes it prints
-  the database, `BIR_UPTIME`, who it acts as, the sign now and what it will
-  do; after, the sign as it stands. `status` writes nothing. Nothing it
-  prints holds a TIN.
-- **The running server picks it up without a restart.** Every run of its
-  rules (every 30 seconds, and after each recorded try) first reads the
-  stored sign's `seq`; the command's change has a higher one, so the server
-  takes its sign and note in, mails staff about it, and shows it on every
-  read within 30 seconds. Every write locks the sign and checks that `seq`
-  again, so the server and the command never write over each other; the
-  command tries again (3 times) if the server wrote in between.
+  this release's. It refuses at `BIR_UPTIME=off`, and before the server
+  has ever started with `record` (no sign is kept yet). Before it writes
+  it prints the database, `BIR_UPTIME`, who it acts as, the sign now and
+  what it will do. `status` only reads. Nothing it prints holds a TIN.
+- **It writes only the note, its audit line and the sign's `seq`,** under
+  the sign's lock, and runs no rule: it cannot end an Offline or write over
+  what the running server holds. The running server takes the note in
+  without a restart: every run of its rules (every 30 seconds, and after
+  each recorded try) reads the stored `seq`, finds the command's higher
+  one, reads the note, makes the change, writes it and mails staff (with
+  the Admin's reason). Within 30 seconds the signed-in answers show it, and
+  everything public from the next 5-minute mark. With no server running,
+  the note takes effect (and is mailed) when one starts. A note set and
+  cleared again before the server's next run changes nothing it shows; the
+  audit lines keep both.
 
 Exit codes: 0 done; 2 refused (with the reason), nothing written; 1 an
 error, nothing written.

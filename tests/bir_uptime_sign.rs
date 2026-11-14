@@ -179,6 +179,28 @@ async fn recorded_tries_move_the_sign_and_every_change_is_an_event(db: PgPool) {
     assert_eq!(events(&db).await.len(), 10);
 }
 
+/// No try is lost on the way to the rules: with the database gone, a try's
+/// row and its run both fail, but the try waits in memory, and the next
+/// run that can write makes the change it called for.
+#[sqlx::test]
+async fn a_try_whose_row_and_run_fail_still_reaches_the_sign(db: PgPool) {
+    let uptime = uptime(t(0));
+    for account in 1..=3 {
+        record(&uptime, &db, account, account as u8, Ends::Landed, t(0)).await;
+    }
+    let gone = sqlx::postgres::PgPoolOptions::new().connect_with((*db.connect_options()).clone()).await.unwrap();
+    gone.close().await;
+    for (offset, account) in (11..=13).enumerate() {
+        record(&uptime, &gone, account, account as u8, Ends::MailboxRefused, t(2 + offset as i64)).await;
+    }
+    assert_eq!(uptime.live.sign().state, Light::Online, "nothing could be written, so nothing is shown");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_tries").fetch_one(&db).await.unwrap();
+    assert_eq!(rows, 3, "their rows are lost");
+    live::tick(&uptime, &db, t(5)).await.unwrap();
+    assert_eq!(uptime.live.sign().state, Light::Offline);
+    assert_eq!(events(&db).await.pop().unwrap().2, "offline");
+}
+
 /// What a restart must keep of a light: everything but the account ids,
 /// which live in memory only.
 fn kept(lamp: &buwiz_cloud::uptime::sign::Lamp) -> impl PartialEq + std::fmt::Debug {

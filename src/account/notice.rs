@@ -131,6 +131,7 @@ notices! {
     NotTestTin = "not_test_tin" => error "Only a made-up TIN (000-000-000, at any branch) is added here. A real TIN is added the usual way, and verified.",
     NotTestAccount = "not_test_account" => error "Only a test account can hold a test TIN. Mark it as a test account first.",
     TestTinThere = "test_tin_there" => error "This account already has that test TIN.",
+    TestTinOwnedElsewhere = "test_tin_owned_elsewhere" => error "Another account holds this test TIN. Pick another branch, or revoke it there first.",
     TestTinAdded = "test_tin_added" => info "Test TIN added, active now. Returns for it are never sent to the BIR.",
     TestTinsHeld = "test_tins_held" => error "This account holds test TINs. Revoke them first, then remove the label.",
     NotSignedInYet = "not_signed_in_yet" => error "They must sign in once first, so the address is proven. Then give them the role.",

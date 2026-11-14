@@ -144,7 +144,10 @@ async fn a_test_tin_is_refused_off_a_test_account_and_for_a_real_tin(db: PgPool)
     assert_eq!(location(&site.post(&path(ana), &staff, FORM).await), back(ana, "test_tin_added"));
     assert_eq!(location(&site.post(&path(ana), &staff, FORM).await), back(ana, "test_tin_there"));
     let (bob, _) = test_account(&site, "bob@example.test").await;
-    assert_eq!(location(&site.post(&path(bob), &staff, FORM).await), back(bob, "tin_owned_elsewhere"));
+    assert_eq!(location(&site.post(&path(bob), &staff, FORM).await), back(bob, "test_tin_owned_elsewhere"));
+    let page = text(site.get(&back(bob, "test_tin_owned_elsewhere"), &staff).await).await;
+    assert!(page.contains("Another account holds this test TIN. Pick another branch"), "{page}");
+    assert!(!page.contains("Reject this claim"), "{page}");
     // Another branch is another test TIN.
     let other_branch = FORM.replace("00000", "00007");
     assert_eq!(location(&site.post(&path(bob), &staff, &other_branch).await), back(bob, "test_tin_added"));
@@ -165,7 +168,7 @@ async fn a_test_tin_is_refused_off_a_test_account_and_for_a_real_tin(db: PgPool)
 async fn the_test_label_stays_while_the_account_holds_a_test_tin(db: PgPool) {
     let site = Site::new(db);
     let (_, staff) = site.person(STAFF).await;
-    let (ana, _) = test_account(&site, "ana@example.test").await;
+    let (ana, ana_cookie) = test_account(&site, "ana@example.test").await;
     let user = format!("/staff/users/{ana}");
     site.post(&format!("{user}/test-tin"), &staff, FORM).await;
     let page = text(site.get(&user, &staff).await).await;
@@ -182,6 +185,10 @@ async fn the_test_label_stays_while_the_account_holds_a_test_tin(db: PgPool) {
     let claim = test_tins(&site.db, ana).await[0].0;
     let response = site.post(&format!("/staff/claims/{claim}/revoke"), &staff, "reason=Done").await;
     assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=ownership_revoked"));
+    // My TINs does not tell them to add it again with papers.
+    let tins = text(site.get("/tins", &ana_cookie).await).await;
+    assert!(tins.contains("No longer active.") && tins.contains("It was a test TIN"), "{tins}");
+    assert!(!tins.contains("You can add the TIN again with new papers."), "{tins}");
     let response = site.post(&format!("{user}/test"), &staff, "test=off&reason=Done").await;
     assert_eq!(location(&response), format!("{user}?notice=test_unmarked"));
 }

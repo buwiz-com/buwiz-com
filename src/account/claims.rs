@@ -1100,7 +1100,7 @@ pub async fn add_test_tin(
     .await;
     let claim_id = match inserted {
         Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_owner") => {
-            return Err(DecideError::Refused(Notice::TinOwnedElsewhere));
+            return Err(DecideError::Refused(Notice::TestTinOwnedElsewhere));
         }
         // Added at the same moment by another Admin.
         Err(sqlx::Error::Database(error)) if error.constraint() == Some("tin_claims_one_live") => {

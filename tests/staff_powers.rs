@@ -165,6 +165,8 @@ async fn claim_exists(db: &PgPool, claim: Uuid) -> bool {
 /// matrix below exercises each.
 const MATRIX: &[&str] = &[
     "/staff",
+    "/staff/overview",
+    "/staff/search",
     "/staff/claims",
     "/staff/claims/{claim_id}",
     "/staff/claims/{claim_id}/decision",
@@ -227,6 +229,9 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
 
         for page in [
             "/staff".to_owned(),
+            "/staff/overview".to_owned(),
+            "/staff/search?q=example".to_owned(),
+            format!("/staff?status=waiting&open={}", t.open),
             "/staff?status=unverified".to_owned(),
             "/staff/users".to_owned(),
             user.clone(),
@@ -477,11 +482,14 @@ fn only_roles_reads_the_email_list() {
 fn staff_routes_in_the_source() -> std::collections::BTreeSet<String> {
     let mut routes = std::collections::BTreeSet::new();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/account");
-    let mut files = vec![dir.join("web.rs")];
-    for entry in std::fs::read_dir(dir.join("pages")).unwrap() {
-        files.push(entry.unwrap().path());
+    let mut files = vec![dir.join("web.rs"), dir.join("pages.rs")];
+    let mut dirs = vec![dir.join("pages")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { dirs.push(path) } else { files.push(path) }
+        }
     }
-    files.push(dir.join("pages.rs"));
     for file in files {
         let source = std::fs::read_to_string(&file).unwrap();
         for marker in [".route(\"", "#[page(\""] {
@@ -673,9 +681,9 @@ async fn staff_pages_show_tins_saved_without_papers(db: PgPool) {
     let no_tin = text(site.get("/staff/users?filter=no_tin", &staff).await).await;
     assert!(no_tin.contains("nobody@example.test") && !no_tin.contains("ana@example.test"), "{no_tin}");
     let users = text(site.get("/staff/users", &staff).await).await;
-    assert!(users.contains("000-123-455-00000") && users.contains("dot unverified"), "{users}");
+    assert!(users.contains("aria-label=\"000-123-455-00000: Not verified\""), "{users}");
     let row = &users[users.find("ana@example.test").unwrap()..];
-    assert!(row[..row.find("</a>").unwrap()].contains("No ID yet"), "{row}");
+    assert!(row[..row.find("</tr>").unwrap()].contains("No ID yet"), "{row}");
 
     let response = site.post(&format!("/staff/claims/{claim}/delete"), &staff, "reason=Typo").await;
     assert_eq!(location(&response), "/staff?notice=claim_deleted");

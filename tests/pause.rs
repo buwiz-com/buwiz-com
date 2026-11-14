@@ -105,7 +105,7 @@ async fn pausing_stops_sending_and_resuming_restores_it(db: PgPool) {
     assert!(review.contains("Resume sending for 000-123-453-00000?"), "{review}");
     let user = text(site.get(&format!("/staff/users/{ana}"), &staff).await).await;
     assert!(
-        user.contains("user-tin-status paused")
+        user.contains("data-status=\"paused\"")
             && user.contains(&format!("Staff {STAFF} paused ***-***-453-00000: {REASON}")),
         "{user}"
     );

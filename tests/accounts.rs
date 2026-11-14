@@ -37,10 +37,14 @@ async fn staff_pages_are_not_found_for_everyone_else(db: PgPool) {
             .await
             .unwrap();
     let pages = [
+        "/staff/overview".to_owned(),
+        "/staff/search?q=cora".to_owned(),
         "/staff".to_owned(),
         "/staff?status=sent_back&q=cora".to_owned(),
+        format!("/staff?status=waiting&open={claim}"),
         "/staff/users".to_owned(),
         "/staff/users?filter=waiting&q=987".to_owned(),
+        format!("/staff/users?open={ana}&new=1"),
         format!("/staff/users/{ana}"),
         format!("/staff/claims/{claim}"),
         format!("/staff/documents/{document}"),
@@ -71,7 +75,11 @@ async fn staff_pages_are_not_found_for_everyone_else(db: PgPool) {
     assert!(response.status().is_redirection() && location(&response).starts_with("/login"));
 
     let queue = text(site.get("/staff", &staff).await).await;
-    assert!(queue.contains("987-654-321-00000") && queue.contains("STAFF"), "{queue}");
+    assert!(
+        queue.contains("987-654-321-00000")
+            && queue.contains("<span class=\"sx-stag\" aria-hidden=\"true\">Staff</span>"),
+        "{queue}"
+    );
     let users = text(site.get("/staff/users?q=cora", &staff).await).await;
     assert!(users.contains("ana@example.test") && users.contains("Cora Trading Inc."), "{users}");
     // Users see the light header, never the staff one.

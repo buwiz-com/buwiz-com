@@ -1,6 +1,10 @@
-//! Staff pages under `/staff`: the claims queue, one claim's review, every
-//! account, and one account. Signed-in people who are not staff get a 404
-//! on all of them ([`admin`]).
+//! Staff pages under `/staff`, in the staff console's shell
+//! ([`shell::document`]): the Overview, the review queue with the selected
+//! claim in the inspector, one claim's full review, every account with the
+//! selected one in the inspector, one account in tabs, and search
+//! everything. Signed-in people who are not staff get a 404 on all of them
+//! ([`staff_member`]). Selection is in the URL (`?open=`, `?tab=`), so every
+//! state works without script; staff.js swaps the inspector in place.
 
 use super::*;
 use crate::account::claims::FIX_REASONS;
@@ -10,16 +14,23 @@ use crate::account::staff::{
 };
 use crate::ocr::extract::{self, Kind, Verdict};
 use crate::ocr::{self, Reading};
+use topcoat::view::{Unescaped, ViewExt};
+use ui::{
+    act, act_buttons, avatar, flag_pill, glyph, href, ic, icon_with, kind_icon, page_head, reason_act, reason_field,
+    short_span, status_pill, sx_notice, sx_pill,
+};
+
+mod overview;
+mod search;
+pub(crate) mod shell;
+pub(crate) mod ui;
+
+pub use overview::overview_page;
+pub use search::search_page;
 
 /// A small note on a queue row or in the checks list: (tone, icon, text).
 /// Tones: `good`, `warn`, `bad`, `info`.
 type Flag = (&'static str, &'static str, String);
-
-#[component]
-async fn flag(item: Flag) -> Result<impl View> {
-    let (tone, icon_name, text) = item;
-    Ok(view! { <span class=(format!("flag {tone}"))>icon(name: icon_name) (text)</span> })
-}
 
 /// The flag on a TIN an Admin activated for themselves.
 const SELF_ACTIVATED: &str = "Activated by its owner, an admin";
@@ -82,11 +93,89 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     flags
 }
 
+/// The `?open=` of the request: the row the inspector shows.
+fn open_id(cx: &Cx) -> Option<Uuid> {
+    query(cx, "open").and_then(|raw| raw.parse().ok())
+}
+
+/// A GET search field that keeps the page's other filters.
+#[component]
+async fn search_box(
+    action: &'static str,
+    label: &'static str,
+    placeholder: &'static str,
+    value: String,
+    keep: Vec<(&'static str, &'static str)>,
+) -> Result<impl View> {
+    let id = format!("search-{}", action.trim_start_matches('/').replace('/', "-"));
+    Ok(view! {
+        <form class="sx-search" method="get" action=(action) role="search">
+            for (name, kept) in keep {
+                <input type="hidden" name=(name) value=(kept)>
+            }
+            (ic("search"))
+            <label class="sx-vh" for=(id.clone())>(label)</label>
+            <input id=(id) type="search" name="q" value=(value) placeholder=(placeholder)>
+        </form>
+    })
+}
+
+/// The inspector: the right-hand panel of a list. On desktop it is always
+/// there, showing `?open=` or the list's first row; on a tablet it slides
+/// over the list and on a phone it is a sheet, both only once a row is
+/// opened (`open`). `close` is the list without the selection.
+#[component]
+async fn inspector(
+    title: &'static str,
+    open: bool,
+    close: String,
+    #[default] child: topcoat::view::Child<'_>,
+) -> Result<impl View> {
+    Ok(view! {
+        <aside id="inspector" class=(if open { "sx-insp is-open" } else { "sx-insp" }) aria-label=(title) aria-labelledby="inspector-title">
+            <span class="sx-grab" aria-hidden="true"></span>
+            <header class="sx-insp-h">
+                <h2 id="inspector-title">(title)</h2>
+                <a class="sx-ib" href=(close.clone()) data-close-insp="" aria-label="Close">(ic("x"))</a>
+            </header>
+            (child)
+        </aside>
+        <a class=(if open { "sx-scrim is-open" } else { "sx-scrim" }) href=(close) data-close-insp="" tabindex="-1" aria-hidden="true"></a>
+    })
+}
+
+// ---------------------------------------------------------------- the review queue
+
+/// A list row's classes: `sel` for the row in the inspector, and `auto`
+/// when nobody chose it (the list's first row), which phones do not mark.
+fn row_class(selected: bool, explicit: bool) -> &'static str {
+    match (selected, explicit) {
+        (true, true) => "sel",
+        (true, false) => "sel auto",
+        _ => "",
+    }
+}
+
+/// What the "When" column says about a claim, and whether it is late.
+fn queue_age(claim: &ClaimRow) -> (String, bool) {
+    match claim.status.as_str() {
+        "pending" => {
+            let since = claim.waiting_since();
+            (short_span(since), OffsetDateTime::now_utc() - since > time::Duration::days(1))
+        }
+        "needs_fix" => (format!("Sent back {}", ago(claim.sent_back_at)), false),
+        "unverified" => (format!("Saved {}", short_date(claim.created_at)), false),
+        "removed" | "revoked" => (format!("Ended {}", claim.removed_at.map(short_date).unwrap_or_default()), false),
+        _ => (format!("Decided {}", claim.decided_at.map(short_date).unwrap_or_default()), false),
+    }
+}
+
 #[page("/staff")]
 pub async fn claims_page(cx: &Cx) -> Result<impl View> {
-    staff_member(cx, Power::Review).await?;
+    let reviewer = staff_member(cx, Power::Review).await?;
     let filter = QueueFilter::parse(query(cx, "status").as_deref());
     let search = query(cx, "q").unwrap_or_default();
+    let opened = open_id(cx);
     let db = &state(cx).db;
     let rows = queries::queue(db, filter, &search).await?;
     let (waiting, sent_back) = queries::open_counts(db).await?;
@@ -101,99 +190,148 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
                 QueueFilter::Auto => Some(unconfirmed_auto),
                 _ => None,
             };
-            (tab, link("/staff", None, &[("status", tab.code()), ("q", &search)]), count)
+            (tab, href("/staff", &[("status", tab.code()), ("q", &search)]), count)
         })
         .collect();
-    Ok(view! {
-        <main class="home page staff">
-            <div class="page-in staff-in">
-                <div class="page-head">
-                    <h1>"TIN claims"</h1>
-                    search_box(action: "/staff", label: "Search claims", placeholder: "Search TIN, name or email", value: search.clone(), keep: vec![("status", filter.code())])
-                </div>
-                page_notice(notice: notice(cx))
-                <div class="filter-row">
-                    <nav class="filters" aria-label="Claim status">
-                        for (tab, href, count) in tabs {
-                            <a href=(href) class=(if tab == filter { "on" } else { "" }) aria-current=(if tab == filter { "page" } else { "false" })>
-                                (tab.label())
-                                if let Some(count) = count {
-                                    <span class=(if tab == QueueFilter::Waiting { "count hot" } else { "count" })>(count.to_string())</span>
-                                }
-                            </a>
-                        }
-                    </nav>
-                    <span class="sort">icon(name: "sort") (if oldest_first { "Oldest first" } else { "Newest first" })</span>
-                </div>
-                if rows.is_empty() {
-                    <p class="panel empty">(if search.is_empty() { "Nothing here." } else { "No claims match that search." })</p>
-                } else {
-                    <div class="list">
-                        #[key(row.claim.id.as_u128())]
-                        for row in rows {
-                            queue_row(row: row)
-                        }
-                    </div>
-                }
-                <p class="fine left">"Flags come from simple checks on each claim. They help you look; you still decide."</p>
-            </div>
-        </main>
-    })
-}
-
-/// A GET search field that keeps the page's other filters.
-#[component]
-async fn search_box(
-    action: &'static str,
-    label: &'static str,
-    placeholder: &'static str,
-    value: String,
-    keep: Vec<(&'static str, &'static str)>,
-) -> Result<impl View> {
-    Ok(view! {
-        <form class="search" method="get" action=(action) role="search">
-            for (name, kept) in keep {
-                <input type="hidden" name=(name) value=(kept)>
-            }
-            icon(name: "search")
-            <input type="search" name="q" value=(value) placeholder=(placeholder) aria-label=(label)>
-        </form>
-    })
-}
-
-#[component]
-async fn queue_row(row: QueueRow) -> Result<impl View> {
-    let flags = queue_flags(&row);
-    let claim = row.claim;
-    let (age, late) = match claim.status.as_str() {
-        "pending" => {
-            let since = claim.waiting_since();
-            (format!("Waiting {}", span_since(since)), OffsetDateTime::now_utc() - since > time::Duration::days(1))
-        }
-        "needs_fix" => (format!("Sent back {}", ago(claim.sent_back_at)), false),
-        "unverified" => (format!("Saved {}", short_date(claim.created_at)), false),
-        "removed" | "revoked" => (format!("Ended {}", claim.removed_at.map(short_date).unwrap_or_default()), false),
-        _ => (format!("Decided {}", claim.decided_at.map(short_date).unwrap_or_default()), false),
+    let (main_tabs, other_tabs): (Vec<_>, Vec<_>) = tabs
+        .into_iter()
+        .partition(|(tab, ..)| matches!(tab, QueueFilter::Waiting | QueueFilter::SentBack | QueueFilter::Auto));
+    let other_on = !matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack | QueueFilter::Auto);
+    let close = href("/staff", &[("status", filter.code()), ("q", &search)]);
+    let selected = opened.or_else(|| rows.first().map(|row| row.claim.id));
+    let review = match selected {
+        Some(claim_id) => load_claim(cx, &reviewer, claim_id).await?,
+        None => None,
+    };
+    let selected = review.as_ref().map(|view| view.claim.id);
+    let explicit = opened.is_some();
+    let lines: Vec<(QueueRow, String, bool)> = rows
+        .into_iter()
+        .map(|row| {
+            let open =
+                href("/staff", &[("status", filter.code()), ("q", &search), ("open", &row.claim.id.to_string())]);
+            let on = Some(row.claim.id) == selected;
+            (row, open, on)
+        })
+        .collect();
+    let empty = lines.is_empty();
+    let subtitle = match filter {
+        QueueFilter::Waiting => format!("{waiting} waiting · oldest first"),
+        _ => format!("{} · {}", filter.label(), if oldest_first { "oldest first" } else { "newest first" }),
     };
     Ok(view! {
-        <a class="list-row" href=(format!("/staff/claims/{}", claim.id))>
-            <span class="row-main">
-                <span class="row-line">kind_pill(kind: claim.kind.clone()) tin_text(tin: claim.tin().to_string())</span>
-                <span class="row-name">(claim.registered_name.clone())</span>
-            </span>
-            <span class="row-who">
-                <span class="row-email">(claim.email.clone())</span>
-                <span class=(if late { "row-age late" } else { "row-age" })>icon(name: "schedule") (age)</span>
-            </span>
-            <span class="row-flags">
-                for item in flags {
-                    flag(item: item)
-                }
-            </span>
-            <span class="row-go">icon(name: "chevron_right")</span>
-        </a>
+        <main id="main" class="sx-main" tabindex="-1">
+            page_head(title: "Review queue", sub: subtitle)
+            <div class="sx-notices">sx_notice(notice: notice(cx))</div>
+            <div class="sx-scroll">
+                <div class="sx-stack">
+                    <div class="sx-tabrow">
+                        <nav class="sx-tabs" aria-label="Claim status">
+                            for (tab, link, count) in main_tabs {
+                                <a class="sx-tab" href=(link) if tab == filter { aria-current="page" }>
+                                    (tab.label())
+                                    if let Some(count) = count {
+                                        <span class=(if tab == QueueFilter::Waiting && count > 0 { "sx-count hot" } else { "sx-count" })>(count.to_string())</span>
+                                    }
+                                </a>
+                            }
+                        </nav>
+                        <details class="sx-moretabs">
+                            <summary class=(if other_on { "sx-tab on-more" } else { "sx-tab" }) if other_on { aria-current="page" }>
+                                (if other_on { filter.label() } else { "More" })
+                                (ic("chevron-down"))
+                            </summary>
+                            <nav class="sx-menu" aria-label="More claim lists">
+                                for (tab, link, _) in other_tabs {
+                                    <a href=(link) if tab == filter { aria-current="page" }>(tab.label())</a>
+                                }
+                            </nav>
+                        </details>
+                    </div>
+                    <div class="sx-toolbar">
+                        search_box(action: "/staff", label: "Search claims", placeholder: "Search TIN, name or email", value: search.clone(), keep: vec![("status", filter.code())])
+                    </div>
+                    if empty {
+                        <p class="sx-card sx-empty big">(if search.is_empty() { "Nothing here. All caught up." } else { "No claims match that search." })</p>
+                    } else {
+                        <div class="sx-card sx-tablewrap">
+                            <table class="sx-table">
+                                <caption class="sx-vh">(format!("{} claims", filter.label()))</caption>
+                                <colgroup><col class="c-tin"><col><col class="sx-col-wide"><col class="c-age"><col class="c-checks"></colgroup>
+                                <thead>
+                                    <tr>
+                                        <th scope="col">"TIN"</th>
+                                        <th scope="col">"Name"</th>
+                                        <th scope="col" class="sx-col-wide">"Email"</th>
+                                        <th scope="col">(if filter == QueueFilter::Waiting { "Waiting" } else { "When" })</th>
+                                        <th scope="col">"Checks"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    #[key(line.0.claim.id.as_u128())]
+                                    for line in lines {
+                                        queue_row(row: line.0, open: line.1, selected: line.2, explicit: explicit)
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                    <p class="sx-fine">"Checks come from simple tests on each claim. They help you look; you still decide."</p>
+                </div>
+            </div>
+        </main>
+        inspector(title: "Claim", open: opened.is_some() && review.is_some(), close: close,
+            if let Some(view) = review {
+                claim_body(view: view, wide: false)
+            } else {
+                <div class="sx-insp-b"><p class="sx-empty">"Nothing to review in this tab."</p></div>
+            }
+        )
+    }
+    .boxed())
+}
+
+#[component]
+async fn queue_row(row: QueueRow, open: String, selected: bool, explicit: bool) -> Result<impl View> {
+    let flags = queue_flags(&row);
+    let claim = row.claim;
+    let (age, late) = queue_age(&claim);
+    // The first flag shows; the rest are read aloud and named in the "+n"
+    // tip, so the row stays one line beside the inspector.
+    let shown: Vec<Flag> = flags.iter().take(1).cloned().collect();
+    let rest: Vec<String> = flags.iter().skip(1).map(|(_, _, text)| text.clone()).collect();
+    Ok(view! {
+        <tr data-id=(claim.id.to_string()) class=(row_class(selected, explicit))>
+            <td class="a-main">
+                <span class="sx-cell-tin">
+                    kind_icon(kind: claim.kind.clone())
+                    <a class="sx-rowlink" href=(open) data-open="" if selected { aria-current="true" }>(claim.tin().to_string())</a>
+                </span>
+            </td>
+            <td class="b cut a-sub">(claim.registered_name.clone())</td>
+            <td class="m cut sx-col-wide">(claim.email.clone())</td>
+            <td class="a-side">
+                <span class=(if late { "sx-age late" } else { "sx-age" })>
+                    (ic("clock"))
+                    (age)
+                </span>
+            </td>
+            <td class="a-foot">
+                <span class="sx-flags">
+                    for item in shown {
+                        flag_pill(item: item)
+                    }
+                    if !rest.is_empty() {
+                        <span class="sx-more" title=(rest.join(" · ")) aria-hidden="true">(format!("+{}", rest.len()))</span>
+                        <span class="sx-vh">(rest.join(". "))</span>
+                    }
+                </span>
+            </td>
+        </tr>
     })
 }
+
+// ---------------------------------------------------------------- one claim
 
 /// One row of "Typed vs. on the document".
 struct CompareRow {
@@ -302,49 +440,45 @@ fn comparison(claim: &ClaimRow, kind: ClaimKind, reading: Option<&Reading>) -> C
 #[component]
 async fn typed_vs_document(comparison: Comparison) -> Result<impl View> {
     let Comparison { waiting, failed, from_pdf, rows } = comparison;
-    let (tag_icon, tag) = if from_pdf {
-        ("picture_as_pdf", "Read from the PDF on our server")
-    } else {
-        ("document_scanner", "Read by OCR on our server")
-    };
+    let tag = if from_pdf { "Read from the PDF on our server" } else { "Read by OCR on our server" };
     Ok(view! {
-        <section class="panel side-card">
-            <div class="side-head">
-                <h2>"Typed vs. on the document"</h2>
-                <span class="side-tag">icon(name: tag_icon) (tag)</span>
+        <section class="sx-sub" aria-labelledby="sx-compare">
+            <div class="sx-subh">
+                <h3 id="sx-compare">"Typed vs. on the document"</h3>
+                <span class="sx-fine">(tag)</span>
             </div>
             if let Some(reason) = failed {
-                <p class="compare-status">icon(name: "error") "Couldn't read: " (reason)</p>
+                <p class="sx-notice error">(ic("alert")) <span>"Couldn't read: " (reason)</span></p>
             }
-            <div class="compare">
+            <div class="sx-cmp">
                 <span></span>
-                <span class="compare-head">"TYPED"</span>
-                <span class="compare-head">"DOCUMENT"</span>
+                <span class="h">"Typed"</span>
+                <span class="h">"On the document"</span>
                 <span></span>
                 for row in rows {
-                    <span class="compare-label">(row.label)</span>
+                    <span class="l">(row.label)</span>
                     if let Some(typed) = row.typed {
-                        <span class="compare-value">(typed)</span>
+                        <span>(typed)</span>
                     } else {
-                        <span class="compare-value unread">"Not asked"</span>
+                        <span class="u">"Not asked"</span>
                     }
                     if let Some(waiting) = waiting {
-                        <span class="compare-value unread">(waiting)</span>
+                        <span class="u">(waiting)</span>
                     } else if let Some(read) = row.read {
-                        <span class="compare-value">
+                        <span>
                             (read)
                             if let Some(sure) = row.confidence {
-                                <span class="compare-sure">(format!("{:.0}% sure", sure * 100.0))</span>
+                                <em>(format!("{:.0}% sure", sure * 100.0))</em>
                             }
                         </span>
                     } else {
-                        <span class="compare-value unread">"Not found"</span>
+                        <span class="u">"Not found"</span>
                     }
                     match row.verdict {
-                        Some(Verdict::Match) => <span class="compare-mark good" title="Matches">icon(name: "check_circle")</span>,
-                        Some(Verdict::Partial) => <span class="compare-mark warn" title="Partly matches">icon(name: "warning")</span>,
-                        Some(Verdict::Mismatch) => <span class="compare-mark bad" title="Differs">icon(name: "warning")</span>,
-                        None => <span class="compare-mark">icon(name: "more_horiz")</span>,
+                        Some(Verdict::Match) => <span class="mk good" title="Matches">(ic("check-circle"))<span class="sx-vh">"Matches"</span></span>,
+                        Some(Verdict::Partial) => <span class="mk warn" title="Partly matches">(ic("warning"))<span class="sx-vh">"Partly matches"</span></span>,
+                        Some(Verdict::Mismatch) => <span class="mk bad" title="Differs">(ic("warning"))<span class="sx-vh">"Differs"</span></span>,
+                        None => <span class="mk">(ic("more"))</span>,
                     }
                 }
             </div>
@@ -352,489 +486,681 @@ async fn typed_vs_document(comparison: Comparison) -> Result<impl View> {
     })
 }
 
+/// Everything a claim's review shows and may offer, read once for the
+/// inspector or the claim's own page.
+struct ClaimView {
+    claim: ClaimRow,
+    documents: Vec<DocumentRow>,
+    empty_viewer: String,
+    other_accounts: Vec<ClaimRow>,
+    joined: String,
+    claimant_tins: usize,
+    claimant_banned: bool,
+    checks: Vec<Flag>,
+    compare: Comparison,
+    status: (&'static str, &'static str, &'static str),
+    age: Option<String>,
+    late: bool,
+    pauses: Vec<claims::PauseLine>,
+    admin_must_approve: bool,
+    paused_by: String,
+    paused_by_buwiz: bool,
+    confirm_needs_admin: bool,
+    own_claim: bool,
+    own_withheld: bool,
+    can_confirm: bool,
+    auto_sure: Option<(String, String)>,
+    auto_doubts: Vec<String>,
+    can_pause: bool,
+    fix_reasons: Vec<&'static str>,
+    show_delete: bool,
+    show_revoke: bool,
+    ended: bool,
+    unverified: bool,
+    can_activate: bool,
+}
+
+/// Staff decide on their own claim only as an Admin (the audit line shows it
+/// was their own); Support leave it to someone else.
+fn own_claim_of(claim: &ClaimRow, reviewer: &Staff) -> bool {
+    claim.account_id == reviewer.account.id
+}
+
+/// Reads [`ClaimView`] for `claim_id`, or `None` when there is no such claim.
+async fn load_claim(cx: &Cx, reviewer: &Staff, claim_id: Uuid) -> Result<Option<ClaimView>> {
+    let db = &state(cx).db;
+    let Some(claim) = claims::find(db, claim_id).await? else {
+        return Ok(None);
+    };
+    let documents = claims::documents(db, claim_id).await?;
+    let rivals = claims::rivals(db, &claim).await?;
+    let claimant = queries::user(db, claim.account_id).await?;
+    let claimant_tins = claims::for_account(db, claim.account_id)
+        .await?
+        .iter()
+        .filter(|other| crate::filing::gate::is_live(&other.status))
+        .count();
+    let kind = ClaimKind::parse(&claim.kind).unwrap_or(ClaimKind::Business);
+    let stored =
+        |document: DocumentKind| documents.iter().any(|row| row.kind == document.as_str() && row.purged_at.is_none());
+
+    let mut checks: Vec<Flag> = Vec::new();
+    let other_accounts: Vec<ClaimRow> =
+        rivals.into_iter().filter(|rival| rival.account_id != claim.account_id).collect();
+    if other_accounts.is_empty() {
+        checks.push(("good", "person_check", "No other account claims this TIN".to_owned()));
+    } else {
+        checks.push(("bad", "group", format!("{} other account(s) claim this TIN", other_accounts.len())));
+    }
+    if claim.self_activated() {
+        checks.push(("warn", "how_to_reg", SELF_ACTIVATED.to_owned()));
+    }
+    if claim.tin().is_test() {
+        checks.push(("info", "science", "Test TIN: Buwiz never sends returns for it".to_owned()));
+    }
+    if claim.is_open() {
+        for required in kind.required() {
+            let label = DocumentKind::label(required.as_str());
+            checks.push(if stored(*required) {
+                ("good", "task", format!("{label} sent"))
+            } else {
+                ("bad", "error", format!("{label} missing"))
+            });
+        }
+        match kind {
+            ClaimKind::Personal => {
+                for (optional, label) in [(DocumentKind::Selfie, "selfie"), (DocumentKind::NationalId, "National ID")] {
+                    checks.push(if stored(optional) {
+                        ("good", "add_task", format!("Sent a {label} too"))
+                    } else {
+                        ("info", "remove", format!("No {label} (optional)"))
+                    });
+                }
+            }
+            ClaimKind::Business => checks.push(if stored(DocumentKind::Authority) {
+                ("good", "gavel", "Proof of authority sent".to_owned())
+            } else {
+                ("info", "gavel", "No proof of authority: needed only if the 2303 names a company".to_owned())
+            }),
+        }
+        if let Some(at) = claim.files_changed_while_waiting() {
+            checks.push(("warn", "swap_horiz", format!("Files changed after sending · {}", date_time(at))));
+        }
+        checks.push(("warn", "visibility", "Looks real, and matches what was typed? Your call".to_owned()));
+    }
+
+    let reading = ocr::for_claim(db, claim_id).await?;
+    let compare = comparison(&claim, kind, reading.as_ref());
+    let status = status_look(claim.shown_status());
+    let pauses = claims::pauses(db, &claim.tin()).await?;
+    // Opening sending again on a TIN that was paused is an Admin's call.
+    let admin_must_approve = !reviewer.can(Power::Pause) && claims::paused_ever(db, &claim.tin()).await?;
+    let paused_by = match claim.paused_at {
+        Some(_) => sqlx::query_scalar::<_, String>(
+            "SELECT a.email FROM tin_claims c JOIN accounts a ON a.id = c.paused_by WHERE c.id = $1",
+        )
+        .bind(claim.id)
+        .fetch_optional(db)
+        .await?
+        // No one named: Buwiz paused it itself.
+        .unwrap_or_else(|| "Buwiz".to_owned()),
+        None => String::new(),
+    };
+    let auto_waiting = claim.verified_by.as_deref() == Some("auto") && claim.auto_confirmed_at.is_none();
+    // Only an Admin reopens a paused TIN, and lifting Buwiz's own pause
+    // takes a reason.
+    let paused_by_buwiz = claim.paused_at.is_some() && paused_by == "Buwiz";
+    let confirm_needs_admin = claim.paused_at.is_some() && !reviewer.can(Power::Pause);
+    let own_claim = own_claim_of(&claim, reviewer);
+    let own_withheld = own_claim && reviewer.role != Role::Admin;
+    let can_confirm = auto_waiting && reviewer.can(Power::ConfirmAuto) && !own_withheld && !confirm_needs_admin;
+    let auto_sure = claim.auto_check.as_ref().map(|check| {
+        let percent = |field: &str| format!("{:.0}%", check["confidence"][field].as_f64().unwrap_or(0.0) * 100.0);
+        (percent("tin"), percent("name"))
+    });
+    let auto_doubts = crate::account::verify::doubt_words(claim.auto_check.as_ref());
+    let can_pause = reviewer.can(Power::Pause) && claim.status == "approved";
+    let age = (claim.status == "pending").then(|| format!("Waiting {}", span_since(claim.waiting_since())));
+    let late = claim.status == "pending" && OffsetDateTime::now_utc() - claim.waiting_since() > time::Duration::days(1);
+    let fix_reasons: Vec<&'static str> =
+        claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(label, _)| label).collect();
+    let show_delete = claims::DELETABLE.contains(&claim.status.as_str()) && reviewer.can(Power::DeleteClaim);
+    let show_revoke = claim.status == "approved" && reviewer.can(Power::EndOwnership);
+    let ended = matches!(claim.status.as_str(), "removed" | "revoked");
+    let unverified = claim.status == "unverified";
+    let claimant_banned = claimant.as_ref().is_some_and(|user| user.banned_at.is_some());
+    let can_activate = reviewer.can(Power::ActivateWithoutPapers)
+        && matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix");
+    let empty_viewer = if unverified {
+        format!("No papers yet. Added without the upload on {}.", date(claim.created_at))
+    } else {
+        "No files on this claim.".to_owned()
+    };
+    Ok(Some(ClaimView {
+        joined: claimant.map(|user| short_date(user.created_at)).unwrap_or_default(),
+        claim,
+        documents,
+        empty_viewer,
+        other_accounts,
+        claimant_tins,
+        claimant_banned,
+        checks,
+        compare,
+        status,
+        age,
+        late,
+        pauses,
+        admin_must_approve,
+        paused_by,
+        paused_by_buwiz,
+        confirm_needs_admin,
+        own_claim,
+        own_withheld,
+        can_confirm,
+        auto_sure,
+        auto_doubts,
+        can_pause,
+        fix_reasons,
+        show_delete,
+        show_revoke,
+        ended,
+        unverified,
+        can_activate,
+    }))
+}
+
+/// A claim's review: in the inspector (`wide: false`, one column with the
+/// thumb bar a phone's sheet shows) or on its own page (`wide: true`, the
+/// papers beside the review). Every decision and action form posts to the
+/// claim's routes, as before.
+#[component]
+async fn claim_body(view: ClaimView, wide: bool) -> Result<impl View> {
+    let ClaimView {
+        claim,
+        documents,
+        empty_viewer,
+        other_accounts,
+        joined,
+        claimant_tins,
+        claimant_banned,
+        checks,
+        compare,
+        status,
+        age,
+        late,
+        pauses,
+        admin_must_approve,
+        paused_by,
+        paused_by_buwiz,
+        confirm_needs_admin,
+        own_claim,
+        own_withheld,
+        can_confirm,
+        auto_sure,
+        auto_doubts,
+        can_pause,
+        fix_reasons,
+        show_delete,
+        show_revoke,
+        ended,
+        unverified,
+        can_activate,
+    } = view;
+    let claim_id = claim.id;
+    let tin = claim.tin().to_string();
+    let (status_label, status_icon, status_tone) = status;
+    let pending = claim.status == "pending";
+    let decide = format!("/staff/claims/{claim_id}/decision");
+    let confirm = format!("/staff/claims/{claim_id}/confirm");
+    let tabs: Vec<(usize, DocumentRow)> = documents.into_iter().enumerate().collect();
+    let kind = claim.kind.clone();
+    let (email, account_id) = (claim.email.clone(), claim.account_id);
+    let decides = claim.is_open() && !own_withheld;
+    let tin_head = tin.clone();
+    let pills = view! {
+        <div class="sx-pills">
+            sx_pill(label: ClaimKind::label(&kind), sym: if kind == "personal" { "person" } else { "store" }, tone: "neutral")
+            if let Some(age) = age {
+                sx_pill(label: age, sym: "clock", tone: if late { "bad" } else { "warn" })
+            } else {
+                sx_pill(label: status_label, sym: glyph(status_icon), tone: ui::status_tone(status_tone))
+            }
+        </div>
+    }
+    .boxed();
+    let rivals = view! {
+        if !other_accounts.is_empty() {
+            <div class="sx-notice error" role="note">
+                (ic("users"))
+                <div>
+                    <strong>"Other accounts claim this TIN:"</strong>
+                    <ul>
+                        for rival in other_accounts {
+                            <li>
+                                <a href=(format!("/staff/claims/{}", rival.id))>(rival.email.clone())</a>
+                                " · " (status_look(rival.shown_status()).0) " since " (short_date(rival.created_at))
+                            </li>
+                        }
+                    </ul>
+                </div>
+            </div>
+        }
+    }
+    .boxed();
+    let who = view! {
+        <div class="sx-who">
+            avatar(email: email.clone())
+            <span class="x">
+                <b>(email)</b>
+                <span>
+                    "Joined " (joined) " · " (if claimant_tins <= 1 { "first TIN".to_owned() } else { format!("{claimant_tins} TINs") })
+                </span>
+            </span>
+            <a class="go" href=(format!("/staff/users/{account_id}"))>"View user" (icon_with("chevron-right", "ic sm"))</a>
+        </div>
+    }
+    .boxed();
+    let sections = view! {
+        if !unverified {
+            typed_vs_document(comparison: compare)
+        }
+        if !checks.is_empty() {
+            <section class="sx-sub" aria-labelledby="sx-checks">
+                <h3 id="sx-checks">"Checks"</h3>
+                <div class="sx-checks">
+                    for (tone, sym, text) in checks {
+                        <span class=(format!("sx-check {tone}"))>(ic(glyph(sym))) <span>(text)</span></span>
+                    }
+                </div>
+            </section>
+        }
+        if !auto_doubts.is_empty() {
+            <section class="sx-sub">
+                <h3>"Not activated automatically"</h3>
+                <ul class="sx-text">
+                    for words in auto_doubts {
+                        <li>(words)</li>
+                    }
+                </ul>
+            </section>
+        }
+        if claim.verified_by.as_deref() == Some("auto") {
+            <section class="sx-sub">
+                <h3>"Activated automatically"</h3>
+                <p class="sx-text">
+                    (claim.decided_at.map(date_time).unwrap_or_default()) ". TIN and name matched the TIN ID read on our server"
+                    if let Some((tin_sure, name_sure)) = auto_sure.clone() {
+                        " (" (tin_sure) " and " (name_sure) " sure)"
+                    }
+                    "."
+                </p>
+                if let Some(at) = claim.auto_confirmed_at {
+                    <p class="sx-text">"Confirmed by staff " (date_time(at)) "; its papers were deleted."</p>
+                } else {
+                    <p class="sx-text">"No person has confirmed it yet. Check the papers, then confirm. They are deleted when you confirm; until then they are kept, even if the TIN is removed or revoked."</p>
+                    if can_confirm && paused_by_buwiz {
+                        <div class="sx-acts">
+                            reason_act(
+                                id: format!("act-confirm-{claim_id}"),
+                                label: "Looks right: confirm and lift the pause",
+                                sym: "check",
+                                tone: "pri",
+                                action: confirm.clone(),
+                                question: format!("Confirm {tin} for {}?", claim.email),
+                                detail: "You checked the papers and they match. They are deleted now, and the pause Buwiz put on it is lifted: the owner can send again at once.",
+                                confirm: "Confirm",
+                                danger: false
+                            )
+                        </div>
+                    } else if can_confirm {
+                        <form class="sx-acts" method="post" action=(confirm.clone()) data-confirm=(format!("Confirm {tin} for {}?", claim.email)) data-confirm-detail="You checked the papers and they match. They are deleted now." data-confirm-label="Confirm" data-confirm-tone="danger">
+                            <button class="sx-btn pri" type="submit">(ic("check")) "Looks right: confirm"</button>
+                        </form>
+                    } else if own_withheld {
+                        <p class="sx-text">"This is your own TIN. Another staff member confirms it."</p>
+                    } else if confirm_needs_admin {
+                        <p class="sx-text">"Sending for this TIN is paused, so an admin confirms it."</p>
+                    }
+                }
+            </section>
+        }
+        if claim.sent_back_at.is_some() {
+            <section class="sx-sub">
+                <h3>"Sent back before"</h3>
+                <p class="sx-text">
+                    (claim.sent_back_at.map(date_time).unwrap_or_default())
+                    if !fix_reasons.is_empty() {
+                        ": " (fix_reasons.join(", "))
+                    }
+                </p>
+                if let Some(note) = claim.fix_note.clone() {
+                    <p class="sx-quote">(note)</p>
+                }
+                if let Some(resent) = claim.resent_at {
+                    <p class="sx-text">"Resent " (date_time(resent))</p>
+                } else {
+                    <p class="sx-text">"Waiting for the person's fix."</p>
+                }
+            </section>
+        }
+        if own_withheld && claim.is_open() {
+            <p class="sx-notice info">(ic("info")) <span>"This is your own claim. Another staff member decides it."</span></p>
+        } else if claim.is_open() {
+            <form class="sx-sub sx-form" id="decision" method="post" action=(decide)>
+                <h3>"Decision"</h3>
+                if own_claim {
+                    <p class="sx-text">"This is your own claim. Your decision goes in your history as one on your own account."</p>
+                }
+                if admin_must_approve {
+                    <p class="sx-text">"Sending for this TIN was paused before: an admin must approve it. You can still send it back or reject it."</p>
+                } else {
+                    <button class="sx-btn pri block sx-in-thumb" type="submit" name="decision" value="approve">
+                        (ic("check"))
+                        <span class="sx-ellipsis">"Approve: " (claim.email.clone()) " owns this TIN"</span>
+                    </button>
+                }
+                if pending {
+                    <fieldset class="sx-sub sx-plain">
+                        <legend class="sx-text">"Or send it back with a reason"</legend>
+                        <div class="sx-reasons">
+                            for (code, label, _) in FIX_REASONS {
+                                <label class="sx-reason">
+                                    <input type="checkbox" name="reasons" value=(*code)>
+                                    <span>(*label)</span>
+                                </label>
+                            }
+                        </div>
+                    </fieldset>
+                }
+                <label class="sx-field">
+                    <span>"Note to the person"</span>
+                    <textarea name="note" rows="3" maxlength="500" placeholder="They see this on their My TINs page. Required to reject."></textarea>
+                </label>
+                <div class="sx-decide sx-in-thumb">
+                    if pending {
+                        <button class="sx-btn" type="submit" name="decision" value="fix">"Ask for a fix"</button>
+                    }
+                    <button class="sx-btn dan" type="submit" name="decision" value="reject">"Reject"</button>
+                </div>
+            </form>
+        } else if unverified {
+            <section class="sx-sub">
+                <h3>"Not verified"</h3>
+                <p class="sx-text">"The person can prepare returns but not send them."</p>
+            </section>
+        } else if ended {
+            <section class="sx-sub">
+                <h3>"Ended"</h3>
+                <p class="sx-text">"Approved " (claim.decided_at.map(date_time).unwrap_or_default())</p>
+                <p class="sx-text">
+                    (if claim.status == "removed" { "Removed by the owner " } else { "Revoked by staff " })
+                    (claim.removed_at.map(date_time).unwrap_or_default())
+                </p>
+                if let Some(note) = claim.removal_note.clone() {
+                    <p class="sx-quote">(note)</p>
+                }
+            </section>
+        } else {
+            <section class="sx-sub">
+                <h3>"Decided"</h3>
+                <p class="sx-text">(status_label) " · " (claim.decided_at.map(date_time).unwrap_or_default())</p>
+                if let Some(note) = claim.decision_note.clone() {
+                    <p class="sx-quote">(note)</p>
+                }
+            </section>
+        }
+        if !pauses.is_empty() {
+            <section class="sx-sub">
+                <h3>"Paused before"</h3>
+                for line in pauses {
+                    <p class="sx-text">
+                        (if line.action == "paused" { "Paused by " } else { "Resumed by " })
+                        (if line.source == "auto" { "Buwiz".to_owned() } else { line.actor_email.clone() }) " on " (date(line.created_at))
+                        if let Some(reason) = line.reason.clone() {
+                            ": " (reason)
+                        }
+                    </p>
+                }
+            </section>
+        }
+        if can_pause {
+            <section class="sx-sub">
+                if let Some(at) = claim.paused_at {
+                    <h3>"Paused"</h3>
+                    <p class="sx-text">"Paused by " (paused_by.clone()) " on " (date(at)) ": " (claim.pause_reason.clone().unwrap_or_default())</p>
+                    <div class="sx-acts">
+                        reason_act(
+                            id: format!("act-resume-{claim_id}"),
+                            label: "Resume sending",
+                            sym: "play",
+                            action: format!("/staff/claims/{claim_id}/resume"),
+                            question: format!("Resume sending for {tin}?"),
+                            detail: "The owner can send returns again at once.",
+                            confirm: "Resume",
+                            danger: false
+                        )
+                    </div>
+                } else {
+                    <h3>"Pause sending"</h3>
+                    <p class="sx-text">"Keeps the TIN on this account but stops every send at once. The owner sees your reason on My TINs."</p>
+                    <div class="sx-acts">
+                        reason_act(
+                            id: format!("act-pause-{claim_id}"),
+                            label: "Pause sending",
+                            sym: "pause",
+                            action: format!("/staff/claims/{claim_id}/pause"),
+                            question: format!("Pause sending for {tin}?"),
+                            detail: "Tickets and sends are refused until you resume. Returns already sent are not affected.",
+                            confirm: "Pause"
+                        )
+                    </div>
+                }
+            </section>
+        }
+        if can_activate {
+            <section class="sx-sub">
+                <h3>(if unverified { "Activate without papers" } else { "Or activate without papers" })</h3>
+                if claimant_banned {
+                    <p class="sx-text">(Notice::ClaimantBanned.message())</p>
+                } else {
+                    <p class="sx-text">"Makes " (claim.email.clone()) " the owner of " (tin.clone()) " now, without papers. Use it for accounts you know. The reason goes in the account's history."</p>
+                    <div class="sx-acts">
+                        reason_act(
+                            id: format!("act-activate-{claim_id}"),
+                            label: "Activate without papers",
+                            sym: "check-circle",
+                            action: format!("/staff/claims/{claim_id}/activate"),
+                            question: format!("Activate {tin} for {} without papers?", claim.email),
+                            detail: "The TIN becomes active at once and can send returns to the BIR. Your reason is kept in the account's history.",
+                            confirm: "Activate",
+                            danger: false
+                        )
+                    </div>
+                }
+            </section>
+        }
+        if show_delete && own_claim {
+            <p class="sx-notice info">(ic("info")) <span>"This is your own claim: delete it from My TINs."</span></p>
+        } else if show_revoke {
+            <section class="sx-sub">
+                <h3>"Revoke ownership"</h3>
+                <p class="sx-text">"Ends this account's ownership. The TIN stops being active at once, its sent returns stay, and it can be claimed again."</p>
+                <div class="sx-acts">
+                    reason_act(
+                        id: format!("act-revoke-{claim_id}"),
+                        label: "Revoke ownership",
+                        sym: "ban",
+                        tone: "dan",
+                        action: format!("/staff/claims/{claim_id}/revoke"),
+                        question: format!("Revoke {}'s ownership of {}?", claim.email, claim.tin()),
+                        detail: "The TIN stops being active at once; the owner sees your reason on My TINs.",
+                        confirm: "Revoke"
+                    )
+                </div>
+            </section>
+        } else if show_delete {
+            <section class="sx-sub">
+                <h3>"Delete claim"</h3>
+                <p class="sx-text">"Erases the claim and its files for good. Only a line in the account's history stays."</p>
+                <div class="sx-acts">
+                    reason_act(
+                        id: format!("act-delete-{claim_id}"),
+                        label: "Delete claim",
+                        sym: "trash",
+                        tone: "dan",
+                        action: format!("/staff/claims/{claim_id}/delete"),
+                        question: format!("Delete this claim by {}?", claim.email),
+                        detail: "The claim and every file on it are erased for good.",
+                        confirm: "Delete"
+                    )
+                </div>
+            </section>
+        }
+    }
+    .boxed();
+    let viewer = view! { document_viewer(documents: tabs, empty: empty_viewer) }.boxed();
+    Ok(view! {
+        if wide {
+            <div class="sx-stack">
+                (rivals)
+                <div class="sx-review">
+                    (viewer)
+                    <div class="sx-review-side">
+                        (pills)
+                        (who)
+                        (sections)
+                    </div>
+                </div>
+            </div>
+            if decides {
+                <div class="sx-thumbbar page">
+                    if !admin_must_approve {
+                        <button class="sx-btn pri" type="submit" form="decision" name="decision" value="approve">(ic("check")) "Approve"</button>
+                    }
+                    if pending {
+                        <button class="sx-btn" type="submit" form="decision" name="decision" value="fix">"Ask for a fix"</button>
+                    }
+                    <button class="sx-btn dan" type="submit" form="decision" name="decision" value="reject">"Reject"</button>
+                </div>
+            }
+        } else {
+            <div class="sx-insp-b">
+                <div class="sx-detail">
+                    <div class="sx-dhead">
+                        <span class="sx-mono">(tin_head)</span>
+                        (pills)
+                    </div>
+                    (rivals)
+                    (viewer)
+                    (who)
+                    (sections)
+                    <a class="sx-btn block" href=(format!("/staff/claims/{claim_id}"))>(ic("external")) "Open full page"</a>
+                </div>
+            </div>
+            if decides {
+                <div class="sx-thumbbar">
+                    if !admin_must_approve {
+                        <button class="sx-btn pri" type="submit" form="decision" name="decision" value="approve">(ic("check")) "Approve"</button>
+                    }
+                    if pending {
+                        <button class="sx-btn" type="submit" form="decision" name="decision" value="fix">"Ask for a fix"</button>
+                    }
+                    <button class="sx-btn dan" type="submit" form="decision" name="decision" value="reject">"Reject"</button>
+                </div>
+            }
+        }
+    })
+}
+
 pub mod claim_id {
     use super::*;
-
-    /// Staff decide on their own claim only as an Admin (the audit line
-    /// shows it was their own); Support leave it to someone else.
-    fn own_claim_of(claim: &ClaimRow, reviewer: &Staff) -> bool {
-        claim.account_id == reviewer.account.id
-    }
 
     #[page("/staff/claims/{claim_id}")]
     pub async fn claim_page(cx: &Cx) -> Result<impl View> {
         let reviewer = staff_member(cx, Power::Review).await?;
         let claim_id = path_id(cx, 0)?;
-        let db = &state(cx).db;
-        let Some(claim) = claims::find(db, claim_id).await? else {
+        let Some(view) = load_claim(cx, &reviewer, claim_id).await? else {
             return Err(topcoat::router::error::not_found().into());
         };
-        let documents = claims::documents(db, claim_id).await?;
-        let rivals = claims::rivals(db, &claim).await?;
-        let (previous, next) = queries::neighbours(db, &claim).await?;
-        let claimant = queries::user(db, claim.account_id).await?;
-        let claimant_tins = claims::for_account(db, claim.account_id)
-            .await?
-            .iter()
-            .filter(|other| crate::filing::gate::is_live(&other.status))
-            .count();
-        let kind = ClaimKind::parse(&claim.kind).unwrap_or(ClaimKind::Business);
-        let stored = |document: DocumentKind| {
-            documents.iter().any(|row| row.kind == document.as_str() && row.purged_at.is_none())
-        };
-
-        let mut checks: Vec<Flag> = Vec::new();
-        let other_accounts: Vec<ClaimRow> =
-            rivals.into_iter().filter(|rival| rival.account_id != claim.account_id).collect();
-        if other_accounts.is_empty() {
-            checks.push(("good", "person_check", "No other account claims this TIN".to_owned()));
-        } else {
-            checks.push(("bad", "group", format!("{} other account(s) claim this TIN", other_accounts.len())));
-        }
-        if claim.self_activated() {
-            checks.push(("warn", "how_to_reg", SELF_ACTIVATED.to_owned()));
-        }
-        if claim.tin().is_test() {
-            checks.push(("info", "science", "Test TIN: Buwiz never sends returns for it".to_owned()));
-        }
-        if claim.is_open() {
-            for required in kind.required() {
-                let label = DocumentKind::label(required.as_str());
-                checks.push(if stored(*required) {
-                    ("good", "task", format!("{label} sent"))
-                } else {
-                    ("bad", "error", format!("{label} missing"))
-                });
-            }
-            match kind {
-                ClaimKind::Personal => {
-                    for (optional, label) in
-                        [(DocumentKind::Selfie, "selfie"), (DocumentKind::NationalId, "National ID")]
-                    {
-                        checks.push(if stored(optional) {
-                            ("good", "add_task", format!("Sent a {label} too"))
-                        } else {
-                            ("info", "remove", format!("No {label} (optional)"))
-                        });
-                    }
-                }
-                ClaimKind::Business => checks.push(if stored(DocumentKind::Authority) {
-                    ("good", "gavel", "Proof of authority sent".to_owned())
-                } else {
-                    ("info", "gavel", "No proof of authority: needed only if the 2303 names a company".to_owned())
-                }),
-            }
-            if let Some(at) = claim.files_changed_while_waiting() {
-                checks.push(("warn", "swap_horiz", format!("Files changed after sending · {}", date_time(at))));
-            }
-            checks.push(("warn", "visibility", "Looks real, and matches what was typed? Your call".to_owned()));
-        }
-
-        let reading = ocr::for_claim(db, claim_id).await?;
-        let compare = comparison(&claim, kind, reading.as_ref());
-        let (status_label, status_icon, status_tone) = status_look(claim.shown_status());
-        let pauses = claims::pauses(db, &claim.tin()).await?;
-        // Opening sending again on a TIN that was paused is an Admin's call.
-        let admin_must_approve = !reviewer.can(Power::Pause) && claims::paused_ever(db, &claim.tin()).await?;
-        let paused_by = match claim.paused_at {
-            Some(_) => sqlx::query_scalar::<_, String>(
-                "SELECT a.email FROM tin_claims c JOIN accounts a ON a.id = c.paused_by WHERE c.id = $1",
-            )
-            .bind(claim.id)
-            .fetch_optional(db)
-            .await?
-            // No one named: Buwiz paused it itself.
-            .unwrap_or_else(|| "Buwiz".to_owned()),
-            None => String::new(),
-        };
-        let auto_waiting = claim.verified_by.as_deref() == Some("auto") && claim.auto_confirmed_at.is_none();
-        // Only an Admin reopens a paused TIN, and lifting Buwiz's own pause
-        // takes a reason.
-        let paused_by_buwiz = claim.paused_at.is_some() && paused_by == "Buwiz";
-        let confirm_needs_admin = claim.paused_at.is_some() && !reviewer.can(Power::Pause);
-        let own_claim = own_claim_of(&claim, &reviewer);
-        let own_withheld = own_claim && reviewer.role != Role::Admin;
-        let can_confirm = auto_waiting && reviewer.can(Power::ConfirmAuto) && !own_withheld && !confirm_needs_admin;
-        let confirm = format!("/staff/claims/{claim_id}/confirm");
-        let auto_sure = claim.auto_check.as_ref().map(|check| {
-            let percent = |field: &str| format!("{:.0}%", check["confidence"][field].as_f64().unwrap_or(0.0) * 100.0);
-            (percent("tin"), percent("name"))
-        });
-        let auto_doubts = crate::account::verify::doubt_words(claim.auto_check.as_ref());
-        let can_pause = reviewer.can(Power::Pause) && claim.status == "approved";
-        let pause = format!("/staff/claims/{claim_id}/pause");
-        let resume = format!("/staff/claims/{claim_id}/resume");
-        let age = match claim.status.as_str() {
-            "pending" => Some(format!("Waiting {}", span_since(claim.waiting_since()))),
-            _ => None,
-        };
-        let late =
-            claim.status == "pending" && OffsetDateTime::now_utc() - claim.waiting_since() > time::Duration::days(1);
-        let fix_reasons: Vec<&str> =
-            claim.fix_reasons.iter().filter_map(|code| claims::fix_reason(code)).map(|(label, _)| label).collect();
-        let decide = format!("/staff/claims/{claim_id}/decision");
-        let delete = format!("/staff/claims/{claim_id}/delete");
-        let revoke = format!("/staff/claims/{claim_id}/revoke");
-        let show_delete = claims::DELETABLE.contains(&claim.status.as_str()) && reviewer.can(Power::DeleteClaim);
-        let show_revoke = claim.status == "approved" && reviewer.can(Power::EndOwnership);
-        let ended = matches!(claim.status.as_str(), "removed" | "revoked");
-        let unverified = claim.status == "unverified";
-        let claimant_banned = claimant.as_ref().is_some_and(|user| user.banned_at.is_some());
-        let can_activate = reviewer.can(Power::ActivateWithoutPapers)
-            && matches!(claim.status.as_str(), "unverified" | "pending" | "needs_fix");
-        let activate = format!("/staff/claims/{claim_id}/activate");
-        let tin = claim.tin().to_string();
-        let empty_viewer = if unverified {
-            format!("No papers yet. Added without the upload on {}.", date(claim.created_at))
-        } else {
-            "No files on this claim.".to_owned()
-        };
-        let tabs: Vec<(usize, DocumentRow)> = documents.into_iter().enumerate().collect();
+        let (previous, next) = queries::neighbours(&state(cx).db, &view.claim).await?;
+        let title = view.claim.tin().to_string();
+        let sub = format!("{} · {}", view.claim.registered_name, view.claim.email);
         Ok(view! {
-            <main class="home page staff">
-                <div class="page-in staff-in">
-                    <div class="claim-head">
-                        <div class="claim-heading">
-                            <a class="back" href="/staff">icon(name: "arrow_back") "Claims waiting"</a>
-                            <div class="claim-title">
-                                <h1 class="mono">(claim.tin().to_string())</h1>
-                                kind_pill(kind: claim.kind.clone())
-                                if let Some(age) = age {
-                                    pill(label: age, icon_name: "schedule", tone: (if late { "status-fix" } else { "status-waiting" }).to_owned())
-                                } else {
-                                    pill(label: status_label.to_owned(), icon_name: status_icon, tone: format!("status-{status_tone}"))
-                                }
-                            </div>
-                        </div>
-                        <nav class="claim-nav" aria-label="Queue">
-                            if let Some(previous) = previous {
-                                <a class="btn btn-ghost btn-small" href=(format!("/staff/claims/{previous}")) aria-label="Previous claim">icon(name: "chevron_left")</a>
-                            }
-                            if let Some(next) = next {
-                                <a class="btn btn-ghost btn-small" href=(format!("/staff/claims/{next}"))>"Next claim" icon(name: "chevron_right")</a>
-                            }
-                        </nav>
-                    </div>
-                    page_notice(notice: notice(cx))
-                    if !other_accounts.is_empty() {
-                        <div class="notice-bar error">
-                            icon(name: "group")
-                            <div>
-                                <strong>"Other accounts claim this TIN:"</strong>
-                                <ul>
-                                    for rival in other_accounts {
-                                        <li>
-                                            <a href=(format!("/staff/claims/{}", rival.id))>(rival.email.clone())</a>
-                                            " · " (status_look(rival.shown_status()).0) " since " (short_date(rival.created_at))
-                                        </li>
-                                    }
-                                </ul>
-                            </div>
-                        </div>
-                    }
-                    <div class="review">
-                        document_viewer(documents: tabs, empty: empty_viewer)
-                        <aside class="review-side">
-                            <section class="panel side-card who">
-                                <span class="avatar big">(initials(&claim.email))</span>
-                                <span class="who-text">
-                                    <b>(claim.email.clone())</b>
-                                    <span>
-                                        "Joined " (claimant.map(|user| short_date(user.created_at)).unwrap_or_default())
-                                        " · " (if claimant_tins <= 1 { "first TIN".to_owned() } else { format!("{claimant_tins} TINs") })
-                                    </span>
-                                </span>
-                                <a href=(format!("/staff/users/{}", claim.account_id))>"View user"</a>
-                            </section>
-                            if !unverified {
-                                typed_vs_document(comparison: compare)
-                            }
-                            if !checks.is_empty() {
-                                <section class="panel side-card">
-                                    <h2>"Checks"</h2>
-                                    <div class="checks">
-                                        for item in checks {
-                                            flag(item: item)
-                                        }
-                                    </div>
-                                </section>
-                            }
-                            if !auto_doubts.is_empty() {
-                                <section class="panel side-card">
-                                    <h2>"Not activated automatically"</h2>
-                                    <ul class="side-text">
-                                        for words in auto_doubts {
-                                            <li>(words)</li>
-                                        }
-                                    </ul>
-                                </section>
-                            }
-                            if claim.verified_by.as_deref() == Some("auto") {
-                                <section class="panel side-card">
-                                    <h2>"Activated automatically"</h2>
-                                    <p class="side-text">
-                                        (claim.decided_at.map(date_time).unwrap_or_default()) ". TIN and name matched the TIN ID read on our server"
-                                        if let Some((tin_sure, name_sure)) = auto_sure.clone() {
-                                            " (" (tin_sure) " and " (name_sure) " sure)"
-                                        }
-                                        "."
-                                    </p>
-                                    if let Some(at) = claim.auto_confirmed_at {
-                                        <p class="side-text">"Confirmed by staff " (date_time(at)) "; its papers were deleted."</p>
-                                    } else {
-                                        <p class="side-text">"No person has confirmed it yet. Check the papers, then confirm. They are deleted when you confirm; until then they are kept, even if the TIN is removed or revoked."</p>
-                                        if can_confirm && paused_by_buwiz {
-                                            confirm_form(
-                                                label: "Looks right: confirm and lift the pause",
-                                                action: confirm.clone(),
-                                                question: format!("Confirm {tin} for {}?", claim.email),
-                                                detail: "You checked the papers and they match. They are deleted now, and the pause Buwiz put on it is lifted: the owner can send again at once.".to_owned(),
-                                                confirm: "Confirm",
-                                                reason: true
-                                            )
-                                        } else if can_confirm {
-                                            confirm_form(
-                                                label: "Looks right: confirm",
-                                                action: confirm.clone(),
-                                                question: format!("Confirm {tin} for {}?", claim.email),
-                                                detail: "You checked the papers and they match. They are deleted now.".to_owned(),
-                                                confirm: "Confirm"
-                                            )
-                                        } else if own_withheld {
-                                            <p class="side-text">"This is your own TIN. Another staff member confirms it."</p>
-                                        } else if confirm_needs_admin {
-                                            <p class="side-text">"Sending for this TIN is paused, so an admin confirms it."</p>
-                                        }
-                                    }
-                                </section>
-                            }
-                            if claim.sent_back_at.is_some() {
-                                <section class="panel side-card">
-                                    <h2>"Sent back before"</h2>
-                                    <p class="side-text">
-                                        (claim.sent_back_at.map(date_time).unwrap_or_default())
-                                        if !fix_reasons.is_empty() {
-                                            ": " (fix_reasons.join(", "))
-                                        }
-                                    </p>
-                                    if let Some(note) = claim.fix_note.clone() {
-                                        <p class="side-text quote">(note)</p>
-                                    }
-                                    if let Some(resent) = claim.resent_at {
-                                        <p class="side-text">"Resent " (date_time(resent))</p>
-                                    } else {
-                                        <p class="side-text">"Waiting for the person's fix."</p>
-                                    }
-                                </section>
-                            }
-                            if own_withheld && claim.is_open() {
-                                <p class="panel side-card side-text">"This is your own claim. Another staff member decides it."</p>
-                            } else if claim.is_open() {
-                                <form class="panel side-card decision" method="post" action=(decide)>
-                                    <h2>"Decision"</h2>
-                                    if own_claim {
-                                        <p class="side-text">"This is your own claim. Your decision goes in your history as one on your own account."</p>
-                                    }
-                                    if admin_must_approve {
-                                        <p class="side-text">"Sending for this TIN was paused before: an admin must approve it. You can still send it back or reject it."</p>
-                                    } else {
-                                        <button class="btn btn-solid btn-block" type="submit" name="decision" value="approve">
-                                            icon(name: "verified")
-                                            <span class="ellipsis">"Approve: " (claim.email.clone()) " owns this TIN"</span>
-                                        </button>
-                                    }
-                                    if claim.status == "pending" {
-                                        <p class="decision-or">"Or send it back with a reason"</p>
-                                        <div class="reason-chips">
-                                            for (code, label, _) in FIX_REASONS {
-                                                <label class="reason">
-                                                    <input type="checkbox" name="reasons" value=(*code)>
-                                                    <span>(*label)</span>
-                                                </label>
-                                            }
-                                        </div>
-                                    }
-                                    <label class="decision-label" for="note">"Note to the person"</label>
-                                    <textarea id="note" name="note" rows="3" maxlength="500" placeholder="They see this on their My TINs page. Required to reject."></textarea>
-                                    <div class="decision-row">
-                                        if claim.status == "pending" {
-                                            <button class="btn btn-ghost" type="submit" name="decision" value="fix">"Ask for a fix"</button>
-                                        }
-                                        <button class="btn btn-danger" type="submit" name="decision" value="reject">"Reject"</button>
-                                    </div>
-                                </form>
-                            } else if unverified {
-                                <section class="panel side-card">
-                                    <h2>"Not verified"</h2>
-                                    <p class="side-text">"The person can prepare returns but not send them."</p>
-                                </section>
-                            } else if ended {
-                                <section class="panel side-card">
-                                    <h2>"Ended"</h2>
-                                    <p class="side-text">"Approved " (claim.decided_at.map(date_time).unwrap_or_default())</p>
-                                    <p class="side-text">
-                                        (if claim.status == "removed" { "Removed by the owner " } else { "Revoked by staff " })
-                                        (claim.removed_at.map(date_time).unwrap_or_default())
-                                    </p>
-                                    if let Some(note) = claim.removal_note.clone() {
-                                        <p class="side-text quote">(note)</p>
-                                    }
-                                </section>
-                            } else {
-                                <section class="panel side-card">
-                                    <h2>"Decided"</h2>
-                                    <p class="side-text">(status_label) " · " (claim.decided_at.map(date_time).unwrap_or_default())</p>
-                                    if let Some(note) = claim.decision_note.clone() {
-                                        <p class="side-text quote">(note)</p>
-                                    }
-                                </section>
-                            }
-                            if !pauses.is_empty() {
-                                <section class="panel side-card">
-                                    <h2>"Paused before"</h2>
-                                    for line in pauses {
-                                        <p class="side-text">
-                                            (if line.action == "paused" { "Paused by " } else { "Resumed by " })
-                                            (if line.source == "auto" { "Buwiz".to_owned() } else { line.actor_email.clone() }) " on " (date(line.created_at))
-                                            if let Some(reason) = line.reason.clone() {
-                                                ": " (reason)
-                                            }
-                                        </p>
-                                    }
-                                </section>
-                            }
-                            if can_pause {
-                                <section class="panel side-card end-claim">
-                                    if let Some(at) = claim.paused_at {
-                                        <h2>"Paused"</h2>
-                                        <p class="side-text">"Paused by " (paused_by.clone()) " on " (date(at)) ": " (claim.pause_reason.clone().unwrap_or_default())</p>
-                                        confirm_form(
-                                            label: "Resume sending",
-                                            action: resume,
-                                            question: format!("Resume sending for {tin}?"),
-                                            detail: "The owner can send returns again at once.".to_owned(),
-                                            confirm: "Resume",
-                                            reason: true
-                                        )
-                                    } else {
-                                        <h2>"Pause sending"</h2>
-                                        <p class="side-text">"Keeps the TIN on this account but stops every send at once. The owner sees your reason on My TINs."</p>
-                                        confirm_form(
-                                            label: "Pause sending",
-                                            action: pause,
-                                            question: format!("Pause sending for {tin}?"),
-                                            detail: "Tickets and sends are refused until you resume. Returns already sent are not affected.".to_owned(),
-                                            confirm: "Pause",
-                                            reason: true
-                                        )
-                                    }
-                                </section>
-                            }
-                            if can_activate {
-                                <section class="panel side-card end-claim">
-                                    <h2>(if unverified { "Activate without papers" } else { "Or activate without papers" })</h2>
-                                    if claimant_banned {
-                                        <p class="side-text">(Notice::ClaimantBanned.message())</p>
-                                    } else {
-                                        <p class="side-text">"Makes " (claim.email.clone()) " the owner of " (tin.clone()) " now, without papers. Use it for accounts you know. The reason goes in the account's history."</p>
-                                        confirm_form(
-                                            label: "Activate without papers",
-                                            action: activate,
-                                            question: format!("Activate {tin} for {} without papers?", claim.email),
-                                            detail: "The TIN becomes active at once and can send returns to the BIR. Your reason is kept in the account's history.".to_owned(),
-                                            confirm: "Activate",
-                                            reason: true
-                                        )
-                                    }
-                                </section>
-                            }
-                            if show_delete && own_claim {
-                                <p class="panel side-card side-text">"This is your own claim: delete it from My TINs."</p>
-                            } else if show_delete || show_revoke {
-                                <section class="panel side-card end-claim">
-                                    if show_revoke {
-                                        <p class="side-text">"Ends this account's ownership. The TIN stops being active at once, its sent returns stay, and it can be claimed again."</p>
-                                        confirm_form(
-                                            label: "Revoke ownership",
-                                            action: revoke,
-                                            question: format!("Revoke {}'s ownership of {}?", claim.email, claim.tin()),
-                                            detail: "The TIN stops being active at once; the owner sees your reason on My TINs.".to_owned(),
-                                            confirm: "Revoke",
-                                            reason: true
-                                        )
-                                    } else {
-                                        <p class="side-text">"Erases the claim and its files for good. Only a line in the account's history stays."</p>
-                                        confirm_form(
-                                            label: "Delete claim",
-                                            action: delete,
-                                            question: format!("Delete this claim by {}?", claim.email),
-                                            detail: "The claim and every file on it are erased for good.".to_owned(),
-                                            confirm: "Delete",
-                                            reason: true
-                                        )
-                                    }
-                                </section>
-                            }
-                        </aside>
-                    </div>
+            <main id="main" class="sx-main" tabindex="-1">
+                page_head(title: title, sub: sub, back: Some("/staff".to_owned()), mono: true,
+                    <nav class="sx-acts" aria-label="Queue">
+                        if let Some(previous) = previous {
+                            <a class="sx-btn sm" href=(format!("/staff/claims/{previous}")) aria-label="Previous claim">(ic("chevron-left"))</a>
+                        }
+                        if let Some(next) = next {
+                            <a class="sx-btn sm" href=(format!("/staff/claims/{next}"))>"Next claim" (ic("chevron-right"))</a>
+                        }
+                    </nav>
+                )
+                <div class="sx-notices">sx_notice(notice: notice(cx))</div>
+                <div class="sx-scroll">
+                    claim_body(view: view, wide: true)
                 </div>
             </main>
-        })
+        }
+        .boxed())
     }
 }
 
 /// The claim's files as tabs. The tabs are radio buttons, so they switch
-/// without JavaScript; `account.js` adds zoom and rotate for photos.
+/// without script; staff.js adds zoom and rotate for photos.
 #[component]
 async fn document_viewer(documents: Vec<(usize, DocumentRow)>, empty: String) -> Result<impl View> {
     let tabs: Vec<(usize, String, &'static str)> = documents
         .iter()
-        .map(|(index, row)| (*index, DocumentKind::label(&row.kind).to_owned(), DocumentKind::icon(&row.kind)))
+        .map(|(index, row)| (*index, DocumentKind::label(&row.kind).to_owned(), glyph(DocumentKind::icon(&row.kind))))
         .collect();
     let radios: Vec<usize> = documents.iter().map(|(index, _)| *index).collect();
     Ok(view! {
-        <section class="viewer" aria-label="Documents">
+        <section class="sx-viewer viewer" aria-label="Documents">
             if documents.is_empty() {
-                <p class="viewer-empty">(empty)</p>
+                <p class="sx-viewer-empty">(empty)</p>
             }
             for index in radios {
-                <input class="viewer-radio" type="radio" name="document" id=(format!("document-{index}")) checked=(index == 0)>
+                <input class="sx-viewer-radio" type="radio" name="document" id=(format!("document-{index}")) checked=(index == 0)>
             }
-            <div class="viewer-bar">
-                <div class="viewer-tabs">
-                    for (index, label, icon_name) in tabs {
-                        <label for=(format!("document-{index}"))>icon(name: icon_name) (label)</label>
-                    }
+            if !tabs.is_empty() {
+                <div class="sx-viewer-bar">
+                    <div class="sx-viewer-tabs">
+                        for (index, label, icon_name) in tabs {
+                            <label for=(format!("document-{index}"))>(icon_with(icon_name, "ic sm")) (label)</label>
+                        }
+                    </div>
+                    <div class="sx-viewer-tools" data-viewer-tools="" hidden=(true)>
+                        <button type="button" data-zoom="-1" aria-label="Zoom out">(ic("zoom-out"))</button>
+                        <button type="button" data-zoom="1" aria-label="Zoom in">(ic("zoom-in"))</button>
+                        <button type="button" data-rotate="" aria-label="Rotate">(ic("rotate"))</button>
+                    </div>
                 </div>
-                <div class="viewer-tools" data-viewer-tools="" hidden=(true)>
-                    <button type="button" data-zoom="-1" aria-label="Zoom out">icon(name: "zoom_out")</button>
-                    <button type="button" data-zoom="1" aria-label="Zoom in">icon(name: "zoom_in")</button>
-                    <button type="button" data-rotate="" aria-label="Rotate">icon(name: "rotate_right")</button>
-                </div>
-            </div>
-            <div class="viewer-panes">
+            }
+            <div class="sx-viewer-panes">
                 for (_, document) in documents {
                     let href = format!("/staff/documents/{}", document.id);
-                    <div class="viewer-pane">
-                        <div class="viewer-stage">
+                    <div class="sx-viewer-pane">
+                        <div class="sx-viewer-stage">
                             if document.purged_at.is_some() {
-                                <p class="viewer-gone">icon(name: "delete") "Deleted when the claim was decided or the file replaced."</p>
+                                <p class="sx-viewer-gone">"Deleted when the claim was decided or the file replaced."</p>
                             } else if document.is_viewable_image() {
                                 <img src=(href.clone()) alt=(DocumentKind::label(&document.kind)) data-zoomable="">
                             } else {
-                                <a class="viewer-open" href=(href.clone()) target="_blank" rel="noopener">
-                                    icon(name: if document.content_type == "application/pdf" { "picture_as_pdf" } else { "image" })
+                                <a class="sx-viewer-open" href=(href.clone()) target="_blank" rel="noopener">
+                                    (ic("file"))
                                     "Open the file"
                                 </a>
                             }
                         </div>
-                        <p class="viewer-foot">
+                        <p class="sx-viewer-foot">
                             <span>
                                 (document.filename.clone()) " · " (format!("{} KB", (document.size_bytes + 1023) / 1024))
                                 (if document.purged_at.is_some() { " · deleted" } else { " · deleted automatically once you decide" })
                             </span>
                             if document.purged_at.is_none() {
-                                <a href=(href) target="_blank" rel="noopener">icon(name: "open_in_new") "Open the original"</a>
+                                <a href=(href) target="_blank" rel="noopener">(icon_with("external", "ic sm")) "Open the original"</a>
                             }
                         </p>
                     </div>
@@ -844,21 +1170,75 @@ async fn document_viewer(documents: Vec<(usize, DocumentRow)>, empty: String) ->
     })
 }
 
+// ---------------------------------------------------------------- users
+
+/// The role that counts for a listed account (see [`roles::of`]).
+fn user_role(config: &crate::base::config::Config, user: &queries::UserRow) -> Option<(Role, bool)> {
+    roles::of(config, &user.email, user.role.as_deref(), user.banned_at.is_some())
+}
+
+/// The badge for a staff role: (label, CSS tone).
+fn role_badge(role: Option<(Role, bool)>) -> Option<(&'static str, &'static str)> {
+    match role? {
+        (Role::Admin, true) => Some(("Admin · server setting", "staff")),
+        (Role::Admin, false) => Some(("Admin", "staff")),
+        (Role::Support, _) => Some(("Support", "support")),
+    }
+}
+
+/// The pill of a role badge: Admins dark, Support blue-grey.
+fn badge_tone(tone: &str) -> &'static str {
+    if tone == "staff" { "inv" } else { "info" }
+}
+
+/// The ID status as a pill tone.
+fn id_tone(status: IdStatus) -> &'static str {
+    match status {
+        IdStatus::Staff => "inv",
+        IdStatus::Waiting => "warn",
+        IdStatus::Verified => "ok",
+        IdStatus::None => "neutral",
+    }
+}
+
+struct UserListRow {
+    user: queries::UserRow,
+    names: Vec<String>,
+    /// (TIN as shown, claim status)
+    tins: Vec<(String, String)>,
+    id_status: IdStatus,
+    badge: Option<(&'static str, &'static str)>,
+    open: String,
+    selected: bool,
+    explicit: bool,
+}
+
 #[page("/staff/users")]
 pub async fn users_page(cx: &Cx) -> Result<impl View> {
     let viewer = staff_member(cx, Power::SeeUsers).await?;
     let can_create = viewer.can(Power::CreateLogin);
     let filter = UserFilter::parse(query(cx, "filter").as_deref());
     let search = query(cx, "q").unwrap_or_default();
+    let opened = open_id(cx);
+    let new_open = can_create && query(cx, "new").is_some();
     let config = &state(cx).config;
     let db = &state(cx).db;
     let users = queries::users(db, filter, &search, &config.admin_emails).await?;
-    let ids: Vec<Uuid> = users.iter().map(|user| user.id).collect();
+    let selected = opened.or_else(|| users.first().map(|user| user.id));
+    let mut ids: Vec<Uuid> = users.iter().map(|user| user.id).collect();
+    if let Some(selected) = selected.filter(|id| !ids.contains(id)) {
+        ids.push(selected);
+    }
     let claims = queries::claims_of(db, &ids).await?;
+    let list_params = |open: &str| href("/staff/users", &[("filter", filter.code()), ("q", &search), ("open", open)]);
+    let summary = match selected {
+        Some(id) => user_summary_data(cx, id, &claims).await?,
+        None => None,
+    };
+    let selected = summary.as_ref().map(|summary| summary.user.id);
     let rows: Vec<UserListRow> = users
         .into_iter()
-        .enumerate()
-        .map(|(index, user)| {
+        .map(|user| {
             let own: Vec<&queries::UserClaim> = claims.iter().filter(|claim| claim.account_id == user.id).collect();
             let mut names: Vec<String> = Vec::new();
             for claim in &own {
@@ -879,180 +1259,311 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 .collect();
             let role = user_role(config, &user);
             let id_status = IdStatus::of(role.is_some(), own.iter().map(|claim| claim.status.as_str()));
-            // The list says "Support"; Admins already read "Staff".
-            let badge = role_badge(role).filter(|(_, tone)| *tone == "support");
-            let (test, banned) = (user.test_account, user.banned_at.is_some());
-            UserListRow { color: index % 5, user, names, tins, id_status, badge, test, banned }
+            let badge = role_badge(role);
+            let open = list_params(&user.id.to_string());
+            let selected = Some(user.id) == selected;
+            UserListRow { user, names, tins, id_status, badge, open, selected, explicit: opened.is_some() }
         })
         .collect();
     let chips: Vec<(UserFilter, String)> = UserFilter::ALL
         .into_iter()
-        .map(|chip| (chip, link("/staff/users", None, &[("filter", chip.code()), ("q", &search)])))
+        .map(|chip| (chip, href("/staff/users", &[("filter", chip.code()), ("q", &search)])))
         .collect();
+    let close = list_params("");
+    let empty = rows.is_empty();
+    let sub = if search.is_empty() {
+        filter.label().to_owned()
+    } else {
+        format!("{} · matching “{search}”", filter.label())
+    };
     Ok(view! {
-        <main class="home page staff">
-            <div class="page-in staff-in">
-                <div class="page-head">
-                    <h1>"Users"</h1>
-                    search_box(action: "/staff/users", label: "Search users", placeholder: "Search email, TIN or registered name", value: search.clone(), keep: vec![("filter", filter.code())])
-                </div>
-                page_notice(notice: notice(cx))
+        <main id="main" class="sx-main" tabindex="-1">
+            page_head(title: "Users", sub: sub,
                 if can_create {
-                    new_login_form()
+                    <a class="sx-btn pri sx-hide-phone" href="/staff/users?new=1" data-new-user="">(ic("user-plus")) "New user"</a>
                 }
-                <nav class="filters" aria-label="Filter users">
-                    for (chip, href) in chips {
-                        <a href=(href) class=(if chip == filter { "on" } else { "" }) aria-current=(if chip == filter { "page" } else { "false" })>
-                            match chip {
-                                UserFilter::Waiting => <span class="dot waiting"></span>,
-                                UserFilter::Verified => <span class="dot active"></span>,
-                                UserFilter::NoTin => <span class="dot none"></span>,
-                                _ => "",
-                            }
-                            (chip.label())
-                        </a>
-                    }
-                </nav>
-                if rows.is_empty() {
-                    <p class="panel empty">(if search.is_empty() { "No accounts here." } else { "No accounts match that search." })</p>
-                } else {
-                    <div class="list">
-                        #[key(row.user.id.as_u128())]
-                        for row in rows {
-                            user_row(row: row)
-                        }
+            )
+            <div class="sx-notices">sx_notice(notice: notice(cx))</div>
+            <div class="sx-scroll">
+                <div class="sx-stack">
+                    <div class="sx-toolbar">
+                        search_box(action: "/staff/users", label: "Search users", placeholder: "Search email, TIN or registered name", value: search.clone(), keep: vec![("filter", filter.code())])
                     </div>
-                }
-                <p class="fine left">"Active is the newest website sign-in or app token. Up to " (queries::LIST_LIMIT.to_string()) " accounts show; search to narrow."</p>
+                    <nav class="sx-chips" aria-label="Filter users">
+                        for (chip, link) in chips {
+                            <a class="sx-chip" href=(link) if chip == filter { aria-current="page" }>
+                                match chip {
+                                    UserFilter::Waiting => <span class="sx-dot warn" aria-hidden="true"></span>,
+                                    UserFilter::Verified => <span class="sx-dot ok" aria-hidden="true"></span>,
+                                    UserFilter::NoTin => <span class="sx-dot" aria-hidden="true"></span>,
+                                    _ => "",
+                                }
+                                (chip.label())
+                            </a>
+                        }
+                    </nav>
+                    if empty {
+                        <p class="sx-card sx-empty big">(if search.is_empty() { "No accounts here." } else { "No accounts match that search." })</p>
+                    } else {
+                        <div class="sx-card sx-tablewrap">
+                            <table class="sx-table users">
+                                <caption class="sx-vh">"Accounts"</caption>
+                                <colgroup><col class="c-acct"><col><col class="c-tins"></colgroup>
+                                <thead>
+                                    <tr>
+                                        <th scope="col">"Account"</th>
+                                        <th scope="col">"Registered name"</th>
+                                        <th scope="col">"TINs"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    #[key(row.user.id.as_u128())]
+                                    for row in rows {
+                                        user_row(row: row)
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                    <p class="sx-fine">"Active is the newest website sign-in or app token. Up to " (queries::LIST_LIMIT.to_string()) " accounts show; search to narrow."</p>
+                </div>
             </div>
         </main>
-    })
-}
-
-/// An Admin adds a made-up TIN to a test account: active at once, it never
-/// sends.
-#[component]
-async fn test_tin_form(account_id: Uuid) -> Result<impl View> {
-    Ok(view! {
-        <details>
-            <summary>"Add a test TIN"</summary>
-            <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test-tin"))>
-                <p class="side-text">"A made-up TIN, 000-000-000 at any branch, active at once for trying the apps. Buwiz never sends its returns to the BIR."</p>
-                <label class="decision-label">
-                    "TIN"
-                    <input type="text" name="tin" required=(true) value="000-000-000-00000" inputmode="numeric">
-                </label>
-                <label class="decision-label">
-                    "Registered name"
-                    <input type="text" name="registered_name" required=(true) maxlength="200">
-                </label>
-                <label class="decision-label">
-                    "Kind"
-                    <select name="kind">
-                        <option value="personal" selected=(true)>"Personal"</option>
-                        <option value="business">"Business"</option>
-                    </select>
-                </label>
-                reason_field()
-                <button class="btn btn-ghost" type="submit">"Add the test TIN"</button>
-            </form>
-        </details>
-    })
-}
-
-/// "New user": an Admin makes a login. Nothing is mailed.
-#[component]
-async fn new_login_form() -> Result<impl View> {
-    Ok(view! {
-        <details class="panel side-card">
-            <summary>"New user"</summary>
-            <form class="end-form" method="post" action="/staff/users/new">
-                <label class="decision-label">
-                    "Email"
-                    <input type="email" name="email" required=(true) maxlength="254" autocomplete="off">
-                </label>
-                <p class="side-text">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now."</p>
-                <label class="decision-label">
-                    "Role"
-                    <select name="role">
-                        <option value="none" selected=(true)>"No staff role"</option>
-                        <option value="support">"Support"</option>
-                        <option value="admin">"Admin"</option>
-                    </select>
-                </label>
-                <label class="reason">
-                    <input type="checkbox" name="test" value="on">
-                    <span>"Test account"</span>
-                </label>
-                reason_field()
-                <button class="btn btn-ghost" type="submit">"Make the login"</button>
-            </form>
-        </details>
-    })
-}
-
-/// The role that counts for a listed account (see [`roles::of`]).
-fn user_role(config: &crate::base::config::Config, user: &queries::UserRow) -> Option<(Role, bool)> {
-    roles::of(config, &user.email, user.role.as_deref(), user.banned_at.is_some())
-}
-
-/// The badge for a staff role: (label, CSS tone).
-fn role_badge(role: Option<(Role, bool)>) -> Option<(&'static str, &'static str)> {
-    match role? {
-        (Role::Admin, true) => Some(("Admin · server setting", "staff")),
-        (Role::Admin, false) => Some(("Admin", "staff")),
-        (Role::Support, _) => Some(("Support", "support")),
+        inspector(title: "User", open: opened.is_some() && summary.is_some(), close: close.clone(),
+            if let Some(summary) = summary {
+                user_summary(summary: summary)
+            } else {
+                <div class="sx-insp-b"><p class="sx-empty">"No account to show."</p></div>
+            }
+        )
+        if can_create {
+            new_login_form(open: new_open, close: close)
+            <a class="sx-fab" href="/staff/users?new=1" data-new-user="" aria-label="New user">(ic("user-plus"))</a>
+        }
     }
-}
-
-struct UserListRow {
-    color: usize,
-    user: queries::UserRow,
-    names: Vec<String>,
-    /// (TIN, claim status)
-    tins: Vec<(String, String)>,
-    id_status: IdStatus,
-    badge: Option<(&'static str, &'static str)>,
-    test: bool,
-    banned: bool,
+    .boxed())
 }
 
 #[component]
 async fn user_row(row: UserListRow) -> Result<impl View> {
-    let (id_label, id_icon, id_tone) = row.id_status.look();
-    let names = if row.names.is_empty() { "No TIN added".to_owned() } else { row.names.join(" · ") };
+    let (id_label, _, _) = row.id_status.look();
+    let names = row.names.join(" · ");
+    let count = row.tins.len();
+    let test_tins = row.tins.iter().any(|(shown, _)| shown.ends_with(" · test"));
     Ok(view! {
-        <a class="list-row" href=(format!("/staff/users/{}", row.user.id))>
-            <span class="row-main user">
-                <span class=(format!("avatar c{}", row.color))>(initials(&row.user.email))</span>
-                <span class="row-stack">
-                    <span class="row-email strong">(row.user.email.clone())</span>
-                    <span class="row-sub">(names)</span>
+        <tr data-id=(row.user.id.to_string()) class=(row_class(row.selected, row.explicit))>
+            <td class="a-main">
+                <span class="sx-acct">
+                    avatar(email: row.user.email.clone(), size: "sm")
+                    <a class="sx-rowlink" href=(row.open) data-open="" if row.selected { aria-current="true" }>(row.user.email.clone())</a>
+                    if let Some((label, tone)) = row.badge.filter(|(_, tone)| *tone == "support") {
+                        sx_pill(label: label, sym: "", tone: badge_tone(tone))
+                    }
+                    if row.user.test_account {
+                        sx_pill(label: "Test", sym: "flask", tone: "test")
+                    }
+                    if row.user.banned_at.is_some() {
+                        sx_pill(label: "Banned", sym: "ban", tone: "bad")
+                    }
                 </span>
-            </span>
-            <span class="row-flags">
-                for (tin, status) in row.tins {
-                    <span class="tin-chip mono"><span class=(format!("dot {}", status_look(&status).2))></span>(tin)</span>
+            </td>
+            <td class="m cut a-sub" title=(names.clone())>
+                if names.is_empty() {
+                    <span class="sx-faint">"No TIN added"</span>
+                } else {
+                    (names)
                 }
-            </span>
-            <span class=(format!("id-badge {id_tone}"))>icon(name: id_icon) (id_label)</span>
-            if let Some((label, tone)) = row.badge {
-                <span class=(format!("id-badge {tone}"))>(label)</span>
-            }
-            if row.test {
-                <span class="id-badge test">icon(name: "science") "Test"</span>
-            }
-            if row.banned {
-                <span class="id-badge banned">icon(name: "block") "Banned"</span>
-            }
-            <span class="row-dates">
-                <span>"Joined " (short_date(row.user.created_at))</span>
-                <span>"Active " (ago(row.user.last_active))</span>
-            </span>
-            <span class="row-go">icon(name: "chevron_right")</span>
-        </a>
+            </td>
+            <td class="a-side">
+                <span class="sx-tins">
+                    <b>(count.to_string())</b>
+                    for (tin, status) in row.tins {
+                        let (label, _, tone) = status_look(&status);
+                        <span class=(format!("sx-dot {}", ui::status_tone(tone))) role="img" aria-label=(format!("{tin}: {label}")) title=(format!("{tin}: {label}"))></span>
+                    }
+                    if test_tins {
+                        <span class="sx-faint">"· test"</span>
+                    }
+                    <span class="sx-faint">(id_label)</span>
+                </span>
+            </td>
+        </tr>
     })
 }
+
+/// What the users inspector shows of one account.
+struct UserSummary {
+    user: queries::UserRow,
+    claims: Vec<queries::UserClaim>,
+    badge: Option<(&'static str, &'static str)>,
+    id_status: IdStatus,
+    live_sessions: usize,
+    apps: Vec<AppRow>,
+}
+
+async fn user_summary_data(cx: &Cx, account_id: Uuid, claims: &[queries::UserClaim]) -> Result<Option<UserSummary>> {
+    let db = &state(cx).db;
+    let Some(user) = queries::user(db, account_id).await? else {
+        return Ok(None);
+    };
+    let claims: Vec<queries::UserClaim> =
+        claims.iter().filter(|claim| claim.account_id == account_id).cloned().collect();
+    let role = user_role(&state(cx).config, &user);
+    let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
+    let live_sessions = queries::sessions(db, account_id).await?.iter().filter(|(_, live)| *live).count();
+    let apps = queries::apps(db, account_id).await?.into_iter().filter(|app| app.signed_in).collect();
+    Ok(Some(UserSummary { badge: role_badge(role), user, claims, id_status, live_sessions, apps }))
+}
+
+/// The inspector's account: who it is, its TINs and sign-ins, and the way
+/// to its full page, where its actions are.
+#[component]
+async fn user_summary(summary: UserSummary) -> Result<impl View> {
+    let UserSummary { user, claims, badge, id_status, live_sessions, apps } = summary;
+    let (id_label, id_icon, _) = id_status.look();
+    let mut names: Vec<String> = Vec::new();
+    for claim in &claims {
+        if !names.contains(&claim.registered_name) {
+            names.push(claim.registered_name.clone());
+        }
+    }
+    let page = format!("/staff/users/{}", user.id);
+    let tins: Vec<(String, bool, String)> = claims
+        .iter()
+        .map(|claim| {
+            let tin = crate::account::tin::Tin::parse_any(&claim.tin_root, &claim.branch_code)
+                .expect("stored TINs have the shape of one");
+            (tin.to_string(), tin.is_test(), claim.status.clone())
+        })
+        .collect();
+    Ok(view! {
+        <div class="sx-insp-b">
+            <div class="sx-detail">
+                <div class="sx-uhead panel">
+                    avatar(email: user.email.clone(), size: "lg")
+                    <span class="x">
+                        <b>(user.email.clone())</b>
+                        <span>
+                            (if names.is_empty() { "No TIN added".to_owned() } else { names.join(" · ") })
+                        </span>
+                        <span class="sx-pills">
+                            sx_pill(label: id_label, sym: glyph(id_icon), tone: id_tone(id_status))
+                            if let Some((label, tone)) = badge.filter(|(_, tone)| *tone == "support") {
+                                sx_pill(label: label, sym: "shield", tone: badge_tone(tone))
+                            }
+                            if user.test_account {
+                                sx_pill(label: "Test account", sym: "flask", tone: "test")
+                            }
+                            if user.banned_at.is_some() {
+                                sx_pill(label: "Banned", sym: "ban", tone: "bad")
+                            }
+                        </span>
+                    </span>
+                </div>
+                <div class="sx-facts">
+                    <div class="sx-fact"><span class="k">"Role"</span><span class="v">(badge.map_or("No staff role", |(label, _)| label))</span></div>
+                    <div class="sx-fact"><span class="k">"Active"</span><span class="v">(ago(user.last_active))</span></div>
+                    <div class="sx-fact"><span class="k">"Joined"</span><span class="v">(date(user.created_at))</span></div>
+                </div>
+                <section class="sx-sub">
+                    <h3>"TINs"</h3>
+                    if tins.is_empty() {
+                        <p class="sx-empty">"No TIN added yet."</p>
+                    }
+                    <div>
+                        for (tin, test, status) in tins {
+                            <div class="sx-tinrow mini">
+                                <span class="sx-mono">(tin)</span>
+                                if test {
+                                    sx_pill(label: "test TIN", sym: "flask", tone: "testtin")
+                                }
+                                <span class="sx-sp"></span>
+                                status_pill(status: status)
+                            </div>
+                        }
+                    </div>
+                </section>
+                <section class="sx-sub">
+                    <h3>"Signed in"</h3>
+                    if live_sessions == 0 && apps.is_empty() {
+                        <p class="sx-empty">"Not signed in anywhere."</p>
+                    }
+                    <div>
+                        if live_sessions > 0 {
+                            <div class="sx-app-row mini">
+                                <span class="sx-app-ic">(ic("globe"))</span>
+                                <span class="x">
+                                    <b>"Website"</b>
+                                    <span>(if live_sessions == 1 { "1 browser signed in".to_owned() } else { format!("{live_sessions} browsers signed in") })</span>
+                                </span>
+                            </div>
+                        }
+                        for app in apps {
+                            <div class="sx-app-row mini">
+                                <span class="sx-app-ic">(ic(if app.is_agent() { "bot" } else { "monitor" }))</span>
+                                <span class="x">
+                                    <b>(app.name())</b>
+                                    <span>(if app.is_agent() { "AI agent · read only" } else { "Buwiz app" })</span>
+                                </span>
+                            </div>
+                        }
+                    </div>
+                </section>
+                <a class="sx-btn pri block sx-in-thumb" href=(page.clone())>(ic("arrow-right")) "Open full page"</a>
+            </div>
+        </div>
+        <div class="sx-thumbbar">
+            <a class="sx-btn pri" href=(page)>(ic("arrow-right")) "Open full page"</a>
+        </div>
+    }
+    .boxed())
+}
+
+/// "New user": an Admin makes a login. Nothing is mailed. A dialog over
+/// the users list: hidden until New user opens it (with script) or the page
+/// is asked for with `?new=1` (without).
+#[component]
+async fn new_login_form(open: bool, close: String) -> Result<impl View> {
+    Ok(view! {
+        <div class="sx-modal" id="new-user" role="dialog" aria-modal="true" aria-labelledby="new-user-title" hidden=(!open)>
+            <a class="sx-scrim-link" href=(close.clone()) data-modal-close="" tabindex="-1" aria-hidden="true"></a>
+            <div class="sx-modal-box">
+                <h2 id="new-user-title">"New user"</h2>
+                <p>"An Admin makes the login. They sign in with a code sent to its email."</p>
+                <form class="sx-form" method="post" action="/staff/users/new">
+                    <label class="sx-field">
+                        <span>"Email"</span>
+                        <input type="email" name="email" required=(true) maxlength="254" autocomplete="off" placeholder="name@example.com">
+                        <span class="sx-hint">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now."</span>
+                    </label>
+                    <label class="sx-field">
+                        <span>"Role"</span>
+                        <select name="role">
+                            <option value="none" selected=(true)>"No staff role"</option>
+                            <option value="support">"Support"</option>
+                            <option value="admin">"Admin"</option>
+                        </select>
+                    </label>
+                    <label class="sx-check-in">
+                        <input type="checkbox" name="test" value="on">
+                        <span>"Test account"</span>
+                    </label>
+                    reason_field()
+                    <div class="sx-form-a">
+                        <a class="sx-btn" href=(close) data-modal-close="">"Cancel"</a>
+                        <button class="sx-btn pri" type="submit">(ic("user-plus")) "Make the login"</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    })
+}
+
+// ---------------------------------------------------------------- one user
+
+/// The user page's tabs: (key, label).
+const USER_TABS: [(&str, &str); 4] =
+    [("account", "Account"), ("tins", "TINs"), ("sign", "Sign-ins and apps"), ("history", "History")];
 
 pub mod account_id {
     use super::*;
@@ -1077,7 +1588,7 @@ pub mod account_id {
         let account_audit = queries::account_audit(db, account_id).await?;
         let role = user_role(config, &user);
         let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
-        let (id_label, id_icon, id_tone) = id_status.look();
+        let (id_label, id_icon, _) = id_status.look();
         let badge = role_badge(role);
         let is_admin = role.is_some_and(|(role, _)| role == Role::Admin);
         let from_server = role.is_some_and(|(_, from_server)| from_server);
@@ -1126,163 +1637,258 @@ pub mod account_id {
             }
             parts.join(" · ")
         };
+        let tab = query(cx, "tab").filter(|tab| USER_TABS.iter().any(|(key, _)| key == tab)).unwrap_or_default();
+        let tab = if tab.is_empty() { "account".to_owned() } else { tab };
+        let page = format!("/staff/users/{account_id}");
+        let tabs: Vec<(&'static str, &'static str, String, bool, Option<usize>)> = USER_TABS
+            .iter()
+            .map(|(key, label)| {
+                let count = (*key == "tins").then_some(claims.len());
+                (*key, *label, href(&page, &[("tab", key)]), *key == tab, count)
+            })
+            .collect();
+        let hidden: Vec<bool> = USER_TABS.iter().map(|(key, _)| *key != tab).collect();
+        let title = if own_page { "My account" } else { "User" };
+        let email = user.email.clone();
         Ok(view! {
-            <main class="home page staff">
-                <div class="page-in staff-in">
-                    <a class="back" href="/staff/users">icon(name: "arrow_back") "Users"</a>
-                    page_notice(notice: notice(cx))
-                    <section class="panel user-head">
-                        <span class="avatar huge">(initials(&user.email))</span>
-                        <span class="user-who">
-                            <b>(user.email.clone())</b>
-                            <span>(subtitle)</span>
-                        </span>
-                        <span class="user-actions">
-                            <span class=(format!("id-badge {id_tone}"))>icon(name: id_icon) (id_label)</span>
-                            if let Some((label, tone)) = badge {
-                                <span class=(format!("id-badge {tone}"))>icon(name: "shield_person") (label)</span>
-                            }
-                            if user.test_account {
-                                <span class="id-badge test">icon(name: "science") "Test account"</span>
-                            }
-                            if user.banned_at.is_some() {
-                                <span class="id-badge banned">icon(name: "block") "Banned"</span>
-                            }
-                        </span>
-                    </section>
-                    <div class="user-grid">
-                        <div class="user-main">
-                            <section class="panel side-card">
-                                <div class="side-head">
-                                    <h2>"Identity documents"</h2>
-                                    <span class="side-note">"Files are deleted once the claim is decided"</span>
+            <main id="main" class="sx-main" tabindex="-1">
+                page_head(title: title, back: Some("/staff/users".to_owned()))
+                <div class="sx-notices">sx_notice(notice: notice(cx))</div>
+                <div class="sx-scroll">
+                    <div class="sx-userpage">
+                        <div class="sx-uhead">
+                            avatar(email: email.clone(), size: "lg", me: own_page)
+                            <span class="x">
+                                <b>(email.clone())</b>
+                                <span>(subtitle)</span>
+                                <span class="sx-pills">
+                                    sx_pill(label: id_label, sym: glyph(id_icon), tone: id_tone(id_status))
+                                    if let Some((label, tone)) = badge {
+                                        sx_pill(label: label, sym: "shield", tone: badge_tone(tone))
+                                    }
+                                    if user.test_account {
+                                        sx_pill(label: "Test account", sym: "flask", tone: "test")
+                                    }
+                                    if user.banned_at.is_some() {
+                                        sx_pill(label: "Banned", sym: "ban", tone: "bad")
+                                    }
+                                </span>
+                            </span>
+                            if may_sign_out {
+                                <div class="sx-uacts">
+                                    reason_act(
+                                        id: "act-sign-out".to_owned(),
+                                        label: "Sign out everywhere",
+                                        sym: "log-out",
+                                        action: format!("/staff/users/{account_id}/sign-out"),
+                                        question: "Sign out everywhere?",
+                                        detail: "This account is signed out of every browser, the desktop app and every AI agent. They can sign in again.",
+                                        confirm: "Sign out everywhere"
+                                    )
                                 </div>
-                                if cards.is_empty() {
-                                    <p class="side-text">"No documents sent."</p>
-                                } else {
-                                    <div class="doc-grid">
-                                        for (document, tin, status) in cards {
-                                            document_card(document: document, tin: tin, status: status)
+                            }
+                        </div>
+                        <nav class="sx-tabs" role="tablist" aria-label="Account" data-tabs="">
+                            for (key, label, link, on, count) in tabs {
+                                <a class="sx-tab" role="tab" id=(format!("tab-{key}-tab")) href=(link) aria-controls=(format!("tab-{key}")) aria-selected=(if on { "true" } else { "false" }) tabindex=(if on { "0" } else { "-1" }) data-tab=(key)>
+                                    (label)
+                                    if let Some(count) = count {
+                                        <span class="sx-count">(count.to_string())</span>
+                                    }
+                                </a>
+                            }
+                        </nav>
+                        <section class="sx-card sx-tabbody" role="tabpanel" id="tab-account" aria-labelledby="tab-account-tab" hidden=(hidden[0])>
+                            <div class="sx-stack">
+                                if !admin_viewer {
+                                    <p class="sx-notice info">(ic("info")) <span>"Only an admin can change roles, bans and test labels."</span></p>
+                                } else if own_page {
+                                    <p class="sx-notice info">(ic("info")) <span>"This is your own account: another admin changes its role, ban or test label."</span></p>
+                                } else if from_server {
+                                    <p class="sx-notice info">(ic("info")) <span>"Admin through the server setting ADMIN_EMAILS. Change it there."</span></p>
+                                }
+                                let acts = admin_viewer && !own_page && !from_server;
+                                <div class="sx-facts">
+                                    <div class="sx-fact">
+                                        <span class="k">"Email"</span>
+                                        <span class="v">(email.clone())</span>
+                                        <span></span>
+                                    </div>
+                                    <div class="sx-fact">
+                                        <span class="k">"Registered names"</span>
+                                        <span class="v">(if names.is_empty() { "None yet".to_owned() } else { names.join(" · ") })</span>
+                                        <span></span>
+                                    </div>
+                                    <div class="sx-fact">
+                                        <span class="k">"Role"</span>
+                                        <span class="v">(badge.map_or("No staff role", |(label, _)| label))</span>
+                                        if acts {
+                                            act(id: "act-role".to_owned(), label: "Change", small: true, question: format!("Change {email}'s role?"), detail: "It takes effect on their next page.".to_owned(),
+                                                <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/role"))>
+                                                    <label class="sx-field">
+                                                        <span>"Role"</span>
+                                                        <select name="role">
+                                                            for (value, label, chosen) in role_choices {
+                                                                <option value=(value) selected=(chosen)>(label)</option>
+                                                            }
+                                                        </select>
+                                                    </label>
+                                                    reason_field()
+                                                    act_buttons(label: "Change role")
+                                                </form>
+                                            )
+                                        } else {
+                                            <span></span>
                                         }
                                     </div>
-                                }
-                            </section>
-                            <section class="panel side-card">
-                                <h2>"TINs"</h2>
-                                if claims.is_empty() {
-                                    <p class="side-text">"No TIN added."</p>
-                                }
-                                for claim in claims.clone() {
-                                    let (label, status_icon, tone) = status_look(claim.shown_status());
-                                    <div class="user-tin">
-                                        kind_pill(kind: claim.kind.clone())
-                                        tin_text(tin: claim.tin().to_string())
-                                        if claim.tin().is_test() {
-                                            pill(label: "Test TIN".to_owned(), icon_name: "science", tone: "status-unverified".to_owned())
-                                        }
-                                        <span class="user-tin-name">(claim.registered_name.clone())</span>
-                                        <span class=(format!("user-tin-status {tone}"))>
-                                            icon(name: status_icon)
-                                            if claim.status == "pending" {
-                                                "Waiting " (span_since(claim.waiting_since()))
+                                    <div class="sx-fact">
+                                        <span class="k">"Test label"</span>
+                                        <span class="v">
+                                            if user.test_account {
+                                                sx_pill(label: "Test account", sym: "flask", tone: "test")
                                             } else {
-                                                (label)
+                                                "Not a test account"
+                                            }
+                                            if acts && holds_test_tins {
+                                                <span class="sx-text">" It holds test TINs: revoke them before you remove the test label."</span>
                                             }
                                         </span>
-                                        <a href=(format!("/staff/claims/{}", claim.id))>"Open claim"</a>
+                                        if acts && !holds_test_tins && user.test_account {
+                                            act(id: "act-test".to_owned(), label: "Remove", small: true, question: format!("Remove the test label from {email}?"), detail: "Staff no longer see it as a test account.".to_owned(),
+                                                <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test"))>
+                                                    <input type="hidden" name="test" value="off">
+                                                    reason_field()
+                                                    act_buttons(label: "Remove the test label")
+                                                </form>
+                                            )
+                                        } else if acts && !holds_test_tins {
+                                            act(id: "act-test".to_owned(), label: "Mark as test", small: true, question: format!("Mark {email} as a test account?"), detail: "A label for staff only. Sends work as usual.".to_owned(),
+                                                <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test"))>
+                                                    <input type="hidden" name="test" value="on">
+                                                    reason_field()
+                                                    act_buttons(label: "Mark as test account")
+                                                </form>
+                                            )
+                                        } else {
+                                            <span></span>
+                                        }
+                                    </div>
+                                    <div class="sx-fact">
+                                        <span class="k">"Status"</span>
+                                        <span class="v">
+                                            if let Some(at) = user.banned_at {
+                                                sx_pill(label: "Banned", sym: "ban", tone: "bad")
+                                                <span class="sx-text">
+                                                    " Banned by " (user.banned_by_email.clone().unwrap_or_default()) " on " (date(at)) ": "
+                                                    (user.ban_reason.clone().unwrap_or_default())
+                                                </span>
+                                            } else {
+                                                "Can sign in"
+                                                if acts && is_admin {
+                                                    <span class="sx-text">" An admin can't be banned. Change the role first."</span>
+                                                }
+                                            }
+                                        </span>
+                                        if acts && user.banned_at.is_some() {
+                                            reason_act(
+                                                id: "act-unban".to_owned(),
+                                                label: "Lift the ban",
+                                                small: true,
+                                                action: format!("/staff/users/{account_id}/unban"),
+                                                question: format!("Lift the ban on {email}?"),
+                                                detail: "They can sign in and send again.",
+                                                confirm: "Lift ban",
+                                                danger: false
+                                            )
+                                        } else if acts && !is_admin {
+                                            reason_act(
+                                                id: "act-ban".to_owned(),
+                                                label: "Ban",
+                                                sym: "ban",
+                                                tone: "dan",
+                                                small: true,
+                                                action: format!("/staff/users/{account_id}/ban"),
+                                                question: format!("Ban {email}?"),
+                                                detail: "They can't sign in or send returns until you lift the ban. Their TINs stay on the account.",
+                                                confirm: "Ban"
+                                            )
+                                        } else {
+                                            <span></span>
+                                        }
+                                    </div>
+                                    <div class="sx-fact">
+                                        <span class="k">"Joined"</span>
+                                        <span class="v">(date(user.created_at))</span>
+                                        <span></span>
+                                    </div>
+                                    <div class="sx-fact">
+                                        <span class="k">"Last active"</span>
+                                        <span class="v">(ago(user.last_active))</span>
+                                        <span></span>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+                        <section class="sx-card sx-tabbody" role="tabpanel" id="tab-tins" aria-labelledby="tab-tins-tab" hidden=(hidden[1])>
+                            <div class="sx-stack">
+                                <div class="sx-subh">
+                                    <span class="sx-faint">(format!("{} TIN{}", claims.len(), if claims.len() == 1 { "" } else { "s" }))</span>
+                                    if admin_viewer && user.test_account && user.banned_at.is_none() {
+                                        test_tin_form(account_id: account_id)
+                                    }
+                                </div>
+                                if claims.is_empty() {
+                                    <p class="sx-empty">"No TIN added."</p>
+                                } else {
+                                    <div>
+                                        for claim in claims.clone() {
+                                            <div class="sx-tinrow" data-status=(claim.shown_status().to_owned())>
+                                                kind_icon(kind: claim.kind.clone())
+                                                <span class="x">
+                                                    <span>
+                                                        <span class="sx-mono">(claim.tin().to_string())</span>
+                                                        if claim.tin().is_test() {
+                                                            sx_pill(label: "Test TIN", sym: "flask", tone: "testtin")
+                                                        }
+                                                    </span>
+                                                    <span class="nm">(claim.registered_name.clone())</span>
+                                                </span>
+                                                if claim.status == "pending" {
+                                                    sx_pill(label: format!("Waiting {}", span_since(claim.waiting_since())), sym: "clock", tone: "warn")
+                                                } else {
+                                                    status_pill(status: claim.shown_status().to_owned())
+                                                }
+                                                <a class="sx-btn sm" href=(format!("/staff/claims/{}", claim.id))>"Open claim"</a>
+                                            </div>
+                                        }
                                     </div>
                                 }
-                                if admin_viewer && user.test_account && user.banned_at.is_none() {
-                                    test_tin_form(account_id: account_id)
-                                }
-                            </section>
-                        </div>
-                        <aside class="user-side">
-                            <section class="panel side-card staff-actions">
-                                <h2>"Staff actions"</h2>
-                                if may_sign_out {
-                                    confirm_form(
-                                        label: "Sign out everywhere",
-                                        action: format!("/staff/users/{account_id}/sign-out"),
-                                        question: "Sign out everywhere?".to_owned(),
-                                        detail: "This account is signed out of every browser, the desktop app and every AI agent. They can sign in again.".to_owned(),
-                                        confirm: "Sign out everywhere",
-                                        reason: true
-                                    )
-                                }
-                                if !admin_viewer {
-                                    <p class="side-text">"Only an admin can change roles, bans and test labels."</p>
-                                } else if own_page {
-                                    <p class="side-text">"This is your own account: another admin changes its role, ban or test label."</p>
-                                } else if from_server {
-                                    <p class="side-text">"Admin through the server setting ADMIN_EMAILS. Change it there."</p>
-                                } else {
-                                    if holds_test_tins {
-                                        <p class="side-text">"It holds test TINs: revoke them before you remove the test label."</p>
-                                    } else if user.test_account {
-                                        <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Remove the test label from {}?", user.email)) data-confirm-detail="Staff no longer see it as a test account." data-confirm-label="Remove">
-                                            <input type="hidden" name="test" value="off">
-                                            reason_field()
-                                            <button class="btn btn-ghost" type="submit">"Remove the test label"</button>
-                                        </form>
+                                <section class="sx-sub">
+                                    <div class="sx-subh">
+                                        <h3>"Identity documents"</h3>
+                                        <span class="sx-fine">"Files are deleted once the claim is decided"</span>
+                                    </div>
+                                    if cards.is_empty() {
+                                        <p class="sx-empty">"No documents sent."</p>
                                     } else {
-                                        <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/test")) data-confirm=(format!("Mark {} as a test account?", user.email)) data-confirm-detail="A label for staff only. Sends work as usual." data-confirm-label="Mark">
-                                            <input type="hidden" name="test" value="on">
-                                            reason_field()
-                                            <button class="btn btn-ghost" type="submit">"Mark as test account"</button>
-                                        </form>
+                                        <div class="sx-docs">
+                                            for (document, tin, status) in cards {
+                                                document_card(document: document, tin: tin, status: status)
+                                            }
+                                        </div>
                                     }
-                                    if let Some(at) = user.banned_at {
-                                        <p class="side-text">
-                                            "Banned by " (user.banned_by_email.clone().unwrap_or_default()) " on " (date(at)) ": "
-                                            (user.ban_reason.clone().unwrap_or_default())
-                                        </p>
-                                        confirm_form(
-                                            label: "Lift the ban",
-                                            action: format!("/staff/users/{account_id}/unban"),
-                                            question: format!("Lift the ban on {}?", user.email),
-                                            detail: "They can sign in and send again.".to_owned(),
-                                            confirm: "Lift ban",
-                                            reason: true
-                                        )
-                                    } else if is_admin {
-                                        <p class="side-text">"An admin can't be banned. Change the role first."</p>
-                                    } else {
-                                        confirm_form(
-                                            label: "Ban this account",
-                                            action: format!("/staff/users/{account_id}/ban"),
-                                            question: format!("Ban {}?", user.email),
-                                            detail: "They can't sign in or send returns until you lift the ban. Their TINs stay on the account.".to_owned(),
-                                            confirm: "Ban",
-                                            reason: true
-                                        )
-                                    }
-                                    <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/role")) data-confirm=(format!("Change {}'s role?", user.email)) data-confirm-detail="It takes effect on their next page." data-confirm-label="Change role">
-                                        <label class="decision-label">
-                                            "Role"
-                                            <select name="role">
-                                                for (value, label, chosen) in role_choices {
-                                                    <option value=(value) selected=(chosen)>(label)</option>
-                                                }
-                                            </select>
-                                        </label>
-                                        <label class="decision-label">
-                                            "Reason"
-                                            <textarea name="reason" rows="2" maxlength="500" required=(true) placeholder="Kept in the account's history."></textarea>
-                                        </label>
-                                        <button class="btn btn-ghost" type="submit">"Change role"</button>
-                                    </form>
-                                }
-                            </section>
-                            <section class="panel side-card">
-                                <h2>"Connected apps"</h2>
-                                if signed_in.is_empty() && live_sessions == 0 {
-                                    <p class="side-text">"Not signed in anywhere."</p>
-                                }
+                                </section>
+                            </div>
+                        </section>
+                        <section class="sx-card sx-tabbody" role="tabpanel" id="tab-sign" aria-labelledby="tab-sign-tab" hidden=(hidden[2])>
+                            if signed_in.is_empty() && live_sessions == 0 {
+                                <p class="sx-empty">"Not signed in anywhere."</p>
+                            }
+                            <div>
                                 if live_sessions > 0 {
-                                    <div class="app">
-                                        <span class="app-icon">icon(name: "language")</span>
-                                        <span class="app-text">
+                                    <div class="sx-app-row">
+                                        <span class="sx-app-ic">(ic("globe"))</span>
+                                        <span class="x">
                                             <b>"Website"</b>
                                             <span>(if live_sessions == 1 { "1 browser signed in".to_owned() } else { format!("{live_sessions} browsers signed in") })</span>
                                         </span>
@@ -1291,24 +1897,54 @@ pub mod account_id {
                                 for app in signed_in {
                                     connected_app(account_id: account_id, app: app, may_sign_out: may_sign_out)
                                 }
-                            </section>
-                            <section class="panel side-card">
-                                <h2>"History"</h2>
-                                <ol class="history">
-                                    for (at, icon_name, what) in history {
-                                        <li>
-                                            <span class="history-icon">icon(name: icon_name)</span>
-                                            <span class="history-text"><b>(what)</b><span>(date_time(at))</span></span>
-                                        </li>
-                                    }
-                                </ol>
-                            </section>
-                        </aside>
+                            </div>
+                        </section>
+                        <section class="sx-card sx-tabbody" role="tabpanel" id="tab-history" aria-labelledby="tab-history-tab" hidden=(hidden[3])>
+                            <ol class="sx-hist">
+                                for (at, icon_name, what) in history {
+                                    <li>
+                                        <span class="sx-feed-ic">(ic(glyph(icon_name)))</span>
+                                        <span class="x"><b>(what)</b><span class="t">(date_time(at))</span></span>
+                                    </li>
+                                }
+                            </ol>
+                        </section>
                     </div>
                 </div>
             </main>
-        })
+        }
+        .boxed())
     }
+}
+
+/// An Admin adds a made-up TIN to a test account: active at once, it never
+/// sends.
+#[component]
+async fn test_tin_form(account_id: Uuid) -> Result<impl View> {
+    Ok(view! {
+        act(id: "act-testtin".to_owned(), label: "Add a test TIN", sym: "plus", small: true, question: "Add a test TIN",
+            detail: "A made-up TIN, 000-000-000 at any branch, active at once for trying the apps. Buwiz never sends its returns to the BIR.".to_owned(),
+            <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test-tin"))>
+                <label class="sx-field">
+                    <span>"TIN"</span>
+                    <input class="sx-mono" type="text" name="tin" required=(true) value="000-000-000-00000" inputmode="numeric">
+                </label>
+                <label class="sx-field">
+                    <span>"Registered name"</span>
+                    <input type="text" name="registered_name" required=(true) maxlength="200">
+                </label>
+                <label class="sx-field">
+                    <span>"Kind"</span>
+                    <select name="kind">
+                        <option value="personal" selected=(true)>"Personal"</option>
+                        <option value="business">"Business"</option>
+                    </select>
+                </label>
+                reason_field()
+                act_buttons(label: "Add the test TIN")
+            </form>
+        )
+    })
 }
 
 /// One file in a user's identity documents, linking to its claim's review.
@@ -1316,25 +1952,23 @@ pub mod account_id {
 async fn document_card(document: DocumentRow, tin: String, status: String) -> Result<impl View> {
     let pending = status == "pending";
     Ok(view! {
-        <a class=(if pending { "doc-card hot" } else { "doc-card" }) href=(format!("/staff/claims/{}", document.claim_id))>
-            <span class="doc-thumb">
+        <a class=(if pending { "sx-doc hot" } else { "sx-doc" }) href=(format!("/staff/claims/{}", document.claim_id))>
+            <span class="sx-doc-thumb">
                 if document.is_viewable_image() {
                     <img src=(format!("/staff/documents/{}", document.id)) alt="" loading="lazy">
                 } else if document.purged_at.is_some() {
-                    icon(name: "delete")
+                    (ic("trash"))
                 } else {
-                    icon(name: DocumentKind::icon(&document.kind))
+                    (ic(glyph(DocumentKind::icon(&document.kind))))
                 }
             </span>
-            <span class="doc-title">
-                <b>(DocumentKind::label(&document.kind))</b>
-                if pending {
-                    <span class="doc-hot">"Review now"</span>
-                } else if document.purged_at.is_some() {
-                    <span class="doc-gone">"Deleted"</span>
-                }
-            </span>
-            <span class="doc-sub">"Sent " (short_date(document.created_at)) " · for " (tin)</span>
+            <b>(DocumentKind::label(&document.kind))</b>
+            if pending {
+                sx_pill(label: "Review now", sym: "clock", tone: "warn")
+            } else if document.purged_at.is_some() {
+                <span class="sx-faint">"Deleted"</span>
+            }
+            <span class="sx-faint">"Sent " (short_date(document.created_at)) " · for " (tin)</span>
         </a>
     })
 }
@@ -1350,27 +1984,32 @@ async fn connected_app(account_id: Uuid, app: AppRow, may_sign_out: bool) -> Res
         format!("Signed in {} · sees TIN ids, never files", short_date(app.created_at))
     };
     let action = format!("/staff/users/{account_id}/apps/{}/sign-out", app.id);
+    let label = if app.is_agent() { "Remove" } else { "Sign out" };
     Ok(view! {
-        <div class="app">
+        <div class="sx-app-row">
             if app.is_agent() {
-                <span class="app-icon agent">(name.chars().next().map(|first| first.to_uppercase().to_string()).unwrap_or_default())</span>
+                <span class="sx-app-ic">(name.chars().next().map(|first| first.to_uppercase().to_string()).unwrap_or_default())</span>
             } else {
-                <span class="app-icon">icon(name: "desktop_windows")</span>
+                <span class="sx-app-ic">(ic("monitor"))</span>
             }
-            <span class="app-text">
+            <span class="x">
                 <b>(name.clone())</b>
                 <span>(detail)</span>
             </span>
             if may_sign_out {
-                <form method="post" action=(action) data-confirm=(format!("Sign {name} out?")) data-confirm-detail="It loses access to this account until the person connects it again." data-confirm-label=(if app.is_agent() { "Remove" } else { "Sign out" }) data-confirm-tone="danger">
-                    reason_field()
-                    <button class="btn btn-ghost btn-small" type="submit">(if app.is_agent() { "Remove" } else { "Sign out" })</button>
-                </form>
+                reason_act(
+                    id: format!("act-app-{}", app.id),
+                    label: label,
+                    small: true,
+                    action: action,
+                    question: format!("Sign {name} out?"),
+                    detail: "It loses access to this account until the person connects it again.",
+                    confirm: label
+                )
             }
         </div>
     })
 }
-
 /// The account's story from the timestamps already kept: when it was
 /// made, its sign-ins, its claims and what happened to them, and the audit
 /// lines (deleted claims included). Newest first.
@@ -1572,15 +2211,4 @@ fn account_audit_text(line: &AccountAuditRow) -> String {
         Some(reason) => format!("{who} {what}: {reason}"),
         None => format!("{who} {what}"),
     }
-}
-
-/// The required reason of a staff form, kept in the account's history.
-#[component]
-async fn reason_field() -> Result<impl View> {
-    Ok(view! {
-        <label class="decision-label">
-            "Reason"
-            <textarea name="reason" rows="2" maxlength="500" required=(true) placeholder="Kept in the account's history."></textarea>
-        </label>
-    })
 }

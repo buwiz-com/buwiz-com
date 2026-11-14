@@ -295,15 +295,27 @@ async fn screenshot(Path(name): Path<String>) -> Response {
     response
 }
 
+/// What the staff pages may load: only this site's own files (staff.css,
+/// staff.js, the icons, the fonts, the brand marks, claim documents), no
+/// inline script or style, and nothing from another host. Not sent with the
+/// 404 that everyone else gets there, which is the site's own page.
+const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
+     font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
 /// Hands a request to the Topcoat router and converts its response back.
 async fn render_page(pages: &topcoat::router::Router, request: axum::extract::Request) -> Response {
     let (parts, body) = request.into_parts();
+    let staff = parts.uri.path() == "/staff" || parts.uri.path().starts_with("/staff/");
     let request = http::Request::from_parts(parts, topcoat::router::Body::new(body));
     let mut response = pages.handle(request).await.map(axum::body::Body::new);
     let headers = response.headers_mut();
     headers.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    if staff && response.status().is_success() {
+        let headers = response.headers_mut();
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STAFF_CSP));
+    }
     response
 }
 

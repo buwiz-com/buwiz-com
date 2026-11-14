@@ -180,7 +180,7 @@ async fn a_clear_tin_id_activates_by_itself_and_waits_for_a_staff_check(db: PgPo
 
     // Staff see it in its tab, with its count, and the card to confirm it.
     let tab = auto_tab(&site, &support_cookie).await;
-    assert!(tab.contains(&format!("/staff/claims/{claim}")), "{tab}");
+    assert!(tab.contains(&format!("<tr data-id=\"{claim}\"")), "{tab}");
     assert!(tab.contains("Activated automatically · check"), "{tab}");
     let page = text(site.get(&format!("/staff/claims/{claim}"), &support_cookie).await).await;
     assert!(page.contains("TIN and name matched the TIN ID read on our server (97% and 97% sure)"), "{page}");
@@ -199,7 +199,7 @@ async fn a_clear_tin_id_activates_by_itself_and_waits_for_a_staff_check(db: PgPo
     assert_eq!(confirmed_by, Some(support));
     let last = claim_audit_lines(&site.db, ana).await.pop().unwrap();
     assert_eq!((last.0.as_str(), last.2.as_str(), last.3.as_str()), ("auto_confirmed", "helper@example.test", "web"));
-    assert!(!auto_tab(&site, &support_cookie).await.contains(&format!("/staff/claims/{claim}")));
+    assert!(!auto_tab(&site, &support_cookie).await.contains(&format!("<tr data-id=\"{claim}\"")));
     // Once is enough.
     let again = site.post(&format!("/staff/claims/{claim}/confirm"), &support_cookie, "").await;
     assert_eq!(location(&again), format!("/staff/claims/{claim}?notice=not_auto"));
@@ -399,7 +399,7 @@ async fn an_activation_removed_or_revoked_stays_listed_with_its_papers(db: PgPoo
     assert_eq!(location(&removed), "/tins?notice=tin_removed");
     assert_eq!(row(&site.db, claim).await.0, "removed");
     assert_eq!(papers(&site.db, claim).await, (1, 1));
-    assert!(auto_tab(&site, &admin).await.contains(&format!("/staff/claims/{claim}")));
+    assert!(auto_tab(&site, &admin).await.contains(&format!("<tr data-id=\"{claim}\"")));
 
     // Adding it again never activates by itself.
     let (_, _, again, document) = sent(&site, "ana@example.test", "000123491").await;
@@ -415,7 +415,7 @@ async fn an_activation_removed_or_revoked_stays_listed_with_its_papers(db: PgPoo
     let revoked = site.post(&format!("/staff/claims/{claim}/revoke"), &admin, "reason=Not+the+owner").await;
     assert_eq!(location(&revoked), format!("/staff/claims/{claim}?notice=ownership_revoked"));
     assert_eq!(papers(&site.db, claim).await, (1, 1));
-    assert!(auto_tab(&site, &admin).await.contains(&format!("/staff/claims/{claim}")));
+    assert!(auto_tab(&site, &admin).await.contains(&format!("<tr data-id=\"{claim}\"")));
     // An Admin confirms it after looking: then the papers go.
     let response = site.post(&format!("/staff/claims/{claim}/confirm"), &admin, "").await;
     assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=auto_confirmed"));

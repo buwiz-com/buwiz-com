@@ -222,6 +222,10 @@ impl Uptime {
 /// How often the day history is rewritten.
 pub const ROLL_UP_EVERY: Duration = Duration::minutes(10);
 
+/// How long one round of staff mail may take in the ticker (each request
+/// is bounded too, [`crate::account::mail`]); one cut short is sent again.
+pub const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How long [`start`] may take for the day history.
 const START_ROLL_UP: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -261,8 +265,11 @@ pub async fn run_ticker(state: AppState) {
         if let Err(error) = live::tick(&uptime, &state.db, now).await {
             tracing::error!(%error, "BIR uptime: the rules could not run");
         }
-        if let Err(error) = alerts::flush(&uptime, &state.db, &state.mailer, &state.config, now).await {
-            tracing::error!(%error, "BIR uptime: staff mail could not be sent");
+        let flush = alerts::flush(&uptime, &state.db, &state.mailer, &state.config, now);
+        match tokio::time::timeout(FLUSH_TIMEOUT, flush).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(%error, "BIR uptime: staff mail could not be sent"),
+            Err(_) => tracing::error!("BIR uptime: staff mail took too long; it is sent again"),
         }
         let day = keys::manila_day(now);
         if rolled.is_none_or(|(at, rolled_day)| now - at >= ROLL_UP_EVERY || rolled_day != day) {

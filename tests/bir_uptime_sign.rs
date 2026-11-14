@@ -10,7 +10,7 @@ mod common;
 use buwiz_cloud::account::accounts::Account;
 use buwiz_cloud::account::mail::Mailer;
 use buwiz_cloud::account::roles::{self, Role, Staff};
-use buwiz_cloud::uptime::alerts::{self, Alert, PER_DAY};
+use buwiz_cloud::uptime::alerts::{self, Alert, Budget};
 use buwiz_cloud::uptime::days;
 use buwiz_cloud::uptime::keys::{Network, manila_day};
 use buwiz_cloud::uptime::live;
@@ -395,6 +395,13 @@ async fn faults_that_touch_the_bir_are_told_and_nothing_pauses(db: PgPool) {
     assert!(!sign.relay.paused, "nothing pauses in this release");
     assert_eq!(sign.state, Light::NoRecentNews, "a fault of Buwiz's is no evidence about the BIR");
     assert!(events(&db).await.iter().all(|(scope, ..)| scope != "relay"));
+    // Staff hear of it, once.
+    let mailer = Mailer::recording("http://localhost:3008");
+    let mail = alerts::flush(&uptime, &db, &mailer, &site.state.config, t(3)).await.unwrap().unwrap();
+    assert!(mail.text.contains("The relay would pause: 3 tries from 2 accounts on 2 networks"), "{}", mail.text);
+    record(&uptime, &db, 3, 3, Ends::HostKey, t(14)).await;
+    let mail = alerts::flush(&uptime, &db, &mailer, &site.state.config, t(14)).await.unwrap();
+    assert!(mail.is_none_or(|mail| !mail.text.contains("would pause")), "at most once a day");
     // A later release never starts up paused from what this one wrote.
     let stored: serde_json::Value = sqlx::query_scalar("SELECT state FROM bir_sign").fetch_one(&db).await.unwrap();
     assert_eq!(stored["relay"]["paused"], false);
@@ -925,26 +932,96 @@ async fn staff_mail_is_batched_every_ten_minutes(db: PgPool) {
     assert_eq!(mailer.notices().len(), 6);
 }
 
+/// (mailed, not mailed) changes in the event log.
+async fn mailed(db: &PgPool) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE mailed_at IS NOT NULL), count(*) FILTER (WHERE mailed_at IS NULL)
+           FROM bir_events WHERE scope = 'overall' AND from_state <> 'none'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
 #[sqlx::test]
-async fn at_most_24_mails_a_day(db: PgPool) {
+async fn each_kind_of_staff_mail_has_its_own_budget(db: PgPool) {
     let (site, mailer) = mail_site(&db).await;
+    let config = &site.state.config;
     let uptime = uptime(t(0));
-    let mut sent = 0;
-    for step in 0..40 {
+    let mut other = 0;
+    for step in 0..12 {
         let at = t(step * 10);
         uptime.alerts.push(Alert::missing_header(at));
-        if let Some(mail) = alerts::flush(&uptime, &db, &mailer, &site.state.config, at).await.unwrap() {
-            sent += 1;
-            if sent == PER_DAY {
-                assert!(mail.text.contains("This is the 24th mail today."));
-            }
+        uptime.alerts.push(Alert::host_key(&format!("SHA256:madeupmadeupmadeupmadeupmadeupmadeupmadeu{step:x}"), at));
+        if let Some(mail) = alerts::flush(&uptime, &db, &mailer, config, at).await.unwrap() {
+            other += mail.text.matches("without CF-Connecting-IP").count();
         }
     }
-    assert_eq!(sent, PER_DAY);
-    // A new Manila day starts the count again (midnight is 16:00 UTC).
-    let tomorrow = OffsetDateTime::parse("2026-11-11T16:05:00Z", &Rfc3339).unwrap();
-    uptime.alerts.push(Alert::missing_header(tomorrow));
-    assert!(alerts::flush(&uptime, &db, &mailer, &site.state.config, tomorrow).await.unwrap().is_some());
+    assert_eq!(other as u32, Budget::Other.per_day());
+    let keys: usize = mailer
+        .notices()
+        .iter()
+        .filter(|notice| notice.to == STAFF)
+        .map(|notice| notice.text.matches("SHA256:").count())
+        .sum();
+    assert_eq!(keys as u32, Budget::HostKey.per_day(), "across every fingerprint");
+    // Their budgets are spent; a change of the sign is still mailed.
+    for account in 1..=3 {
+        record(&uptime, &db, account, account as u8, Ends::Landed, t(125)).await;
+    }
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(130)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: online");
+    assert_eq!(mailed(&db).await, (1, 0));
+}
+
+#[sqlx::test]
+async fn a_mail_that_went_nowhere_is_tried_again_and_spends_nothing(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let config = &site.state.config;
+    let uptime = uptime(t(0));
+    an_outage(&uptime, &db).await;
+    mailer.fail_notices(true);
+    assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap(), None);
+    assert_eq!(mailed(&db).await, (0, 3), "not marked mailed");
+    // A minute later, the mailer back: the same alerts go, and only now are
+    // they marked.
+    mailer.fail_notices(false);
+    assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(12) + Duration::seconds(30)).await.unwrap(), None);
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(13)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: online (and 2 more)");
+    assert_eq!(mailed(&db).await, (3, 0));
+    assert_eq!(mailer.notices().len(), 3, "one mail to each of the three");
+}
+
+#[sqlx::test]
+async fn a_window_change_is_mailed_under_a_declare_online_note(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let config = &site.state.config;
+    let uptime = uptime(t(0));
+    let admin = admin(&site).await;
+    for account in 1..=3 {
+        record(&uptime, &db, account, account as u8, Ends::Landed, t(0)).await;
+    }
+    notes::declare_online(&uptime, &db, config, &admin, "Made-up: the BIR says it is fine", t(120), t(1))
+        .await
+        .unwrap();
+    alerts::flush(&uptime, &db, &mailer, config, t(1)).await.unwrap().unwrap();
+    // The mailbox goes Offline; the sign stays Online.
+    for (offset, account) in (11..=13).enumerate() {
+        record(&uptime, &db, account, account as u8, Ends::MailboxRefused, t(10 + offset as i64)).await;
+    }
+    assert_eq!((uptime.live.sign().state, uptime.live.sign().upload.state), (Light::Online, Light::Offline));
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: mailbox offline");
+    assert!(
+        mail.text.contains("The mailbox is offline: 3 accounts on 3 networks didn't get past the mailbox within 15 min. The sign shows Online, as an Admin declared."),
+        "{}",
+        mail.text
+    );
+    // And back.
+    record(&uptime, &db, 4, 4, Ends::Landed, t(30)).await;
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(30)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: mailbox back");
 }
 
 #[sqlx::test]
@@ -980,7 +1057,9 @@ async fn nothing_is_mailed_or_judged_at_off(db: PgPool) {
     assert!(mailer.notices().is_empty());
     // The ticker does nothing either: it returns at once.
     let off = Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up secret", uptime);
-    buwiz_cloud::uptime::run_ticker(off.state.clone()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), buwiz_cloud::uptime::run_ticker(off.state.clone()))
+        .await
+        .expect("the ticker returns at once at off");
     let events: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
     assert_eq!(events, 0);
 }

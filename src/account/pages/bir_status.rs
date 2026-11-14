@@ -521,7 +521,7 @@ pub(super) async fn bir_banner(cx: &Cx) -> Result<impl View> {
             <p class=(format!("bir-banner {}", banner.tone.class())) role="status">
                 icon(name: banner.tone.icon())
                 <span>
-                    <strong>(banner.title.clone())</strong> " " (banner.line.clone())
+                    <strong>(format!("{}.", banner.title))</strong> " " (banner.line.clone())
                     if let Some(note) = banner.note.clone() {
                         " " <q>(note)</q>
                     }

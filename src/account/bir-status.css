@@ -13,7 +13,7 @@
   --bir-x-bg: #fbeaea; --bir-x-ink: #a32020; --bir-x-fill: #c63b30;
   --bir-m-bg: #efe8f8; --bir-m-ink: #5b2c91; --bir-m-fill: #7d4fc0;
   --bir-n-bg: #f1efe9; --bir-n-ink: #5d6166; --bir-n-fill: #aeaba3;
-  --bir-w-bg: #f4f3ef; --bir-w-ink: #5d6166; --bir-w-line: #d6d3ca;
+  --bir-w-bg: #f4f3ef; --bir-w-ink: #5d6166; --bir-w-line: #e0ddd4;
   --bir-none-ink: #5d6166; --bir-none-line: #cfccc3;
 }
 @media (prefers-color-scheme: dark) {
@@ -186,7 +186,7 @@
 .bir-swatch { display: inline-grid; place-items: center; }
 
 /* The calendar: months of weeks from Sunday, a link per day */
-.bir-months { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 18px 22px; }
+.bir-months { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 18px 28px; }
 .bir-month { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .bir-week, .bir-cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
 .bir-week span { text-align: center; color: var(--muted); font-size: 12px; font-weight: 700; }
@@ -197,8 +197,8 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  gap: 2px;
-  min-height: 46px;
+  gap: 3px;
+  min-height: 50px;
   padding: 4px 5px 5px;
   border: 1px solid color-mix(in srgb, var(--ink) 22%, transparent);
   border-radius: 8px;
@@ -213,11 +213,11 @@
 .bir-date.sel { border-color: var(--text); box-shadow: 0 0 0 2px var(--text); }
 .bir-date.today .bir-date-n { text-decoration: underline; text-underline-offset: 2px; }
 .bir-date-n { font-size: 13px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
-.bir-date-s { position: absolute; top: 3px; right: 3px; line-height: 1; }
+.bir-date-s { line-height: 1; }
 .bir-date-s .icon { font-size: 15px; }
 .bir-mini { display: none; grid-template-columns: repeat(24, minmax(0, 1fr)); height: 4px; border-radius: 2px; overflow: hidden; }
 @media (min-width: 640px) {
-  .bir-date { min-height: 52px; padding: 5px 6px 6px; }
+  .bir-date { min-height: 58px; padding: 5px 6px 6px; }
   .bir-mini { display: grid; }
 }
 

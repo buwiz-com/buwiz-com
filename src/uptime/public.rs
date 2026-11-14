@@ -324,19 +324,12 @@ pub fn banner(sign: &SignState) -> Option<Banner> {
     let words = words(sign, Times::Public);
     let note = sign.note.as_ref().filter(|note| note.kind.holds()).map(|note| note.text.clone());
     let (tone, what) = match (sign.state, sign.note.as_ref().map(|note| note.kind)) {
-        (_, Some(NoteKind::Maintenance)) => (
-            Tone::Maintenance,
-            "Returns sent before it ends won't get in. Queued returns wait; check your app's send queue before the due date.",
-        ),
+        (_, Some(NoteKind::Maintenance)) => {
+            (Tone::Maintenance, "Queued returns wait; check your app's send queue before the due date.")
+        }
         (_, Some(NoteKind::Online)) => return None,
-        (Light::Offline, _) => (
-            Tone::Offline,
-            "Returns sent now won't get in. Queued returns wait; check your app's send queue before the due date.",
-        ),
-        (Light::Busy, _) => (
-            Tone::Busy,
-            "Queued returns keep trying, but some take longer to get in. Leave a little time before the due date.",
-        ),
+        (Light::Offline, _) => (Tone::Offline, "Queued returns wait; check your app's send queue before the due date."),
+        (Light::Busy, _) => (Tone::Busy, "Queued returns keep trying; leave a little time before the due date."),
         (Light::Online | Light::NoRecentNews, _) => return None,
     };
     Some(Banner { tone, title: words.title, line: format!("{} {what}", words.line), note })

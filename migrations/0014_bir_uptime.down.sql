@@ -11,7 +11,8 @@
 -- grow), move, whole, to the `rollback_archive` schema, which the release
 -- before this one does not read. Migrating up again brings them back.
 -- Rolling back twice adds to the archive; the way up takes the newest copy
--- of each row.
+-- of each row. Every column is named, so an archive table made by an
+-- earlier rollback reads the same whatever order its columns are in.
 --
 -- What it loses: the tries of the last 90 days (`bir_tries`), queue
 -- reports and turns (at most a day old), held requests, the recorded
@@ -19,16 +20,44 @@
 -- and when each device first reported its queue.
 
 CREATE SCHEMA IF NOT EXISTS rollback_archive;
-CREATE TABLE IF NOT EXISTS rollback_archive.bir_days AS SELECT now() AS archived_at, * FROM bir_days WITH NO DATA;
-INSERT INTO rollback_archive.bir_days SELECT now(), * FROM bir_days;
-CREATE TABLE IF NOT EXISTS rollback_archive.bir_events AS SELECT now() AS archived_at, * FROM bir_events WITH NO DATA;
-INSERT INTO rollback_archive.bir_events SELECT now(), * FROM bir_events;
-CREATE TABLE IF NOT EXISTS rollback_archive.bir_notes AS SELECT now() AS archived_at, * FROM bir_notes WITH NO DATA;
-INSERT INTO rollback_archive.bir_notes SELECT now(), * FROM bir_notes;
-CREATE TABLE IF NOT EXISTS rollback_archive.bir_proofs AS SELECT now() AS archived_at, * FROM bir_proofs WITH NO DATA;
-INSERT INTO rollback_archive.bir_proofs SELECT now(), * FROM bir_proofs;
-CREATE TABLE IF NOT EXISTS rollback_archive.bir_sign AS SELECT now() AS archived_at, * FROM bir_sign WITH NO DATA;
-INSERT INTO rollback_archive.bir_sign SELECT now(), * FROM bir_sign;
+CREATE TABLE IF NOT EXISTS rollback_archive.bir_days AS
+    SELECT now() AS archived_at, day, tries, got_in, failed, maybe, ours, user_network, held, accounts,
+        networks, online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes,
+        unwatched_minutes, worst, hours, outages, windows, final
+      FROM bir_days WITH NO DATA;
+INSERT INTO rollback_archive.bir_days (archived_at, day, tries, got_in, failed, maybe, ours, user_network,
+    held, accounts, networks, online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes,
+    unwatched_minutes, worst, hours, outages, windows, final)
+    SELECT now(), day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
+        online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, unwatched_minutes, worst,
+        hours, outages, windows, final FROM bir_days;
+CREATE TABLE IF NOT EXISTS rollback_archive.bir_events AS
+    SELECT now() AS archived_at, id, at, scope, from_state, to_state, cause, reason, actor_id,
+        actor_email, mailed_at, sign_seq, ord
+      FROM bir_events WITH NO DATA;
+INSERT INTO rollback_archive.bir_events (archived_at, id, at, scope, from_state, to_state, cause, reason,
+    actor_id, actor_email, mailed_at, sign_seq, ord)
+    SELECT now(), id, at, scope, from_state, to_state, cause, reason, actor_id, actor_email, mailed_at,
+        sign_seq, ord FROM bir_events;
+CREATE TABLE IF NOT EXISTS rollback_archive.bir_notes AS
+    SELECT now() AS archived_at, id, kind, text, starts_at, until, set_by, set_by_email, cleared_at,
+        cleared_by, cleared_by_email, cleared_how, cleared_reason
+      FROM bir_notes WITH NO DATA;
+INSERT INTO rollback_archive.bir_notes (archived_at, id, kind, text, starts_at, until, set_by,
+    set_by_email, cleared_at, cleared_by, cleared_by_email, cleared_how, cleared_reason)
+    SELECT now(), id, kind, text, starts_at, until, set_by, set_by_email, cleared_at, cleared_by,
+        cleared_by_email, cleared_how, cleared_reason FROM bir_notes;
+CREATE TABLE IF NOT EXISTS rollback_archive.bir_proofs AS
+    SELECT now() AS archived_at, id, account_id, claim_id, day, form, period, kid, jws, created_at
+      FROM bir_proofs WITH NO DATA;
+INSERT INTO rollback_archive.bir_proofs (archived_at, id, account_id, claim_id, day, form, period, kid,
+    jws, created_at)
+    SELECT now(), id, account_id, claim_id, day, form, period, kid, jws, created_at FROM bir_proofs;
+CREATE TABLE IF NOT EXISTS rollback_archive.bir_sign AS
+    SELECT now() AS archived_at, id, seq, state, updated_at
+      FROM bir_sign WITH NO DATA;
+INSERT INTO rollback_archive.bir_sign (archived_at, id, seq, state, updated_at)
+    SELECT now(), id, seq, state, updated_at FROM bir_sign;
 
 DROP TABLE bir_proofs;
 DROP TABLE bir_days;

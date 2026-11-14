@@ -1070,14 +1070,26 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
         &db,
         &format!(
             "INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
-                 online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst, hours, final)
-             VALUES ('2026-11-11', 4, 1, 3, 0, 0, 0, 0, 3, 3, 900, 0, 530, 10, 0, 'offline', '{hours}', true);
-             INSERT INTO bir_events (scope, from_state, to_state, cause, reason)
-             VALUES ('upload', 'online', 'offline', 'rule', '3 accounts on 3 networks didn''t get in within 15 min'),
-                    ('overall', 'online', 'offline', 'rule', '3 accounts on 3 networks didn''t get in within 15 min');
+                 online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, unwatched_minutes, worst,
+                 hours, outages, windows, final)
+             VALUES ('2026-11-11', 4, 1, 3, 1, 2, 5, 6, 3, 3, 880, 5, 530, 10, 15, 20, 'offline', '{hours}',
+                 '[{{\"from\": \"2026-11-11T07:10:00Z\", \"to\": \"2026-11-11T16:00:00Z\", \"window\": \"upload\", \"source\": \"tries\"}}]',
+                 '{{\"upload\": {{\"worst\": \"offline\", \"online_minutes\": 880}}}}', true);
+             INSERT INTO bir_events (scope, from_state, to_state, cause, reason, sign_seq, ord, mailed_at)
+             VALUES ('upload', 'online', 'offline', 'rule', '3 accounts on 3 networks didn''t get in within 15 min',
+                     1794381000, 0, NULL),
+                    ('overall', 'online', 'offline', 'rule', '3 accounts on 3 networks didn''t get in within 15 min',
+                     1794381000, 1, '2026-11-11T07:15:00Z');
+             INSERT INTO bir_events (scope, from_state, to_state, cause, reason, actor_id, actor_email, sign_seq, ord)
+             VALUES ('overall', 'offline', 'offline', 'note_cleared', 'An Admin cleared the note: made-up', '{ana}',
+                     'ana@example.test', 1794381300, 0);
              INSERT INTO bir_notes (kind, text, until, set_by, set_by_email)
              VALUES ('outage', 'The upload server is down.', now() + interval '2 hours', '{ana}', 'ana@example.test');
-             INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, '{{}}', now());
+             INSERT INTO bir_notes (kind, text, starts_at, until, set_by, set_by_email, cleared_at, cleared_by,
+                                    cleared_by_email, cleared_how, cleared_reason)
+             VALUES ('maintenance', 'Planned work.', '2026-11-10T01:00:00Z', '2026-11-10T03:00:00Z', '{ana}',
+                     'ana@example.test', '2026-11-10T02:00:00Z', '{ana}', 'ana@example.test', 'staff', 'Made-up: done');
+             INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, '{{\"made_up\": true}}', now());
              INSERT INTO bir_proofs (id, account_id, claim_id, day, form, period, kid, jws)
              VALUES ('p_kept', '{ana}', '{kept_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c'),
                     ('p_gone', '{ana}', '{gone_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c');
@@ -1085,15 +1097,30 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
              VALUES ('SHA256:{fingerprint}', now(), now(), '[]');
              INSERT INTO bir_held (account_id, claim_id, form, period, code)
              VALUES ('{ana}', '{kept_claim}', '1601C', '102026', 'bir_offline')",
-            hours = "o".repeat(15) + &"x".repeat(9),
+            hours = "-".repeat(2) + "obxmn" + &"w".repeat(8) + &"x".repeat(9),
             fingerprint = "A".repeat(43),
         ),
     )
     .await;
     let kept = uptime_kept(&db).await;
-    assert_eq!(kept, (1, 2, 1, 2, Some(41)));
+    assert_eq!(kept, (1, 3, 2, 2, Some(41)));
     let events: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, scope FROM bir_events ORDER BY id").fetch_all(&db).await.unwrap();
+    let whole = whole_rows(&db).await;
+
+    // An archive table an earlier rollback left, its columns in another
+    // order: the down file names every column, so it fills it right.
+    exec(
+        &db,
+        "CREATE SCHEMA rollback_archive;
+         CREATE TABLE rollback_archive.bir_sign (updated_at timestamptz, state jsonb, archived_at timestamptz,
+                                                 seq bigint, id smallint);
+         CREATE TABLE rollback_archive.bir_notes AS
+             SELECT cleared_reason, cleared_how, id, now() AS archived_at, kind, text, starts_at, until, set_by,
+                    set_by_email, cleared_at, cleared_by, cleared_by_email
+               FROM bir_notes WITH NO DATA",
+    )
+    .await;
 
     // Back to 13 the way sqlx reverts: 13's schema exactly, the archive
     // filled.
@@ -1101,7 +1128,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_13, "the schema is migration 13's");
     assert_eq!(archived(&db, "bir_days", "day").await, ["2026-11-11"]);
-    assert_eq!(archived(&db, "bir_events", "scope").await, ["overall", "upload"]);
+    assert_eq!(archived(&db, "bir_events", "scope").await, ["overall", "overall", "upload"]);
     assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_gone", "p_kept"]);
     assert_eq!(archived(&db, "bir_sign", "seq").await, ["41"]);
     release_13().run(&db).await.unwrap();
@@ -1110,10 +1137,14 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     // its proof, and the events' ids go on from where they were.
     exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{gone_claim}'")).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(uptime_kept(&db).await, (1, 2, 1, 1, Some(41)));
+    assert_eq!(uptime_kept(&db).await, (1, 3, 2, 1, Some(41)));
     let back: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, scope FROM bir_events ORDER BY id").fetch_all(&db).await.unwrap();
     assert_eq!(back, events);
+    // Every column of every row, as it was (the gone claim's proof aside).
+    let mut expected = whole.clone();
+    expected.get_mut("bir_proofs").unwrap().retain(|row| !row.contains("p_gone"));
+    assert_eq!(whole_rows(&db).await, expected);
     let next: i64 = sqlx::query_scalar(
         "INSERT INTO bir_events (scope, from_state, to_state, cause, reason)
          VALUES ('overall', 'offline', 'online', 'scout', 'A scout got in') RETURNING id",
@@ -1144,7 +1175,26 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_13);
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(uptime_kept(&db).await, (1, 3, 1, 1, Some(41)));
+    assert_eq!(uptime_kept(&db).await, (1, 4, 2, 1, Some(41)));
+    let again = whole_rows(&db).await;
+    assert_eq!(again["bir_days"], expected["bir_days"]);
+    assert_eq!(again["bir_notes"], expected["bir_notes"]);
+    assert_eq!(again["bir_sign"], expected["bir_sign"]);
+}
+
+/// Every row of the tables migration 14's down file keeps, each whole as
+/// JSON, by table.
+async fn whole_rows(db: &PgPool) -> BTreeMap<String, Vec<String>> {
+    let mut tables = BTreeMap::new();
+    for table in ["bir_days", "bir_events", "bir_notes", "bir_proofs", "bir_sign"] {
+        let rows: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text"))
+                .fetch_all(db)
+                .await
+                .unwrap();
+        tables.insert(table.to_owned(), rows);
+    }
+    tables
 }
 
 /// Migration 14 changes two existing tables, `tickets` and `devices`: a

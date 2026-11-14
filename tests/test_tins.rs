@@ -271,3 +271,27 @@ async fn a_paused_test_tin_still_answers_test_only(db: PgPool) {
     let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;
     assert_eq!((&all[0]["status"], &all[0]["message"]), (&json!("test_only"), &json!(TEST_ONLY)), "{all}");
 }
+
+/// A test TIN proves no identity: an account whose only TIN is one reads
+/// "No ID yet", and the "Verified" filter leaves it out.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_test_tin_alone_is_no_verified_id(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = test_account(&site, "ana@example.test").await;
+    site.post(&format!("/staff/users/{ana}/test-tin"), &staff, FORM).await;
+    let page = text(site.get(&format!("/staff/users/{ana}"), &staff).await).await;
+    assert!(page.contains("No ID yet") && !page.contains("ID verified"), "{page}");
+    let list = text(site.get("/staff/users?q=ana%40", &staff).await).await;
+    assert!(list.contains("ana@example.test") && list.contains("No ID yet"), "{list}");
+    assert!(!list.contains("ID verified"), "{list}");
+    let verified = text(site.get("/staff/users?filter=verified", &staff).await).await;
+    assert!(!verified.contains("ana@example.test"), "{verified}");
+
+    // A real TIN, active, makes it verified as before.
+    add_claim(&site.db, ana, "000123453", "approved").await;
+    let page = text(site.get(&format!("/staff/users/{ana}"), &staff).await).await;
+    assert!(page.contains("ID verified"), "{page}");
+    let verified = text(site.get("/staff/users?filter=verified", &staff).await).await;
+    assert!(verified.contains("ana@example.test"), "{verified}");
+}

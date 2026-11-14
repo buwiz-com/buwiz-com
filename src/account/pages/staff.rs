@@ -887,7 +887,9 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 })
                 .collect();
             let role = user_role(config, &user);
-            let id_status = IdStatus::of(role.is_some(), own.iter().map(|claim| claim.status.as_str()));
+            // A test TIN proves no identity.
+            let real = own.iter().filter(|claim| claim.tin_root != crate::account::tin::TEST_ROOT);
+            let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
             // The list says "Support"; Admins already read "Staff".
             let badge = role_badge(role).filter(|(_, tone)| *tone == "support");
             let (test, banned) = (user.test_account, user.banned_at.is_some());
@@ -1077,7 +1079,9 @@ pub mod account_id {
         let audit = queries::audit(db, account_id).await?;
         let account_audit = queries::account_audit(db, account_id).await?;
         let role = user_role(config, &user);
-        let id_status = IdStatus::of(role.is_some(), claims.iter().map(|claim| claim.status.as_str()));
+        // A test TIN proves no identity.
+        let real = claims.iter().filter(|claim| !claim.tin().is_test());
+        let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
         let (id_label, id_icon, id_tone) = id_status.look();
         let badge = role_badge(role);
         let is_admin = role.is_some_and(|(role, _)| role == Role::Admin);

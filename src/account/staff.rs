@@ -315,7 +315,8 @@ pub async fn users(
                WHEN 'waiting' THEN EXISTS (SELECT 1 FROM tin_claims c
                                            WHERE c.account_id = a.id AND c.status IN ('pending', 'needs_fix'))
                WHEN 'verified' THEN EXISTS (SELECT 1 FROM tin_claims c
-                                            WHERE c.account_id = a.id AND c.status = 'approved')
+                                            WHERE c.account_id = a.id AND c.status = 'approved'
+                                              AND c.tin_root <> '{test_root}')
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
                                               AND c.{LIVE_SQL})
                WHEN 'staff' THEN {staff}
@@ -325,7 +326,8 @@ pub async fn users(
            END
          ORDER BY last_active DESC NULLS LAST, a.created_at DESC
          LIMIT $5",
-        staff = crate::account::roles::is_staff_sql("a", "$4")
+        staff = crate::account::roles::is_staff_sql("a", "$4"),
+        test_root = crate::account::tin::TEST_ROOT
     ))
     .bind(contains(search))
     .bind(tin_digits(search))
@@ -431,7 +433,8 @@ pub enum IdStatus {
 impl IdStatus {
     /// Staff first; then a claim waiting for review or a fix; then any
     /// approved claim. A TIN saved without papers proves no identity, so it
-    /// counts for neither.
+    /// counts for neither; nor does a test TIN, which callers leave out of
+    /// `statuses` (as the "Verified" filter of [`users`] does).
     pub fn of(is_staff: bool, statuses: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         if is_staff {
             return Self::Staff;

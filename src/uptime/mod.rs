@@ -21,10 +21,12 @@
 //! - [`history`]: the public day history and the last 24 hours.
 //! - [`api`]: the read routes and the header on existing responses (from
 //!   `public`).
+//! - [`cli`]: `buwiz-cloud bir`, the manual switch for an Admin.
 
 pub mod alerts;
 pub mod api;
 pub mod classify;
+pub mod cli;
 pub mod days;
 pub mod history;
 pub mod keys;

@@ -598,6 +598,69 @@ claim was deleted meanwhile stays in `rollback_archive.bir_proofs`. Going
 further back runs 14's down file first, then 13's and the others as
 [above](#migration-13-test-tins); each commits on its own.
 
+### Setting the BIR sign by hand (`buwiz-cloud bir`)
+
+Until the staff page exists, an Admin sets the BIR sign by hand with a
+server command ([bir-uptime.md](bir-uptime.md#154-notes-and-resuming-the-relay)):
+
+```text
+usage: buwiz-cloud bir declare online|offline|maintenance --as <admin email> --reason <text>
+           (--until <time> | --hours <n>) [--text <public note>]
+       buwiz-cloud bir clear --as <admin email> --reason <text>
+       buwiz-cloud bir status
+```
+
+- `declare offline` is an outage note: the sign reads Offline until its
+  end, an Admin clears it, or a real return gets in. `declare maintenance`
+  reads Offline until its end or an Admin clears it. `declare online` reads
+  Online whatever the tries say (the windows are still kept, and staff are
+  mailed if one goes Offline under it).
+- `--until` is a Manila time (`2026-11-14T18:00`) or RFC 3339; `--hours` a
+  whole number. More than 72 hours ahead is refused, as is a second note
+  while one is in force (clear it first).
+- `--text` is public: every app and the status page show it. No personal
+  data. Without it the note reads a plain sentence for its kind. `--reason`
+  is for staff: it goes into the audit line (`bir_events`, with the Admin's
+  id and email) and the staff mail.
+- `--as` must be an Admin, by the same check the staff pages use (the
+  stored role or the server's `ADMIN_EMAILS`), with a Buwiz account. Support
+  and everyone else are refused.
+- It runs on the instance with the service's own settings, like the seed
+  tool, runs no migration and refuses a database whose migrations are not
+  this release's. It refuses at `BIR_UPTIME=off`. Before it writes it prints
+  the database, `BIR_UPTIME`, who it acts as, the sign now and what it will
+  do; after, the sign as it stands. `status` writes nothing. Nothing it
+  prints holds a TIN.
+- **The running server picks it up without a restart.** Every run of its
+  rules (every 30 seconds, and after each recorded try) first reads the
+  stored sign's `seq`; the command's change has a higher one, so the server
+  takes its sign and note in, mails staff about it, and shows it on every
+  read within 30 seconds. Every write locks the sign and checks that `seq`
+  again, so the server and the command never write over each other; the
+  command tries again (3 times) if the server wrote in between.
+
+Exit codes: 0 done; 2 refused (with the reason), nothing written; 1 an
+error, nothing written.
+
+In an SSM session, with the service's settings:
+```sh
+sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
+  -E RUST_LOG=off \
+  /opt/buwiz/buwiz-cloud bir declare maintenance --as <admin login> \
+  --reason "BIR advisory: eFPS maintenance tonight" --until 2026-11-14T23:00 \
+  --text "The BIR announced maintenance until 11 PM."
+echo "exit $?"
+```
+and to end it early, or to look:
+```sh
+sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
+  -E RUST_LOG=off /opt/buwiz/buwiz-cloud bir clear --as <admin login> --reason "The BIR is back"
+sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
+  -E RUST_LOG=off /opt/buwiz/buwiz-cloud bir status
+```
+Below `BIR_UPTIME=public` the note is kept and staff see it in the mail,
+but no app or page shows anything.
+
 ## OCR of claim documents
 
 The image is built with `--features ocr`: the TIN ID or 2303 of each claim

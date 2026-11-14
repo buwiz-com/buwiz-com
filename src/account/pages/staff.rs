@@ -170,7 +170,7 @@ fn queue_age(claim: &ClaimRow) -> (String, bool) {
     }
 }
 
-#[page("/staff")]
+#[page("/staff/queue")]
 pub async fn claims_page(cx: &Cx) -> Result<impl View> {
     let reviewer = staff_member(cx, Power::Review).await?;
     let filter = QueueFilter::parse(query(cx, "status").as_deref());
@@ -190,14 +190,14 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
                 QueueFilter::Auto => Some(unconfirmed_auto),
                 _ => None,
             };
-            (tab, href("/staff", &[("status", tab.code()), ("q", &search)]), count)
+            (tab, href("/staff/queue", &[("status", tab.code()), ("q", &search)]), count)
         })
         .collect();
     let (main_tabs, other_tabs): (Vec<_>, Vec<_>) = tabs
         .into_iter()
         .partition(|(tab, ..)| matches!(tab, QueueFilter::Waiting | QueueFilter::SentBack | QueueFilter::Auto));
     let other_on = !matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack | QueueFilter::Auto);
-    let close = href("/staff", &[("status", filter.code()), ("q", &search)]);
+    let close = href("/staff/queue", &[("status", filter.code()), ("q", &search)]);
     let selected = opened.or_else(|| rows.first().map(|row| row.claim.id));
     let review = match selected {
         Some(claim_id) => load_claim(cx, &reviewer, claim_id).await?,
@@ -209,7 +209,7 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
         .into_iter()
         .map(|row| {
             let open =
-                href("/staff", &[("status", filter.code()), ("q", &search), ("open", &row.claim.id.to_string())]);
+                href("/staff/queue", &[("status", filter.code()), ("q", &search), ("open", &row.claim.id.to_string())]);
             let on = Some(row.claim.id) == selected;
             (row, open, on)
         })
@@ -249,7 +249,7 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
                         </details>
                     </div>
                     <div class="sx-toolbar">
-                        search_box(action: "/staff", label: "Search claims", placeholder: "Search TIN, name or email", value: search.clone(), keep: vec![("status", filter.code())])
+                        search_box(action: "/staff/queue", label: "Search claims", placeholder: "Search TIN, name or email", value: search.clone(), keep: vec![("status", filter.code())])
                     </div>
                     if empty {
                         <p class="sx-card sx-empty big">(if search.is_empty() { "Nothing here. All caught up." } else { "No claims match that search." })</p>
@@ -1101,7 +1101,7 @@ pub mod claim_id {
         let sub = format!("{} · {}", view.claim.registered_name, view.claim.email);
         Ok(view! {
             <main id="main" class="sx-main" tabindex="-1">
-                page_head(title: title, sub: sub, back: Some("/staff".to_owned()), mono: true,
+                page_head(title: title, sub: sub, back: Some("/staff/queue".to_owned()), mono: true,
                     <nav class="sx-acts" aria-label="Queue">
                         if let Some(previous) = previous {
                             <a class="sx-btn sm" href=(format!("/staff/claims/{previous}")) aria-label="Previous claim">(ic("chevron-left"))</a>

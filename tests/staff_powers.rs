@@ -166,6 +166,7 @@ async fn claim_exists(db: &PgPool, claim: Uuid) -> bool {
 const MATRIX: &[&str] = &[
     "/staff",
     "/staff/overview",
+    "/staff/queue",
     "/staff/search",
     "/staff/claims",
     "/staff/claims/{claim_id}",
@@ -220,19 +221,23 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
     let site = Site::new(db);
     let site = &Tracked { site, hits: Default::default() };
     for (n, (who, cookie)) in actors(site).await.into_iter().enumerate() {
-        // The old address of the queue moves to /staff, for everyone.
+        // The old address of the queue moves to /staff/queue, for everyone.
         site.hit("/staff/claims");
         let moved = site.get("/staff/claims", &cookie).await;
-        assert_eq!((moved.status(), location(&moved)), (StatusCode::PERMANENT_REDIRECT, "/staff".to_owned()));
+        assert_eq!((moved.status(), location(&moved)), (StatusCode::PERMANENT_REDIRECT, "/staff/queue".to_owned()));
+        // The Overview's earlier address leads to /staff, for everyone.
+        site.hit("/staff/overview");
+        let moved = site.get("/staff/overview", &cookie).await;
+        assert_eq!((moved.status(), location(&moved)), (StatusCode::TEMPORARY_REDIRECT, "/staff".to_owned()));
         let t = target(site, n as u32).await;
         let user = format!("/staff/users/{}", t.account);
 
         for page in [
             "/staff".to_owned(),
-            "/staff/overview".to_owned(),
+            "/staff/queue".to_owned(),
             "/staff/search?q=example".to_owned(),
-            format!("/staff?status=waiting&open={}", t.open),
-            "/staff?status=unverified".to_owned(),
+            format!("/staff/queue?status=waiting&open={}", t.open),
+            "/staff/queue?status=unverified".to_owned(),
             "/staff/users".to_owned(),
             user.clone(),
             format!("/staff/claims/{}", t.open),
@@ -247,11 +252,32 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             }
         }
 
+        // Old queue links (`/staff?…`) are the queue's, with the whole query:
+        // staff are sent on, everyone else gets what `/staff` gives them.
+        for query in ["notice=claim_decided", "status=sent_back&q=a+b&open=x", "open=x", "status="] {
+            let old = format!("/staff?{query}");
+            site.hit("/staff");
+            let response = site.get(&old, &cookie).await;
+            match who {
+                Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?} {old}"),
+                Who::User => assert_eq!(response.status(), StatusCode::NOT_FOUND, "{who:?} {old}"),
+                _ => assert_eq!(location(&response), format!("/staff/queue?{query}"), "{who:?} {old}"),
+            }
+        }
+
         // Review: Support and Admins.
         let claim_page = format!("/staff/claims/{}", t.open);
         let path = format!("{claim_page}/decision");
-        expect_post(site, (who, &cookie), &path, "decision=approve", false, &claim_page, "/staff?notice=claim_decided")
-            .await;
+        expect_post(
+            site,
+            (who, &cookie),
+            &path,
+            "decision=approve",
+            false,
+            &claim_page,
+            "/staff/queue?notice=claim_decided",
+        )
+        .await;
         assert_eq!(site.claim_status(t.open).await == "approved", who.may(false), "{who:?}");
 
         // Approving a TIN that was paused before (on another account):
@@ -263,15 +289,23 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
             Who::SignedOut => assert!(location(&response).starts_with("/login?"), "{who:?}"),
             Who::User => assert_eq!(response.status(), StatusCode::NOT_FOUND, "{who:?}"),
             Who::Support => assert_eq!(location(&response), format!("{claim_page}?notice=admin_must_decide")),
-            Who::Admin | Who::ServerAdmin => assert_eq!(location(&response), "/staff?notice=claim_decided"),
+            Who::Admin | Who::ServerAdmin => assert_eq!(location(&response), "/staff/queue?notice=claim_decided"),
         }
         assert_eq!(site.claim_status(t.paused_before).await == "approved", who.may(true), "{who:?}");
 
         // Delete a claim: Admins only.
         let claim_page = format!("/staff/claims/{}", t.unverified);
         let path = format!("{claim_page}/delete");
-        expect_post(site, (who, &cookie), &path, "reason=Duplicate", true, &claim_page, "/staff?notice=claim_deleted")
-            .await;
+        expect_post(
+            site,
+            (who, &cookie),
+            &path,
+            "reason=Duplicate",
+            true,
+            &claim_page,
+            "/staff/queue?notice=claim_deleted",
+        )
+        .await;
         assert_eq!(!claim_exists(&site.db, t.unverified).await, who.may(true), "{who:?}");
 
         // End an ownership: Admins only.
@@ -674,9 +708,9 @@ async fn staff_pages_show_tins_saved_without_papers(db: PgPool) {
     let (_, _) = site.person("nobody@example.test").await;
     let claim = add_claim(&site.db, ana, "000123455", "unverified").await;
 
-    let queue = text(site.get("/staff?status=unverified", &staff).await).await;
+    let queue = text(site.get("/staff/queue?status=unverified", &staff).await).await;
     assert!(queue.contains("Not verified") && queue.contains("000-123-455-00000"), "{queue}");
-    assert!(!text(site.get("/staff", &staff).await).await.contains("000-123-455-00000"));
+    assert!(!text(site.get("/staff/queue", &staff).await).await.contains("000-123-455-00000"));
 
     let no_tin = text(site.get("/staff/users?filter=no_tin", &staff).await).await;
     assert!(no_tin.contains("nobody@example.test") && !no_tin.contains("ana@example.test"), "{no_tin}");
@@ -686,7 +720,7 @@ async fn staff_pages_show_tins_saved_without_papers(db: PgPool) {
     assert!(row[..row.find("</tr>").unwrap()].contains("No ID yet"), "{row}");
 
     let response = site.post(&format!("/staff/claims/{claim}/delete"), &staff, "reason=Typo").await;
-    assert_eq!(location(&response), "/staff?notice=claim_deleted");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_deleted");
     let history = text(site.get(&format!("/staff/users/{ana}"), &staff).await).await;
     assert!(
         history.contains(&format!("Staff {STAFF} deleted ***-***-455-00000, saved without papers: Typo")),
@@ -875,7 +909,7 @@ async fn staff_read_the_decision_note_and_pause_reasons_of_their_own_claim(db: P
     let claim = add_claim(&site.db, helper, "000123453", "pending").await;
     let page = format!("/staff/claims/{claim}");
     let response = site.post(&format!("{page}/decision"), &staff, "decision=approve&note=Vouched+for+by+Ana").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     site.post(&format!("{page}/pause"), &staff, "reason=Complaint+from+a+client").await;
     site.post(&format!("{page}/resume"), &staff, "reason=Client+withdrew+it").await;
 
@@ -1015,7 +1049,14 @@ async fn a_banned_support_member_cannot_use_staff_powers(db: PgPool) {
         let response = site.post(&path, &cookie, &form).await;
         assert!(location(&response).starts_with("/login?"), "{path}: {} {}", response.status(), location(&response));
     }
-    for page in ["/staff".to_owned(), "/staff/users".to_owned(), user.clone(), format!("/staff/claims/{}", t.open)] {
+    for page in [
+        "/staff".to_owned(),
+        "/staff?notice=claim_decided".to_owned(),
+        "/staff/queue".to_owned(),
+        "/staff/users".to_owned(),
+        user.clone(),
+        format!("/staff/claims/{}", t.open),
+    ] {
         assert!(location(&site.get(&page, &cookie).await).starts_with("/login?"), "{page}");
     }
     assert_eq!(everything(&site.db).await, before);

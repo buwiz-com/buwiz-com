@@ -220,8 +220,8 @@ fn head_for(path: &str) -> Head {
         _ if path.starts_with("/tins/") && path.ends_with("/verify") => "Verify a TIN · Buwiz",
         _ if path.starts_with("/tins/") && path.ends_with("/files") => "Your files · Buwiz",
         _ if path.starts_with("/tins/") => "Fix and send again · Buwiz",
-        "/staff" => "Staff · Buwiz",
-        "/staff/overview" => "Overview · Staff · Buwiz",
+        "/staff" => "Overview · Staff · Buwiz",
+        "/staff/queue" => "Staff · Buwiz",
         "/staff/users" => "Staff · Buwiz",
         "/staff/search" => "Search · Staff · Buwiz",
         _ if path.starts_with("/staff/claims/") => "Claim · Staff · Buwiz",
@@ -285,8 +285,7 @@ async fn account_menu(email: String, admin: bool, staff_area: bool) -> Result<im
                 if staff_area {
                     <a href="/tins">icon(name: "badge") "My TINs"</a>
                 } else if admin {
-                    // The staff console opens on its Overview.
-                    <a href="/staff/overview">icon(name: "shield_person") "Staff"</a>
+                    <a href="/staff">icon(name: "shield_person") "Staff"</a>
                 }
                 <form method="post" action="/logout">
                     <button type="submit">icon(name: "logout") "Sign out"</button>
@@ -833,7 +832,8 @@ mod tests {
             ("/tins/claims/0b6e/fix", "Fix and send again · Buwiz"),
             ("/tins/claims/0b6e/verify", "Verify a TIN · Buwiz"),
             ("/tins/claims/0b6e/files", "Your files · Buwiz"),
-            ("/staff", "Staff · Buwiz"),
+            ("/staff", "Overview · Staff · Buwiz"),
+            ("/staff/queue", "Staff · Buwiz"),
             ("/staff/users", "Staff · Buwiz"),
             ("/nowhere", "Buwiz"),
         ] {

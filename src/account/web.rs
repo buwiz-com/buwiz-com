@@ -120,7 +120,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         )
         .route("/tins/claims/{claim_id}/documents/{document_id}/remove", post(remove_document))
         // Staff. Everyone else gets a 404 (see `require_staff`).
-        .route("/staff/claims", get(|| async { Redirect::permanent("/staff") }))
+        .route("/staff/claims", get(|| async { Redirect::permanent("/staff/queue") }))
+        .route("/staff/overview", get(|| async { Redirect::temporary("/staff") }))
         .route("/staff/claims/{claim_id}/decision", post(decide_claim))
         .route("/staff/claims/{claim_id}/delete", post(staff_delete_claim))
         .route("/staff/claims/{claim_id}/revoke", post(revoke_claim))
@@ -465,12 +466,12 @@ async fn moved_to_tins(uri: Uri) -> Response {
     moved(&uri, "/tins")
 }
 
-/// `/admin/…` became `/staff/…`; the claims list is `/staff` itself. A
+/// `/admin/…` became `/staff/…`; the claims list is `/staff/queue`. A
 /// permanent redirect keeps the method, so old forms still post.
 async fn moved_to_staff(uri: Uri) -> Response {
     let rest = uri.path().strip_prefix("/admin").unwrap_or_default().trim_end_matches('/');
     let path = match rest {
-        "" | "/claims" => "/staff".to_owned(),
+        "" | "/claims" => "/staff/queue".to_owned(),
         rest => format!("/staff{rest}"),
     };
     moved(&uri, &path)
@@ -989,7 +990,7 @@ async fn decide_claim(
         _ => return (StatusCode::BAD_REQUEST, "unknown decision").into_response(),
     };
     match claims::decide(&state.db, &state.config, &state.documents, claim_id, &reviewer, &decision, &note).await {
-        Ok(notice) => see_other(link("/staff", Some(notice), &[])),
+        Ok(notice) => see_other(link("/staff/queue", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }
@@ -1018,7 +1019,7 @@ async fn staff_delete_claim(
     };
     let by = By::Staff { reason: &form.reason, config: &state.config };
     match claims::delete(&state.db, &state.documents, claim_id, &staff, by).await {
-        Ok(notice) => see_other(link("/staff", Some(notice), &[])),
+        Ok(notice) => see_other(link("/staff/queue", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }

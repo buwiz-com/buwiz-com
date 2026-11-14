@@ -45,9 +45,29 @@ below them names a colour, size or radius of its own.
 A page renders `<main id="main" class="sx-main">` and, where it lists
 things, the inspector beside it (`inspector()` in `pages/staff.rs`).
 
+## Addresses
+
+The console opens on the Overview ("Overview first"), so the review queue has
+an address of its own.
+
+| URL | What it is |
+|---|---|
+| `/staff` | The Overview. Staff only (Support and Admins). |
+| `/staff?…` (any query at all) | Old queue links: staff are redirected (307) to `/staff/queue?…` with the whole query kept, so `?notice=`, `?status=`, `?open=` and `?q=` links, bookmarks and emails still work. Checked after the staff check, so non-staff get what they get for `/staff`. |
+| `/staff/queue` | The review queue, with `?status=`, `?q=`, `?open=` and `?notice=`. Every decision, delete and revoke redirects here with its notice. |
+| `/staff/overview` | Redirects (307) to `/staff`. |
+| `/staff/claims`, `/admin`, `/admin/claims` | Redirect (308) to `/staff/queue`. |
+| `/staff/claims/{id}` | A claim's own page (its "back" link is the queue). |
+
+Non-staff see a 404 on all of these (signed-out visitors are sent to
+`/login?next=…`, and after signing in with `next=/staff` staff land on the
+Overview). In the navigation, `aria-current` marks Overview on `/staff` and
+Queue (the sidebar's Waiting, Sent back and Activated automatically, the
+rail's icons, the phone's Queue tab) on `/staff/queue` and on a claim's page.
+
 ## State in the URL
 
-Everything works without script. The row in the inspector is `?open=<id>`
+Everything works without script. The row in the inspector is `?open=<id>` (on `/staff/queue`)
 (desktop shows the list's first row when none is chosen); the user page's
 tab is `?tab=account|tins|sign|history`; the New user dialog is
 `/staff/users?new=1`. `staff.js` then swaps the inspector in place (and
@@ -76,7 +96,8 @@ script, a `<dialog>` with it); the New user modal (`.sx-modal`).
 
 1. Add a `#[page("/staff/…")]` in `src/account/pages/staff.rs` (or a module
    beside it), starting with `staff_member(cx, Power::…)` so non-staff get
-   a 404, and register it in `pages.rs`.
+   a 404, and register it in `pages.rs`. Do not add a query-carrying use of
+   `/staff` itself: `/staff?…` is the queue's old address and redirects.
 2. Render `<main id="main" class="sx-main" tabindex="-1">` with
    `page_head(…)`, a `<div class="sx-notices">` for `sx_notice`, and the
    content in `<div class="sx-scroll">`. Add an `inspector(…)` beside it

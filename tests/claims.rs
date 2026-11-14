@@ -110,7 +110,7 @@ async fn a_claim_sent_back_is_fixed_and_resent(db: PgPool) {
     let response = site.post(&decide, &staff, "decision=fix").await;
     assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=fix_needs_reason"));
     let response = site.post(&decide, &staff, "decision=fix&reasons=blurry&reasons=name_mismatch&note=Retake+it").await;
-    assert_eq!(location(&response), "/staff?notice=claim_sent_back");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_sent_back");
     assert_eq!(site.claim_status(claim).await, "needs_fix");
     let reasons: Vec<String> = sqlx::query_scalar("SELECT fix_reasons FROM tin_claims WHERE id = $1")
         .bind(claim)
@@ -175,7 +175,7 @@ async fn a_claim_sent_back_is_fixed_and_resent(db: PgPool) {
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Typed vs. on the document") && review.contains("Resent"), "{review}");
     assert!(review.contains("Read by OCR on our server") && review.contains(&format!("read: {expected}")), "{review}");
-    assert_eq!(location(&site.post(&decide, &staff, "decision=approve").await), "/staff?notice=claim_decided");
+    assert_eq!(location(&site.post(&decide, &staff, "decision=approve").await), "/staff/queue?notice=claim_decided");
     assert_eq!(site.claim_status(claim).await, "approved");
     // Staff made it active with its papers, and it says since when.
     let (verified_by, decided): (Option<String>, bool) =
@@ -354,7 +354,7 @@ async fn deleting_a_claim_purges_its_files_from_the_store(db: PgPool) {
     let claim = site.newest_claim(ana).await;
     assert_eq!(objects.of_claim(claim).len(), 2);
     let response = site.post(&format!("/staff/claims/{claim}/delete"), &staff, "reason=Duplicate").await;
-    assert_eq!(location(&response), "/staff?notice=claim_deleted");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_deleted");
     assert!(objects.of_claim(claim).is_empty());
 }
 
@@ -427,7 +427,7 @@ async fn removing_an_active_tin_keeps_its_returns_and_frees_it(db: PgPool) {
     assert_eq!(location(&site.upload("/tins/claims", &maria_cookie, &parts).await), "/tins?notice=claim_submitted");
     let again = site.newest_claim(maria).await;
     let decided = site.post(&format!("/staff/claims/{again}/decision"), &staff, "decision=approve").await;
-    assert_eq!(location(&decided), "/staff?notice=claim_decided");
+    assert_eq!(location(&decided), "/staff/queue?notice=claim_decided");
     assert_eq!(site.claim_status(again).await, "approved");
 
     let lines = audit_lines(&site.db, juan).await;
@@ -463,7 +463,10 @@ async fn staff_delete_or_revoke_claims_with_a_reason(db: PgPool) {
     );
     let revoke_open = site.post(&format!("/staff/claims/{open}/revoke"), &staff, "reason=x").await;
     assert_eq!(location(&revoke_open), format!("/staff/claims/{open}?notice=tin_not_active"));
-    assert_eq!(location(&site.post(&delete, &staff, "reason=Duplicate+claim").await), "/staff?notice=claim_deleted");
+    assert_eq!(
+        location(&site.post(&delete, &staff, "reason=Duplicate+claim").await),
+        "/staff/queue?notice=claim_deleted"
+    );
     assert!(!claim_exists(&site.db, open).await);
 
     let delete_active = site.post(&format!("/staff/claims/{active}/delete"), &staff, "reason=x").await;
@@ -480,7 +483,7 @@ async fn staff_delete_or_revoke_claims_with_a_reason(db: PgPool) {
 
     let tins = text(site.get("/tins", &cookie).await).await;
     assert!(tins.contains("No longer active") && tins.contains("Owner of record changed"), "{tins}");
-    assert!(text(site.get("/staff?status=ended", &staff).await).await.contains("111-111-111-00000"));
+    assert!(text(site.get("/staff/queue?status=ended", &staff).await).await.contains("111-111-111-00000"));
     assert!(text(site.get(&format!("/staff/claims/{active}"), &staff).await).await.contains("Revoked by staff"));
 
     let lines = audit_lines(&site.db, ana).await;
@@ -576,7 +579,7 @@ async fn claimants_replace_and_remove_files_while_open(db: PgPool) {
     assert_eq!(site.claim_status(claim).await, "pending");
 
     // Staff see it on the queue and the review.
-    assert!(text(site.get("/staff", &staff).await).await.contains("Files changed after sending"));
+    assert!(text(site.get("/staff/queue", &staff).await).await.contains("Files changed after sending"));
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Files changed after sending"), "{review}");
 
@@ -638,12 +641,12 @@ async fn every_review_decision_has_an_audit_line_that_outlives_the_claim(db: PgP
     let fix = [("registered_name", Text("Cora Trading Inc")), ("supporting", File("more.pdf", PDF))];
 
     let response = site.post(&decide, &support, "decision=fix&reasons=blurry&note=Retake+it").await;
-    assert_eq!(location(&response), "/staff?notice=claim_sent_back");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_sent_back");
     site.upload(&resend, &cora_cookie, &fix).await;
     let response = site.post(&decide, &staff, "decision=fix&reasons=name_mismatch").await;
-    assert_eq!(location(&response), "/staff?notice=claim_sent_back");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_sent_back");
     let response = site.post(&decide, &support, "decision=reject&note=Not+the+company%27s+papers").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     let response = site.post(&format!("/tins/claims/{claim}/delete"), &cora_cookie, "").await;
     assert_eq!(location(&response), "/tins?notice=claim_deleted");
     assert!(!claim_exists(&site.db, claim).await);
@@ -672,7 +675,7 @@ async fn every_review_decision_has_an_audit_line_that_outlives_the_claim(db: PgP
     site.upload("/tins/claims", &cora_cookie, &BUSINESS).await;
     let again = site.newest_claim(cora).await;
     let response = site.post(&format!("/staff/claims/{again}/decision"), &support, "decision=approve").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     let last = claim_audit_lines(&site.db, cora).await.pop().unwrap();
     assert_eq!(
         (last.0.as_str(), last.1.as_str(), last.2.as_str(), last.3.as_str(), last.4),

@@ -804,7 +804,7 @@ async fn a_rerun_does_not_bring_back_a_tin_ended_on_the_website(db: PgPool) {
     let response = site.post(&format!("/staff/claims/{active}/revoke"), &staff, "reason=Not+hers").await;
     assert_eq!(location(&response), format!("/staff/claims/{active}?notice=ownership_revoked"));
     let response = site.post(&format!("/staff/claims/{unverified}/delete"), &staff, "reason=Typo").await;
-    assert_eq!(location(&response), "/staff?notice=claim_deleted");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_deleted");
 
     let before = counts(db).await;
     let problem = refused(seed(db, EXAMPLE, &opts).await);
@@ -1121,7 +1121,7 @@ async fn the_seed_activating_its_own_admins_tin_is_flagged(db: PgPool) {
     assert!(page.contains("Activated by its owner, an admin"), "{page}");
     let page = text(site.get(&format!("/staff/claims/{jos}"), &other_admin).await).await;
     assert!(!page.contains("Activated by its owner, an admin"), "{page}");
-    let queue = text(site.get("/staff?status=approved", &other_admin).await).await;
+    let queue = text(site.get("/staff/queue?status=approved", &other_admin).await).await;
     assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
 }
 

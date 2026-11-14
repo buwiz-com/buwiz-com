@@ -56,9 +56,9 @@ async fn the_sidebar_counts_are_the_lengths_of_the_lists(db: PgPool) {
     assert_eq!(counts, queries::Counts { waiting: 2, sent_back: 1, auto: 1, users: 6, staff: 2, test: 1, banned: 1 });
     // Each count is what its list holds.
     for (path, rows) in [
-        ("/staff?status=waiting", 2),
-        ("/staff?status=sent_back", 1),
-        ("/staff?status=auto", 1),
+        ("/staff/queue?status=waiting", 2),
+        ("/staff/queue?status=sent_back", 1),
+        ("/staff/queue?status=auto", 1),
         ("/staff/users", 6),
         ("/staff/users?filter=staff", 2),
         ("/staff/users?filter=test", 1),
@@ -68,7 +68,7 @@ async fn the_sidebar_counts_are_the_lengths_of_the_lists(db: PgPool) {
         assert_eq!(before_inspector(&page).matches("<tr data-id=").count(), rows, "{path}");
     }
     // The sidebar shows them, the waiting count as hot.
-    let page = text(site.get("/staff/overview", &staff).await).await;
+    let page = text(site.get("/staff", &staff).await).await;
     assert!(page.contains(r#"<span class="sx-count hot">2<span class="sx-vh"> waiting</span></span>"#), "{page}");
     assert!(page.contains(r#"<span class="t">All users</span><span class="sx-count">6</span>"#), "{page}");
     assert!(page.contains(r#"<span class="t">Banned</span><span class="sx-count">1</span>"#), "{page}");
@@ -130,7 +130,7 @@ async fn the_overview_counts_what_it_says(db: PgPool) {
     assert_eq!((numbers.accounts, numbers.accounts_week), (4, 4));
     assert!(numbers.oldest_waiting.is_some());
 
-    let admin = text(site.get("/staff/overview", &staff).await).await;
+    let admin = text(site.get("/staff", &staff).await).await;
     assert!(admin.contains("Claims waiting</span><span class=\"n\">2</span>"), "{admin}");
     assert!(admin.contains("Oldest 1 d 2 h"), "{admin}");
     assert!(admin.contains("Active TINs</span><span class=\"n\">2</span>"), "{admin}");
@@ -143,7 +143,7 @@ async fn the_overview_counts_what_it_says(db: PgPool) {
         admin[start..].split("<span class=\"n\">").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
     assert!((1..=3).contains(&sent), "{sent}");
     // Returns are an Admin's number: no staff page lists them for Support.
-    let support = text(site.get("/staff/overview", &support).await).await;
+    let support = text(site.get("/staff", &support).await).await;
     assert!(!support.contains("Returns sent today"), "{support}");
     assert!(support.contains("Claims waiting</span><span class=\"n\">2</span>"), "{support}");
 }
@@ -163,7 +163,7 @@ async fn recent_activity_names_staff_actions_without_their_reasons(db: PgPool) {
     let lines = queries::recent_activity(&site.db, 8).await.unwrap();
     let actions: Vec<(&str, &str)> = lines.iter().map(|line| (line.kind.as_str(), line.action.as_str())).collect();
     assert_eq!(actions, [("account", "test_marked"), ("claim", "approved")]);
-    let page = text(site.get("/staff/overview", &staff).await).await;
+    let page = text(site.get("/staff", &staff).await).await;
     assert!(page.contains(&format!("<b>{STAFF}</b> approved")), "{page}");
     assert!(page.contains("***-***-451-00000 for ana@example.test"), "{page}");
     assert!(page.contains("marked as a test account"), "{page}");
@@ -221,23 +221,23 @@ async fn the_inspector_shows_the_row_in_the_link(db: PgPool) {
         .unwrap();
 
     // Nothing chosen: the oldest claim, closed on tablets and phones.
-    let page = text(site.get("/staff", &staff).await).await;
+    let page = text(site.get("/staff/queue", &staff).await).await;
     let side = inspector(&page);
     assert!(side.starts_with("id=\"inspector\" class=\"sx-insp\""), "{side}");
     assert!(side.contains("000-123-451-00000") && !side.contains("000-123-452-00000"), "{side}");
     assert!(side.contains(&format!("action=\"/staff/claims/{first}/decision\"")), "{side}");
     assert!(page.contains(&format!("<tr data-id=\"{first}\" class=\"sel auto\">")), "{page}");
     // `?open=` chooses the row and opens the panel, wherever it is in the list.
-    let page = text(site.get(&format!("/staff?status=waiting&open={second}"), &staff).await).await;
+    let page = text(site.get(&format!("/staff/queue?status=waiting&open={second}"), &staff).await).await;
     let side = inspector(&page);
     assert!(side.starts_with("id=\"inspector\" class=\"sx-insp is-open\""), "{side}");
     assert!(side.contains("000-123-452-00000") && side.contains("bob@example.test"), "{side}");
     assert!(side.contains(&format!("action=\"/staff/claims/{second}/decision\"")), "{side}");
     assert!(page.contains(&format!("<tr data-id=\"{second}\" class=\"sel\">")), "{page}");
     // Its close link is the same list without the choice.
-    assert!(side.contains("href=\"/staff?status=waiting\" data-close-insp=\"\""), "{side}");
+    assert!(side.contains("href=\"/staff/queue?status=waiting\" data-close-insp=\"\""), "{side}");
     // A claim that is not there leaves the panel empty.
-    let page = text(site.get(&format!("/staff?open={}", Uuid::new_v4()), &staff).await).await;
+    let page = text(site.get(&format!("/staff/queue?open={}", Uuid::new_v4()), &staff).await).await;
     assert!(inspector(&page).contains("Nothing to review in this tab."));
     // The users list does the same with an account.
     let page = text(site.get(&format!("/staff/users?open={bob}"), &staff).await).await;
@@ -265,7 +265,7 @@ async fn support_sees_no_admin_controls_in_the_console(db: PgPool) {
     assert!(page.contains(
         r#"<div class="sx-modal" id="new-user" role="dialog" aria-modal="true" aria-labelledby="new-user-title" hidden"#
     ));
-    for path in ["/staff/users", "/staff/users?new=1", "/staff/overview"] {
+    for path in ["/staff/users", "/staff/users?new=1", "/staff"] {
         let page = text(site.get(path, &support).await).await;
         assert!(!page.contains("New user") && !page.contains("/staff/users/new"), "{path}: {page}");
     }
@@ -295,7 +295,7 @@ async fn staff_open_their_own_account_from_the_console(db: PgPool) {
     let site = Site::new(db);
     let (boss, cookie) = site.person(STAFF).await;
     add_claim(&site.db, boss, "000123451", "approved").await;
-    let overview = text(site.get("/staff/overview", &cookie).await).await;
+    let overview = text(site.get("/staff", &cookie).await).await;
     // "My account" in the sidebar and "Me" in the phone's tab bar lead there.
     assert!(tag(&overview, "class=\"sx-me\"").contains(&format!("href=\"/staff/users/{boss}\"")), "{overview}");
     let tabbar = &overview[overview.find("class=\"sx-tabbar\"").unwrap()..];
@@ -320,8 +320,8 @@ async fn the_console_loads_only_its_own_files(db: PgPool) {
     let (ana, ana_cookie) = site.person("ana@example.test").await;
     let claim = add_claim(&site.db, ana, "000123451", "pending").await;
     let pages = [
-        "/staff/overview".to_owned(),
         "/staff".to_owned(),
+        "/staff/queue".to_owned(),
         "/staff/users".to_owned(),
         format!("/staff/users/{ana}"),
         format!("/staff/claims/{claim}"),
@@ -343,7 +343,7 @@ async fn the_console_loads_only_its_own_files(db: PgPool) {
     }
     // The owner's pages keep their own look and no new policy, the 404
     // that people get under /staff included.
-    let refused = site.get("/staff/overview", &ana_cookie).await;
+    let refused = site.get("/staff", &ana_cookie).await;
     assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     assert!(refused.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
     let tins = site.get("/tins", &ana_cookie).await;
@@ -367,5 +367,114 @@ async fn the_console_loads_only_its_own_files(db: PgPool) {
     let css = text(site.get("/assets/staff.css", "").await).await;
     for url in css.split("url(\"").skip(1).filter_map(|rest| rest.split('"').next()) {
         assert_eq!(site.get(url, "").await.status(), StatusCode::OK, "{url}");
+    }
+}
+
+/// The sidebar link, the phone's tab bar entry and the page's own heading
+/// that mark where the staff member is.
+fn marked(page: &str) -> (bool, bool, bool, bool) {
+    let side = &page[page.find("class=\"sx-nav\"").expect("a sidebar")..];
+    let tabbar = &page[page.find("class=\"sx-tabbar\"").expect("a tab bar")..];
+    let on = |html: &str, needle: &str| tag(html, needle).contains("aria-current=\"page\"");
+    (
+        on(side, "title=\"Overview\""),
+        on(side, "title=\"Waiting\""),
+        on(tabbar, "href=\"/staff\""),
+        on(tabbar, "href=\"/staff/queue?status=waiting\""),
+    )
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_bare_staff_address_is_the_overview_for_admin_and_support(db: PgPool) {
+    let site = Site::new(db);
+    let (_, admin) = site.person(STAFF).await;
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    for (who, cookie) in [("admin", &admin), ("support", &support)] {
+        let response = site.get("/staff", cookie).await;
+        assert_eq!(response.status(), StatusCode::OK, "{who}");
+        let page = text(response).await;
+        assert!(page.contains("<h1 class=\"\">Overview</h1>"), "{who}: {page}");
+        assert!(page.contains("<title>Overview · Staff · Buwiz</title>"), "{who}");
+        // Overview is marked in the sidebar and the tab bar, the queue is not.
+        assert_eq!(marked(&page), (true, false, true, false), "{who}");
+        // Its links into the queue name the queue's own address.
+        assert!(page.contains("href=\"/staff/queue?status=waiting\""), "{who}");
+        assert!(!page.contains("href=\"/staff?"), "{who}");
+    }
+    // The earlier address of the Overview leads to it.
+    let response = site.get("/staff/overview", &admin).await;
+    assert_eq!((response.status(), location(&response)), (StatusCode::TEMPORARY_REDIRECT, "/staff".to_owned()));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_queue_lives_at_its_own_address_and_old_links_reach_it(db: PgPool) {
+    let site = Site::new(db);
+    let (_, admin) = site.person(STAFF).await;
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    add_claim(&site.db, ana, "000123451", "pending").await;
+    add_claim(&site.db, ana, "000123453", "needs_fix").await;
+
+    for cookie in [&admin, &support] {
+        // The queue itself, marked in the sidebar and the tab bar.
+        let page = text(site.get("/staff/queue", cookie).await).await;
+        assert!(page.contains("<h1 class=\"\">Review queue</h1>") && page.contains("000-123-451-00000"), "{page}");
+        assert_eq!(marked(&page), (false, true, false, true), "{page}");
+
+        // A notice carried by an old `/staff?notice=…` link lands on the queue.
+        let old = site.get("/staff?notice=claim_decided", cookie).await;
+        assert!(old.status().is_redirection());
+        let new = location(&old);
+        assert_eq!(new, "/staff/queue?notice=claim_decided");
+        let page = text(site.get(&new, cookie).await).await;
+        assert!(page.contains("Decision saved."), "{page}");
+        assert!(page.contains("Review queue") && page.contains("000-123-451-00000"), "{page}");
+
+        // So does a filter, with the whole query kept.
+        let old =
+            site.get("/staff?status=sent_back&q=000123453&open=00000000-0000-0000-0000-000000000000", cookie).await;
+        let new = location(&old);
+        assert_eq!(new, "/staff/queue?status=sent_back&q=000123453&open=00000000-0000-0000-0000-000000000000");
+        let page = text(site.get(&new, cookie).await).await;
+        assert!(page.contains("000-123-453-00000") && !page.contains("000-123-451-00000"), "{page}");
+        let filtered = text(site.get("/staff/queue?status=sent_back", cookie).await).await;
+        assert!(filtered.contains("000-123-453-00000") && !filtered.contains("000-123-451-00000"), "{filtered}");
+        assert_eq!(marked(&filtered), (false, false, false, true), "{filtered}");
+    }
+
+    // `/staff/claims` and `/admin/claims` end at the queue, not the Overview.
+    for old in ["/staff/claims", "/admin/claims", "/admin"] {
+        let first = site.get(old, &admin).await;
+        assert_eq!(first.status(), StatusCode::PERMANENT_REDIRECT, "{old}");
+        let page = text(site.get(&location(&first), &admin).await).await;
+        assert!(page.contains("<h1 class=\"\">Review queue</h1>"), "{old}: {page}");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_decision_lands_on_the_queue_with_its_notice(db: PgPool) {
+    let site = Site::new(db);
+    let (_, admin) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "000123451", "pending").await;
+    let response = site.post(&format!("/staff/claims/{claim}/decision"), &admin, "decision=approve").await;
+    let landing = location(&response);
+    assert_eq!(landing, "/staff/queue?notice=claim_decided");
+    let page = text(site.get(&landing, &admin).await).await;
+    assert!(page.contains("<h1 class=\"\">Review queue</h1>") && page.contains("Decision saved."), "{page}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn non_staff_get_what_they_always_got_at_the_staff_address(db: PgPool) {
+    let site = Site::new(db);
+    let (_, ana) = site.person("ana@example.test").await;
+    for path in ["/staff", "/staff?notice=claim_decided", "/staff?status=waiting", "/staff/queue"] {
+        let response = site.get(path, &ana).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let response = site.get(path, "").await;
+        assert!(response.status().is_redirection(), "{path}");
+        let to = location(&response);
+        let next = form_urlencoded::byte_serialize(path.as_bytes()).collect::<String>();
+        assert!(to.starts_with("/login?") && to.contains(&format!("next={next}")), "{path}: {to}");
     }
 }

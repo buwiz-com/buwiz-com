@@ -135,7 +135,7 @@ fn doubts(outcome: Outcome) -> Vec<Doubt> {
 
 /// The claims listed in the staff tab "Activated automatically".
 async fn auto_tab(site: &Site, staff: &str) -> String {
-    text(site.get("/staff?status=auto", staff).await).await
+    text(site.get("/staff/queue?status=auto", staff).await).await
 }
 
 #[sqlx::test(migrations = "./migrations")]

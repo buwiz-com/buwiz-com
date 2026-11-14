@@ -91,9 +91,15 @@ fn activity_words(line: &Activity) -> (&'static str, String, String) {
     (sym, verb.to_owned(), what)
 }
 
-#[page("/staff/overview")]
+#[page("/staff")]
 pub async fn overview_page(cx: &Cx) -> Result<impl View> {
     let viewer = staff_member(cx, Power::Review).await?;
+    // The queue's old address was `/staff?…`: anything that carries a query
+    // (`?notice=`, `?status=`, `?open=`, `?q=`) is a queue link, kept alive.
+    // Only after the staff check, so everyone else gets what they always did.
+    if let Some(query) = uri(cx).query() {
+        return Err(redirect(format!("/staff/queue?{query}")).into());
+    }
     let db = &state(cx).db;
     let now = OffsetDateTime::now_utc();
     let numbers = queries::overview(db).await?;
@@ -124,7 +130,7 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
             <div class="sx-scroll">
                 <div class="sx-home">
                     <div class="sx-tiles">
-                        <a class="sx-card sx-tile" href="/staff?status=waiting">
+                        <a class="sx-card sx-tile" href="/staff/queue?status=waiting">
                             <span class="l">(ic("inbox")) "Claims waiting"</span>
                             <span class="n">(numbers.waiting.to_string())</span>
                             if let Some(oldest) = oldest.clone() {
@@ -152,7 +158,7 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                                 </span>
                             </div>
                         }
-                        <a class="sx-card sx-tile" href="/staff?status=auto">
+                        <a class="sx-card sx-tile" href="/staff/queue?status=auto">
                             <span class="l">(ic("bolt")) "Activated automatically"</span>
                             <span class="n">(numbers.auto.to_string())</span>
                             <span class="s">"For a person to check"</span>
@@ -168,7 +174,7 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                                     for claim in longest {
                                         let since = claim.waiting_since();
                                         let late = now - since > time::Duration::days(1);
-                                        <a class="sx-li" href=(format!("/staff?status=waiting&open={}", claim.id))>
+                                        <a class="sx-li" href=(format!("/staff/queue?status=waiting&open={}", claim.id))>
                                             kind_icon(kind: claim.kind.clone())
                                             <span class="x">
                                                 <b class="sx-mono">(claim.tin().to_string())</b>
@@ -182,7 +188,7 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                                     }
                                 </div>
                             }
-                            <a class="sx-btn" href="/staff?status=waiting">(ic("arrow-right")) "Open the queue"</a>
+                            <a class="sx-btn" href="/staff/queue?status=waiting">(ic("arrow-right")) "Open the queue"</a>
                         </section>
                         <section class="sx-card sx-sec" aria-labelledby="sx-activity">
                             <h2 id="sx-activity">"Recent staff activity"</h2>

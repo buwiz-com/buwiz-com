@@ -26,8 +26,8 @@ enum Here {
 
 fn here(path: &str, status: Option<&str>, filter: Option<&str>, me: Uuid) -> Here {
     match path {
-        "/staff/overview" => Here::Overview,
-        "/staff" => Here::Queue(QueueFilter::parse(status)),
+        "/staff" => Here::Overview,
+        "/staff/queue" => Here::Queue(QueueFilter::parse(status)),
         "/staff/users" => Here::Users(UserFilter::parse(filter)),
         "/staff/search" => Here::Search,
         _ if path.starts_with("/staff/claims/") => Here::Claim,
@@ -77,7 +77,7 @@ pub(crate) async fn document(
                 <div class="sx-app">
                     <aside class="sx-side" id="sx-side" aria-label="Staff">
                         <div class="sx-brand">
-                            <a href="/staff/overview" aria-label="Buwiz staff: overview">
+                            <a href="/staff" aria-label="Buwiz staff: overview">
                                 <span class="brand-wordmark sx-word" aria-hidden="true"></span>
                                 <span class="brand-mark sx-mark" aria-hidden="true"></span>
                             </a>
@@ -99,13 +99,13 @@ pub(crate) async fn document(
                             </a>
                         }
                         <nav class="sx-nav" aria-label="Staff sections">
-                            <a class="sx-ni" href="/staff/overview" if at == Here::Overview { aria-current="page" } title="Overview">
+                            <a class="sx-ni" href="/staff" if at == Here::Overview { aria-current="page" } title="Overview">
                                 (ic("grid"))
                                 <span class="t">"Overview"</span>
                             </a>
                             <div class="sx-ng" role="group" aria-labelledby="sx-ng-review">
                                 <p class="sx-ng-h" id="sx-ng-review">"Review"</p>
-                                <a class="sx-ni" href="/staff?status=waiting" if at == Here::Queue(QueueFilter::Waiting) { aria-current="page" } title="Waiting">
+                                <a class="sx-ni" href="/staff/queue?status=waiting" if at == Here::Queue(QueueFilter::Waiting) { aria-current="page" } title="Waiting">
                                     (ic("inbox"))
                                     <span class="t">"Waiting"</span>
                                     <span class=(if counts.waiting > 0 { "sx-count hot" } else { "sx-count" })>
@@ -116,12 +116,12 @@ pub(crate) async fn document(
                                         <span class="sx-badge" aria-hidden="true">(counts.waiting.to_string())</span>
                                     }
                                 </a>
-                                <a class="sx-ni rail-hide" href="/staff?status=sent_back" if at == Here::Queue(QueueFilter::SentBack) { aria-current="page" } title="Sent back">
+                                <a class="sx-ni rail-hide" href="/staff/queue?status=sent_back" if at == Here::Queue(QueueFilter::SentBack) { aria-current="page" } title="Sent back">
                                     (ic("replay"))
                                     <span class="t">"Sent back"</span>
                                     <span class="sx-count">(counts.sent_back.to_string())</span>
                                 </a>
-                                <a class="sx-ni rail-hide" href="/staff?status=auto" if at == Here::Queue(QueueFilter::Auto) { aria-current="page" } title="Activated automatically">
+                                <a class="sx-ni rail-hide" href="/staff/queue?status=auto" if at == Here::Queue(QueueFilter::Auto) { aria-current="page" } title="Activated automatically">
                                     (ic("bolt"))
                                     <span class="t">"Activated automatically"</span>
                                     <span class="sx-count">(counts.auto.to_string())</span>
@@ -169,7 +169,7 @@ pub(crate) async fn document(
                         </div>
                     </aside>
                     <header class="sx-top">
-                        <a href="/staff/overview" aria-label="Buwiz staff: overview">
+                        <a href="/staff" aria-label="Buwiz staff: overview">
                             <span class="brand-wordmark sx-word" aria-hidden="true"></span>
                         </a>
                         <span class="sx-stag" aria-hidden="true">"Staff"</span>
@@ -181,11 +181,11 @@ pub(crate) async fn document(
                     </header>
                     <div class="sx-body">(child)</div>
                     <nav class="sx-tabbar" aria-label="Staff sections">
-                        <a href="/staff/overview" if at == Here::Overview { aria-current="page" }>
+                        <a href="/staff" if at == Here::Overview { aria-current="page" }>
                             <span class="i">(ic("grid"))</span>
                             "Overview"
                         </a>
-                        <a href="/staff?status=waiting" if queue_on { aria-current="page" }>
+                        <a href="/staff/queue?status=waiting" if queue_on { aria-current="page" }>
                             <span class="i">
                                 (ic("inbox"))
                                 if counts.waiting > 0 {
@@ -217,9 +217,9 @@ mod tests {
     #[test]
     fn the_navigation_knows_where_it_is() {
         let me = Uuid::nil();
-        assert_eq!(here("/staff/overview", None, None, me), Here::Overview);
-        assert_eq!(here("/staff", None, None, me), Here::Queue(QueueFilter::Waiting));
-        assert_eq!(here("/staff", Some("auto"), None, me), Here::Queue(QueueFilter::Auto));
+        assert_eq!(here("/staff", None, None, me), Here::Overview);
+        assert_eq!(here("/staff/queue", None, None, me), Here::Queue(QueueFilter::Waiting));
+        assert_eq!(here("/staff/queue", Some("auto"), None, me), Here::Queue(QueueFilter::Auto));
         assert_eq!(here("/staff/users", None, Some("banned"), me), Here::Users(UserFilter::Banned));
         assert_eq!(here(&format!("/staff/users/{me}"), None, None, me), Here::Me);
         assert_eq!(here("/staff/users/0b6e", None, None, me), Here::User);

@@ -191,6 +191,12 @@ pub struct Uptime {
     pub live: Live,
     /// Staff mail not sent yet ([`alerts`]).
     pub alerts: Alerts,
+    /// How often the ticker runs ([`live::TICK`]; tests run it faster).
+    pub tick_every: std::time::Duration,
+    /// Tests only: how many runs of the ticker's rules panic, to prove the
+    /// ticker goes on.
+    #[doc(hidden)]
+    pub panics: std::sync::atomic::AtomicU32,
 }
 
 impl Uptime {
@@ -209,6 +215,8 @@ impl Uptime {
             sightings: Sightings::default(),
             live: Live::new(now),
             alerts: Alerts::default(),
+            tick_every: live::TICK,
+            panics: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -238,45 +246,55 @@ pub const ROLL_UP_EVERY: Duration = Duration::minutes(10);
 /// failed for the addresses it did not reach.
 pub const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long [`start`] may take for the day history.
-const START_ROLL_UP: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long [`start`] waits for the sign before the server takes requests.
+pub const START_LOAD: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// From `record` up, before the server takes requests: the sign loaded and
+/// From `record` up, before the server binds its port: the sign loaded and
 /// aged by the clock (a restart's gap written as "not watched"), so nothing
-/// reads the stored sign as it was, and every day line since the last
-/// final one. Nothing at `off`. A failure is logged; the ticker tries again.
+/// reads the stored sign as it was. At most [`START_LOAD`]: past it, or on
+/// a failure (logged), the server starts with No recent news and `seq` 0,
+/// which claims nothing, and the ticker tries again. Nothing at `off`. The
+/// day history is not written here: the ticker does it, in the background,
+/// once its rules have run.
 pub async fn start(state: &AppState) {
     let uptime = &state.uptime;
     if !uptime.level.records() {
         return;
     }
     let now = OffsetDateTime::now_utc();
-    if let Err(error) = live::tick(uptime, &state.db, now).await {
-        tracing::error!(%error, "BIR uptime: the sign could not be loaded at start");
-    }
-    match tokio::time::timeout(START_ROLL_UP, days::roll_up_recent(uptime, &state.db, now)).await {
+    match tokio::time::timeout(START_LOAD, live::tick(uptime, &state.db, now)).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!(%error, "BIR uptime: the day history could not be written at start"),
-        Err(_) => tracing::error!("BIR uptime: the day history took too long at start; the ticker goes on"),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "BIR uptime: the sign could not be loaded at start; No recent news until the ticker can")
+        }
+        Err(_) => tracing::error!("BIR uptime: loading the sign took too long at start; No recent news until the ticker can"),
     }
 }
 
 /// From `record` up, for as long as the server runs: every 30 seconds runs
 /// the rules for what the clock alone changes (and the tries waiting) and
 /// sends the staff mail that is due, and every 10 minutes (and after each
-/// Manila midnight) rewrites every day line not final yet. Nothing at
-/// `off`.
+/// Manila midnight), once the rules have run, rewrites every day line not
+/// final yet in a task of its own (one at a time), so a long roll-up never
+/// holds the rules. Nothing at `off`.
 pub async fn run_ticker(state: AppState) {
     let uptime = state.uptime.clone();
     if !uptime.level.records() {
         return;
     }
     let mut rolled: Option<(OffsetDateTime, time::Date)> = None;
+    let mut rolling: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let now = OffsetDateTime::now_utc();
+        let mut ruled = false;
         guarded("the rules", async {
-            if let Err(error) = live::tick(&uptime, &state.db, now).await {
-                tracing::error!(%error, "BIR uptime: the rules could not run");
+            if uptime.panics.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                uptime.panics.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("a made-up panic in the rules");
+            }
+            match live::tick(&uptime, &state.db, now).await {
+                Ok(()) => ruled = true,
+                Err(error) => tracing::error!(%error, "BIR uptime: the rules could not run"),
             }
         })
         .await;
@@ -293,17 +311,23 @@ pub async fn run_ticker(state: AppState) {
             }
         })
         .await;
+        // The day history only after a run of the rules that wrote, so a
+        // day's end is evaluated (or its gap written) before it is final.
         let day = keys::manila_day(now);
-        if rolled.is_none_or(|(at, rolled_day)| now - at >= ROLL_UP_EVERY || rolled_day != day) {
-            guarded("the day history", async {
-                match days::roll_up_recent(&uptime, &state.db, now).await {
-                    Ok(()) => rolled = Some((now, day)),
-                    Err(error) => tracing::error!(%error, "BIR uptime: the day history could not be written"),
-                }
-            })
-            .await;
+        let due = rolled.is_none_or(|(at, rolled_day)| now - at >= ROLL_UP_EVERY || rolled_day != day || now < at);
+        if ruled && due && rolling.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
+            rolled = Some((now, day));
+            let (uptime, db) = (uptime.clone(), state.db.clone());
+            rolling = Some(tokio::spawn(async move {
+                guarded("the day history", async {
+                    if let Err(error) = days::roll_up_recent(&uptime, &db, now).await {
+                        tracing::error!(%error, "BIR uptime: the day history could not be written");
+                    }
+                })
+                .await;
+            }));
         }
-        tokio::time::sleep(live::TICK).await;
+        tokio::time::sleep(uptime.tick_every).await;
     }
 }
 

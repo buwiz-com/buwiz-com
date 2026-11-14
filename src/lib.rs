@@ -81,12 +81,14 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::error!(error = ?error, "could not resume document readings");
     }
     let uptime = state.uptime.clone();
+    // The sign only (at most 10 seconds) before the port; the day history
+    // is the ticker's, after it.
     uptime::start(&state).await;
-    tokio::spawn(uptime::run_ticker(state.clone()));
-    let app = app(state);
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");
+    tokio::spawn(uptime::run_ticker(state.clone()));
+    let app = app(state);
     tokio::select! {
         served = axum::serve(listener, app).into_future() => served?,
         () = shutdown() => tracing::info!("stopping: no new connections; open ones end with the process"),

@@ -463,7 +463,19 @@ pub async fn roll_up(
     let networks = key_networks.unwrap_or(0).max(i64::try_from(set_networks).unwrap_or(i64::MAX));
     let outages = serde_json::to_value(&states.outages).unwrap_or(Value::Array(Vec::new()));
     let windows = serde_json::json!({ "dispatcher": states.dispatcher, "upload": states.upload });
-    let is_final = now >= day_end + FINAL_AFTER;
+    // Final only once the sign was evaluated after the day ended (or a gap
+    // in watching covers its end): a day whose last stretch nobody judged
+    // is written again later, never fixed as it stood.
+    let judged: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM bir_sign WHERE updated_at >= $1)
+             OR EXISTS (SELECT 1 FROM bir_events stop JOIN bir_events back ON back.id > stop.id
+                         WHERE stop.scope = 'watch' AND stop.to_state = 'not_watched' AND stop.at <= $1
+                           AND back.scope = 'watch' AND back.to_state = 'watched' AND back.at >= $1)",
+    )
+    .bind(day_end)
+    .fetch_one(db)
+    .await?;
+    let is_final = now >= day_end + FINAL_AFTER && judged;
     let count = |value: i64| i32::try_from(value).unwrap_or(i32::MAX);
     sqlx::query(
         "INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,

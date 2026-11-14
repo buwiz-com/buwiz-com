@@ -778,7 +778,7 @@ async fn the_day_history_adds_up_across_midnight_and_a_restart(db: PgPool) {
     assert_eq!(row.quiet_minutes, 24 * 60);
     assert_eq!(row.worst, "no_recent_news");
     assert_eq!(row.hours, "n".repeat(24));
-    assert!(row.is_final);
+    assert!(!row.is_final, "not final: the sign was not evaluated after it ended");
 }
 
 /// (at, scope, from, to, cause, reason) of the `watch` events.
@@ -1327,4 +1327,56 @@ async fn a_try_never_waits_for_the_rules(db: PgPool) {
     drop(held);
     live::tick(&uptime, &db, t(1) + Duration::seconds(30)).await.unwrap();
     assert_eq!(uptime.live.sign().state, Light::Online);
+}
+
+/// A day is final only once the sign was evaluated after it ended, or a
+/// gap in watching covers its end: a server that stopped before midnight
+/// and has not run since leaves the day open.
+#[sqlx::test]
+async fn a_day_is_final_only_once_its_end_was_watched(db: PgPool) {
+    let uptime = uptime(t(0));
+    let day = manila_day(t(0));
+    record(&uptime, &db, 1, 1, Ends::Landed, t(0)).await;
+    // Watched until 23:20 Manila (t(800)), then stopped.
+    watch(&uptime, &db, t(800)).await;
+    live::tick(&uptime, &db, t(800)).await.unwrap();
+    days::roll_up(&db, &uptime.day_sets, day, t(900)).await.unwrap();
+    assert!(!day_row(&db, day).await.is_final, "its last 40 minutes were never judged");
+    // Back at 00:05: the gap covers midnight, and the day is final.
+    live::tick(&uptime, &db, t(845)).await.unwrap();
+    days::roll_up(&db, &uptime.day_sets, day, t(900)).await.unwrap();
+    let row = day_row(&db, day).await;
+    assert!(row.is_final);
+    let unwatched: i32 =
+        sqlx::query_scalar("SELECT unwatched_minutes FROM bir_days WHERE day = $1").bind(day).fetch_one(&db).await.unwrap();
+    assert_eq!(unwatched, 40, "23:20 to midnight");
+}
+
+/// The real ticker, through a tick whose rules panic: the same tick's
+/// staff mail still goes, the day history waits for a run of the rules,
+/// and the next tick runs them.
+#[sqlx::test]
+async fn the_ticker_goes_on_through_a_panicking_tick(db: PgPool) {
+    let mut uptime = Uptime::new(Level::Record, vec![22], false, OffsetDateTime::now_utc());
+    uptime.tick_every = std::time::Duration::from_millis(20);
+    uptime.panics.store(1, std::sync::atomic::Ordering::SeqCst);
+    uptime.alerts.push(Alert::missing_header(OffsetDateTime::now_utc()));
+    let site = Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up Sender secret, 32 characters or more", uptime);
+    site.staff_with_role("admin@example.test", "admin").await;
+    let ticker = tokio::spawn(buwiz_cloud::uptime::run_ticker(site.state.clone()));
+    let uptime = &site.state.uptime;
+    let today = manila_day(OffsetDateTime::now_utc());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let days: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM bir_days WHERE day = $1").bind(today).fetch_one(&db).await.unwrap();
+        if uptime.live.sign().seq > 0 && uptime.alerts.queued() == 0 && days == 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the ticker stopped after the panic");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(uptime.panics.load(std::sync::atomic::Ordering::SeqCst), 0, "the tick did panic");
+    assert!(!ticker.is_finished());
+    ticker.abort();
 }

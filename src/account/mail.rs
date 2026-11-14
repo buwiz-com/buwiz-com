@@ -12,9 +12,12 @@ use crate::base::config::MailConfig;
 
 /// How long connecting to the mail provider may take ...
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// ... and one whole request, so a provider that hangs never holds a caller
-/// (a sign-in, or BIR uptime's ticker) for longer.
+/// ... and one whole request, so a provider that hangs never holds BIR
+/// uptime's ticker for longer ...
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// ... but a sign-in code gets longer: a slow provider that still delivers
+/// it must not show the person an error page for a code that arrives.
+const CODE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The HTML sign-in code email; `{{code}}` and `{{logo_url}}` are filled in.
 const SIGN_IN_CODE_HTML: &str = include_str!("email/sign_in_code.html");
@@ -112,6 +115,7 @@ impl Mailer {
             MailConfig::Resend { api_key, from } => {
                 self.http
                     .post("https://api.resend.com/emails")
+                    .timeout(CODE_TIMEOUT)
                     .bearer_auth(api_key)
                     .json(&json!({
                         "from": from,

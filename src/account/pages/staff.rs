@@ -971,15 +971,7 @@ async fn new_login_form() -> Result<impl View> {
                     "Email"
                     <input type="email" name="email" required=(true) maxlength="254" autocomplete="off">
                 </label>
-                <p class="side-text">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now."</p>
-                <label class="decision-label">
-                    "Role"
-                    <select name="role">
-                        <option value="none" selected=(true)>"No staff role"</option>
-                        <option value="support">"Support"</option>
-                        <option value="admin">"Admin"</option>
-                    </select>
-                </label>
+                <p class="side-text">"They sign in with a code sent to this address, so it must be able to receive mail. Nothing is sent now. A staff role can be given on their page after their first sign-in."</p>
                 <label class="reason">
                     <input type="checkbox" name="test" value="on">
                     <span>"Test account"</span>
@@ -1116,6 +1108,8 @@ pub mod account_id {
             })
             .collect();
         let live_sessions = sessions.iter().filter(|(_, live)| *live).count();
+        // A role waits for a first sign-in (`admin::change_role`).
+        let never_signed_in = sessions.is_empty();
         let signed_in: Vec<AppRow> = apps.iter().filter(|app| app.signed_in).cloned().collect();
         let history = history(&user, &claims, &apps, &sessions, &audit, &account_audit);
         let subtitle = {
@@ -1256,6 +1250,9 @@ pub mod account_id {
                                             confirm: "Ban",
                                             reason: true
                                         )
+                                    }
+                                    if never_signed_in {
+                                        <p class="side-text">"They have not signed in yet: a staff role can be given after their first sign-in."</p>
                                     }
                                     <form class="end-form" method="post" action=(format!("/staff/users/{account_id}/role")) data-confirm=(format!("Change {}'s role?", user.email)) data-confirm-detail="It takes effect on their next page." data-confirm-label="Change role">
                                         <label class="decision-label">

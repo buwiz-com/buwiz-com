@@ -1256,8 +1256,6 @@ async fn add_test_tin(
 struct NewLoginForm {
     #[serde(default)]
     email: String,
-    #[serde(default)]
-    role: String,
     /// `on` when the box is ticked.
     #[serde(default)]
     test: String,
@@ -1265,8 +1263,9 @@ struct NewLoginForm {
     reason: String,
 }
 
-/// An Admin makes a login: an email, a role (`none`, `support`, `admin`),
-/// maybe the test label, and a reason. It opens the new account's page.
+/// An Admin makes a login: an email, maybe the test label, and a reason (no
+/// role: one is given after the person's first sign-in). It opens the new
+/// account's page.
 async fn create_login(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<NewLoginForm>) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
@@ -1276,14 +1275,7 @@ async fn create_login(State(state): State<AppState>, headers: HeaderMap, Form(fo
         Ok(staff) => staff,
         Err(response) => return response,
     };
-    let role = match form.role.as_str() {
-        "" | "none" => None,
-        raw => match Role::parse(raw) {
-            Some(role) => Some(role),
-            None => return see_other(link(back_to, Some(Notice::RoleUnknown), &[])),
-        },
-    };
-    let login = admin::NewLogin { email: &form.email, role, test: form.test == "on", reason: &form.reason };
+    let login = admin::NewLogin { email: &form.email, test: form.test == "on", reason: &form.reason };
     match admin::create_login(&state.db, &state.config, &staff, &login).await {
         Ok((id, notice)) => see_other(link(&format!("/staff/users/{id}"), Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(back_to, Some(notice), &[])),

@@ -652,6 +652,25 @@ async fn the_first_admin_comes_from_the_file_only_when_the_server_has_no_list(db
     );
 }
 
+/// The file may not leave only Admins nobody signed in as, where an Admin
+/// who had signed in was left before: one mistyped address would leave
+/// nobody able to sign in as an Admin. A first Admin made on a database
+/// with none (above) is no such change.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_file_cannot_leave_only_admins_who_never_signed_in(db: PgPool) {
+    let site = Site::with_admins(db, &[]);
+    site.staff_with_role("ana@example.test", "admin").await;
+    let root = listing("root@example.test", false, &["root@example.test"]);
+    let demote = "[[login]]\nemail = \"ana@example.test\"\nrole = \"none\"\n";
+    let problem = refused(seed(&site.db, demote, &root).await);
+    assert!(problem.contains("the roles in the file leave Buwiz with no Admin who has signed in"), "{problem}");
+    assert_eq!(account(&site.db, "ana@example.test").await.1.as_deref(), Some("admin"));
+    // Once the server's Admin has signed in, the same file runs.
+    site.person("root@example.test").await;
+    seed(&site.db, demote, &root).await.unwrap();
+    assert_eq!(account(&site.db, "ana@example.test").await.1, None);
+}
+
 /// The command refuses to guess the list from the shell it runs in.
 #[sqlx::test(migrations = "./migrations")]
 async fn the_seed_command_needs_admin_emails_or_says_there_is_none(db: PgPool) {

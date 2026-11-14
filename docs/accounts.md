@@ -36,7 +36,19 @@ everyone who is not staff gets a 404. Each action checks its actor's role
 again inside its own transaction, so one whose page check passed just
 before the actor was demoted or banned does nothing. Role changes refuse
 one's own account, an `ADMIN_EMAILS` person, and a change that would leave
-no Admin; a change to the role the account has says nothing changed. Every
+no Admin who has signed in; a change to the role the account has says
+nothing changed. A role (Support or Admin) goes only to an account that
+has signed in: sign-in is by a code mailed to the address, so until then
+nobody has shown the address is theirs, and a mistyped one would hand staff
+powers to whoever has it ("They must sign in once first, so the address is
+proven"). What counts is a website session on record, ended ones too
+(`web_sessions`, never deleted; every sign-in starts one). Taking a role
+away is not held up by it. For the same reason an Admin who never signed
+in, by stored role or `ADMIN_EMAILS`, does not count as the Admin who
+stays when another is demoted. The seed tool still gives roles to logins
+it makes, as before (it is an operator's run, with its dry run), and it
+refuses a file that leaves only such Admins where one who had signed in
+was left before. Every
 staff action takes a reason (500 characters at most, like the review
 notes), signing one app out included, but two: approving a claim and
 confirming an automatic activation (unless the confirmation lifts the
@@ -45,11 +57,15 @@ person, and sending it back needs a fix reason or a note. Nobody bans
 themselves, changes their own role or labels their own account a test
 account; their own page says so instead of showing those forms.
 
-"New user" makes a login the way the seed tool does: the account, its
-role and test label if asked, and a `created` line (and one per role or
-label) with the reason. It refuses an address that already has an
-account, and mails nothing: the person signs in with a code sent to the
-address when they ask, so it must be able to receive mail.
+"New user" makes a login the way the seed tool does: the account, the
+test label if asked, and a `created` line (and a `test_marked` one) with
+the reason. It gives no staff role: an Admin gives one on the person's
+page after their first sign-in. It refuses an address that already has an
+account, and the test label for an address in `ADMIN_EMAILS` (whose page
+has no test-label controls, so the label could not come off), and it mails
+nothing: the person signs in with a code sent to the address when they
+ask, so it must be able to receive mail. The History of such a login
+starts with who made it.
 
 Staff open their own page under `/staff/users` and read it in full,
 History and every reason included, and their own claims' pages too. An

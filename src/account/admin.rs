@@ -121,19 +121,20 @@ pub(crate) async fn create_account(tx: &mut Transaction<'_, Postgres>, email: &s
     }
 }
 
-/// A login an Admin makes on the staff pages.
+/// A login an Admin makes on the staff pages. It has no staff role: a role
+/// waits until its person signs in ([`change_role`]).
 pub struct NewLogin<'a> {
     pub email: &'a str,
-    pub role: Option<Role>,
     pub test: bool,
     pub reason: &'a str,
 }
 
-/// An Admin makes a login: the account, with its role and test label, and
-/// a line for each in `account_audit`, all with the one reason. Refused for
-/// an address that already has an account. No mail goes out: the person
-/// signs in with a code sent to the address when they ask for one. Locks
-/// as a role change does: the roles lock, then the actor.
+/// An Admin makes a login: the account, with the test label if asked, and
+/// a line for each in `account_audit`, both with the one reason. Refused
+/// for an address that already has an account, and the label for an
+/// address in `ADMIN_EMAILS` (whose page cannot take it off). No mail goes
+/// out: the person signs in with a code sent to the address when they ask
+/// for one. Locks as a role change does: the roles lock, then the actor.
 pub async fn create_login(
     db: &PgPool,
     config: &Config,
@@ -147,42 +148,38 @@ pub async fn create_login(
     if !roles::may(&mut tx, config, actor.account.id, Power::CreateLogin).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
-    if login.role.is_some() && roles::in_server_setting(config, &email) {
-        return Err(DecideError::Refused(Notice::RoleFromServer));
+    if login.test && roles::in_server_setting(config, &email) {
+        return Err(DecideError::Refused(Notice::TestLabelFromServer));
     }
     let (id, made) = create_account(&mut tx, &email).await?;
     if !made {
         return Err(DecideError::Refused(Notice::AccountExists));
     }
-    let line = |action, new_value| Line {
+    let line = |action| Line {
         account_id: id,
         action,
         old_value: None,
-        new_value,
+        new_value: None,
         source: Source::Web,
         reason: Some(&reason),
     };
-    audit(&mut tx, &actor.account, line("created", None)).await?;
-    if let Some(role) = login.role {
-        sqlx::query("UPDATE accounts SET role = $2 WHERE id = $1")
-            .bind(id)
-            .bind(role.as_str())
-            .execute(&mut *tx)
-            .await?;
-        audit(&mut tx, &actor.account, line("role_changed", Some(role.as_str()))).await?;
-    }
+    audit(&mut tx, &actor.account, line("created")).await?;
     if login.test {
         sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1").bind(id).execute(&mut *tx).await?;
-        audit(&mut tx, &actor.account, line("test_marked", None)).await?;
+        audit(&mut tx, &actor.account, line("test_marked")).await?;
     }
     tx.commit().await?;
-    tracing::info!(account_id = %id, actor = %actor.account.id, role = login.role.map(Role::as_str), "login created");
+    tracing::info!(account_id = %id, actor = %actor.account.id, test = login.test, "login created");
     Ok((id, Notice::LoginCreated))
 }
 
 /// An Admin gives an account a role, or takes it away (`None`). Refused for
 /// one's own account, for a person who is an Admin through `ADMIN_EMAILS`,
-/// and when it would leave Buwiz without an Admin.
+/// when it would leave Buwiz without an Admin who has signed in, and a
+/// role for an account that never signed in: sign-in is by a code mailed
+/// to the address, so until then nobody has shown the address is theirs (a
+/// mistyped one would hand staff powers to whoever has it). Taking a role
+/// away is never held up by that.
 pub async fn change_role(
     db: &PgPool,
     config: &Config,
@@ -204,6 +201,9 @@ pub async fn change_role(
     let old = target.role.as_deref().and_then(Role::parse);
     if old == role {
         return Ok(Notice::RoleUnchanged);
+    }
+    if role.is_some() && !roles::has_signed_in(&mut *tx, target.id).await? {
+        return Err(DecideError::Refused(Notice::NotSignedInYet));
     }
     // Under the lock, so a demotion running at the same time has committed
     // and is counted.

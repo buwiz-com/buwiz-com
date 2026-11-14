@@ -244,7 +244,8 @@ The order:
    `sudo systemctl stop buwiz.service`.
 3. From the release's checkout, run the newer down file, then the older,
    each in one transaction (from a release with migration 13, run
-   [its down file](#migration-13-test-tins) first; it commits on its own,
+   [its down file](#migration-13-test-tins) first, and from one with 14,
+   [14's](#migration-14-bir-uptime) before that; each commits on its own,
    [below](#rolling-back-from-13)):
    ```sh
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0012_staff_roles.down.sql
@@ -500,6 +501,63 @@ and put the previous binaries back. Their audit lines stay (the TIN masked,
 then 12's and 11's as [above](#rolling-back), step by step: 13's commits
 before 12's checks run, and a refusal by 12's leaves the database at 12
 ([Rolling back from 13](#rolling-back-from-13)).
+
+## Migration 14 (BIR uptime)
+
+The release that records BIR uptime ([bir-uptime.md](bir-uptime.md))
+runs migration 14 when it starts. It adds new tables only (`bir_tries`,
+`bir_events`, `bir_sign`, `bir_notes`, `bir_queue_reports`, `bir_turns`,
+`bir_held`, `bir_host_keys`, `bir_days`, `bir_proofs`) and two nullable
+columns, `tickets.bir_admission` and `devices.bir_reported_at`. No
+existing row changes. None of the tables holds a TIN, a name, an email or
+an IP address. The release before it (at 13) refuses to start on a
+database at 14, as with any newer migration.
+
+**Before you deploy.** The database is at 13 and has no uptime table
+yet (after a rollback, what it kept is in `rollback_archive` and comes
+back at start); both as read-only checks:
+```sql
+SELECT max(version) FROM _sqlx_migrations;                            -- 13
+SELECT count(*) FROM information_schema.tables
+ WHERE table_schema = 'public' AND table_name LIKE 'bir\_%';          -- 0
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+The Sender and the Gatekeeper ship from one build and restart together, so
+the Sender's `sender` frame (its mode, [relay-protocol.md](relay-protocol.md#6-the-sender))
+arrives with the Gatekeeper that reads it; a try during the restart is
+recorded with mode `unknown` and not counted.
+
+**The new settings** (Gatekeeper, `/buwiz/*`):
+- `BIR_UPTIME`: leave it unset (it means `record`) for the first deploy.
+  The server then records each relay try and changes nothing any app sees.
+  `off` records nothing. `public` and `enforce` come with later releases
+  and are switched on only when those say so; `enforce` waits until no
+  mini app 0.3.2 install remains. A value it does not know is logged and
+  read as `record`.
+- `BIR_UPTIME_UPLOAD_PORTS`: leave it unset (`22`).
+
+Check the record after the first real sends:
+```sql
+SELECT date_trunc('hour', started_at) AS hour, mode, outcome, failure_class, failure_kind, count(*)
+  FROM bir_tries GROUP BY 1, 2, 3, 4, 5 ORDER BY 1 DESC;
+```
+
+**Rolling back to 13.** The down file never refuses. It moves what Buwiz
+keeps forever, the day history (`bir_days`), events, notes, proofs and the
+sign (`bir_sign`, whose `seq` only grows), to tables in the
+`rollback_archive` schema, which the release before this one does not
+read, and drops the rest: the tries of the last 90 days, queue reports,
+turns, held requests and recorded host keys. Stop the app, then:
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0014_bir_uptime.down.sql
+psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 13
+```
+and put the previous binaries back. When this release (or a later one)
+starts again, migration 14 copies the archived rows back and drops their
+archive tables, so the history is whole again. A proof whose account or
+claim was deleted meanwhile stays in `rollback_archive.bir_proofs`. Going
+further back runs 14's down file first, then 13's and the others as
+[above](#migration-13-test-tins); each commits on its own.
 
 ## OCR of claim documents
 

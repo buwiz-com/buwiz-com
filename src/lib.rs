@@ -43,8 +43,8 @@ const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 /// restarting` with `Retry-After`, while requests already under way go on
 /// and the BIR uptime records of tries that end get written, for at most 10
 /// seconds; the BIR sign's evaluation time is written (at most 5 seconds);
-/// then the process exits at once, so blocking work (a document reading)
-/// cannot hold the restart. Connections still open (a relay send under way)
+/// then the process exits at once, without exit-time destructors, so
+/// blocking work (a document reading) cannot hold the restart. Connections still open (a relay send under way)
 /// end with the process, as they did when SIGTERM killed it. SIGUSR1, at
 /// any time, only makes the BIR sign take in a note the `bir` command wrote
 /// ([`uptime::poke`]).
@@ -123,6 +123,23 @@ pub async fn run() -> anyhow::Result<()> {
     }
     uptime::stop(&state, time::OffsetDateTime::now_utc()).await;
     tracing::info!("stopped");
+    exit_now()
+}
+
+/// Leaves at once, with status 0 and without exit-time destructors, so a
+/// native library's static destructors (the OCR runtime's) cannot crash or
+/// stall the stop while its worker threads still run. What was logged is
+/// flushed first.
+fn exit_now() -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    // SAFETY: `_exit` only ends the process; nothing in it is touched.
+    unsafe {
+        libc::_exit(0)
+    }
+    #[cfg(not(unix))]
     std::process::exit(0)
 }
 

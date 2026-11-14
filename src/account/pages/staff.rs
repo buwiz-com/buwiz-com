@@ -1151,7 +1151,7 @@ async fn review_this_claim(review: String, open: bool) -> Result<impl View> {
     Ok(view! {
         <section class="sx-sub sx-preview" aria-labelledby="sx-preview">
             <h3 id="sx-preview">(if open { "Decision" } else { "Actions" })</h3>
-            <p class="sx-text">"The first claim in the list, shown until you choose one. Its decision and actions are on the claim itself."</p>
+            <p class="sx-text">"Shown because it is first in the list. Choose it to see its decision and actions."</p>
             <a class="sx-btn pri block" href=(review)>(ic("arrow-right")) "Review this claim"</a>
         </section>
     })

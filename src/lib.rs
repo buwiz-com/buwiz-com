@@ -12,6 +12,7 @@ pub mod ocr;
 pub mod relay;
 pub mod sender;
 pub mod sites;
+pub mod uptime;
 
 // The old flat paths (`buwiz_cloud::config`, `crate::tickets`, ...) stay as
 // re-exports: the private BIR files restored only on the owner's machine

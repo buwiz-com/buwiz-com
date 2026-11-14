@@ -538,10 +538,13 @@ recorded with mode `unknown` and not counted.
 **The new settings** (Gatekeeper, `/buwiz/*`):
 - `BIR_UPTIME`: leave it unset (it means `record`) for the first deploy.
   The server then records each relay try and changes nothing any app sees.
-  `off` records nothing. `public` today only adds `class` to the relay
-  result, and `enforce` does nothing more than `public`; both are switched
-  on only when the later releases that build them say so, and `enforce`
-  waits until no mini app 0.3.2 install remains. Any case is read; a value
+  `off` records nothing. `public` adds what apps and people read: the
+  `/api/bir/*` routes, the `buwiz-bir` header, `class` and `bir` on the
+  relay result, the status page `/bir-status` with its footer link, and the
+  My TINs line ([bir-uptime.md](bir-uptime.md#13-server-settings)); below
+  it none of those exist. `enforce` does nothing more than `public` yet.
+  The owner's plan: `record` first, `public` after two weeks of history
+  that looks right, `enforce` only after the new apps are released. Any case is read; a value
   it does not know is logged and read as `record`.
 - `BIR_UPTIME_UPLOAD_PORTS`: leave it unset (`22`).
 

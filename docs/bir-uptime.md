@@ -8,31 +8,34 @@ code changes meaning, and an app that knows nothing of this page keeps
 working ([Compatibility](#12-compatibility)).
 
 **What runs today.** The server's `BIR_UPTIME` setting decides how much of
-this is switched on ([Settings](#13-server-settings)). This release
-records: every real send through the relay leaves one classified row per
-try ([The per-try record](#14-the-per-try-record)). From those rows the
-server keeps the sign, both lights and the overall state, by the rules of
-§2.1, in memory and in its database, with an event for every change;
-Admins can set a note by hand and resume a paused relay (functions only,
-no staff screen yet); one line of day history is kept per Manila day; and
-Admins and Support get mail about changes
-([What the server keeps](#15-what-the-server-keeps)). None of that is
-shown to an app yet. At `public` the server also adds `class` to the relay
-`result` and keeps the Sender's mode on a failed or unknown submission;
-`enforce` does nothing more yet.
+this is switched on ([Settings](#13-server-settings)). From `record`: every
+real send through the relay leaves one classified row per try
+([The per-try record](#14-the-per-try-record)); from those rows the server
+keeps the sign, both lights and the overall state, by the rules of §2.1,
+in memory and in its database, with an event for every change; Admins set
+a note by hand with the `buwiz-cloud bir` command (§15.4; no staff screen
+yet); one line of day history is kept per Manila day; and Admins and
+Support are mailed when the sign goes Offline or comes back
+([What the server keeps](#15-what-the-server-keeps)). Apps and people see
+none of it at `record`: every response is as it was. From `public`: the
+read routes of §4 (`/api/bir/status`, `/api/bir/status/mine`,
+`/api/bir/history`), the `buwiz-bir` header and the `bir` and `class`
+fields of §3, the public status page and the My TINs line of §4.4, and
+`mode` kept on a failed or unknown submission. `enforce` does nothing more
+yet.
 
-**Planned, not built yet:** everything else on this page. Reading the sign
-(its `buwiz-bir` header, §2.3, §3, and the routes of sections 4 to 8: they
-do not exist yet, so they answer `404` at every level), the sign object's
-`scout_at`, `wait_until`, `admission`, `words`, `queue` and `links`, holds
-on tickets and the v1 relay (§5), turns, queue reports, scouts and
-admission (§6; waking starts but nothing ends it yet), the `bir_turn` and
-`bir_try_anyway` ticket fields, the direct app's reports (§7), proofs
-(§8), the queue numbers (§9), the codes of §10 but `class`, the `bir` and
-`hold` fields of the relay `result`, the staff screens, and holding
-anything while the relay is paused. Their tables exist (migration 14).
-The sections below describe them as they will be, so app authors can
-build against them.
+**Planned, not built yet:** the sign object's `scout_at`, `wait_until`,
+`admission`, `queue` and `links.manual_filing` (left out of the answers,
+not sent as nulls), `detail.yours` on `/mine`, `/api/bir/history/mine`
+(staff-only counts), holds on tickets and the v1 relay (§5), turns, queue
+reports, scouts and admission (§6; waking starts but nothing ends it yet),
+the `bir_turn` and `bir_try_anyway` ticket fields, the direct app's reports
+(§7), proofs and "Another way to file" (§8), the queue numbers (§9), the
+codes of §10 but `class` and `rate_limited`, the `hold` field of the relay
+`result`, the staff screens, and holding anything while the relay is
+paused. Their tables exist (migration 14). The sections below describe them
+as they will be, so app authors can build against them; each says what is
+built.
 
 ## 0. Ground rules
 
@@ -162,13 +165,28 @@ Where a full object does not fit (section 3), the sign rides as one HTTP
 header, an RFC 8941 dictionary:
 
 ```
-buwiz-bir: v=1, seq=4182, state=offline, dispatcher=online, upload=offline, relay=ok, since=1762845000, until=1762852421, scout=1762852421, admit=?0, note=?0
+buwiz-bir: v=1, seq=4182, state=offline, dispatcher=online, upload=offline, relay=ok, since=1794381000, until=1794388421, scout=1794388421, admit=?0, note=?0
 ```
 
 Times are Unix seconds (`since` rounded as in §2.2). `until` is
 `wait_until`; `scout` is `scout_at`; absent members are `null`. A client
 that sees a higher `seq` and wants the note text or the words reads the
 full object (§4.1).
+
+**As built:** `v`, `seq`, `state`, `dispatcher`, `upload`, `relay`, `since`
+and `note`, in that order; `until`, `scout` and `admit` are left out until
+they are built:
+
+```
+buwiz-bir: v=1, seq=4182, state=offline, dispatcher=online, upload=offline, relay=ok, since=1794381000, note=?0
+```
+
+It is added from memory as the response leaves, whatever its status, and
+nothing else about the response changes: not its body, not its caching.
+The trust list keeps `Cache-Control: public, max-age=300`, so a copy a
+cache kept can carry a sign up to 5 minutes old; its `seq` is lower than
+the one a client already has from a later response, and the client keeps
+the higher.
 
 ## 3. How apps hear the sign
 
@@ -182,7 +200,7 @@ sign too. A sleeping queue makes no other request.
 | `GET /.well-known/buwiz-hpke.json` | header `buwiz-bir` |
 | `POST /api/tickets` (every answer, 2xx or not) | header `buwiz-bir`; on a hold also body `bir` (full object) |
 | `POST /api/v2/submissions`, `POST /api/submissions` | header `buwiz-bir` |
-| relay `result` frame | field `class` (built, from `public`) and, planned, `bir` (full object, right after this try) |
+| relay `result` frame | fields `class` and then `bir` (the public sign object), from `public`. `bir` is the sign as it is when the app is told: this try's record is written after the app has its result (never delaying a send), so the try itself shows in the next sign, not this one. `bir` comes with every result of a live try and every one with a `class`; a lab try, or one whose mode is unknown, gets neither. |
 | `GET /api/tax-profiles` | header `buwiz-bir` |
 | `POST /api/bir/queue`, `POST /api/bir/reports` | body (full object) |
 | `GET /api/bir/status`, `GET /api/bir/status/mine` | body (full object) |
@@ -215,7 +233,33 @@ or a one-shot sender on the same database, starts from them.
 - Safe to expose: no counts, no account, no TIN, no host name, no IP; past
   times rounded to 5 minutes.
 - `404` while the server's `BIR_UPTIME` setting is below `public`: apps
-  treat that as "this server has no sign".
+  treat that as "this server has no sign". Below `public` the route does
+  not exist at all: the answer is the site's own 404, byte for byte what
+  any unknown address gets.
+
+**As built.** The `ETag` is `"b-{revision}-{n}"`: the sign's `revision`
+(which moves with everything a reader sees) and the 5-minute mark its
+`evaluated_at` is rounded to, so a cached copy never outlives either.
+`If-None-Match` with it (or `*`, or a weak `W/` form, or in a list) answers
+`304` with the same `ETag` and caching. The address counted is
+`CF-Connecting-IP`, an IPv6 address by its /64; the history counts in the
+same 120. A `429` is `Cache-Control: no-store`, so no cache keeps it for
+others. No `Vary`: the answer is the same for everyone. Example:
+
+```json
+{"v":1,"seq":4182,"state":"offline","since":"2026-11-11T07:10:00Z","evaluated_at":"2026-11-11T09:00:00Z",
+ "source":"tries","relay":"ok",
+ "windows":{"dispatcher":{"state":"online","since":"2026-11-11T01:00:00Z","last_ok_at":"2026-11-11T08:55:00Z"},
+            "upload":{"state":"offline","since":"2026-11-11T07:10:00Z","last_ok_at":"2026-11-11T07:00:00Z"}},
+ "last_success_at":"2026-11-11T07:00:00Z","last_news_at":"2026-11-11T08:55:00Z","last_state":null,"note":null,
+ "words":{"title":"The BIR is offline",
+          "line":"The BIR's mailbox is offline since Nov 11, 3:10 PM. Returns can't get in until it's back."},
+ "links":{"status_page":"https://ebirforms.buwiz.com/bir-status"}}
+```
+
+`note`, when one is in force: `{"kind":"outage","text":"…","set_at":"…"
+(rounded),"until":"…" (exact)}`; `source` is then `staff`. `words` name
+times in Manila time with the date, so they change only with the sign.
 
 ### 4.2 Signed-in detail: `GET /api/bir/status/mine`
 
@@ -233,6 +277,14 @@ with exact times, plus:
 
 `yours` comes from this account's own queue reports (§6.1): its waiting
 count across its devices, and a turn if one of its devices holds one.
+
+**As built:** `last_10` (the mailbox's last 10, as the rules last read
+them) and `today` (counted tries of the Manila day, Buwiz-wide; `accounts`
+the larger of the day's set in memory and the distinct keys within one key
+period); `yours` is planned. The sign's past times are to the minute. A
+Bearer token of any scope (the BIR apps, Books, AI agents) or the website
+session; none answers `401`, a banned account `403`. No `ETag`, and never a
+`304`, whatever `If-None-Match` says.
 
 **The small cached read** (for screens): each client keeps one in memory:
 one request shared by concurrent callers; answered from memory when younger
@@ -269,12 +321,35 @@ counts.
 Days come from the one-line-per-day history kept forever; today's line is
 computed live.
 
+**As built** (`/history/mine` is planned): at most **90** days a request
+(the default: the 90 up to today); `from` after `to`, `to` after today, or
+not a date: `400 bad_range`. `Cache-Control: public, max-age=300`. Every
+day in the range has a line; a day before the history began is `state:
+"none"` with `-` every hour. Each line gives the worst state (and
+`not_watched` for a day Buwiz watched none of), the hours (with `w`, an
+hour not watched at all), `online_minutes`, `busy_minutes`,
+`offline_minutes`, `no_recent_news_minutes`, `note_minutes` and
+`not_watched_minutes` (each rounded to 5 minutes), the shares of the
+watched time in whole percent (`online_percent` and so on; null when none
+was watched), and `note`. No count of tries, accounts or networks: on a
+quiet day they would point at one person. The last of the 96 letters of
+`last_24h` is the quarter hour now running.
+
+```json
+{"v":1,"from":"2026-08-17","to":"2026-11-14",
+ "days":[{"day":"2026-11-11","state":"offline","hours":"nnnnnnnnoooooooxxxxxxxxx","online_minutes":420,
+          "busy_minutes":0,"offline_minutes":530,"no_recent_news_minutes":480,"note_minutes":0,
+          "not_watched_minutes":10,"online_percent":29,"busy_percent":0,"offline_percent":37,
+          "no_recent_news_percent":34}, …],
+ "last_24h":"nnnn…96 letters…xxxx"}
+```
+
 ### 4.4 Pages
 
 | Address | Who |
 |---|---|
-| `https://ebirforms.buwiz.com/bir-status` | Public status page: the sign, the 24-hour bar and the month calendar (the same calendar view staff see, without counts), and "Another way to file" (§8). |
-| `https://account.buwiz.com/tins` | A banner at the top of My TINs while the state is `busy` or `offline`, or a hand-set note is in force. Not for `no_recent_news`. |
+| `https://ebirforms.buwiz.com/bir-status` | Public status page: the sign, the 24-hour bar and the month calendar (the same calendar view staff see, without counts), and "Another way to file" (§8). **Built** from `public`: the sign in large words with since when, both windows, a hand-set note, the last 24 hours, a calendar of the last 90 days (one link per day, `?day=YYYY-MM-DD`, so it works by keyboard and without script, each day named for screen readers; a word and a shape with every colour; "not watched" hatched and "no data" dashed), what each state means for a return and how Buwiz knows. Indexed; nothing personal. The site footer links it; the Bot host sends it there; the account host answers 404. "Another way to file" is planned. |
+| `https://account.buwiz.com/tins` | A banner at the top of My TINs while the state is `busy` or `offline`, or a hand-set outage or maintenance note is in force. Not for `online` (a "declare Online" note too) or `no_recent_news`. Built, from `public`: the sign's words, what it means for queued returns, the note's text, and a link to the status page. |
 | `/staff/bir` | The staff "BIR status" page. |
 
 ## 5. Holds on tickets
@@ -738,9 +813,9 @@ gate runs 0.3.2, 0.3.3 and 0.4.0 against a local server. New builds send
 **New apps on an old server** (no sign; `/api/bir/*` answer `404`): the
 smart queue without the sign: the waits of section 9, the spread, one at a
 time, stay queued, no sleeping. No queue reports for an hour after a
-`404`. **At `record`, and at `public` and `enforce` in this release:** the
-same (the routes are not built yet), plus `class` on the relay `result`
-from `public`. The full behaviour comes with the releases that build it.
+`404`. **At `record`:** the same. **At `public` and `enforce` in this
+release:** the sign can be read (§4) and rides on responses (§3); queue
+reports, turns and holds come with the releases that build them.
 
 **Versioning:** fields and codes may be added to v1. A client ignores
 fields it does not know and treats an unknown `state` as `no_recent_news`,
@@ -763,7 +838,7 @@ Gatekeeper (`buwiz-cloud`):
 
 | Setting | Default | |
 |---|---|---|
-| `BIR_UPTIME` | `record` | `off`: nothing new runs (the Sender's `sender` frame is still dropped); no sign is kept and no staff mail is sent. `record`: every relay try is recorded and classified (§14), the sign is kept with its events, the day history is written and Admins and Support are mailed (§15); clients see no change. `public`: today, plus `class` on the relay `result` and `mode` on failed and unknown submissions; planned: the routes of §4 to §8, the `buwiz-bir` header and `bir` on results. `enforce`: today the same as `public`; planned: holds on tickets and the v1 relay, the legacy scout and Try anyway. Read in any case, spaces around it ignored. A value it does not know is logged and read as `record`; it never stops the server from starting. |
+| `BIR_UPTIME` | `record` | `off`: nothing new runs (the Sender's `sender` frame is still dropped); no sign is kept and no staff mail is sent. `record`: every relay try is recorded and classified (§14), the sign is kept with its events, the day history is written and Admins and Support are mailed (§15); clients see no change. `public`: plus the read routes of §4, the `buwiz-bir` header, `class` and `bir` on the relay `result`, `mode` on failed and unknown submissions, the status page, the My TINs line and the footer link; below it none of these exist (their addresses are the site's own 404, every other response as it was). Planned: the routes of §6 to §8. `enforce`: today the same as `public`; planned: holds on tickets and the v1 relay, the legacy scout and Try anyway. Read in any case, spaces around it ignored. A value it does not know is logged and read as `record`; it never stops the server from starting. |
 | `BIR_UPTIME_UPLOAD_PORTS` | `22` | Comma-separated ports whose relay streams are the upload window; every other stream is the front desk. A value it cannot read is logged and the default is used. |
 
 Going down a level is a setting and a restart. `off` and back on again is
@@ -900,8 +975,8 @@ that matches no pin is not by itself proof the key changed.
 
 ## 15. What the server keeps
 
-Built in this release, from `record` up; nothing of it is shown to an app
-yet. `src/uptime/sign.rs` is the rule engine: a pure function of the
+Built in this release, from `record` up; apps and people read it from
+`public` (§4). `src/uptime/sign.rs` is the rule engine: a pure function of the
 previous sign, the recent tries, the open note, the key periods in memory
 and the clock, so it is tested rule by rule and replayed.
 `src/uptime/live.rs` runs it after each recorded try (in the recorder's
@@ -1047,6 +1122,19 @@ email) with the change.
   (`note_return_got_in`).
 - **Resume sending** after the relay paused: for the later staff page;
   nothing in this release pauses it, so it answers "not paused".
+
+Until the staff page exists an Admin uses the server command `buwiz-cloud
+bir declare online|offline|maintenance`, `bir clear` and `bir status`
+(`src/uptime/cli.rs`; the runbook is in [deploy.md](deploy.md)). It calls
+these same functions with an engine of its own, so the check, the limits
+and the audit line (with the Admin's reason) are the staff page's. The
+running server takes its change in without a restart: every run of the
+rules first reads the stored sign's `seq`, and a higher one (written by
+another process) replaces the engine's sign and note, keeps the tries in
+memory and the lost votes' account ids, and queues the staff mail for its
+events. Every write locks the sign and checks `seq` again: a process that
+finds it moved writes nothing, takes the other's sign in at its next run,
+and the command tries again.
 
 ### 15.5 The day history
 

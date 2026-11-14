@@ -121,6 +121,16 @@ async fn staff_member(cx: &Cx, power: Power) -> Result<Staff> {
     }
 }
 
+/// Staff with at least one of `powers` (a page whose parts each ask for
+/// their own); everyone else as [`staff_member`].
+async fn staff_member_with_any(cx: &Cx, powers: &[Power]) -> Result<Staff> {
+    let account = signed_in(cx).await?;
+    match staff_role(cx, &account).await? {
+        Some(staff) if powers.iter().any(|power| staff.can(*power)) => Ok(staff),
+        _ => Err(topcoat::router::error::not_found().into()),
+    }
+}
+
 #[layout("/")]
 async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let account = current(cx).await?;

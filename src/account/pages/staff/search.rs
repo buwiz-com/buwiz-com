@@ -1,6 +1,8 @@
 //! Search everything: people and TIN claims from one box, by the rules the
 //! users list and the claims queue already search by (email, registered or
-//! trade name, the TIN's digits). TINs show as the queue shows them.
+//! trade name, the TIN's digits). TINs show as the queue shows them. Each
+//! part asks for its own power: people the users list's (SeeUsers), claims
+//! the queue's (Review).
 
 use super::ui::{avatar, ic, kind_icon, page_head, status_pill, sx_pill};
 use super::*;
@@ -10,14 +12,21 @@ use topcoat::view::ViewExt;
 /// and its staff badge.
 type Person = (queries::UserRow, String, usize, Option<(&'static str, &'static str)>);
 
+/// Which parts of a search a staff member sees: (people, claims). Each is
+/// the power of the list it searches.
+fn search_parts(can: impl Fn(Power) -> bool) -> (bool, bool) {
+    (can(Power::SeeUsers), can(Power::Review))
+}
+
 #[page("/staff/search")]
 pub async fn search_page(cx: &Cx) -> Result<impl View> {
-    staff_member(cx, Power::SeeUsers).await?;
+    let viewer = staff_member_with_any(cx, &[Power::SeeUsers, Power::Review]).await?;
+    let (people_part, claims_part) = search_parts(|power| viewer.can(power));
     let config = &state(cx).config;
     let db = &state(cx).db;
-    let search = query(cx, "q").unwrap_or_default();
+    let search = queries::search_text(&query(cx, "q").unwrap_or_default());
     let searched = !search.trim().is_empty();
-    let users = if searched {
+    let users = if searched && people_part {
         let mut users = queries::users(db, UserFilter::Everyone, &search, &config.admin_emails).await?;
         users.truncate(queries::SEARCH_LIMIT as usize);
         users
@@ -45,11 +54,16 @@ pub async fn search_page(cx: &Cx) -> Result<impl View> {
             (user, names.join(" · "), live, badge)
         })
         .collect();
-    let claims = queries::search_claims(db, &search).await?;
+    let claims = if claims_part { queries::search_claims(db, &search).await? } else { Vec::new() };
+    let sub = match (people_part, claims_part) {
+        (true, true) => "People and TIN claims, by email, registered name or TIN",
+        (true, false) => "People, by email, registered name or TIN",
+        _ => "TIN claims, by email, registered name or TIN",
+    };
     let (people_count, claim_count) = (people.len(), claims.len());
     Ok(view! {
         <main id="main" class="sx-main" tabindex="-1">
-            page_head(title: "Search", sub: "People and TIN claims, by email, registered name or TIN".to_owned())
+            page_head(title: "Search", sub: sub.to_owned())
             <div class="sx-scroll">
                 <div class="sx-stack">
                     <form class="sx-search sx-bigsearch" method="get" action="/staff/search" role="search">
@@ -60,6 +74,7 @@ pub async fn search_page(cx: &Cx) -> Result<impl View> {
                     if !searched {
                         <p class="sx-empty">"Type an email, a registered or trade name, or a TIN's digits."</p>
                     } else {
+                        if people_part {
                         <section class="sx-results" aria-labelledby="sx-found-people">
                             <h2 id="sx-found-people">"People" <span class="sx-count">(people_count.to_string())</span></h2>
                             if people.is_empty() {
@@ -98,6 +113,8 @@ pub async fn search_page(cx: &Cx) -> Result<impl View> {
                                 </div>
                             }
                         </section>
+                        }
+                        if claims_part {
                         <section class="sx-results" aria-labelledby="sx-found-claims">
                             <h2 id="sx-found-claims">"TIN claims" <span class="sx-count">(claim_count.to_string())</span></h2>
                             if claims.is_empty() {
@@ -128,6 +145,7 @@ pub async fn search_page(cx: &Cx) -> Result<impl View> {
                                 </div>
                             }
                         </section>
+                        }
                         <p class="sx-fine">(format!("Up to {} of each show; add more of the email, name or TIN to narrow.", queries::SEARCH_LIMIT))</p>
                     }
                 </div>
@@ -135,4 +153,20 @@ pub async fn search_page(cx: &Cx) -> Result<impl View> {
         </main>
     }
     .boxed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_part_of_a_search_asks_for_its_own_power() {
+        assert_eq!(search_parts(|_| true), (true, true));
+        assert_eq!(search_parts(|power| power == Power::Review), (false, true));
+        assert_eq!(search_parts(|power| power == Power::SeeUsers), (true, false));
+        // As the roles are today, Support and Admins see both.
+        for role in [Role::Support, Role::Admin] {
+            assert_eq!(search_parts(|power| role.can(power)), (true, true), "{role:?}");
+        }
+    }
 }

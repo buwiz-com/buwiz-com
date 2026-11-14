@@ -195,7 +195,7 @@ fn queue_age(claim: &ClaimRow) -> (String, bool) {
 pub async fn claims_page(cx: &Cx) -> Result<impl View> {
     let reviewer = staff_member(cx, Power::Review).await?;
     let filter = QueueFilter::parse(query(cx, "status").as_deref());
-    let search = query(cx, "q").unwrap_or_default();
+    let search = queries::search_text(&query(cx, "q").unwrap_or_default());
     let opened = open_id(cx);
     let db = &state(cx).db;
     let rows = queries::queue(db, filter, &search).await?;
@@ -1376,7 +1376,7 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
     let viewer = staff_member(cx, Power::SeeUsers).await?;
     let can_create = viewer.can(Power::CreateLogin);
     let filter = UserFilter::parse(query(cx, "filter").as_deref());
-    let search = query(cx, "q").unwrap_or_default();
+    let search = queries::search_text(&query(cx, "q").unwrap_or_default());
     let opened = open_id(cx);
     let new_open = can_create && query(cx, "new").is_some();
     let config = &state(cx).config;

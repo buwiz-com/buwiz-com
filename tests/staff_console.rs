@@ -396,6 +396,28 @@ async fn search_everything_finds_people_and_claims_by_the_queue_rules(db: PgPool
     assert!(none.contains("No accounts match that search.") && none.contains("No claims match that search."));
 }
 
+/// A NUL in a search (`%00`) is dropped, not sent to Postgres, which
+/// cannot hold it in text: every search box answers, and finds what the
+/// search says without it.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_nul_in_a_search_is_dropped_everywhere(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    add_claim(&site.db, ana, "000123451", "pending").await;
+    for path in ["/staff/search?q=a%00b", "/staff/queue?q=a%00b", "/staff/users?q=a%00b", "/staff/search?q=%00"] {
+        let response = site.get(path, &staff).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(!text(response).await.contains('\0'), "{path}");
+    }
+    for path in ["/staff/search?q=an%00a", "/staff/queue?q=an%00a", "/staff/users?q=an%00a", "/staff/queue?q=1234%0051"]
+    {
+        let page = text(site.get(path, &staff).await).await;
+        assert!(before_inspector(&page).contains("ana@example.test") || page.contains("000-123-451-00000"), "{path}");
+        assert!(page.contains("<tr data-id="), "{path}: {page}");
+    }
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn the_inspector_shows_the_row_in_the_link(db: PgPool) {
     let site = Site::new(db);

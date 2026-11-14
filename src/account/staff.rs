@@ -13,9 +13,18 @@ use crate::filing::gate::LIVE_SQL;
 /// Rows a list shows at most; a search narrows the rest.
 pub const LIST_LIMIT: i64 = 200;
 
+/// A search as the staff pages read it: without NUL, which a Postgres
+/// `text` cannot hold (a `q` carrying one was a 500). Every search box
+/// (queue, users, search everything) reads its `q` through this, and so
+/// does every query here that takes one.
+pub fn search_text(raw: &str) -> String {
+    raw.replace('\0', "")
+}
+
 /// `%text%` for `ILIKE`, with `text`'s own wildcards escaped, or `None` for
 /// an empty search.
 fn contains(text: &str) -> Option<String> {
+    let text = search_text(text);
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -758,6 +767,11 @@ mod tests {
         assert_eq!(contains("100%_a\\b").as_deref(), Some("%100\\%\\_a\\\\b%"));
         assert_eq!(tin_digits("123-456").as_deref(), Some("%123456%"));
         assert_eq!(tin_digits("ana"), None);
+        // NUL is dropped, never sent to Postgres.
+        assert_eq!(contains("a\0b").as_deref(), Some("%ab%"));
+        assert_eq!(contains("\0"), None);
+        assert_eq!(tin_digits("12\03").as_deref(), Some("%123%"));
+        assert_eq!(search_text("a\0b\0"), "ab");
     }
 
     #[test]

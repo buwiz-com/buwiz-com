@@ -339,3 +339,19 @@ async fn an_admin_adds_a_test_tin_to_their_own_test_account(db: PgPool) {
     let response = site.post(&format!("{user}/test"), &ana_cookie, "test=off&reason=Done").await;
     assert_eq!(location(&response), format!("{user}?notice=own_account"));
 }
+
+/// Someone in ADMIN_EMAILS who carries the test label (given before they
+/// were listed, say) gets no test TIN: their page has no test-label
+/// controls, so the label it would hold in place could not come off.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_admin_emails_address_gets_no_test_tin(db: PgPool) {
+    let site = Site::with_admins(db, &[STAFF, "boss@example.test"]);
+    let (_, staff) = site.person(STAFF).await;
+    let (boss, _) = test_account(&site, "boss@example.test").await;
+    let user = format!("/staff/users/{boss}");
+    let page = text(site.get(&user, &staff).await).await;
+    assert!(page.contains("Test account") && !page.contains("test-tin"), "{page}");
+    let response = site.post(&format!("{user}/test-tin"), &staff, FORM).await;
+    assert_eq!(location(&response), format!("{user}?notice=test_label_from_server"));
+    assert!(test_tins(&site.db, boss).await.is_empty());
+}

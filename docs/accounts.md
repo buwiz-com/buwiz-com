@@ -97,7 +97,9 @@ on the staff page of an account with the test label ("Add a test TIN":
 the TIN, its name and kind, a reason), active at once and without papers
 (`verified_by = 'admin'`, an `activated` line with the reason). A real TIN
 is refused there (it is added the usual way, and verified), and so is any
-account without the label. An Admin whose own account another Admin
+account without the label, and one in `ADMIN_EMAILS` (their page has no
+test-label controls, so the label a test TIN holds in place could not come
+off; the form is not shown there). An Admin whose own account another Admin
 labelled adds one to it as to anyone's; its line names them as the actor
 ("Staff … activated their own TIN …"), and the claim is flagged
 "Activated by its owner, an admin". It never sends, whatever `BIR_RELAY_MODE` says:

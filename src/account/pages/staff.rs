@@ -1199,7 +1199,8 @@ pub mod account_id {
                                         <a href=(format!("/staff/claims/{}", claim.id))>"Open claim"</a>
                                     </div>
                                 }
-                                if admin_viewer && user.test_account && user.banned_at.is_none() {
+                                // Not for ADMIN_EMAILS: their page cannot take the label off.
+                                if admin_viewer && user.test_account && user.banned_at.is_none() && !from_server {
                                     test_tin_form(account_id: account_id)
                                 }
                             </section>

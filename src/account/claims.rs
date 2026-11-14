@@ -1031,7 +1031,8 @@ pub struct NewTestTin<'a> {
 /// 'admin'`), with a reason in its audit line. It never sends: the gate
 /// refuses it (`tin_test_only`). Refused for a TIN that is not a test TIN
 /// (that one is added the usual way, and verified), for an account without
-/// the label or banned, and for a test TIN already active anywhere. Locks
+/// the label or banned, one in `ADMIN_EMAILS`, and for a test TIN already
+/// active anywhere. Locks
 /// as the test label does (the roles lock, the actor, then the account), so
 /// the label cannot come off while one is being added.
 pub async fn add_test_tin(
@@ -1055,15 +1056,20 @@ pub async fn add_test_tin(
     if !roles::may(&mut tx, config, actor.id, Power::ActivateWithoutPapers).await? {
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
-    let account: Option<(bool, bool)> =
-        sqlx::query_as("SELECT test_account, banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE")
+    let account: Option<(String, bool, bool)> =
+        sqlx::query_as("SELECT email, test_account, banned_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE")
             .bind(account_id)
             .fetch_optional(&mut *tx)
             .await?;
     match account {
         None => return Err(DecideError::Refused(Notice::AccountMissing)),
-        Some((false, _)) => return Err(DecideError::Refused(Notice::NotTestAccount)),
-        Some((_, true)) => return Err(DecideError::Refused(Notice::ClaimantBanned)),
+        Some((_, false, _)) => return Err(DecideError::Refused(Notice::NotTestAccount)),
+        Some((_, _, true)) => return Err(DecideError::Refused(Notice::ClaimantBanned)),
+        // Their page has no test-label controls: the label, held in place
+        // by the test TIN, could not come off.
+        Some((email, _, _)) if roles::in_server_setting(config, &email) => {
+            return Err(DecideError::Refused(Notice::TestLabelFromServer));
+        }
         Some(_) => {}
     }
     let there: bool = sqlx::query_scalar(&format!(

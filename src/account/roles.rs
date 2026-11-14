@@ -81,6 +81,10 @@ pub enum Power {
     ChangeRole,
     /// Make a login on the staff pages.
     CreateLogin,
+    /// Set or clear a hand-set BIR note (an outage, planned maintenance, or
+    /// "declare Online"), and resume sending after the relay paused
+    /// ([`crate::uptime::notes`]).
+    SetBirStatus,
 }
 
 /// A signed-in staff member.
@@ -120,6 +124,32 @@ pub fn in_list(admin_emails: &[String], email: &str) -> bool {
 /// with a stored role or in the list bound as `list`.
 pub fn is_staff_sql(account: &str, list: &str) -> String {
     format!("({account}.banned_at IS NULL AND ({account}.role IS NOT NULL OR {account}.email = ANY({list})))")
+}
+
+/// Every staff address, for staff mail: accounts with a stored role that
+/// are not banned and have signed in at least once ([`signed_in_sql`]: a
+/// role given to an address nobody has proved is theirs mails nobody), the
+/// accounts in `admin_emails` that are not banned, and addresses in
+/// `admin_emails` with no account yet. Sorted.
+pub async fn staff_emails(db: &PgPool, admin_emails: &[String]) -> sqlx::Result<Vec<String>> {
+    staff_emails_on(&mut *db.acquire().await?, admin_emails).await
+}
+
+/// [`staff_emails`] on one connection (a transaction of the caller's).
+pub async fn staff_emails_on(db: &mut sqlx::PgConnection, admin_emails: &[String]) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(&format!(
+        "SELECT email FROM accounts a
+          WHERE {} AND (a.email = ANY($1) OR {})
+         UNION
+         SELECT listed FROM unnest($1::text[]) AS listed
+          WHERE NOT EXISTS (SELECT 1 FROM accounts b WHERE b.email = listed)
+         ORDER BY 1",
+        is_staff_sql("a", "$1"),
+        signed_in_sql("a")
+    ))
+    .bind(admin_emails)
+    .fetch_all(db)
+    .await
 }
 
 /// [`of`], given whether the email is in `ADMIN_EMAILS`.
@@ -263,6 +293,7 @@ mod tests {
             MarkTest,
             ChangeRole,
             CreateLogin,
+            SetBirStatus,
         ];
         for power in all {
             assert!(Role::Admin.can(power), "{power:?}");

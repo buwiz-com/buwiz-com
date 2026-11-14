@@ -377,11 +377,19 @@ async fn relay_job(State(sender): State<Arc<Sender>>, headers: HeaderMap, upgrad
     upgrade.max_message_size(crate::filing::submissions::BODY_LIMIT).on_upgrade(move |socket| run_job(sender, socket))
 }
 
+/// The Sender's first text frame on a job's socket: its relay mode, for
+/// the Gatekeeper's record of the try. The Gatekeeper never forwards it to
+/// the app; an app would ignore it anyway (an unknown `type`).
+pub fn sender_frame(mode: Mode) -> String {
+    json!({ "type": "sender", "mode": mode.as_str() }).to_string()
+}
+
 async fn run_job(sender: Arc<Sender>, mut socket: WebSocket) {
     let job = match socket.recv().await {
         Some(Ok(Message::Text(text))) => serde_json::from_str::<Job>(&text).ok(),
         _ => None,
     };
+    let _ = socket.send(Message::Text(sender_frame(sender.config.relay.mode).into())).await;
     let (to_app, from_server) = mpsc::channel(64);
     let (to_server, from_app) = mpsc::channel(64);
     let pump = tokio::spawn(relay::pump_socket(socket, from_server, to_server));
@@ -447,6 +455,21 @@ mod tests {
         let result = Sender::new(config()).handle(&pipe, job).await;
         drop(pipe);
         (result, from_server.try_recv().is_ok())
+    }
+
+    #[test]
+    fn the_sender_frame_says_the_mode_and_is_no_control() {
+        for (mode, json) in [
+            (Mode::Live, r#"{"mode":"live","type":"sender"}"#),
+            (Mode::Lab, r#"{"mode":"lab","type":"sender"}"#),
+            (Mode::DryRun, r#"{"mode":"dry_run","type":"sender"}"#),
+        ] {
+            let frame = sender_frame(mode);
+            let value: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(value, serde_json::from_str::<Value>(json).unwrap());
+            // Every Control reader ignores it.
+            assert_eq!(relay::Frame::decode_text(&frame), None);
+        }
     }
 
     #[tokio::test]

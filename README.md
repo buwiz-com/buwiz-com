@@ -69,5 +69,6 @@ load that file. See
   - MCP for AI agents.
 - [docs/relay.md](docs/relay.md): the submission relay. The Gatekeeper and the Sender, the `bir` feature and the relay modes.
 - [docs/relay-protocol.md](docs/relay-protocol.md): the relay's wire protocol (v2), for app authors.
+- [docs/bir-uptime.md](docs/bir-uptime.md): the BIR uptime record and sign, and the smart send queue's contract, for app authors.
 - [docs/development.md](docs/development.md): settings, features and tests.
 - [docs/deploy.md](docs/deploy.md): production.

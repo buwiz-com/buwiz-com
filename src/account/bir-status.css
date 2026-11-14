@@ -1,0 +1,245 @@
+/*
+ * The BIR status page (src/account/pages/bir_status.rs) and the BIR line
+ * at the top of My TINs. Served only from BIR_UPTIME=public, and linked
+ * only by those two. Every state has a colour, a shape (a Material Symbol)
+ * and a word; text on each tone keeps 4.5:1 in both themes.
+ *
+ *   o online   b busy   x offline   m set by staff   n no recent news
+ *   w not watched (hatched)   none: no data (dashed)
+ */
+:root {
+  --bir-o-bg: #e3ece8; --bir-o-ink: #0f5b46; --bir-o-fill: #2f8f6f;
+  --bir-b-bg: #fdf0d9; --bir-b-ink: #8a4b00; --bir-b-fill: #d9920f;
+  --bir-x-bg: #fbeaea; --bir-x-ink: #a32020; --bir-x-fill: #c63b30;
+  --bir-m-bg: #efe8f8; --bir-m-ink: #5b2c91; --bir-m-fill: #7d4fc0;
+  --bir-n-bg: #f1efe9; --bir-n-ink: #5d6166; --bir-n-fill: #aeaba3;
+  --bir-w-bg: #f4f3ef; --bir-w-ink: #5d6166; --bir-w-line: #e0ddd4;
+  --bir-none-ink: #5d6166; --bir-none-line: #cfccc3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bir-o-bg: #173029; --bir-o-ink: #5fd0a6; --bir-o-fill: #3fb58f;
+    --bir-b-bg: #33260f; --bir-b-ink: #f5b54a; --bir-b-fill: #d9920f;
+    --bir-x-bg: #3a1c1c; --bir-x-ink: #ff8a80; --bir-x-fill: #e0574b;
+    --bir-m-bg: #2a2140; --bir-m-ink: #cdb2ff; --bir-m-fill: #9a72e0;
+    --bir-n-bg: #262a2e; --bir-n-ink: #b4b8bc; --bir-n-fill: #6b7075;
+    --bir-w-bg: #1e2124; --bir-w-ink: #b4b8bc; --bir-w-line: #33383d;
+    --bir-none-ink: #a3a7ab; --bir-none-line: #3a3f44;
+  }
+}
+
+/* The tones: a background and ink for text, a fill for bars. */
+.bir .t-o, .bir-banner.online { --bg: var(--bir-o-bg); --ink: var(--bir-o-ink); --fill: var(--bir-o-fill); }
+.bir .t-b, .bir-banner.busy { --bg: var(--bir-b-bg); --ink: var(--bir-b-ink); --fill: var(--bir-b-fill); }
+.bir .t-x, .bir-banner.offline { --bg: var(--bir-x-bg); --ink: var(--bir-x-ink); --fill: var(--bir-x-fill); }
+.bir .t-m, .bir-banner.maintenance { --bg: var(--bir-m-bg); --ink: var(--bir-m-ink); --fill: var(--bir-m-fill); }
+.bir .t-n { --bg: var(--bir-n-bg); --ink: var(--bir-n-ink); --fill: var(--bir-n-fill); }
+.bir .t-w {
+  --bg: var(--bir-w-bg);
+  --ink: var(--bir-w-ink);
+  --fill: repeating-linear-gradient(135deg, var(--bir-w-line) 0 3px, transparent 3px 6px);
+}
+.bir .t-none { --bg: transparent; --ink: var(--bir-none-ink); --fill: transparent; }
+
+/* The line on My TINs */
+.bir-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--ink) 30%, transparent);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+}
+.bir-banner .icon { font-size: 20px; flex: none; font-variation-settings: "FILL" 1; }
+.bir-banner a { color: inherit; font-weight: 700; text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+.bir-banner q { font-style: italic; }
+
+/* The page */
+.bir .page-in { gap: 20px; }
+.bir h2 { font-size: 18px; line-height: 1.3; font-weight: 800; letter-spacing: -0.01em; }
+.bir h3 { font-size: 15px; font-weight: 800; }
+.bir .icon { font-variation-settings: "FILL" 1; }
+.bir-hint { color: var(--muted); font-size: 14px; line-height: 1.5; }
+
+.bir-sign {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  padding: 22px;
+  border: 1px solid color-mix(in srgb, var(--ink) 25%, transparent);
+  border-radius: 16px;
+  background: var(--bg);
+  color: var(--ink);
+}
+.bir-shape {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--ink) 35%, transparent);
+}
+.bir-shape .icon { font-size: 34px; }
+.bir-sign-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.bir-eyebrow { font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.bir .bir-word {
+  font-family: var(--font-display);
+  font-size: 40px;
+  line-height: 1.05;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+.bir-since { font-size: 15px; font-weight: 700; }
+.bir-line { color: var(--text); font-size: 15px; line-height: 1.55; }
+@media (min-width: 640px) {
+  .bir-sign { padding: 28px; gap: 22px; }
+  .bir-shape { width: 72px; height: 72px; }
+  .bir-shape .icon { font-size: 44px; }
+  .bir .bir-word { font-size: 56px; }
+}
+
+.bir-note {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--bir-m-fill);
+  border-radius: 12px;
+  background: var(--surface);
+  font-size: 15px;
+  line-height: 1.5;
+}
+.bir-note > .icon { color: var(--bir-m-ink); font-size: 22px; }
+.bir-note-text { margin-top: 2px; }
+
+.bir-windows { display: grid; grid-template-columns: 1fr; gap: 12px; }
+@media (min-width: 640px) { .bir-windows { grid-template-columns: 1fr 1fr; } }
+.bir-window {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.bir-light {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg);
+  color: var(--ink);
+}
+.bir-light .icon { font-size: 24px; }
+.bir-window h2 { font-size: 16px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.bir-window-does { color: var(--muted); font-size: 13px; font-weight: 600; letter-spacing: 0; }
+.bir-window-word { margin-top: 2px; color: var(--ink); font-size: 20px; font-weight: 800; }
+.bir-window-line { margin-top: 2px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+
+.bir-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+}
+@media (min-width: 640px) { .bir-panel { padding: 22px 24px; } }
+
+/* Bars: 96 quarter hours, or 24 hours */
+.bir-bar { display: grid; gap: 1px; height: 28px; border-radius: 6px; overflow: hidden; background: var(--line); }
+.bir-bar.big { grid-template-columns: repeat(96, minmax(0, 1fr)); height: 36px; }
+.bir-bar.hours { grid-template-columns: repeat(24, minmax(0, 1fr)); }
+.bir-bar i, .bir-mini i { display: block; background: var(--fill); }
+.bir-bar i.t-none, .bir-mini i.t-none { background: var(--surface); }
+.bir-bar i.t-w, .bir-mini i.t-w { background: var(--fill), var(--bir-w-bg); }
+.bir-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; font-weight: 600; }
+
+.bir-spans, .bir-legend { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.bir-spans li, .bir-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 3px 10px 3px 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+.bir-spans li .icon, .bir-legend li .icon { font-size: 17px; }
+.bir-spans time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.bir-spans li.t-w, .bir-legend li.t-w { background: var(--fill), var(--bg); }
+.bir-spans li.t-none, .bir-legend li.t-none { box-shadow: inset 0 0 0 1px var(--bir-none-line); }
+.bir-swatch { display: inline-grid; place-items: center; }
+
+/* The calendar: months of weeks from Sunday, a link per day */
+.bir-months { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 18px 28px; }
+.bir-month { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.bir-week, .bir-cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.bir-week span { text-align: center; color: var(--muted); font-size: 12px; font-weight: 700; }
+.bir-cal { list-style: none; margin: 0; padding: 0; }
+.bir-cal li { min-width: 0; }
+.bir-date {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 3px;
+  min-height: 50px;
+  padding: 4px 5px 5px;
+  border: 1px solid color-mix(in srgb, var(--ink) 22%, transparent);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--ink);
+  text-decoration: none;
+}
+.bir-date.t-w { background: var(--fill), var(--bg); }
+.bir-date.t-none { border-style: dashed; border-color: var(--bir-none-line); }
+.bir-date:hover { border-color: var(--ink); }
+.bir-date:focus-visible { outline: 3px solid var(--brand); outline-offset: 2px; }
+.bir-date.sel { border-color: var(--text); box-shadow: 0 0 0 2px var(--text); }
+.bir-date.today .bir-date-n { text-decoration: underline; text-underline-offset: 2px; }
+.bir-date-n { font-size: 13px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+.bir-date-s { line-height: 1; }
+.bir-date-s .icon { font-size: 15px; }
+.bir-mini { display: none; grid-template-columns: repeat(24, minmax(0, 1fr)); height: 4px; border-radius: 2px; overflow: hidden; }
+@media (min-width: 640px) {
+  .bir-date { min-height: 58px; padding: 5px 6px 6px; }
+  .bir-mini { display: grid; }
+}
+
+.bir-day-detail { display: flex; flex-direction: column; gap: 10px; padding-top: 14px; border-top: 1px solid var(--line); }
+.bir-day-detail:focus { outline: none; }
+.bir-shares { color: var(--muted); font-size: 14px; line-height: 1.5; }
+
+/* What it means */
+.bir-means { display: grid; gap: 8px; margin: 0; }
+.bir-means > div { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.bir-means > div.now { border-color: var(--ink); box-shadow: inset 4px 0 0 var(--ink); }
+.bir-means dt { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 800; }
+.bir-means dt .icon { font-size: 20px; }
+.bir-means dd { margin: 0; color: var(--text); font-size: 14px; line-height: 1.55; }
+.bir-now-tag {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.bir-how { display: flex; flex-direction: column; gap: 10px; color: var(--text); font-size: 15px; line-height: 1.6; }

@@ -1,9 +1,23 @@
-//! Sends sign-in codes.
+//! Sends sign-in codes, and short plain-text notices to staff (BIR uptime's
+//! alerts, [`crate::uptime::alerts`]).
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::json;
 
 use crate::base::config::MailConfig;
+
+/// How long connecting to the mail provider may take ...
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// ... and one whole request, so a provider that hangs never holds BIR
+/// uptime's ticker for longer ...
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// ... but a sign-in code gets longer: a slow provider that still delivers
+/// it must not show the person an error page for a code that arrives.
+const CODE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The HTML sign-in code email; `{{code}}` and `{{logo_url}}` are filled in.
 const SIGN_IN_CODE_HTML: &str = include_str!("email/sign_in_code.html");
@@ -14,6 +28,18 @@ pub struct Mailer {
     /// not show WebP or SVG reliably).
     logo_url: String,
     http: reqwest::Client,
+    /// Tests only ([`Mailer::recording`]): notices are kept here, not sent.
+    outbox: Option<Mutex<Vec<Notice>>>,
+    /// Tests only: a recording mailer that fails every notice.
+    failing: AtomicBool,
+}
+
+/// A staff notice as sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub to: String,
+    pub subject: String,
+    pub text: String,
 }
 
 impl Mailer {
@@ -21,7 +47,61 @@ impl Mailer {
         Self {
             config,
             logo_url: format!("{site_origin}/assets/brand/buwiz_wordmark_email.png"),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            outbox: None,
+            failing: AtomicBool::new(false),
+        }
+    }
+
+    /// A mailer for tests: notices are kept in memory ([`Mailer::notices`])
+    /// and nothing goes out; sign-in codes are logged.
+    pub fn recording(site_origin: &str) -> Self {
+        Self { outbox: Some(Mutex::new(Vec::new())), ..Self::new(MailConfig::Log, site_origin) }
+    }
+
+    /// Tests only: a [`Mailer::recording`] fails every notice while `fail`.
+    pub fn fail_notices(&self, fail: bool) {
+        self.failing.store(fail, Ordering::SeqCst);
+    }
+
+    /// The notices a [`Mailer::recording`] kept, oldest first.
+    pub fn notices(&self) -> Vec<Notice> {
+        self.outbox
+            .as_ref()
+            .map_or_else(Vec::new, |outbox| outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// A short plain-text notice to one staff address.
+    pub async fn send_notice(&self, to: &str, subject: &str, text: &str) -> anyhow::Result<()> {
+        if let Some(outbox) = &self.outbox {
+            if self.failing.load(Ordering::SeqCst) {
+                anyhow::bail!("made-up mail failure");
+            }
+            let notice = Notice { to: to.into(), subject: subject.into(), text: text.into() };
+            outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(notice);
+            return Ok(());
+        }
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(to, subject, text, "staff notice (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .bearer_auth(api_key)
+                    .json(&json!({ "from": from, "to": [to], "subject": subject, "text": text }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
         }
     }
 
@@ -35,6 +115,7 @@ impl Mailer {
             MailConfig::Resend { api_key, from } => {
                 self.http
                     .post("https://api.resend.com/emails")
+                    .timeout(CODE_TIMEOUT)
                     .bearer_auth(api_key)
                     .json(&json!({
                         "from": from,

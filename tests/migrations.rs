@@ -1,8 +1,9 @@
-//! Migrations 11 to 13 on a database at migration 10 with a row in every
+//! Migrations 11 to 14 on a database at migration 10 with a row in every
 //! claim status, files, readings, audit lines, tickets and returns: the
 //! rows survive and read as before, and going back down to 10 leaves a
 //! database the release before this one starts on, every return kept.
-//! Migration 13 (test TINs) goes back to 12 on its own.
+//! Migration 13 (test TINs) goes back to 12 on its own, and 14 (BIR
+//! uptime) to 13, keeping its history in the archive for the way up.
 //! Each test gets its own empty database (`migrations = false`).
 
 use std::borrow::Cow;
@@ -318,7 +319,7 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     let before = rows(&db).await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
     let after = rows(&db).await;
     assert_eq!(only_columns_at_10(&after, &before), before, "no row or old column changed");
 
@@ -770,6 +771,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
     for (down, set) in [
+        (include_str!("../migrations/0014_bir_uptime.down.sql"), ""),
         (include_str!("../migrations/0013_test_tins.down.sql"), ""),
         (include_str!("../migrations/0012_staff_roles.down.sql"), "SET LOCAL buwiz.rollback_drop_roles = 'yes'"),
         (include_str!("../migrations/0011_tin_states.down.sql"), ""),
@@ -901,7 +903,7 @@ async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgP
     assert_eq!(versions(&db).await, (1..=10).collect::<Vec<_>>());
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
 }
 
 /// Migration 13: a test TIN (root 000-000-000) is only ever one an Admin or
@@ -963,6 +965,7 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
 
     let refused = MIGRATOR.undo(&db, 12).await.unwrap_err().to_string();
     assert!(refused.contains("1 row(s) hold a test TIN (000-000-000)"), "{refused}");
+    // 14 went back on its own first: it never refuses.
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
     // Ended, it still blocks: the old release reads ended rows too.
     exec(&db, &format!("UPDATE tin_claims SET status = 'revoked', removed_at = now() WHERE id = '{test_tin}'")).await;
@@ -977,5 +980,309 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
             .unwrap();
     assert_eq!(checks, 0);
     MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+}
+
+/// The migrations of the release before BIR uptime: 1 to 13.
+fn release_13() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 13).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// Counts of what migration 14's down file keeps: days, events, notes,
+/// proofs, and the sign's `seq`.
+async fn uptime_kept(db: &PgPool) -> (i64, i64, i64, i64, Option<i64>) {
+    let count = |sql: &'static str| {
+        let db = db.clone();
+        async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&db).await.unwrap() }
+    };
+    (
+        count("SELECT count(*) FROM bir_days").await,
+        count("SELECT count(*) FROM bir_events").await,
+        count("SELECT count(*) FROM bir_notes").await,
+        count("SELECT count(*) FROM bir_proofs").await,
+        sqlx::query_scalar("SELECT seq FROM bir_sign").fetch_optional(db).await.unwrap(),
+    )
+}
+
+/// One `bir_tries` row: `values` are mode, outcome, stage, dispatcher,
+/// upload, class, kind, touched_bir and counted.
+fn try_row(values: &str) -> String {
+    format!(
+        "INSERT INTO bir_tries (started_at, ended_at, source, mode, outcome, stage, dispatcher, upload, failure_class,
+             failure_kind, touched_bir, counted, admission, key_epoch, account_key)
+         VALUES ('2026-11-11T07:12:00Z', '2026-11-11T07:13:00Z', 'relay', {values}, 'open', 1,
+             decode('0102030405060708', 'hex'))"
+    )
+}
+
+/// Migration 14: new tables only, whose checks keep a try's row to what the
+/// record may hold. Going back to 13 never refuses, leaves 13's schema, and
+/// keeps the day history, events, notes, proofs and the sign in
+/// `rollback_archive`; the way up brings them back (a proof whose claim is
+/// gone without it), a proof whose account is gone excepted, which stays in
+/// the archive.
+#[sqlx::test(migrations = false)]
+async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
+    release_13().run(&db).await.unwrap();
+    let schema_13 = schema(&db).await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+
+    // What a try may hold: a live failure has a class and a kind, a lab
+    // try neither and is never counted, times are to the minute, keys are
+    // 8 bytes.
+    exec(&db, &try_row("'live', 'failed', 'upload', 'ok', 'fail', 'bir', 'timeout', true, true")).await;
+    exec(&db, &try_row("'live', 'sent', 'uploaded', 'ok', 'ok', NULL, NULL, true, true")).await;
+    exec(&db, &try_row("'lab', 'failed', 'upload', 'none', 'fail', NULL, NULL, false, false")).await;
+    exec(&db, &try_row("'unknown', 'failed', 'none', 'none', 'none', 'ours', 'sender_down', false, false")).await;
+    for bad in [
+        try_row("'live', 'failed', 'upload', 'ok', 'fail', NULL, NULL, true, true"),
+        try_row("'live', 'sent', 'uploaded', 'ok', 'ok', 'bir', 'cut', true, true"),
+        try_row("'live', 'failed', 'upload', 'ok', 'fail', 'bir', NULL, true, true"),
+        try_row("'lab', 'failed', 'upload', 'none', 'fail', 'bir', 'timeout', false, false"),
+        try_row("'lab', 'sent', 'uploaded', 'none', 'ok', NULL, NULL, false, true"),
+        try_row("'live', 'failed', 'upload', 'ok', 'fail', 'bir', 'Timeout', true, true"),
+        try_row("'live', 'failed', 'upload', 'ok', 'fail', 'bir', 'timeout', true, true")
+            .replace("07:12:00Z", "07:12:31Z"),
+        try_row("'live', 'failed', 'upload', 'ok', 'fail', 'bir', 'timeout', true, true")
+            .replace("0102030405060708", "010203040506070809"),
+        try_row("'live', 'failed', 'upload', 'ok', 'fail', 'bir', 'timeout', true, true")
+            .replace("'relay'", "'direct'"),
+    ] {
+        match sqlx::raw_sql(&bad).execute(&db).await {
+            Err(sqlx::Error::Database(error)) => assert_eq!(error.code().as_deref(), Some("23514"), "{bad}"),
+            other => panic!("{bad} should break a check: {other:?}"),
+        }
+    }
+
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let bea = id(&db, "INSERT INTO accounts (email) VALUES ('bea@example.test') RETURNING id").await;
+    let claim = |root: &str| {
+        format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+             VALUES ('{ana}', 'personal', '{root}', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'staff') RETURNING id"
+        )
+    };
+    let kept_claim = id(&db, &claim("000123453")).await;
+    let gone_claim = id(&db, &claim("000123461")).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
+                 online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, unwatched_minutes, worst,
+                 hours, outages, windows, final)
+             VALUES ('2026-11-11', 4, 1, 3, 1, 2, 5, 6, 3, 3, 880, 5, 530, 10, 15, 20, 'offline', '{hours}',
+                 '[{{\"from\": \"2026-11-11T07:10:00Z\", \"to\": \"2026-11-11T16:00:00Z\", \"window\": \"upload\", \"source\": \"tries\"}}]',
+                 '{{\"upload\": {{\"worst\": \"offline\", \"online_minutes\": 880}}}}', true);
+             INSERT INTO bir_events (scope, from_state, to_state, cause, reason, sign_seq, ord, mailed_at)
+             VALUES ('upload', 'online', 'offline', 'rule', '3 accounts on 3 networks didn''t get in within 15 min',
+                     1794381000, 0, NULL),
+                    ('overall', 'online', 'offline', 'rule', '3 accounts on 3 networks didn''t get in within 15 min',
+                     1794381000, 1, '2026-11-11T07:15:00Z');
+             INSERT INTO bir_events (scope, from_state, to_state, cause, reason, actor_id, actor_email, sign_seq, ord)
+             VALUES ('overall', 'offline', 'offline', 'note_cleared', 'An Admin cleared the note: made-up', '{ana}',
+                     'ana@example.test', 1794381300, 0);
+             INSERT INTO bir_notes (kind, text, until, set_by, set_by_email)
+             VALUES ('outage', 'The upload server is down.', now() + interval '2 hours', '{ana}', 'ana@example.test');
+             INSERT INTO bir_notes (kind, text, starts_at, until, set_by, set_by_email, cleared_at, cleared_by,
+                                    cleared_by_email, cleared_how, cleared_reason)
+             VALUES ('maintenance', 'Planned work.', '2026-11-10T01:00:00Z', '2026-11-10T03:00:00Z', '{ana}',
+                     'ana@example.test', '2026-11-10T02:00:00Z', '{ana}', 'ana@example.test', 'staff', 'Made-up: done');
+             INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, '{{\"made_up\": true}}', now());
+             INSERT INTO bir_proofs (id, account_id, claim_id, day, form, period, kid, jws)
+             VALUES ('p_kept', '{ana}', '{kept_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c'),
+                    ('p_gone', '{ana}', '{gone_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c'),
+                    ('p_orphan', '{bea}', '{kept_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c');
+             INSERT INTO bir_host_keys (fingerprint, first_seen, last_seen, seen)
+             VALUES ('SHA256:{fingerprint}', now(), now(), '[]');
+             INSERT INTO bir_held (account_id, claim_id, form, period, code)
+             VALUES ('{ana}', '{kept_claim}', '1601C', '102026', 'bir_offline')",
+            hours = "-".repeat(2) + "obxmn" + &"w".repeat(8) + &"x".repeat(9),
+            fingerprint = "A".repeat(43),
+        ),
+    )
+    .await;
+    let kept = uptime_kept(&db).await;
+    assert_eq!(kept, (1, 3, 2, 3, Some(41)));
+    let events: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, scope FROM bir_events ORDER BY id").fetch_all(&db).await.unwrap();
+    let whole = whole_rows(&db).await;
+
+    // An archive table an earlier rollback left, its columns in another
+    // order: the down file names every column, so it fills it right.
+    exec(
+        &db,
+        "CREATE SCHEMA rollback_archive;
+         CREATE TABLE rollback_archive.bir_sign (updated_at timestamptz, state jsonb, archived_at timestamptz,
+                                                 seq bigint, id smallint);
+         CREATE TABLE rollback_archive.bir_notes AS
+             SELECT cleared_reason, cleared_how, id, now() AS archived_at, kind, text, starts_at, until, set_by,
+                    set_by_email, cleared_at, cleared_by, cleared_by_email
+               FROM bir_notes WITH NO DATA",
+    )
+    .await;
+
+    // Back to 13 the way sqlx reverts: 13's schema exactly, the archive
+    // filled.
+    MIGRATOR.undo(&db, 13).await.unwrap();
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_13, "the schema is migration 13's");
+    assert_eq!(archived(&db, "bir_days", "day").await, ["2026-11-11"]);
+    assert_eq!(archived(&db, "bir_events", "scope").await, ["overall", "overall", "upload"]);
+    assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_gone", "p_kept", "p_orphan"]);
+    assert_eq!(archived(&db, "bir_sign", "seq").await, ["41"]);
+    release_13().run(&db).await.unwrap();
+
+    // Meanwhile one claim and one account go away; the way up brings back
+    // everything but the gone account's proof (the gone claim's without its
+    // claim), and the events' ids go on from where they were.
+    exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{gone_claim}'")).await;
+    exec(&db, &format!("DELETE FROM accounts WHERE id = '{bea}'")).await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(uptime_kept(&db).await, (1, 3, 2, 2, Some(41)));
+    let back: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, scope FROM bir_events ORDER BY id").fetch_all(&db).await.unwrap();
+    assert_eq!(back, events);
+    // Every column of every row, as it was (the proofs aside whose account
+    // or claim went).
+    let mut expected = whole.clone();
+    let proofs = expected.get_mut("bir_proofs").unwrap();
+    proofs.retain(|row| !row.contains("p_orphan"));
+    for row in proofs.iter_mut().filter(|row| row.contains("p_gone")) {
+        *row = row.replace(&format!(r#""claim_id":"{gone_claim}""#), r#""claim_id":null"#);
+    }
+    proofs.sort();
+    let mut back_rows = whole_rows(&db).await;
+    back_rows.get_mut("bir_proofs").unwrap().sort();
+    assert_eq!(back_rows, expected);
+    let next: i64 = sqlx::query_scalar(
+        "INSERT INTO bir_events (scope, from_state, to_state, cause, reason)
+         VALUES ('overall', 'offline', 'online', 'scout', 'A scout got in') RETURNING id",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(next > events.last().unwrap().0);
+    let archive_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.tables
+         WHERE table_schema = 'rollback_archive' AND table_name LIKE 'bir_%' ORDER BY 1",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(archive_tables, ["bir_proofs"]);
+    assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_orphan"]);
+    // What is not kept: tries, held requests, host keys.
+    for table in ["bir_tries", "bir_held", "bir_host_keys"] {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(&db).await.unwrap();
+        assert_eq!(rows, 0, "{table}");
+    }
+
+    // By hand, as psql runs it, the down file does the same.
+    let mut tx = db.begin().await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0014_bir_uptime.down.sql")).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_13);
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(uptime_kept(&db).await, (1, 4, 2, 2, Some(41)));
+    let again = whole_rows(&db).await;
+    assert_eq!(again["bir_days"], expected["bir_days"]);
+    assert_eq!(again["bir_notes"], expected["bir_notes"]);
+    assert_eq!(again["bir_sign"], expected["bir_sign"]);
+}
+
+/// At 14 a claim can be deleted whatever was held or proved for it: its
+/// held requests and proofs stay, without it, each found by an index.
+#[sqlx::test(migrations = false)]
+async fn a_claim_goes_and_its_holds_and_proofs_stay(db: PgPool) {
+    MIGRATOR.run(&db).await.unwrap();
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let claim = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+             VALUES ('{ana}', 'personal', '000123453', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'staff') RETURNING id"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO bir_held (account_id, claim_id, form, period, code)
+             VALUES ('{ana}', '{claim}', '1601C', '102026', 'bir_offline');
+             INSERT INTO bir_proofs (id, account_id, claim_id, day, form, period, kid, jws)
+             VALUES ('p_made_up', '{ana}', '{claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c')"
+        ),
+    )
+    .await;
+    exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{claim}'")).await;
+    let held: Vec<Option<Uuid>> = sqlx::query_scalar("SELECT claim_id FROM bir_held").fetch_all(&db).await.unwrap();
+    assert_eq!(held, [None]);
+    let proofs: Vec<(String, Option<Uuid>, String)> =
+        sqlx::query_as("SELECT id, claim_id, jws FROM bir_proofs").fetch_all(&db).await.unwrap();
+    assert_eq!(proofs, [("p_made_up".to_owned(), None, "a.b.c".to_owned())]);
+    let indexed: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes WHERE indexname IN ('bir_held_claim', 'bir_proofs_claim') ORDER BY 1",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(indexed, ["bir_held_claim", "bir_proofs_claim"]);
+}
+
+/// Every row of the tables migration 14's down file keeps, each whole as
+/// JSON, by table.
+async fn whole_rows(db: &PgPool) -> BTreeMap<String, Vec<String>> {
+    let mut tables = BTreeMap::new();
+    for table in ["bir_days", "bir_events", "bir_notes", "bir_proofs", "bir_sign"] {
+        let rows: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text"))
+                .fetch_all(db)
+                .await
+                .unwrap();
+        tables.insert(table.to_owned(), rows);
+    }
+    tables
+}
+
+/// Migration 14 changes two existing tables, `tickets` and `devices`: a
+/// transaction left open on either makes start-up fail within seconds
+/// instead of hanging, and once it ends the migration goes in. The new
+/// check on `tickets` is added without scanning the table (every existing
+/// row is NULL), so it holds no lock longer than adding the column does.
+async fn a_stray_open_transaction_fails_migration_14(db: PgPool, table: &str) {
+    release_13().run(&db).await.unwrap();
+    let mut stray = db.begin().await.unwrap();
+    sqlx::query(&format!("SELECT count(*) FROM {table}")).execute(&mut *stray).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), MIGRATOR.run(&db))
+        .await
+        .expect("the migration waited for the lock without end");
+    let error = outcome.expect_err("the migration ran past an open transaction").to_string();
+    assert!(error.contains("lock timeout"), "{table}: {error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{table}");
+    assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>(), "{table}");
+    stray.rollback().await.unwrap();
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    let validated: bool =
+        sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tickets_bir_admission_check'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(!validated, "the check was added without a scan");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stray_open_transaction_on_tickets_fails_migration_14(db: PgPool) {
+    a_stray_open_transaction_fails_migration_14(db, "tickets").await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stray_open_transaction_on_devices_fails_migration_14(db: PgPool) {
+    a_stray_open_transaction_fails_migration_14(db, "devices").await;
 }

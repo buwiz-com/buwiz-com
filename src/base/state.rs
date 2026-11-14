@@ -14,6 +14,7 @@ use crate::filing::link::SenderLink;
 use crate::ocr::Reader;
 use crate::sites::downloads::{self, Downloads};
 use crate::sites::github::Stars;
+use crate::uptime::Uptime;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
@@ -40,6 +41,28 @@ pub struct Inner {
     pub bot_downloads: Downloads,
     /// Buwiz Bot's GitHub stars, for buwiz.com's GitHub links.
     pub stars: Stars,
+    /// BIR uptime (`BIR_UPTIME`, [`crate::uptime`]): day keys, rate
+    /// limiters, the record's settings.
+    pub uptime: Arc<Uptime>,
+    /// Set when the server is told to stop: a request that would start a
+    /// send is refused from then on ([`crate::account::web`]).
+    pub stopping: Stopping,
+}
+
+/// Whether the server is stopping (SIGTERM came): from then on a request
+/// that would start a send is answered `503` before anything starts, while
+/// those already under way finish and their records are written.
+#[derive(Default)]
+pub struct Stopping(std::sync::atomic::AtomicBool);
+
+impl Stopping {
+    pub fn begin(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl AppState {
@@ -54,6 +77,7 @@ impl AppState {
         let downloads = Downloads::new(&config.downloads_url, downloads::APP, true);
         let bot_downloads = Downloads::new(&config.downloads_url, downloads::BOT_APP, false);
         let stars = Stars::new(&config.github_api_url);
+        let uptime = Arc::new(Uptime::from_env(config.account_origin.starts_with("https://")));
         Self(Arc::new(Inner {
             config,
             db,
@@ -66,6 +90,8 @@ impl AppState {
             downloads,
             bot_downloads,
             stars,
+            uptime,
+            stopping: Stopping::default(),
         }))
     }
 }
@@ -75,6 +101,13 @@ impl AppState {
     /// tests. Only before the state is shared (cloned).
     pub fn with_verification(mut self, verification: Verification) -> Self {
         Arc::get_mut(&mut self.0).expect("set before the state is shared").verification = verification;
+        self
+    }
+
+    /// The same state with BIR uptime set to `uptime`, for tests. Only
+    /// before the state is shared (cloned).
+    pub fn with_uptime(mut self, uptime: Uptime) -> Self {
+        Arc::get_mut(&mut self.0).expect("set before the state is shared").uptime = Arc::new(uptime);
         self
     }
 }

@@ -507,6 +507,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "libc",
  "oar-ocr",
  "pbkdf2 0.12.2",
  "pdf-extract",

@@ -1086,6 +1086,12 @@ fn step(side: Side, lamp: &Lamp, reading: &Reading, evidence: &[Evidence], now: 
     let quiet_for = |limit: Duration| lamp.last_evidence_at.is_none_or(|at| now - at >= limit);
     let last_n = reading.last.len();
     let quiet = || change(Light::NoRecentNews, Cause::Quiet, "Nobody filed in the last 60 min".into());
+    // Online and Busy both need a return that got past the window within
+    // the hour; failures alone never keep either.
+    let nothing_in = reading.newest_ok_at.is_none_or(|at| now - at >= QUIET);
+    let nothing_got_in = || {
+        change(Light::NoRecentNews, Cause::Rule, format!("Nothing got past the {} in the last 60 min", side.word()))
+    };
     match lamp.state {
         Light::Offline => {
             let landing = reading.newest_landing.map(|index| &evidence[index]);
@@ -1125,14 +1131,12 @@ fn step(side: Side, lamp: &Lamp, reading: &Reading, evidence: &[Evidence], now: 
                 quiet()
             } else if reading.online() {
                 None
+            } else if nothing_in {
+                // Checked before Busy: Busy is never shown without a return
+                // got in within the hour.
+                nothing_got_in()
             } else if reading.failure_spread >= BUSY_SPREAD {
                 change(Light::Busy, Cause::Rule, busy_reason(reading))
-            } else if reading.newest_ok_at.is_none_or(|at| now - at >= QUIET) {
-                change(
-                    Light::NoRecentNews,
-                    Cause::Rule,
-                    format!("Nothing got past the {} in the last 60 min", side.word()),
-                )
             } else {
                 None
             }
@@ -1144,6 +1148,9 @@ fn step(side: Side, lamp: &Lamp, reading: &Reading, evidence: &[Evidence], now: 
                 change(Light::Online, Cause::Rule, format!("{} of the last {last_n} got in", reading.oks))
             } else if quiet_for(QUIET) {
                 quiet()
+            } else if nothing_in {
+                // However many failures keep coming: Busy says some get in.
+                nothing_got_in()
             } else {
                 None
             }
@@ -1191,8 +1198,20 @@ fn overall_reason(state: &SignState) -> String {
         Light::NoRecentNews if state.last_state == Some(Light::Offline) => {
             "Nobody tried for 3 hours since the BIR went offline".into()
         }
+        Light::NoRecentNews if failing(state, state.evaluated_at) => {
+            "No return got in during the last 60 min; some tries failed, too few to call it Offline".into()
+        }
         Light::NoRecentNews => "Nobody filed in the last 60 min".into(),
     }
+}
+
+/// Some tries reached a window within the hour before `at`, and none got
+/// past it: what No recent news says when people are trying.
+pub fn failing(state: &SignState, at: OffsetDateTime) -> bool {
+    Side::BOTH.into_iter().map(|side| state.lamp(side)).any(|lamp| {
+        lamp.last_evidence_at.is_some_and(|evidence| at - evidence < QUIET)
+            && lamp.last_ok_at.is_none_or(|ok| at - ok >= QUIET)
+    })
 }
 
 /// The next sign. Deterministic: the same inputs give the same sign and the
@@ -1335,7 +1354,12 @@ pub fn evaluate(previous: &SignState, inputs: &Inputs<'_>) -> Evaluation {
             .or_else(|| events.last().map(|event| event.cause))
             .unwrap_or(Cause::Rule);
         if state != previous.state {
-            next.last_state = (state == Light::NoRecentNews).then_some(previous.state);
+            // What the evidence said before the quiet: never a note's state,
+            // so a note that ends over quiet lights says nothing went
+            // offline.
+            let lights_before = overall(previous.dispatcher.state, previous.upload.state, None);
+            next.last_state =
+                (state == Light::NoRecentNews && lights_before != Light::NoRecentNews).then_some(lights_before);
             next.state = state;
             next.since = now;
         }

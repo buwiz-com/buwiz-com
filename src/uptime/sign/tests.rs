@@ -649,13 +649,23 @@ fn the_dwell_holds_only_what_lets_more_through() {
     sim.feed(mailbox_down(t(14), 33, 33));
     assert_eq!(sim.upload(), Light::Offline);
 
-    // Busy to No recent news only after the dwell (an hour of quiet is
-    // always past it).
+    // Busy to No recent news once nothing got in for an hour (always past
+    // the dwell), however recent the last failure.
     let mut sim = online_at(0);
     sim.feed_all([mailbox_down(t(1), 11, 11), mailbox_down(t(1), 11, 11), mailbox_down(t(2), 12, 12)]);
-    sim.tick(t(61));
+    sim.tick(ts(59, 59));
     assert_eq!(sim.upload(), Light::Busy);
-    sim.tick(t(62));
+    sim.tick(t(60));
+    assert_eq!(sim.upload(), Light::NoRecentNews);
+    // ... but not before the dwell: Busy at 55 from landings at 0 and 50,
+    // nothing got in after 50: Busy holds to 65, then No recent news.
+    let mut sim = online_at(0);
+    sim.feed(landed(t(50), 1, 1));
+    sim.feed_all([mailbox_down(t(55), 11, 11), mailbox_down(t(55), 12, 12)]);
+    assert_eq!(sim.upload(), Light::Busy);
+    sim.tick(ts(64, 59));
+    assert_eq!(sim.upload(), Light::Busy, "the dwell");
+    sim.tick(t(110));
     assert_eq!(sim.upload(), Light::NoRecentNews);
 
     // The dwell off the minute: Busy at 2:40, Online not before 12:40.
@@ -1335,10 +1345,12 @@ fn offline_never_ends_without_a_relay_landing_or_three_quiet_hours() {
                     let quiet = was.last_evidence_at.is_none_or(|last| at - last >= OFFLINE_QUIET);
                     assert!(landing_on(side) || (quiet && now.state == Light::NoRecentNews), "seed {seed}");
                 }
-                if now.state == Light::Online {
-                    let got_in =
-                        sim.evidence.iter().any(|item| item.hit(side) == Some(Hit::Ok) && at - item.at < QUIET);
-                    assert!(got_in, "seed {seed}: Online with no return past it within the hour");
+                if now.state == Light::Online || now.state == Light::Busy && at - now.since >= DWELL {
+                    let got_in = sim
+                        .evidence
+                        .iter()
+                        .any(|item| item.hit(side) == Some(Hit::Ok) && at - item.at < QUIET && item.at <= at);
+                    assert!(got_in, "seed {seed}: {:?} with no return past it within the hour", now.state);
                 }
                 if was.state != now.state {
                     assert!(events.iter().any(|event| event.scope == Scope::of(side)), "seed {seed}");
@@ -1414,4 +1426,71 @@ fn a_scripted_day_replays_to_the_same_event_log() {
     for (_, event) in &log {
         assert!(!event.reason.contains("0x") && event.reason.len() < 200, "{}", event.reason);
     }
+}
+
+/// Busy never outlasts the hour after the last return got in, however one
+/// account keeps failing; and Online never goes Busy on failures alone.
+#[test]
+fn busy_leaves_once_nothing_got_in_for_an_hour() {
+    // Two accounts on two networks push Online to Busy ...
+    let mut sim = online_at(0);
+    sim.feed_all([mailbox_down(t(1), 11, 11), mailbox_down(t(2), 12, 12)]);
+    assert_eq!(sim.upload(), Light::Busy);
+    // ... then one account fails every 30 minutes for a day, nothing gets
+    // in: the light leaves Busy within about an hour, and stays off it.
+    let mut left_at = None;
+    for minute in (30..24 * 60).step_by(30) {
+        sim.feed(mailbox_down(t(minute), 11, 11));
+        for tick in 1..=59 {
+            sim.tick(t(minute) + Duration::seconds(30 * tick));
+        }
+        if sim.upload() != Light::Busy && left_at.is_none() {
+            left_at = Some(minute);
+        }
+        if left_at.is_some() {
+            assert_eq!(sim.upload(), Light::NoRecentNews, "minute {minute}");
+        }
+    }
+    let left = sim.log.iter().find(|(_, event)| event.scope == Scope::Upload && event.from == "busy").unwrap();
+    assert_eq!((left.0, left.1.to.as_str(), left.1.cause), (t(60), "no_recent_news", Cause::Rule));
+    assert!(left_at.is_some_and(|minute| minute <= 60));
+    // The words stay true: failures, but no return got in.
+    let words = crate::uptime::public::words(&sim.state, crate::uptime::public::Times::Public);
+    assert!(words.line.starts_with("No return has got in during the last hour: some tries failed"), "{}", words.line);
+    let overall = sim.log.iter().rev().find(|(_, event)| event.scope == Scope::Overall).unwrap();
+    assert!(overall.1.reason.starts_with("No return got in during the last 60 min"), "{}", overall.1.reason);
+
+    // Online whose last landing is an hour old goes to No recent news, not
+    // Busy, when two accounts on two networks fail.
+    let mut sim = online_at(0);
+    sim.feed(mailbox_down(t(30), 11, 11));
+    sim.feed(mailbox_down(ts(60, 10), 12, 12));
+    assert_eq!(sim.upload(), Light::NoRecentNews);
+    assert!(sim.log.iter().all(|(_, event)| event.to != "busy"));
+    // Nor does No recent news go Busy without a landing within the hour.
+    for minute in 61..90 {
+        sim.feed(mailbox_down(t(minute), 13 + (minute % 5) as u8, 13 + (minute % 5) as u8));
+    }
+    assert_ne!(sim.upload(), Light::Busy);
+}
+
+/// A note that ends while the lights read No recent news says nothing went
+/// offline: the state before the quiet is the evidence's, never a note's.
+#[test]
+fn a_note_ending_over_quiet_lights_says_nothing_went_offline() {
+    let mut sim = Sim::new();
+    sim.note = Some(note(NoteKind::Outage, t(0), t(30)));
+    sim.tick(t(1));
+    assert_eq!(sim.overall(), Light::Offline);
+    sim.tick(t(30));
+    assert_eq!(sim.overall(), Light::NoRecentNews);
+    assert_eq!(sim.state.last_state, None, "the lights were quiet: no state before");
+    let words = crate::uptime::public::words(&sim.state, crate::uptime::public::Times::Public);
+    assert!(!words.line.contains("offline"), "{}", words.line);
+    let document = crate::uptime::public::document(&sim.state, "", crate::uptime::public::Times::Public);
+    assert_eq!(document.last_state, None);
+    // An Offline the evidence made, quiet for 3 hours, still says so.
+    let mut sim = offline_at_12();
+    sim.tick(t(12) + OFFLINE_QUIET);
+    assert_eq!((sim.upload(), sim.state.last_state), (Light::NoRecentNews, Some(Light::Offline)));
 }

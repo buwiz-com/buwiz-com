@@ -235,9 +235,9 @@ fn window(name: &'static str, does: &'static str, lamp: &Lamp) -> Window {
         (Light::Busy, _) => format!("Since {since}. Some returns get past it, some don't."),
         (Light::Offline, _) => format!("Since {since}. Returns that reach it don't get in."),
         (Light::NoRecentNews, Some(last)) => {
-            format!("No return reached it in the last hour. One last got past it at about {last}.")
+            format!("No return got past it in the last hour. One last got past it at about {last}.")
         }
-        (Light::NoRecentNews, None) => "No return reached it in the last hour.".to_owned(),
+        (Light::NoRecentNews, None) => "No return got past it in the last hour.".to_owned(),
     };
     Window { name, does, look: look(letter_of(lamp.state)), line }
 }
@@ -259,7 +259,7 @@ const MEANINGS: [(char, &str); 6] = [
     ),
     (
         'n',
-        "Nobody sent a return through Buwiz in the last hour, so Buwiz can't say. Send as usual: your app tells you if a return doesn't get in.",
+        "No return got in through Buwiz in the last hour: nobody sent one, or a few people's tries failed but too few to call it Offline. So Buwiz can't say. Send as usual: your app tells you if a return doesn't get in.",
     ),
     (
         'w',
@@ -441,7 +441,7 @@ pub async fn bir_status_page(cx: &Cx) -> Result<impl View> {
                     <h2 id="bir-how">"How Buwiz knows"</h2>
                     <div class="bir-how">
                         <p>"Every return sent through Buwiz goes to the BIR's front desk, which says which mailbox takes it, and then to that mailbox. Buwiz notes whether each real return got past each one. It never tests, pings or probes the BIR's servers: everything here comes from returns people sent anyway."</p>
-                        <p>"Offline means at least 3 people on 3 different networks couldn't get in within 15 minutes, and nobody got in since. Busy means some got in and some didn't. No recent news means nobody sent a return in the last hour. Buwiz staff can also mark an outage or planned maintenance by hand; a note then says so."</p>
+                        <p>"Offline means at least 3 people on 3 different networks couldn't get in within 15 minutes, and nobody got in since. Busy means some got in and some didn't. No recent news means no return got in during the last hour. Buwiz staff can also mark an outage or planned maintenance by hand; a note then says so."</p>
                         <p>"No names, TINs or addresses are shown here."</p>
                     </div>
                 </section>

@@ -15,7 +15,7 @@ use time::{Duration, OffsetDateTime, UtcOffset};
 
 use super::alerts::manila_time;
 use super::keys::{MANILA, manila_day};
-use super::sign::{Lamp, Light, NoteKind, Side, SignState};
+use super::sign::{Lamp, Light, NoteKind, Side, SignState, failing};
 use super::store::to_minute;
 
 /// The contract's version.
@@ -153,8 +153,14 @@ pub fn words(sign: &SignState, times: Times) -> Words {
                 "Nobody tried for 3 hours since the BIR went offline, so Buwiz can't say whether it's back.{got_in}"
             ),
         ),
+        (Light::NoRecentNews, None) if failing(sign, sign.evaluated_at) => (
+            "No recent news",
+            format!(
+                "No return has got in during the last hour: some tries failed, but too few people to call it Offline.{got_in}"
+            ),
+        ),
         (Light::NoRecentNews, None) => {
-            ("No recent news", format!("Nobody filed in the last hour, so Buwiz can't say.{got_in}"))
+            ("No recent news", format!("No return has got in during the last hour, so Buwiz can't say.{got_in}"))
         }
     };
     Words { title: title.to_owned(), line }

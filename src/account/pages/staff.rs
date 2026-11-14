@@ -199,8 +199,9 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
     let opened = open_id(cx);
     let db = &state(cx).db;
     let rows = queries::queue(db, filter, &search).await?;
-    let (waiting, sent_back) = queries::open_counts(db).await?;
-    let unconfirmed_auto = queries::unconfirmed_auto(db).await?;
+    // The tabs' counts are the sidebar's, read once for the page.
+    let counts = *staff_counts(cx).await?;
+    let (waiting, sent_back, unconfirmed_auto) = (counts.waiting, counts.sent_back, counts.auto);
     let oldest_first = matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack);
     let tabs: Vec<(QueueFilter, String, Option<i64>)> = QueueFilter::ALL
         .into_iter()

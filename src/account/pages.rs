@@ -6,7 +6,7 @@ use std::fmt::Display;
 
 use time::{Duration, OffsetDateTime, UtcOffset};
 use topcoat::Result;
-use topcoat::context::{Cx, app_context};
+use topcoat::context::{Cx, app_context, memoize};
 use topcoat::router::error::redirect;
 use topcoat::router::request::{headers, uri};
 use topcoat::router::{Router, Slot, layout, page};
@@ -92,8 +92,27 @@ fn path_id(cx: &Cx, segment_from_end: usize) -> Result<Uuid> {
         .ok_or_else(|| topcoat::router::error::not_found().into())
 }
 
+/// Who is asking: the signed-in account, and its staff role if it has one.
+struct Viewer {
+    account: Option<Account>,
+    staff: Option<Staff>,
+}
+
+/// [`Viewer`], read once per request: the layout and the page both ask
+/// (the layout for the header or the console's frame, the page for its
+/// staff check), and the session and role lookups each run once.
+#[memoize(as_ref)]
+async fn viewer(cx: &Cx) -> Result<Viewer> {
+    let account = session_account(state(cx), headers(cx)).await.map_err(fail)?;
+    let staff = match &account {
+        Some(account) => roles::staff(&state(cx).db, &state(cx).config, account).await.map_err(fail)?,
+        None => None,
+    };
+    Ok(Viewer { account, staff })
+}
+
 async fn current(cx: &Cx) -> Result<Option<Account>> {
-    session_account(state(cx), headers(cx)).await.map_err(fail)
+    Ok(viewer(cx).await?.account.clone())
 }
 
 /// The signed-in account, or a redirect to sign in and return here.
@@ -108,14 +127,21 @@ async fn signed_in(cx: &Cx) -> Result<Account> {
 }
 
 /// The signed-in account's staff role, if it has one.
-async fn staff_role(cx: &Cx, account: &Account) -> Result<Option<Staff>> {
-    roles::staff(&state(cx).db, &state(cx).config, account).await.map_err(fail)
+async fn staff_role(cx: &Cx) -> Result<Option<Staff>> {
+    Ok(viewer(cx).await?.staff.clone())
+}
+
+/// The staff sidebar's counts, read once per request: the console's frame
+/// shows them and the queue's tabs reuse them.
+#[memoize(as_ref)]
+async fn staff_counts(cx: &Cx) -> Result<crate::account::staff::Counts> {
+    crate::account::staff::counts(&state(cx).db, &state(cx).config.admin_emails).await.map_err(fail)
 }
 
 /// Staff with `power` only; signed-in people who are not get a 404.
 async fn staff_member(cx: &Cx, power: Power) -> Result<Staff> {
-    let account = signed_in(cx).await?;
-    match staff_role(cx, &account).await? {
+    signed_in(cx).await?;
+    match staff_role(cx).await? {
         Some(staff) if staff.can(power) => Ok(staff),
         _ => Err(topcoat::router::error::not_found().into()),
     }
@@ -124,8 +150,8 @@ async fn staff_member(cx: &Cx, power: Power) -> Result<Staff> {
 /// Staff with at least one of `powers` (a page whose parts each ask for
 /// their own); everyone else as [`staff_member`].
 async fn staff_member_with_any(cx: &Cx, powers: &[Power]) -> Result<Staff> {
-    let account = signed_in(cx).await?;
-    match staff_role(cx, &account).await? {
+    signed_in(cx).await?;
+    match staff_role(cx).await? {
         Some(staff) if powers.iter().any(|power| staff.can(*power)) => Ok(staff),
         _ => Err(topcoat::router::error::not_found().into()),
     }
@@ -134,19 +160,14 @@ async fn staff_member_with_any(cx: &Cx, powers: &[Power]) -> Result<Staff> {
 #[layout("/")]
 async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let account = current(cx).await?;
-    let staff = match &account {
-        Some(account) => staff_role(cx, account).await?,
-        None => None,
-    };
+    let staff = staff_role(cx).await?;
     let admin = staff.is_some();
     let path = uri(cx).path().to_owned();
     // Staff pages have their own document (staff/shell.rs): the console's
     // stylesheet, script and fonts, and none of the site's.
     let staff_area = admin && (path == "/staff" || path.starts_with("/staff/"));
     let counts = match &staff {
-        Some(_) if staff_area => {
-            crate::account::staff::counts(&state(cx).db, &state(cx).config.admin_emails).await.map_err(fail)?
-        }
+        Some(_) if staff_area => *staff_counts(cx).await?,
         _ => Default::default(),
     };
     let mut head = head_for(&path);

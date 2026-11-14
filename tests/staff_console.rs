@@ -72,6 +72,16 @@ async fn the_sidebar_counts_are_the_lengths_of_the_lists(db: PgPool) {
     assert!(page.contains(r#"<span class="sx-count hot">2<span class="sx-vh"> waiting</span></span>"#), "{page}");
     assert!(page.contains(r#"<span class="t">All users</span><span class="sx-count">6</span>"#), "{page}");
     assert!(page.contains(r#"<span class="t">Banned</span><span class="sx-count">1</span>"#), "{page}");
+    // The queue's tabs show the same counts, from the same read.
+    let queue = text(site.get("/staff/queue", &staff).await).await;
+    let tabs = &queue[queue.find("aria-label=\"Claim status\"").unwrap()..];
+    let tabs = &tabs[..tabs.find("</nav>").unwrap()];
+    for (label, count) in
+        [("Waiting", r#"<span class="sx-count hot">2</span>"#), ("Sent back", r#"<span class="sx-count">1</span>"#)]
+    {
+        assert!(tabs.contains(&format!("{label}{count}")), "{label}: {tabs}");
+    }
+    assert!(tabs.contains(r#"Activated automatically<span class="sx-count">1</span>"#), "{tabs}");
     let _ = helper;
 }
 

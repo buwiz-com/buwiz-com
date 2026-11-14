@@ -194,33 +194,16 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
     .await
 }
 
-/// TINs activated automatically that no person has confirmed yet, for the
-/// tab's count.
-pub async fn unconfirmed_auto(db: &PgPool) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL")
-        .fetch_one(db)
-        .await
-}
-
-/// Claims waiting for review and claims sent back, for the tab counts.
-pub async fn open_counts(db: &PgPool) -> sqlx::Result<(i64, i64)> {
-    sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE status = 'pending'), count(*) FILTER (WHERE status = 'needs_fix')
-         FROM tin_claims WHERE status IN ('pending', 'needs_fix')",
-    )
-    .fetch_one(db)
-    .await
-}
-
 /// The staff sidebar's live counts. Each is the length of a list every
 /// staff member can already open: the Waiting, Sent back and Activated
 /// automatically tabs, and the Everyone, Staff, Test accounts and Banned
-/// filters of the users list (without its row limit).
+/// filters of the users list (without its row limit). The queue's tabs
+/// show the same three claim counts, from the same read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct Counts {
     pub waiting: i64,
     pub sent_back: i64,
-    /// [`unconfirmed_auto`].
+    /// TINs activated automatically that no person has confirmed yet.
     pub auto: i64,
     pub users: i64,
     pub staff: i64,
@@ -265,7 +248,7 @@ pub struct Overview {
     pub test: i64,
     pub accounts: i64,
     pub accounts_week: i64,
-    /// [`unconfirmed_auto`].
+    /// TINs activated automatically that no person has confirmed yet.
     pub auto: i64,
 }
 

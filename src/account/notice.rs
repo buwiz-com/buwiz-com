@@ -135,6 +135,7 @@ notices! {
     TestTinsHeld = "test_tins_held" => error "This account holds test TINs. Revoke them first, then remove the label.",
     NotSignedInYet = "not_signed_in_yet" => error "They must sign in once first, so the address is proven. Then give them the role.",
     TestLabelFromServer = "test_label_from_server" => error "This address is an admin through the server setting ADMIN_EMAILS, and their page can't take a test label off. Make the login without it.",
+    OwnNeedsReason = "own_needs_reason" => error "This is your own TIN: write why you make it active. It is kept in your history.",
     LoginCreated = "login_created" => info "Login made. No email was sent: they sign in with a code sent to this address when they ask for one.",
     AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
     AdminMustConfirm = "admin_must_confirm" => error "Sending for this TIN is paused: an admin confirms it, and lifting Buwiz's pause takes a reason.",

@@ -627,6 +627,8 @@ pub struct ClaimRow {
     pub auto_confirmed_at: Option<OffsetDateTime>,
     /// Who decided it: the reviewer, or the Admin who activated it.
     pub decided_by: Option<Uuid>,
+    /// Who confirmed its automatic activation.
+    pub auto_confirmed_by: Option<Uuid>,
 }
 
 impl ClaimRow {
@@ -645,10 +647,13 @@ impl ClaimRow {
         matches!(self.status.as_str(), "pending" | "needs_fix")
     }
 
-    /// An Admin activated their own TIN without papers, on the staff pages
-    /// or as the `--as` of a seed run.
+    /// It became active on its owner's own say: an Admin activated it
+    /// without papers (on the staff pages, or as the `--as` of a seed run),
+    /// approved it, or confirmed its automatic activation, on their own
+    /// account.
     pub fn self_activated(&self) -> bool {
-        matches!(self.verified_by.as_deref(), Some("admin" | "seed")) && self.decided_by == Some(self.account_id)
+        self.verified_by.is_some()
+            && (self.decided_by == Some(self.account_id) || self.auto_confirmed_by == Some(self.account_id))
     }
 
     /// When it last went into the review queue: resent, or its papers sent.
@@ -666,7 +671,7 @@ impl ClaimRow {
 pub const CLAIM_COLUMNS: &str = "c.id, c.account_id, a.email, c.kind, c.tin_root, c.branch_code, c.registered_name, \
      c.trade_name, c.status, c.decision_note, c.fix_reasons, c.fix_note, c.created_at, c.sent_back_at, c.resent_at, \
      c.decided_at, c.removed_at, c.removal_note, c.files_changed_at, c.submitted_at, c.verified_by, c.paused_at, \
-     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by";
+     c.pause_reason, c.auto_check, c.auto_confirmed_at, c.decided_by, c.auto_confirmed_by";
 
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<ClaimRow>> {
     sqlx::query_as(&format!(
@@ -822,8 +827,9 @@ pub enum Decision {
 /// so neither a later send-back nor the claimant deleting the claim erases
 /// who decided. Approving a TIN that was ever paused, on any account, is an
 /// Admin's call, and so is deciding one's own claim (its audit line names
-/// the owner as the actor). The reviewer's role is checked again inside the
-/// transaction.
+/// the owner as the actor); approving one's own takes a written reason
+/// (`note`), kept on that line. The reviewer's role is checked again inside
+/// the transaction.
 pub async fn decide(
     db: &PgPool,
     config: &Config,
@@ -893,6 +899,10 @@ pub async fn decide(
     let approve = *decision == Decision::Approve;
     if !approve && note.is_empty() {
         return Err(DecideError::Refused(Notice::RejectNeedsNote));
+    }
+    // As visible as activating it without papers: the reason is on record.
+    if approve && claim.account_id == reviewer.id && note.is_empty() {
+        return Err(DecideError::Refused(Notice::OwnNeedsReason));
     }
     let status = if approve { "approved" } else { "rejected" };
     let updated = sqlx::query(

@@ -52,7 +52,7 @@ was left before. Every
 staff action takes a reason (500 characters at most, like the review
 notes), signing one app out included, but two: approving a claim and
 confirming an automatic activation (unless the confirmation lifts the
-pause Buwiz put on it). Rejecting a claim needs a note to the
+pause Buwiz put on it, or the claim is the Admin's own: below). Rejecting a claim needs a note to the
 person, and sending it back needs a fix reason or a note. Nobody bans
 themselves, changes their own role or labels their own account a test
 account; their own page says so instead of showing those forms.
@@ -71,7 +71,14 @@ Staff open their own page under `/staff/users` and read it in full,
 History and every reason included, and their own claims' pages too. An
 Admin acts on their own TINs as on anyone's, with the usual reason: each
 of those audit lines names the account itself as the actor, and the
-History reads "Staff … paused their own TIN …".
+History reads "Staff … paused their own TIN …". Approving their own claim
+or confirming the automatic activation of their own TIN takes a written
+reason too (`own_needs_reason`; for an approval it is the note), kept on
+that audit line. A TIN that became active on its owner's own say (an
+Admin activating it without papers, approving it or confirming its
+automatic activation, on their own account: `decided_by` or
+`auto_confirmed_by` is the account itself) is flagged "Activated by its
+owner, an admin" in the queue and on the claim.
 
 ### Bans and test accounts
 
@@ -156,7 +163,8 @@ An Admin can also:
   or sent back, their own too (refused while another account owns it, or
   for a banned account). The reason stays in the audit only. Their own
   reads as "Staff … activated their own TIN …" and is flagged "Activated
-  by its owner, an admin" in the queue and on the claim;
+  by its owner, an admin" in the queue and on the claim, as is one they
+  approved or confirmed on their own account (above);
 - **pause** an active TIN, with a reason the owner reads: it stays owned
   but nothing sends (`tin_paused`) until resumed. The owner cannot remove a
   paused TIN. A "Paused before" card shows every pause of the TIN, on any

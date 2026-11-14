@@ -12,6 +12,8 @@ use uuid::Uuid;
 use common::Part::{File, Text};
 use common::*;
 
+const SELF_ACTIVATED: &str = "Activated by its owner, an admin";
+
 async fn papers(site: &Site, cookie: &str, tin: &'static str) -> Uuid {
     let parts = [
         ("kind", Text("personal")),
@@ -161,8 +163,10 @@ async fn support_reads_but_does_not_decide_their_own_claim(db: PgPool) {
     assert!(claim_audit_lines(&site.db, helper).await.is_empty());
 }
 
-/// An automatic activation of their own TIN: an Admin confirms it, and the
-/// line names them; Support may not (tests/auto_verify.rs).
+/// An automatic activation of their own TIN: an Admin confirms it, with a
+/// written reason on its line, and the line names them; Support may not
+/// (tests/auto_verify.rs). Like an Admin's own activation without papers,
+/// the queue and the claim flag it.
 #[sqlx::test(migrations = "./migrations")]
 async fn an_admin_confirms_the_automatic_activation_of_their_own_tin(db: PgPool) {
     let site = Site::new(db);
@@ -175,15 +179,79 @@ async fn an_admin_confirms_the_automatic_activation_of_their_own_tin(db: PgPool)
     .fetch_one(&site.db)
     .await
     .unwrap();
-    let page = text(site.get(&format!("/staff/claims/{claim}"), &cookie).await).await;
-    assert!(page.contains(&format!("action=\"/staff/claims/{claim}/confirm\"")), "{page}");
-    let response = site.post(&format!("/staff/claims/{claim}/confirm"), &cookie, "").await;
-    assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=auto_confirmed"));
+    let path = format!("/staff/claims/{claim}");
+    let page = text(site.get(&path, &cookie).await).await;
+    assert!(page.contains(&format!("action=\"{path}/confirm\"")), "{page}");
+    assert!(page.contains("This is your own TIN: write why; it goes in your history."), "{page}");
+    assert!(!page.contains(SELF_ACTIVATED), "{page}");
+    for form in ["", "reason=+"] {
+        let response = site.post(&format!("{path}/confirm"), &cookie, form).await;
+        assert_eq!(location(&response), format!("{path}?notice=own_needs_reason"), "{form}");
+    }
+    assert!(actors(&site.db, boss).await.is_empty());
+    let response = site.post(&format!("{path}/confirm"), &cookie, "reason=My+own+ID").await;
+    assert_eq!(location(&response), format!("{path}?notice=auto_confirmed"));
     assert_eq!(actors(&site.db, boss).await, [("auto_confirmed".to_owned(), boss)]);
+    assert_eq!(claim_audit_lines(&site.db, boss).await[0].4.as_deref(), Some("My own ID"));
     let history = text(site.get(&format!("/staff/users/{boss}"), &cookie).await).await;
     assert!(
-        history
-            .contains("Staff boss@example.test confirmed the automatic activation of their own TIN ***-***-456-00000"),
+        history.contains(
+            "Staff boss@example.test confirmed the automatic activation of their own TIN ***-***-456-00000: My own ID"
+        ),
         "{history}"
     );
+    let page = text(site.get(&path, &cookie).await).await;
+    assert!(page.contains(SELF_ACTIVATED), "{page}");
+    let queue = text(site.get("/staff?status=approved", &cookie).await).await;
+    assert!(queue.contains(SELF_ACTIVATED), "{queue}");
+}
+
+/// An Admin approving their own claim writes why, as one activating it
+/// without papers does, and the queue and the claim flag it. Approving
+/// someone else's claim needs no note, as before.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_admin_approving_their_own_claim_writes_why_and_it_is_flagged(db: PgPool) {
+    let site = Site::new(db);
+    let (boss, cookie) = site.staff_with_role("boss@example.test", "admin").await;
+    let own = papers(&site, &cookie, "000123457").await;
+    let path = format!("/staff/claims/{own}");
+    let page = text(site.get(&path, &cookie).await).await;
+    assert!(page.contains("to approve it, write why in the note."), "{page}");
+    for form in ["decision=approve", "decision=approve&note=+"] {
+        let response = site.post(&format!("{path}/decision"), &cookie, form).await;
+        assert_eq!(location(&response), format!("{path}?notice=own_needs_reason"), "{form}");
+    }
+    assert_eq!(site.claim_status(own).await, "pending");
+    let page = text(site.get(&format!("{path}?notice=own_needs_reason"), &cookie).await).await;
+    assert!(page.contains("This is your own TIN: write why you make it active."), "{page}");
+    let response = site.post(&format!("{path}/decision"), &cookie, "decision=approve&note=Checked+my+own+ID").await;
+    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(site.claim_status(own).await, "approved");
+    assert_eq!(
+        claim_audit_lines(&site.db, boss).await,
+        [(
+            "approved".into(),
+            "pending".into(),
+            "boss@example.test".into(),
+            "web".into(),
+            Some("Checked my own ID".into())
+        )]
+    );
+    let page = text(site.get(&path, &cookie).await).await;
+    assert!(page.contains(SELF_ACTIVATED), "{page}");
+    let queue = text(site.get("/staff?status=approved", &cookie).await).await;
+    assert!(queue.contains(SELF_ACTIVATED), "{queue}");
+    let history = text(site.get(&format!("/staff/users/{boss}"), &cookie).await).await;
+    assert!(
+        history.contains("Staff boss@example.test approved their own claim on ***-***-457-00000: Checked my own ID"),
+        "{history}"
+    );
+
+    // Someone else's claim: approved without a note, and no flag.
+    let (_, ana_cookie) = site.person("ana@example.test").await;
+    let theirs = papers(&site, &ana_cookie, "000123458").await;
+    let response = site.post(&format!("/staff/claims/{theirs}/decision"), &cookie, "decision=approve").await;
+    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    let page = text(site.get(&format!("/staff/claims/{theirs}"), &cookie).await).await;
+    assert!(!page.contains(SELF_ACTIVATED), "{page}");
 }

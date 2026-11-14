@@ -131,10 +131,17 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     let page = text(site.get(&format!("/staff/claims/{papers}"), &boss_cookie).await).await;
     assert!(page.contains("This is your own claim. Your decision goes in your history"), "{page}");
     assert!(page.contains("Or activate without papers"), "{page}");
+    // Approving it takes a written reason (tests/own_page.rs).
     let response = site.post(&format!("/staff/claims/{papers}/decision"), &boss_cookie, "decision=approve").await;
+    assert_eq!(location(&response), format!("/staff/claims/{papers}?notice=own_needs_reason"));
+    let response =
+        site.post(&format!("/staff/claims/{papers}/decision"), &boss_cookie, "decision=approve&note=Mine").await;
     assert_eq!(location(&response), "/staff?notice=claim_decided");
     let history = text(site.get(&format!("/staff/users/{boss}"), &staff).await).await;
-    assert!(history.contains("Staff boss@example.test approved their own claim on ***-***-454-00000"), "{history}");
+    assert!(
+        history.contains("Staff boss@example.test approved their own claim on ***-***-454-00000: Mine"),
+        "{history}"
+    );
 }
 
 async fn token_for(site: &Site, account: Uuid, scope: &str) -> String {

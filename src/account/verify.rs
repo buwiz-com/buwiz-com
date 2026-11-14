@@ -619,7 +619,8 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
 /// Staff confirm an automatic activation after looking at its papers (also
 /// one the owner removed or staff revoked since): the papers are deleted,
 /// and a pause Buwiz put on it for waiting too long is lifted. On one's own
-/// TIN only as an Admin. Only an Admin reopens a paused TIN: Support confirms only one
+/// TIN only as an Admin, with `reason` (kept on the `auto_confirmed` line).
+/// Only an Admin reopens a paused TIN: Support confirms only one
 /// that is not paused, and an Admin lifting Buwiz's pause gives `reason`
 /// (a staff pause stays, and needs none). The actor's role is checked
 /// again inside the transaction; the route checks the power first
@@ -681,6 +682,12 @@ pub async fn confirm(
     if paused && role != Some(Role::Admin) {
         return Err(DecideError::Refused(Notice::AdminMustConfirm));
     }
+    // As visible as activating it without papers: the reason is on record.
+    let own = if owner == actor.id {
+        Some(crate::account::admin::reason_text(reason).map_err(|_| DecideError::Refused(Notice::OwnNeedsReason))?)
+    } else {
+        None
+    };
     let resumed = if paused_by_buwiz {
         let reason = crate::account::admin::required_reason(reason)?;
         Some(format!("Confirmed after Buwiz paused it for waiting too long: {reason}"))
@@ -707,7 +714,7 @@ pub async fn confirm(
     .fetch_all(&mut *tx)
     .await?;
     let masked = Tin::parse_any(&root, &branch).map_err(|_| anyhow::anyhow!("stored TIN"))?.masked();
-    let mut lines = vec![("auto_confirmed", None)];
+    let mut lines = vec![("auto_confirmed", own.as_deref())];
     if let Some(reason) = resumed.as_deref() {
         lines.push(("resumed", Some(reason)));
     }

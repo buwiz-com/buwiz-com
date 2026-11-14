@@ -592,6 +592,15 @@ pub mod claim_id {
                                                 confirm: "Confirm",
                                                 reason: true
                                             )
+                                        } else if can_confirm && own_claim {
+                                            confirm_form(
+                                                label: "Looks right: confirm",
+                                                action: confirm.clone(),
+                                                question: format!("Confirm your own TIN {tin}?"),
+                                                detail: "You checked the papers and they match. They are deleted now. This is your own TIN: write why; it goes in your history.".to_owned(),
+                                                confirm: "Confirm",
+                                                reason: true
+                                            )
                                         } else if can_confirm {
                                             confirm_form(
                                                 label: "Looks right: confirm",
@@ -633,7 +642,7 @@ pub mod claim_id {
                                 <form class="panel side-card decision" method="post" action=(decide)>
                                     <h2>"Decision"</h2>
                                     if own_claim {
-                                        <p class="side-text">"This is your own claim. Your decision goes in your history as one on your own account."</p>
+                                        <p class="side-text">"This is your own claim. Your decision goes in your history as one on your own account; to approve it, write why in the note."</p>
                                     }
                                     if admin_must_approve {
                                         <p class="side-text">"Sending for this TIN was paused before: an admin must approve it. You can still send it back or reject it."</p>

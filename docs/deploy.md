@@ -630,8 +630,10 @@ psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 
 ```
 and put the previous binaries back. When this release (or a later one)
 starts again, migration 14 copies the archived rows back and drops their
-archive tables, so the history is whole again. A proof whose account or
-claim was deleted meanwhile stays in `rollback_archive.bir_proofs`. Going
+archive tables, so the history is whole again. A proof whose account was
+deleted meanwhile stays in `rollback_archive.bir_proofs`; one whose claim
+was deleted comes back without it (`claim_id` NULL, its JWS still carries
+the masked TIN), as deleting a claim at 14 leaves it. Going
 further back runs 14's down file first, then 13's and the others as
 [above](#migration-13-test-tins); each commits on its own.
 

@@ -163,12 +163,14 @@ CREATE TABLE bir_held (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     at          timestamptz NOT NULL DEFAULT now(),
     account_id  uuid NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-    claim_id    uuid NOT NULL REFERENCES tin_claims (id),
+    -- NULL once the claim is deleted: a hold never stops a claim going.
+    claim_id    uuid REFERENCES tin_claims (id) ON DELETE SET NULL,
     form        text NOT NULL,
     period      text NOT NULL,
     code        text NOT NULL CHECK (code IN ('bir_offline', 'bir_busy', 'relay_paused'))
 );
 CREATE INDEX bir_held_account ON bir_held (account_id, at DESC);
+CREATE INDEX bir_held_claim ON bir_held (claim_id);
 
 -- Upload-server host keys offered to live tries, read from the SSH
 -- handshake the user's app relays. A sighting can be forged, so it is
@@ -227,7 +229,9 @@ CREATE TABLE bir_proofs (
     -- 'p_' and 16 random bytes.
     id          text PRIMARY KEY,
     account_id  uuid NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-    claim_id    uuid NOT NULL REFERENCES tin_claims (id),
+    -- NULL once the claim is deleted: the proof stays valid, its JWS still
+    -- carries the TIN masked, and a proof never stops a claim going.
+    claim_id    uuid REFERENCES tin_claims (id) ON DELETE SET NULL,
     day         date NOT NULL,
     form        text NOT NULL,
     period      text NOT NULL,
@@ -235,6 +239,7 @@ CREATE TABLE bir_proofs (
     jws         text NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX bir_proofs_claim ON bir_proofs (claim_id);
 
 -- How a ticket got through the doorman; NULL for tickets from before. The
 -- check is added NOT VALID: every existing row is NULL, so it holds, and
@@ -247,8 +252,10 @@ ALTER TABLE tickets ADD CONSTRAINT tickets_bir_admission_check
 ALTER TABLE devices ADD COLUMN bir_reported_at timestamptz;
 
 -- Back from a rollback: 0014's down file kept these in `rollback_archive`.
--- Each row comes back, then leaves the archive; a proof whose account or
--- claim no longer exists stays there (and so does its table).
+-- Each row comes back, then leaves the archive; a proof whose account no
+-- longer exists stays there (and so does its table), and one whose claim
+-- was deleted meanwhile comes back without it (`claim_id` NULL, as a
+-- deletion at 14 leaves it; its JWS keeps the masked TIN).
 DO $$
 BEGIN
     IF to_regclass('rollback_archive.bir_days') IS NOT NULL THEN
@@ -286,11 +293,11 @@ BEGIN
     END IF;
     IF to_regclass('rollback_archive.bir_proofs') IS NOT NULL THEN
         INSERT INTO bir_proofs (id, account_id, claim_id, day, form, period, kid, jws, created_at)
-            SELECT DISTINCT ON (p.id) p.id, p.account_id, p.claim_id, p.day, p.form, p.period, p.kid, p.jws,
+            SELECT DISTINCT ON (p.id) p.id, p.account_id,
+                   (SELECT c.id FROM tin_claims c WHERE c.id = p.claim_id), p.day, p.form, p.period, p.kid, p.jws,
                    p.created_at
               FROM rollback_archive.bir_proofs p
              WHERE EXISTS (SELECT 1 FROM accounts a WHERE a.id = p.account_id)
-               AND EXISTS (SELECT 1 FROM tin_claims c WHERE c.id = p.claim_id)
              ORDER BY p.id, p.archived_at DESC;
         DELETE FROM rollback_archive.bir_proofs p WHERE EXISTS (SELECT 1 FROM bir_proofs b WHERE b.id = p.id);
         IF NOT EXISTS (SELECT 1 FROM rollback_archive.bir_proofs) THEN

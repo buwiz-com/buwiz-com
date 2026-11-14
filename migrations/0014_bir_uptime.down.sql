@@ -12,7 +12,10 @@
 -- before this one does not read. Migrating up again brings them back.
 -- Rolling back twice adds to the archive; the way up takes the newest copy
 -- of each row. Every column is named, so an archive table made by an
--- earlier rollback reads the same whatever order its columns are in.
+-- earlier rollback reads the same whatever order its columns are in. A
+-- proof keeps its `claim_id` here, NULL if its claim was deleted (its JWS
+-- keeps the masked TIN); if the claim is deleted while at 13, the way up
+-- brings the proof back without it.
 --
 -- What it loses: the tries of the last 90 days (`bir_tries`), queue
 -- reports and turns (at most a day old), held requests, the recorded

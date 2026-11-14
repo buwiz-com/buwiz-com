@@ -1021,8 +1021,9 @@ fn try_row(values: &str) -> String {
 /// Migration 14: new tables only, whose checks keep a try's row to what the
 /// record may hold. Going back to 13 never refuses, leaves 13's schema, and
 /// keeps the day history, events, notes, proofs and the sign in
-/// `rollback_archive`; the way up brings them back, a proof whose claim is
-/// gone excepted, which stays in the archive.
+/// `rollback_archive`; the way up brings them back (a proof whose claim is
+/// gone without it), a proof whose account is gone excepted, which stays in
+/// the archive.
 #[sqlx::test(migrations = false)]
 async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     release_13().run(&db).await.unwrap();
@@ -1058,6 +1059,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     }
 
     let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let bea = id(&db, "INSERT INTO accounts (email) VALUES ('bea@example.test') RETURNING id").await;
     let claim = |root: &str| {
         format!(
             "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
@@ -1092,7 +1094,8 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
              INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, '{{\"made_up\": true}}', now());
              INSERT INTO bir_proofs (id, account_id, claim_id, day, form, period, kid, jws)
              VALUES ('p_kept', '{ana}', '{kept_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c'),
-                    ('p_gone', '{ana}', '{gone_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c');
+                    ('p_gone', '{ana}', '{gone_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c'),
+                    ('p_orphan', '{bea}', '{kept_claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c');
              INSERT INTO bir_host_keys (fingerprint, first_seen, last_seen, seen)
              VALUES ('SHA256:{fingerprint}', now(), now(), '[]');
              INSERT INTO bir_held (account_id, claim_id, form, period, code)
@@ -1103,7 +1106,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     )
     .await;
     let kept = uptime_kept(&db).await;
-    assert_eq!(kept, (1, 3, 2, 2, Some(41)));
+    assert_eq!(kept, (1, 3, 2, 3, Some(41)));
     let events: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, scope FROM bir_events ORDER BY id").fetch_all(&db).await.unwrap();
     let whole = whole_rows(&db).await;
@@ -1129,22 +1132,32 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     assert_eq!(schema(&db).await, schema_13, "the schema is migration 13's");
     assert_eq!(archived(&db, "bir_days", "day").await, ["2026-11-11"]);
     assert_eq!(archived(&db, "bir_events", "scope").await, ["overall", "overall", "upload"]);
-    assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_gone", "p_kept"]);
+    assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_gone", "p_kept", "p_orphan"]);
     assert_eq!(archived(&db, "bir_sign", "seq").await, ["41"]);
     release_13().run(&db).await.unwrap();
 
-    // Meanwhile one claim goes away; the way up brings back everything but
-    // its proof, and the events' ids go on from where they were.
+    // Meanwhile one claim and one account go away; the way up brings back
+    // everything but the gone account's proof (the gone claim's without its
+    // claim), and the events' ids go on from where they were.
     exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{gone_claim}'")).await;
+    exec(&db, &format!("DELETE FROM accounts WHERE id = '{bea}'")).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(uptime_kept(&db).await, (1, 3, 2, 1, Some(41)));
+    assert_eq!(uptime_kept(&db).await, (1, 3, 2, 2, Some(41)));
     let back: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, scope FROM bir_events ORDER BY id").fetch_all(&db).await.unwrap();
     assert_eq!(back, events);
-    // Every column of every row, as it was (the gone claim's proof aside).
+    // Every column of every row, as it was (the proofs aside whose account
+    // or claim went).
     let mut expected = whole.clone();
-    expected.get_mut("bir_proofs").unwrap().retain(|row| !row.contains("p_gone"));
-    assert_eq!(whole_rows(&db).await, expected);
+    let proofs = expected.get_mut("bir_proofs").unwrap();
+    proofs.retain(|row| !row.contains("p_orphan"));
+    for row in proofs.iter_mut().filter(|row| row.contains("p_gone")) {
+        *row = row.replace(&format!(r#""claim_id":"{gone_claim}""#), r#""claim_id":null"#);
+    }
+    proofs.sort();
+    let mut back_rows = whole_rows(&db).await;
+    back_rows.get_mut("bir_proofs").unwrap().sort();
+    assert_eq!(back_rows, expected);
     let next: i64 = sqlx::query_scalar(
         "INSERT INTO bir_events (scope, from_state, to_state, cause, reason)
          VALUES ('overall', 'offline', 'online', 'scout', 'A scout got in') RETURNING id",
@@ -1161,7 +1174,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     .await
     .unwrap();
     assert_eq!(archive_tables, ["bir_proofs"]);
-    assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_gone"]);
+    assert_eq!(archived(&db, "bir_proofs", "id").await, ["p_orphan"]);
     // What is not kept: tries, held requests, host keys.
     for table in ["bir_tries", "bir_held", "bir_host_keys"] {
         let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(&db).await.unwrap();
@@ -1175,11 +1188,50 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_13);
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(uptime_kept(&db).await, (1, 4, 2, 1, Some(41)));
+    assert_eq!(uptime_kept(&db).await, (1, 4, 2, 2, Some(41)));
     let again = whole_rows(&db).await;
     assert_eq!(again["bir_days"], expected["bir_days"]);
     assert_eq!(again["bir_notes"], expected["bir_notes"]);
     assert_eq!(again["bir_sign"], expected["bir_sign"]);
+}
+
+/// At 14 a claim can be deleted whatever was held or proved for it: its
+/// held requests and proofs stay, without it, each found by an index.
+#[sqlx::test(migrations = false)]
+async fn a_claim_goes_and_its_holds_and_proofs_stay(db: PgPool) {
+    MIGRATOR.run(&db).await.unwrap();
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let claim = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+             VALUES ('{ana}', 'personal', '000123453', '00000', 'SYNTHETIC TAXPAYER', 'approved', now(), 'staff') RETURNING id"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO bir_held (account_id, claim_id, form, period, code)
+             VALUES ('{ana}', '{claim}', '1601C', '102026', 'bir_offline');
+             INSERT INTO bir_proofs (id, account_id, claim_id, day, form, period, kid, jws)
+             VALUES ('p_made_up', '{ana}', '{claim}', '2026-11-11', '1601C', '102026', 'k1', 'a.b.c')"
+        ),
+    )
+    .await;
+    exec(&db, &format!("DELETE FROM tin_claims WHERE id = '{claim}'")).await;
+    let held: Vec<Option<Uuid>> = sqlx::query_scalar("SELECT claim_id FROM bir_held").fetch_all(&db).await.unwrap();
+    assert_eq!(held, [None]);
+    let proofs: Vec<(String, Option<Uuid>, String)> =
+        sqlx::query_as("SELECT id, claim_id, jws FROM bir_proofs").fetch_all(&db).await.unwrap();
+    assert_eq!(proofs, [("p_made_up".to_owned(), None, "a.b.c".to_owned())]);
+    let indexed: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes WHERE indexname IN ('bir_held_claim', 'bir_proofs_claim') ORDER BY 1",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(indexed, ["bir_held_claim", "bir_proofs_claim"]);
 }
 
 /// Every row of the tables migration 14's down file keeps, each whole as

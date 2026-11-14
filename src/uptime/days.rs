@@ -5,8 +5,9 @@
 //! overall sign and both windows), the hand-set notes from `bir_notes`, the
 //! tries' counts from `bir_tries`, held requests from `bir_held`, and the
 //! day's distinct accounts and networks from memory ([`super::keys::DaySets`]).
-//! It is rewritten every 10 minutes while the day lasts and once more after
-//! it ends, then marked final and never computed again (the tries it was
+//! It is rewritten every 10 minutes while the day lasts (every hour while
+//! the sign is idle, [`super::hourly`]) and once more after it ends, then
+//! marked final and never computed again (the tries it was
 //! counted from are deleted after 90 days). Computing it twice gives the
 //! same line. On start every day since the last final line is computed, so
 //! a day the server was down for still gets its line.

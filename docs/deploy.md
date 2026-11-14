@@ -523,17 +523,27 @@ assumed (as today): two would each keep, write and mail their own sign.
 
 **Before you deploy.** The database is at 13 and has no uptime table
 yet (after a rollback, what it kept is in `rollback_archive` and comes
-back at start); both as read-only checks:
+back at start), and the `rollback_archive` schema, if there is one, is
+the app's own (the role in `DATABASE_URL`), so migration 14 can read and
+drop its tables there; all read-only checks:
 ```sql
 SELECT max(version) FROM _sqlx_migrations;                            -- 13
 SELECT count(*) FROM information_schema.tables
  WHERE table_schema = 'public' AND table_name LIKE 'bir\_%';          -- 0
+SELECT nspowner::regrole FROM pg_namespace
+ WHERE nspname = 'rollback_archive';                  -- no row, or the app's role
+```
+And no `/buwiz/BIR_UPTIME*` parameter is left over from testing (the
+first deploy runs at the default, `record`):
+```sh
+aws ssm get-parameters-by-path --path /buwiz --query "Parameters[?starts_with(Name, '/buwiz/BIR_UPTIME')].Name"   # []
 ```
 Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
-The Sender and the Gatekeeper ship from one build and restart together, so
-the Sender's `sender` frame (its mode, [relay-protocol.md](relay-protocol.md#6-the-sender))
-arrives with the Gatekeeper that reads it; a try during the restart is
-recorded with mode `unknown` and not counted.
+The Sender and the Gatekeeper ship from one build, but the installer
+restarts the Sender first: for a moment the old Gatekeeper forwards the
+new Sender's `sender` frame (its mode, [relay-protocol.md](relay-protocol.md#6-the-sender))
+to the app, and every app version ignores a frame it does not know. A
+try during the restart is recorded with mode `unknown` and not counted.
 
 **The new settings** (Gatekeeper, `/buwiz/*`):
 - `BIR_UPTIME`: leave it unset (it means `record`) for the first deploy.
@@ -574,11 +584,15 @@ no TIN refusal, and never an `unknown`). Everything else, and every
 request already under way, is still served, and the BIR uptime records of
 tries that end meanwhile are still written. The server waits for those
 records at most 10 seconds (usually none are pending, so it goes on at
-once), then exits with status 0 without waiting for anything else, so a
-document reading (OCR) still running cannot hold the restart. A relay send
-still open at that moment is cut when the process exits, as it was before,
-when SIGTERM killed it; the app records it from its own side. Ctrl-C
-(SIGINT) does the same. A deploy takes no longer than before.
+once), writes the BIR sign's time of the last evaluation once (a moment;
+at most 5 seconds), then exits with status 0 without waiting for anything
+else and without running exit-time destructors, so a document reading
+(OCR) still running cannot hold or crash the restart. A relay send still
+open at that moment is cut when the process exits, as it was before, when
+SIGTERM killed it; the app records it from its own side. Ctrl-C (SIGINT)
+does the same. So a restart can take up to about 10 seconds longer at stop
+(only when a record is pending) and up to 10 seconds longer at start
+(below); the installer waits up to 45 seconds for the app to answer.
 
 **What a deploy does at start.** After the migrations, the server loads
 the BIR sign before it binds its port, waiting at most 10 seconds: the
@@ -586,19 +600,34 @@ stored sign as it was, the `live` tries of the last 3 hours and the open
 note, aged by the clock (it never turns Offline into Online or Online into
 Offline), with its `seq` moved on once (every start does that, so a
 database restored from an older backup still passes any `seq` an app
-holds). If the database is slow or down, it starts at No recent news with
-`seq` 0, which claims nothing, logs `BIR uptime: the sign could not be
-loaded at start`, and the ticker tries again every 30 seconds. Then it
-binds, serves, and starts the ticker, which writes the day history in the
-background once its first run of the rules worked. The time the server
-was not running is written as "not watched" and shown as a gap in the day
-history, never as the BIR's state; a stop of under 5 minutes (a deploy)
-leaves no gap, one of 5 to 7 minutes may not either (the stored time of
-the last run is to the minute and at most a minute old). The first start
-ever writes the history's first line ("Buwiz began keeping the sign") and
-shows No recent news everywhere; the first return that gets in turns it
-Online. A note set with `buwiz-cloud bir` while the server was stopped
-takes effect, and is mailed to staff, at this start.
+holds). If the database is slow, or the load fails, it starts at No recent
+news with `seq` 0, which claims nothing, logs `BIR uptime: the sign could
+not be loaded at start`, and the ticker tries again every 30 seconds. With
+the database down the server never gets that far: it fails at the
+migration step and systemd restarts it, over and over, as it always did,
+until the database is back. Then it binds, serves and starts the ticker,
+and the hourly upkeep runs at once, which writes the day history. The time
+the server was not running is written as "not watched" and shown as a gap
+in the day history, never as the BIR's state; a stop of under 5 minutes (a
+deploy) leaves no gap, one of 5 to 7 minutes may not either (the stored
+time of the last evaluation is to the minute, written at the stop). After
+a crash while the sign was idle (below) the gap may start up to an hour
+early. The first start ever writes the history's first line ("Buwiz began
+keeping the sign") and shows No recent news everywhere; the first return
+that gets in turns it Online. A note set with `buwiz-cloud bir` while the
+server was stopped takes effect, and is mailed to staff, at this start.
+
+**The database may sleep while nothing happens.** Neon scales an idle
+database to zero, and the plan may depend on it. While the BIR sign is
+idle (no relay try in the last 3 hours, no note, nothing waiting to be
+written or mailed, both lights No recent news) the server's 30-second
+ticker runs in memory only and sends the database nothing; uptime's only
+database work is then one small write an hour, with the hourly upkeep
+that ran before this release (and the day history, rolled up there, so the
+first upkeep after Manila midnight still closes the day). A relay try, a
+note taken in or SIGUSR1 ends idle at once; while anything is active the
+server reads and writes the sign as before (every 30 seconds, written at
+least every minute, the day history every 10 minutes).
 
 **From `public`, the public sign can be up to 5 minutes behind.** The
 public document, the history, the status page and the `buwiz-bir` header
@@ -624,14 +653,26 @@ keeps forever, the day history (`bir_days`), events, notes, proofs and the
 sign (`bir_sign`, whose `seq` only grows), to tables in the
 `rollback_archive` schema, which the release before this one does not
 read, and drops the rest: the tries of the last 90 days, queue reports,
-turns, held requests and recorded host keys. Stop the app, then:
-```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0014_bir_uptime.down.sql
-psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 13
-```
-and put the previous binaries back. When this release (or a later one)
-starts again, migration 14 copies the archived rows back and drops their
-archive tables, so the history is whole again. A proof whose account was
+turns, held requests and recorded host keys. In this order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run check 6 ("nothing is being sent", [above](#before-you-deploy)): it
+   must be `0`.
+3. Run the down file, with a lock timeout set first, so a stray session
+   holding one of the tables makes it fail at once instead of waiting:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0014_bir_uptime.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 13
+   ```
+4. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead (systemd restarted it, or the binaries were not swapped
+   yet), it runs migration 14 again, and the rollback starts over at 1.
+
+When this release (or a later one) starts again, migration 14 copies the
+archived rows back and drops their archive tables, so the history is
+whole again. A proof whose account was
 deleted meanwhile stays in `rollback_archive.bir_proofs`; one whose claim
 was deleted comes back without it (`claim_id` NULL, its JWS still carries
 the masked TIN), as deleting a claim at 14 leaves it. Going
@@ -678,15 +719,19 @@ usage: buwiz-cloud bir declare online|offline|maintenance --as <admin email> --r
   what it will do. `status` only reads. Nothing it prints holds a TIN.
 - **It writes only the note, its audit line and the sign's `seq`,** under
   the sign's lock, and runs no rule: it cannot end an Offline or write over
-  what the running server holds. The running server takes the note in
-  without a restart: every run of its rules (every 30 seconds, and after
-  each recorded try) reads the stored `seq`, finds the command's higher
-  one, reads the note, makes the change, writes it and mails staff (with
-  the Admin's reason). Within 30 seconds the signed-in answers show it, and
-  everything public from the next 5-minute mark. With no server running,
-  the note takes effect (and is mailed) when one starts. A note set and
-  cleared again before the server's next run changes nothing it shows; the
-  audit lines keep both.
+  what the running server holds. **Then tell the running server:**
+  `sudo systemctl kill -s USR1 buwiz.service` (the command prints this
+  reminder). On SIGUSR1 the server reads the stored note and `seq` at once,
+  makes the change, writes it and mails staff (with the Admin's reason);
+  the signal does nothing else and is harmless at any time. Without it,
+  every run of the rules while anything is active (every 30 seconds, and
+  after each recorded try) reads the stored `seq` too, so a forgotten poke
+  is picked up within 30 seconds; but while the sign is idle (above) only
+  the hourly upkeep reads it, so then it can take up to an hour. Once taken
+  in, the signed-in answers show it, and everything public from the next
+  5-minute mark. With no server running, the note takes effect (and is
+  mailed) when one starts. A note set and cleared again before the server
+  reads it changes nothing it shows; the audit lines keep both.
 
 Exit codes: 0 done; 2 refused (with the reason), nothing written; 1 an
 error, nothing written.
@@ -699,11 +744,13 @@ sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz
   --reason "BIR advisory: eFPS maintenance tonight" --until 2026-11-14T23:00 \
   --text "The BIR announced maintenance until 11 PM."
 echo "exit $?"
+sudo systemctl kill -s USR1 buwiz.service
 ```
 and to end it early, or to look:
 ```sh
 sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
   -E RUST_LOG=off /opt/buwiz/buwiz-cloud bir clear --as <admin login> --reason "The BIR is back"
+sudo systemctl kill -s USR1 buwiz.service
 sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz/env \
   -E RUST_LOG=off /opt/buwiz/buwiz-cloud bir status
 ```

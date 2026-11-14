@@ -1030,8 +1030,9 @@ and the clock, so it is tested rule by rule and replayed.
 `src/uptime/live.rs` runs it after each recorded try (in the recorder's
 own task, after the app has its result: a send is never delayed or broken
 by it) and every 30 seconds for what the clock alone changes, writes every
-change, and holds the sign in memory for every read. A single Gatekeeper
-process is assumed: two would each keep, write and mail their own sign.
+change, and holds the sign in memory for every read; while the sign is idle
+those 30-second runs stay in memory (§15.3). A single Gatekeeper process is
+assumed: two would each keep, write and mail their own sign.
 
 ### 15.1 The rules
 
@@ -1099,7 +1100,8 @@ field fewer or more, reads whole (a missing time is its last write's, a
 time after now is now, logged). It is written in the same transaction as
 the events, at once for any change but the times of news and of the
 evaluation, which alone are written at most once a minute (and at least
-once a minute while the ticker runs).
+once a minute while the ticker runs and the sign is not idle; while it is
+idle, once an hour and at a clean stop, §15.3).
 
 **`seq`.** Every change moves it to `max(seq + 1, the change's 5-minute
 mark in Unix seconds)` (a gap in watching is a change, and so is every
@@ -1154,10 +1156,13 @@ event, not the BIR's.
   Offline into Online or Online into Offline. Tries from before it carry
   only the key they were recorded under, of a key period no longer in
   memory, so a quorum needs fresh tries, and lost votes are gone (§15.1).
-  If the load fails or takes longer, the server starts at No recent news
-  with `seq` 0 (which claims nothing) and the ticker tries again every 30
-  seconds. The day history is written after the port is bound, by the
-  ticker, in the background, once its first run of the rules worked.
+  If the load fails, panics (logged) or takes longer, the server starts at
+  No recent news with `seq` 0 (which claims nothing) and the ticker tries
+  again every 30 seconds. The load reads at most the newest 20,000 tries.
+  The day history is written after the port is bound, by the hourly
+  upkeep, which runs right after the start. With the database down the
+  server does not get this far: it stops at the migrations, and systemd
+  starts it again, as before this feature.
   Until the sign is loaded, everything public shows that placeholder; the
   first sign shown after a start is public at once, not from the next mark.
 - **Time Buwiz was not watching** (the server was stopped, or the sign was
@@ -1167,9 +1172,12 @@ event, not the BIR's.
   day history. It is never given to a BIR state, never extends the state
   before it, counts in no duration, and splits any outage it falls in. Its
   start is the last time the sign was evaluated: exact within a running
-  process; across a restart the stored one, to the minute and at most a
-  minute old, so a restart of under 5 minutes writes no gap (and one of 5
-  to 7 minutes may not either). One gap is at most 31 days: a clock that
+  process; across a restart the stored one, to the minute, written at a
+  clean stop (and at least once a minute while the sign is not idle), so a
+  restart of under 5 minutes writes no gap (and one of 5 to 7 minutes may
+  not either). After a crash while the sign was idle the stored time can
+  be up to an hour old (the hourly write), so that gap may start up to an
+  hour early: accepted. One gap is at most 31 days: a clock that
   jumps forward writes no absurd span (logged).
 - **A clock that steps back** more than 2 minutes behind the last run does
   not hold the rules until it catches up: the sign's and the tries' times
@@ -1185,8 +1193,28 @@ event, not the BIR's.
   about to exit and none that had not started becomes `unknown`. Requests
   already under way are still served, and the records of tries that end
   meanwhile are still written. After at most 10 seconds of waiting for
-  those records the process exits at once, so blocking work cannot hold
-  the restart; a send still open then is cut, as before.
+  those records, the time of the last evaluation is written once (at most
+  5 seconds) and the process exits at once (`_exit`, without exit-time
+  destructors), so blocking work cannot hold the restart and a native
+  library cannot crash it; a send still open then is cut, as before.
+- **Idle, the database may sleep.** The sign is idle while nothing is in
+  memory from the last 3 hours, no note is open, no write waits to be
+  retried, no try or staff mail waits, and both lights are No recent news:
+  then nothing but a new try or a note can change it. The 30-second runs
+  then age it in memory only and touch the database not at all (a run that
+  would change it anyway, a lost vote running out or a gap in watching, is
+  an ordinary one). The write of the evaluation time, the reading of the
+  stored note and the day history then ride on the hourly upkeep (one
+  small write an hour; the first upkeep after Manila midnight still rolls
+  the day up, and a day is final at the first one after it is 10 minutes
+  old), and a clean stop writes the evaluation time once. A recorded try,
+  a note taken in or SIGUSR1 ends idle at once; when not idle everything
+  runs as described above.
+- **SIGUSR1** (`sudo systemctl kill -s USR1 buwiz.service`) makes the
+  server read the stored note and `seq` at once and run the rules with
+  them, idle or not; it does nothing else, nothing at `off` or before the
+  sign is loaded, and is harmless at any time (it is caught from the
+  process's first log line on, through the start and the stop).
 
 ### 15.4 Notes and resuming the relay
 
@@ -1232,8 +1260,12 @@ rules first reads the stored `seq`, and a higher one (written by the
 command) makes it read the open note and take that `seq`, keeping its own
 sign whole; the run then makes the note's change (`note_set`,
 `note_cleared`), writes it and mails staff, with the Admin's own words
-from the audit line. With no server running, the note takes effect and is
-mailed when one starts. A note set and cleared again before the server's
+from the audit line. The command prints a reminder to send the server
+SIGUSR1, which makes such a run at once. Without it, a run while anything
+is active (every 30 seconds) takes the note in within 30 seconds; while the
+sign is idle no run reads the database, so then the hourly upkeep's run
+takes it in, within the hour. With no server running, the note takes
+effect and is mailed when one starts. A note set and cleared again before the server's
 next run changes nothing shown; the audit lines keep both. A server's
 write that finds the stored `seq` moved writes nothing (no line, no `seq`)
 and its next run takes the change in.
@@ -1252,12 +1284,14 @@ that got in, failed and broke midway, `ours` and `user_network` tries, held
 requests, and the distinct accounts and networks of the day's counted
 tries. A day with no tries is No recent news; a day Buwiz did not watch at
 all is `w` every hour, worst `none`. The lines not final yet are rewritten
-every 10 minutes and at start: every day from the one after the last final
+every 10 minutes and right after start: every day from the one after the last final
 line, so a day the server was down for still gets its line; each is
 marked final 10 minutes after the day ends, once the sign was evaluated
 after the day ended (or a gap in watching covers its end), and never
 computed again: a day whose last stretch nobody judged (the server
 stopped before midnight and has not run since) stays open until it is.
+While the sign is idle the lines are rewritten by the hourly upkeep
+instead of every 10 minutes (§15.3).
 Running it twice gives the same line.
 
 Distinct accounts and networks come from the raw sets held in memory
@@ -1325,5 +1359,9 @@ in the next staff mail.
 
 The ticker runs each part (the rules, the mail, the day history) on its
 own: a panic in one is logged and the next part, and the next tick, go
-on. The day history runs in a task of its own (one at a time), only after
-a run of the rules that worked, so a long roll-up never holds the rules.
+on. The day history runs in a task of its own (one at a time, the hourly
+upkeep's included), only after a run of the rules that worked with the
+database, so a long roll-up never holds the rules. The hourly upkeep's
+retention of the uptime tables logs its own failure ("BIR uptime: the
+hourly cleanup of the uptime tables failed"), apart from the submissions'
+upkeep.

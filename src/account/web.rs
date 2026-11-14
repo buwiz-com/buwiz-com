@@ -8,7 +8,7 @@
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{MethodRouter, any, get, post};
 use axum::{Form, Router};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use serde::Deserialize;
@@ -35,6 +35,7 @@ use crate::ocr;
 use crate::sites::canonical::is_app_host;
 use crate::sites::downloads::{self, Arch, File, Kind, Platform};
 use crate::sites::seo;
+use crate::uptime;
 
 /// Room for the largest claim: 40 MB of files, plus form overhead. Each
 /// file is also checked on its own (10 MB).
@@ -47,8 +48,18 @@ macro_rules! claim_total_mb {
 pub(crate) use claim_total_mb;
 const CLAIM_TOTAL_BYTES: usize = claim_total_mb!() * 1024 * 1024;
 
+/// From `BIR_UPTIME=public`, a route whose responses carry the compact BIR
+/// sign (`buwiz-bir`); below it, the route as it was.
+fn signed(state: &AppState, route: MethodRouter<AppState>) -> MethodRouter<AppState> {
+    if state.uptime.level.is_public() {
+        route.layer(axum::middleware::from_fn_with_state(state.clone(), uptime::api::sign_header))
+    } else {
+        route
+    }
+}
+
 pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/site.css", get(stylesheet))
         .route("/assets/home.css", get(home_stylesheet))
@@ -73,11 +84,13 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/oauth/token", post(oauth::token))
         .route("/me", get(oauth::me))
         .route("/api/auth/logout", post(oauth::logout))
-        .route("/api/tax-profiles", get(claims::tax_profiles))
+        .route("/api/tax-profiles", signed(&state, get(claims::tax_profiles)))
         // Submission relay.
         .route(
             "/api/submissions",
-            post(submissions::create).get(submissions::list).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+            signed(&state, post(submissions::create))
+                .get(submissions::list)
+                .layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
         )
         .route("/api/submissions/{id}", get(submissions::show))
         .route("/api/submissions/{id}/relay", get(submissions::relay))
@@ -85,13 +98,15 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         // Submission v2: device keys, tickets, sealed returns.
         .route("/api/devices", post(devices::register).get(devices::list))
         .route("/api/devices/{id}/revoke", post(devices::revoke_api))
-        .route("/api/tickets", post(tickets::issue))
+        .route("/api/tickets", signed(&state, post(tickets::issue)))
         .route(
             "/api/v2/submissions",
-            post(submissions::create_v2).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
+            signed(&state, post(submissions::create_v2)).layer(DefaultBodyLimit::max(submissions::BODY_LIMIT)),
         )
-        .route("/.well-known/buwiz-hpke.json", get(submissions::hpke_key))
-        .route("/.well-known/buwiz-trust.json", get(trust::list))
+        .route("/.well-known/buwiz-hpke.json", signed(&state, get(submissions::hpke_key)))
+        // `public, max-age=300` as before: a cached copy carries an older
+        // sign, whose `seq` tells a client to keep the newer one it has.
+        .route("/.well-known/buwiz-trust.json", signed(&state, get(trust::list)))
         // MCP and OAuth for AI agents.
         .route("/mcp", post(mcp::handle))
         .route("/.well-known/oauth-protected-resource", get(agents::protected_resource))
@@ -136,7 +151,19 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/{account_id}/test-tin", post(add_test_tin))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
-        .route("/devices/{device_id}/revoke", post(revoke_device))
+        .route("/devices/{device_id}/revoke", post(revoke_device));
+    // BIR uptime's reads exist from `public`; below it they are not routed,
+    // so they answer the site's own 404 as before.
+    let router = if state.uptime.level.is_public() {
+        router
+            .route("/api/bir/status", get(uptime::api::status))
+            .route("/api/bir/status/mine", get(uptime::api::status_mine))
+            .route("/api/bir/history", get(uptime::api::history))
+            .route("/assets/bir-status.css", get(bir_status_stylesheet))
+    } else {
+        router
+    };
+    router
         .fallback(move |request: axum::extract::Request| {
             let pages = pages.clone();
             async move { render_page(&pages, request).await }
@@ -156,6 +183,10 @@ async fn home_stylesheet() -> Response {
 
 async fn account_stylesheet() -> Response {
     css(include_str!("account.css"))
+}
+
+async fn bir_status_stylesheet() -> Response {
+    css(include_str!("bir-status.css"))
 }
 
 async fn account_script() -> Response {

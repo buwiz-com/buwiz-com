@@ -43,6 +43,7 @@ use crate::sender::{Job, identity};
 use crate::uptime::classify::{Class, Mode};
 use crate::uptime::keys::Network;
 use crate::uptime::observe::{self, TryObserver};
+use crate::uptime::public;
 use crate::uptime::store::{self, RelayTry};
 
 const MAX_XML_BYTES: usize = 2 * 1024 * 1024;
@@ -605,6 +606,9 @@ const OUTCOME_WAIT: Duration = Duration::from_secs(60);
 struct Told {
     class: Option<Class>,
     mode: Option<Mode>,
+    /// The public sign as it is when the app is told (this try's record is
+    /// written after, off the send's path).
+    bir: Option<Value>,
 }
 
 /// Records `result`; the app hears it only after that, so the submission
@@ -620,6 +624,9 @@ async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control, told: &Told
     let mut added = Vec::new();
     if let Some(class) = told.class {
         added.push(("class", Value::from(class.as_str())));
+    }
+    if let Some(bir) = &told.bir {
+        added.push(("bir", bir.clone()));
     }
     Ok(with_fields(serde_json::to_string(result)?, &added))
 }
@@ -663,7 +670,18 @@ async fn settle(
         _ => None,
     };
     let told = match &observed {
-        Some(observed) if state.uptime.level.is_public() => Told { class: observed.class(), mode: Some(observed.mode) },
+        Some(observed) if state.uptime.level.is_public() => {
+            let class = observed.class();
+            // The sign goes with every result the app is told about: a live
+            // try's, or one with a class. A lab try, or one whose mode is
+            // unknown, is told nothing.
+            let bir = (observed.mode == Mode::Live || class.is_some()).then(|| {
+                let sign = state.uptime.live.sign();
+                let document = public::document(&sign, &state.config.forms_origin, public::Times::Public);
+                serde_json::to_value(document).unwrap_or(Value::Null)
+            });
+            Told { class, mode: Some(observed.mode), bir }
+        }
         _ => Told::default(),
     };
     let text = conclude(&state.db, id, v2, result, &told).await?;

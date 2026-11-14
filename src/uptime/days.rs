@@ -99,7 +99,21 @@ fn at(changes: &Changes, instant: OffsetDateTime) -> Option<Light> {
     changes.iter().rev().find(|(at, _)| *at <= instant).and_then(|(_, state)| *state)
 }
 
-fn letter_rank(letter: char) -> u8 {
+/// The letter of a stretch watched: the overall state, `m` when a
+/// hand-set outage or maintenance alone makes it Offline.
+fn letter(state: Option<Light>, sides: [Option<Light>; 2], holding: bool) -> char {
+    match state {
+        None => '-',
+        Some(Light::Offline) if sides.contains(&Some(Light::Offline)) || !holding => 'x',
+        Some(Light::Offline) => 'm',
+        Some(Light::Busy) => 'b',
+        Some(Light::Online) => 'o',
+        Some(Light::NoRecentNews) => 'n',
+    }
+}
+
+/// How bad a letter is: `x` worst, then `m`, `b`, `o`, `n`, `w` and `-`.
+pub fn letter_rank(letter: char) -> u8 {
     match letter {
         'x' => 6,
         'm' => 5,
@@ -175,14 +189,7 @@ pub fn day_states(
                 .map(|(kind, ..)| *kind)
                 .collect();
             let holding = notes_now.iter().any(|kind| kind.holds());
-            let letter = match state {
-                None => '-',
-                Some(Light::Offline) if sides.contains(&Some(Light::Offline)) || !holding => 'x',
-                Some(Light::Offline) => 'm',
-                Some(Light::Busy) => 'b',
-                Some(Light::Online) => 'o',
-                Some(Light::NoRecentNews) => 'n',
-            };
+            let letter = letter(state, sides, holding);
             if letter_rank(letter) > letter_rank(hours[hour]) {
                 hours[hour] = letter;
             }
@@ -257,6 +264,94 @@ pub fn day_states(
         hours: hours.into_iter().collect(),
         outages,
     }
+}
+
+/// One letter per `step` from `start`, `count` of them, each the worst of
+/// its stretch up to `now` (`-` once past it), as [`day_states`] gives the
+/// hours. Pure.
+#[allow(clippy::too_many_arguments)]
+pub fn slot_letters(
+    start: OffsetDateTime,
+    step: Duration,
+    count: usize,
+    overall: &Changes,
+    windows: [&Changes; 2],
+    notes: &[NoteSpan],
+    gaps: &[Gap],
+    now: OffsetDateTime,
+) -> String {
+    let edges: Vec<OffsetDateTime> = overall
+        .iter()
+        .chain(windows[0])
+        .chain(windows[1])
+        .map(|(at, _)| *at)
+        .chain(notes.iter().flat_map(|(_, from, to)| [*from, *to]))
+        .chain(gaps.iter().flat_map(|(from, to)| [*from, *to]))
+        .collect();
+    (0..count)
+        .map(|index| {
+            let from = start + step * u32::try_from(index).unwrap_or(u32::MAX);
+            let to = (from + step).min(now);
+            if from >= to {
+                return '-';
+            }
+            let mut cuts: Vec<OffsetDateTime> = edges.iter().copied().filter(|at| *at > from && *at < to).collect();
+            cuts.push(from);
+            cuts.sort();
+            cuts.dedup();
+            let mut worst = '-';
+            for at in cuts {
+                let letter = if gaps.iter().any(|(begin, finish)| *begin <= at && at < *finish) {
+                    'w'
+                } else {
+                    let holding =
+                        notes.iter().any(|(kind, begin, finish)| kind.holds() && *begin <= at && at < *finish);
+                    letter(self::at(overall, at), [self::at(windows[0], at), self::at(windows[1], at)], holding)
+                };
+                if letter_rank(letter) > letter_rank(worst) {
+                    worst = letter;
+                }
+            }
+            worst
+        })
+        .collect()
+}
+
+/// What a stretch of history is read from: the overall and both windows'
+/// changes, the notes and the spans not watched, from `start` to `end`.
+pub struct Record {
+    pub overall: Vec<(OffsetDateTime, Option<Light>)>,
+    pub dispatcher: Vec<(OffsetDateTime, Option<Light>)>,
+    pub upload: Vec<(OffsetDateTime, Option<Light>)>,
+    pub notes: Vec<NoteSpan>,
+    pub gaps: Vec<Gap>,
+}
+
+/// Reads [`Record`] for `start` to `end`.
+pub async fn record(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Record> {
+    let overall = changes(db, "overall", start, end).await?;
+    let dispatcher = changes(db, "dispatcher", start, end).await?;
+    let upload = changes(db, "upload", start, end).await?;
+    let notes: Vec<(String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
+        "SELECT kind, starts_at, LEAST(until, COALESCE(cleared_at, until)) FROM bir_notes
+          WHERE starts_at < $2 AND LEAST(until, COALESCE(cleared_at, until)) > $1",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(db)
+    .await?;
+    let notes: Vec<NoteSpan> =
+        notes.into_iter().filter_map(|(kind, from, to)| Some((NoteKind::parse(&kind)?, from, to))).collect();
+    let gaps = gaps(db, start, end).await?;
+    Ok(Record { overall, dispatcher, upload, notes, gaps })
+}
+
+/// The states of Manila day `day` up to `now`, from the record.
+pub async fn states(db: &PgPool, day: Date, now: OffsetDateTime) -> sqlx::Result<DayStates> {
+    let start = manila_midnight(day);
+    let end = (start + Duration::DAY).min(now).max(start);
+    let record = record(db, start, end).await?;
+    Ok(day_states(day, &record.overall, [&record.dispatcher, &record.upload], &record.notes, &record.gaps, now))
 }
 
 async fn changes(
@@ -336,22 +431,7 @@ pub async fn roll_up(
     if final_now == Some(true) {
         return Ok(None);
     }
-    let end = day_end.min(now);
-    let overall = changes(db, "overall", start, end).await?;
-    let dispatcher = changes(db, "dispatcher", start, end).await?;
-    let upload = changes(db, "upload", start, end).await?;
-    let notes: Vec<(String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
-        "SELECT kind, starts_at, LEAST(until, COALESCE(cleared_at, until)) FROM bir_notes
-          WHERE starts_at < $2 AND LEAST(until, COALESCE(cleared_at, until)) > $1",
-    )
-    .bind(start)
-    .bind(end)
-    .fetch_all(db)
-    .await?;
-    let notes: Vec<NoteSpan> =
-        notes.into_iter().filter_map(|(kind, from, to)| Some((NoteKind::parse(&kind)?, from, to))).collect();
-    let gaps = gaps(db, start, end).await?;
-    let states = day_states(day, &overall, [&dispatcher, &upload], &notes, &gaps, now);
+    let states = states(db, day, now).await?;
 
     let (tries, got_in, failed, maybe, ours, user_network): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE counted), count(*) FILTER (WHERE counted AND outcome = 'sent'),

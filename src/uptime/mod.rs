@@ -16,14 +16,22 @@
 //! - [`notes`]: what an Admin sets by hand.
 //! - [`days`]: the day history and the tables' retention.
 //! - [`alerts`]: staff mail.
+//! - [`public`]: the sign as apps and people read it, its words, the
+//!   compact header and the My TINs banner.
+//! - [`history`]: the public day history and the last 24 hours.
+//! - [`api`]: the read routes and the header on existing responses (from
+//!   `public`).
 
 pub mod alerts;
+pub mod api;
 pub mod classify;
 pub mod days;
+pub mod history;
 pub mod keys;
 pub mod live;
 pub mod notes;
 pub mod observe;
+pub mod public;
 pub mod sign;
 pub mod sshkex;
 pub mod store;
@@ -49,9 +57,10 @@ pub enum Level {
     /// Every relay try is recorded and classified; no app sees a change.
     #[default]
     Record,
-    /// Plus what apps read: `class` on the relay `result`, the mode on
-    /// failed and unknown submissions, and (in later releases) the routes,
-    /// the header and the sign.
+    /// Plus what apps and people read: `class` and `bir` on the relay
+    /// `result`, the mode on failed and unknown submissions, the read
+    /// routes, the `buwiz-bir` header, the status page, the My TINs banner
+    /// and the footer link.
     Public,
     /// Plus holds.
     Enforce,

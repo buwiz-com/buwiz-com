@@ -902,10 +902,23 @@ fn flows() -> Vec<Flow> {
     ]
 }
 
+/// Takes `,"bir":{…}` off the end of the last text frame (a `result`),
+/// and gives what it held.
+fn without_bir(got: &mut [Got]) -> Option<Value> {
+    let Some(Got::Text(last)) = got.last_mut() else {
+        return None;
+    };
+    let at = last.find(r#","bir":"#)?;
+    let bir: Value = serde_json::from_str(&last[at + 7..last.len() - 1]).unwrap();
+    last.truncate(at);
+    last.push('}');
+    Some(bir)
+}
+
 /// A v1 and a v2 send get byte for byte the frames the Gatekeeper sent
 /// before this feature (written out in [`before`]), at `off` and `record`;
 /// at `public` the same but for `class` added at the end of a `result` that
-/// did not get in. The `sender` frame never reaches the app.
+/// did not get in, and `bir` (the sign) after it on every live result. The `sender` frame never reaches the app.
 #[sqlx::test]
 async fn apps_get_the_frames_they_got_before_but_for_the_added_fields(db: PgPool) {
     let world = World::new(db.clone()).await;
@@ -914,7 +927,15 @@ async fn apps_get_the_frames_they_got_before_but_for_the_added_fields(db: PgPool
         for flow in flows() {
             for v2 in [false, true] {
                 let id = if v2 { world.v2(None).await } else { world.v1().await };
-                let got = gatekeeper.send(&world, id, flow.script.clone(), &flow.answers, HOME).await;
+                let mut got = gatekeeper.send(&world, id, flow.script.clone(), &flow.answers, HOME).await;
+                // At `public` every live result ends with the sign, `bir`:
+                // the public document, checked here and then taken off.
+                let bir = without_bir(&mut got);
+                let told = matches!(flow.before.last(), Some(Got::Text(last)) if last.contains(r#""type":"result""#));
+                assert_eq!(bir.is_some(), level == Level::Public && told, "{}: {level:?}", flow.name);
+                if let Some(bir) = bir {
+                    assert_eq!((bir["v"].as_u64(), bir["source"].as_str()), (Some(1), Some("tries")), "{bir}");
+                }
                 let mut expected = flow.before.clone();
                 if let (Level::Public, Some(class), Some(Got::Text(last))) = (level, flow.class, expected.last_mut()) {
                     last.truncate(last.len() - 1);
@@ -928,7 +949,8 @@ async fn apps_get_the_frames_they_got_before_but_for_the_added_fields(db: PgPool
     for level in [Level::Off, Level::Record, Level::Public] {
         let uptime = Uptime::new(level, vec![22], false, OffsetDateTime::now_utc());
         let gatekeeper = Gatekeeper::at(&world, uptime, "http://127.0.0.1:9", FakeSender::default()).await;
-        let got = gatekeeper.send(&world, world.v1().await, vec![], &[], HOME).await;
+        let mut got = gatekeeper.send(&world, world.v1().await, vec![], &[], HOME).await;
+        assert_eq!(without_bir(&mut got).is_some(), level == Level::Public, "unreachable: {level:?}");
         let expected = match level {
             Level::Public => before::UNREACHABLE.replace(r#""receipt":null}"#, r#""receipt":null,"class":"ours"}"#),
             _ => before::UNREACHABLE.to_owned(),
@@ -993,6 +1015,7 @@ async fn at_public_the_result_says_whose_side(db: PgPool) {
     let (script, answers) = landed();
     let got = gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
     assert_eq!(the_result(&got).unwrap().get("class"), None);
+    assert_eq!(the_result(&got).unwrap()["bir"]["v"], 1, "a live result carries the sign");
     // Lab: no class to tell.
     let got = gatekeeper
         .send(
@@ -1004,6 +1027,7 @@ async fn at_public_the_result_says_whose_side(db: PgPool) {
         )
         .await;
     assert_eq!(the_result(&got).unwrap().get("class"), None);
+    assert_eq!(the_result(&got).unwrap().get("bir"), None, "nor the sign");
     // No `sender` frame (a Sender from before it): like lab, nothing told.
     let (script, answers) = front_desk_down();
     let got = gatekeeper.send(&world, world.v1().await, script[1..].to_vec(), &answers, HOME).await;

@@ -533,6 +533,69 @@ fn link_with<'a>(page: &'a str, words: &str) -> &'a str {
     &page[start..start + page[start..].find('>').unwrap() + 1]
 }
 
+/// The flags a queue row shows on itself (before its "+n"), as
+/// (pill tone, text), and what its "+n" names.
+fn row_flags(page: &str, claim: Uuid) -> (Vec<(String, String)>, String) {
+    let row = &page[page.find(&format!("<tr data-id=\"{claim}\"")).expect("the row")..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    let flags = &row[row.find("class=\"sx-flags\"").unwrap()..];
+    let (shown, rest) = flags.split_once("class=\"sx-more\"").unwrap_or((flags, ""));
+    let pills = shown
+        .split("class=\"sx-pill ")
+        .skip(1)
+        .map(|pill| {
+            let tone = pill[..pill.find('"').unwrap()].to_owned();
+            let text = pill.split("<span>").nth(1).unwrap().split('<').next().unwrap().to_owned();
+            (tone, text)
+        })
+        .collect();
+    (pills, rest.to_owned())
+}
+
+/// Reads `document` as the OCR would have: its TIN and name compared.
+async fn read_as(db: &PgPool, document: Uuid, tin: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO document_readings (id, document_id, status, tin_match, name_match, read_at)
+         VALUES (gen_random_uuid(), $1, 'read', $2, $3, now())",
+    )
+    .bind(document)
+    .bind(tin)
+    .bind(name)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_queue_row_shows_its_worst_flag_first_and_every_bad_one(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (bob, _) = site.person("bob@example.test").await;
+    let (cara, _) = site.person("cara@example.test").await;
+    // Ana's is the first claim on its TIN (green) but its 2303 reads
+    // another TIN (red).
+    let alone = add_claim(&site.db, ana, "000123451", "pending").await;
+    let paper = add_files(&site.db, alone, 1, 0).await[0];
+    read_as(&site.db, paper, "mismatch", "match").await;
+    // Bob's has that red flag and another account on the TIN (red too).
+    let rivalled = add_claim(&site.db, bob, "000123452", "pending").await;
+    let paper = add_files(&site.db, rivalled, 1, 0).await[0];
+    read_as(&site.db, paper, "mismatch", "match").await;
+    add_claim(&site.db, cara, "000123452", "pending").await;
+
+    let page = text(site.get("/staff/queue", &staff).await).await;
+    let list = before_inspector(&page);
+    let (shown, rest) = row_flags(list, alone);
+    assert_eq!(shown, [("bad".to_owned(), "TIN differs from the 2303".to_owned())], "{list}");
+    // The green ones are named in the "+n", after it.
+    assert!(rest.contains("First claim on this TIN") && rest.contains("Name matches"), "{rest}");
+    let (shown, rest) = row_flags(list, rivalled);
+    let shown: Vec<&str> = shown.iter().map(|(tone, _)| tone.as_str()).collect();
+    assert_eq!(shown, ["bad", "bad"], "{list}");
+    assert!(!rest.contains("TIN differs") && !rest.contains("Another account"), "{rest}");
+}
+
 /// The `<form …>…</form>` on `page` that holds `needle`.
 fn form_with<'a>(page: &'a str, needle: &str) -> &'a str {
     let at = page.find(needle).unwrap_or_else(|| panic!("no {needle}"));

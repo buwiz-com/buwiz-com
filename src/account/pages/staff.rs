@@ -93,6 +93,27 @@ fn queue_flags(row: &QueueRow) -> Vec<Flag> {
     flags
 }
 
+/// How serious a flag's tone is: `bad` first, then `warn`, `info`, `good`.
+fn severity(tone: &str) -> u8 {
+    match tone {
+        "bad" => 0,
+        "warn" => 1,
+        "info" => 2,
+        _ => 3,
+    }
+}
+
+/// A queue row's flags as the row shows them, most serious first: every
+/// `bad` one on the row itself (the most serious one when none is), the
+/// rest read aloud and named in the "+n" tip, so a red warning never hides
+/// behind a green one and the row stays one line beside the inspector.
+fn row_flags(mut flags: Vec<Flag>) -> (Vec<Flag>, Vec<Flag>) {
+    flags.sort_by_key(|(tone, ..)| severity(tone));
+    let bad = flags.iter().filter(|(tone, ..)| *tone == "bad").count();
+    let rest = flags.split_off(bad.max(1).min(flags.len()));
+    (flags, rest)
+}
+
 /// The `?open=` of the request: the row the inspector shows.
 fn open_id(cx: &Cx) -> Option<Uuid> {
     query(cx, "open").and_then(|raw| raw.parse().ok())
@@ -298,13 +319,10 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
 
 #[component]
 async fn queue_row(row: QueueRow, open: String, selected: bool, explicit: bool) -> Result<impl View> {
-    let flags = queue_flags(&row);
+    let (shown, rest) = row_flags(queue_flags(&row));
     let claim = row.claim;
     let (age, late) = queue_age(&claim);
-    // The first flag shows; the rest are read aloud and named in the "+n"
-    // tip, so the row stays one line beside the inspector.
-    let shown: Vec<Flag> = flags.iter().take(1).cloned().collect();
-    let rest: Vec<String> = flags.iter().skip(1).map(|(_, _, text)| text.clone()).collect();
+    let rest: Vec<String> = rest.into_iter().map(|(_, _, text)| text).collect();
     Ok(view! {
         <tr data-id=(claim.id.to_string()) class=(row_class(selected, explicit))>
             <td class="a-main">
@@ -2361,5 +2379,42 @@ fn account_audit_text(line: &AccountAuditRow) -> String {
     match &line.reason {
         Some(reason) => format!("{who} {what}: {reason}"),
         None => format!("{who} {what}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flag(tone: &'static str, text: &str) -> Flag {
+        (tone, "dot", text.to_owned())
+    }
+
+    #[test]
+    fn a_row_shows_its_most_serious_flags_and_every_bad_one() {
+        let texts = |flags: Vec<Flag>| flags.into_iter().map(|(_, _, text)| text).collect::<Vec<_>>();
+        let (shown, rest) = row_flags(vec![
+            flag("good", "First claim"),
+            flag("info", "Test"),
+            flag("bad", "TIN differs"),
+            flag("warn", "Paused"),
+        ]);
+        assert_eq!(
+            (texts(shown), texts(rest)),
+            (vec!["TIN differs".to_owned()], vec!["Paused".into(), "Test".into(), "First claim".into()])
+        );
+        // Two bad ones: both on the row, in their order.
+        let (shown, rest) = row_flags(vec![
+            flag("good", "Selfie"),
+            flag("bad", "Another account"),
+            flag("info", "Test"),
+            flag("bad", "TIN differs"),
+        ]);
+        assert_eq!(texts(shown), ["Another account", "TIN differs"]);
+        assert_eq!(texts(rest), ["Test", "Selfie"]);
+        // None bad: the most serious one.
+        let (shown, rest) = row_flags(vec![flag("good", "Selfie"), flag("info", "Test")]);
+        assert_eq!((texts(shown), texts(rest)), (vec!["Test".to_owned()], vec!["Selfie".to_owned()]));
+        assert_eq!(row_flags(Vec::new()), (Vec::new(), Vec::new()));
     }
 }

@@ -113,7 +113,7 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     );
     assert!(!history.contains("The person activated"), "{history}");
     let queue = text(site.get("/staff/queue?status=approved", &staff).await).await;
-    assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+    assert!(list_part(&queue).contains("Activated by its owner, an admin"), "{queue}");
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Activated by its owner, an admin"), "{review}");
     let own = text(site.get(&format!("/staff/users/{boss}"), &boss_cookie).await).await;

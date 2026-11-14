@@ -1122,7 +1122,7 @@ async fn the_seed_activating_its_own_admins_tin_is_flagged(db: PgPool) {
     let page = text(site.get(&format!("/staff/claims/{jos}"), &other_admin).await).await;
     assert!(!page.contains("Activated by its owner, an admin"), "{page}");
     let queue = text(site.get("/staff/queue?status=approved", &other_admin).await).await;
-    assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+    assert!(list_part(&queue).contains("Activated by its owner, an admin"), "{queue}");
 }
 
 /// The Overview's feed reads a TIN the seed saved without papers as that,

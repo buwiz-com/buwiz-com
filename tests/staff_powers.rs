@@ -1054,6 +1054,8 @@ async fn a_banned_support_member_cannot_use_staff_powers(db: PgPool) {
         "/staff?notice=claim_decided".to_owned(),
         "/staff/queue".to_owned(),
         "/staff/users".to_owned(),
+        "/staff/search".to_owned(),
+        "/staff/search?q=example".to_owned(),
         user.clone(),
         format!("/staff/claims/{}", t.open),
     ] {

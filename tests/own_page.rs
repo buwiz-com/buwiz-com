@@ -206,7 +206,7 @@ async fn an_admin_confirms_the_automatic_activation_of_their_own_tin(db: PgPool)
     let page = text(site.get(&path, &cookie).await).await;
     assert!(page.contains(SELF_ACTIVATED), "{page}");
     let queue = text(site.get("/staff/queue?status=approved", &cookie).await).await;
-    assert!(queue.contains(SELF_ACTIVATED), "{queue}");
+    assert!(list_part(&queue).contains(SELF_ACTIVATED), "{queue}");
 }
 
 /// An Admin approving their own claim writes why, as one activating it
@@ -243,7 +243,7 @@ async fn an_admin_approving_their_own_claim_writes_why_and_it_is_flagged(db: PgP
     let page = text(site.get(&path, &cookie).await).await;
     assert!(page.contains(SELF_ACTIVATED), "{page}");
     let queue = text(site.get("/staff/queue?status=approved", &cookie).await).await;
-    assert!(queue.contains(SELF_ACTIVATED), "{queue}");
+    assert!(list_part(&queue).contains(SELF_ACTIVATED), "{queue}");
     let history = text(site.get(&format!("/staff/users/{boss}"), &cookie).await).await;
     assert!(
         history.contains("Staff boss@example.test approved their own claim on ***-***-457-00000: Checked my own ID"),

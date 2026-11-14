@@ -27,7 +27,7 @@ fn tag<'a>(page: &'a str, needle: &str) -> &'a str {
 
 /// The part of a staff page before the inspector: the sidebar and the list.
 fn before_inspector(page: &str) -> &str {
-    &page[..page.find("id=\"inspector\"").unwrap_or(page.len())]
+    list_part(page)
 }
 
 async fn label_test(db: &PgPool, id: Uuid) {
@@ -457,6 +457,43 @@ async fn the_inspector_shows_the_row_in_the_link(db: PgPool) {
     let side = inspector(&page);
     assert!(side.contains("bob@example.test") && side.contains(&format!("href=\"/staff/users/{bob}\"")), "{side}");
     assert!(side.contains("000-123-452-00000"), "{side}");
+    // A claim's id is no account: the panel is empty, no row is chosen,
+    // and the page answers as for any id that is not there.
+    for open in [second.to_string(), Uuid::new_v4().to_string(), "not-an-id".to_owned()] {
+        let response = site.get(&format!("/staff/users?open={open}"), &staff).await;
+        assert_eq!(response.status(), StatusCode::OK, "{open}");
+        let page = text(response).await;
+        let side = inspector(&page);
+        if open == "not-an-id" {
+            // Not an id at all: the first account, as with no ?open=.
+            assert!(side.starts_with("id=\"inspector\" class=\"sx-insp\""), "{side}");
+        } else {
+            assert!(side.contains("No account to show.") && !side.contains("bob@example.test"), "{open}: {side}");
+            assert!(side.starts_with("id=\"inspector\" class=\"sx-insp\""), "{side}");
+            assert!(!before_inspector(&page).contains("class=\"sel"), "{open}");
+        }
+    }
+}
+
+/// An unknown `?tab=` on a user page shows the Account tab, as no `?tab=`
+/// does, and is never written back into the page.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unknown_tab_opens_the_account_tab(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    for tab in ["nope", "TINS", "tins%20", "%3Cb%3E", "", "account%00"] {
+        let page = text(site.get(&format!("/staff/users/{ana}?tab={tab}"), &staff).await).await;
+        assert!(page.contains(r#"id="tab-account" aria-labelledby="tab-account-tab">"#), "{tab}: {page}");
+        for hidden in ["tins", "sign", "history"] {
+            assert!(
+                page.contains(&format!(r#"id="tab-{hidden}" aria-labelledby="tab-{hidden}-tab" hidden"#)),
+                "{tab} {hidden}"
+            );
+        }
+        assert!(tag(&page, "id=\"tab-account-tab\"").contains("aria-selected=\"true\""), "{tab}");
+        assert!(!page.contains("nope") && !page.contains("TINS") && !page.contains("&lt;b&gt;"), "{tab}");
+    }
 }
 
 /// Adds `n` files to `claim`, oldest first: photos and PDFs in turn, the

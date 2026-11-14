@@ -247,6 +247,13 @@ pub async fn text(response: Response) -> String {
     String::from_utf8(bytes(response).await).unwrap()
 }
 
+/// A staff list page (the queue, the users list) up to its inspector: the
+/// sidebar and the list's rows. The inspector repeats the first row's
+/// checks, so a flag found here is on a row.
+pub fn list_part(page: &str) -> &str {
+    &page[..page.find("id=\"inspector\"").unwrap_or(page.len())]
+}
+
 /// An app sign-in for `account_id` with the BIR app's scope.
 pub async fn app_token(db: &PgPool, account_id: Uuid) -> String {
     token(db, account_id, "buwiz-desktop", "app").await

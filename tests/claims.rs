@@ -579,7 +579,7 @@ async fn claimants_replace_and_remove_files_while_open(db: PgPool) {
     assert_eq!(site.claim_status(claim).await, "pending");
 
     // Staff see it on the queue and the review.
-    assert!(text(site.get("/staff/queue", &staff).await).await.contains("Files changed after sending"));
+    assert!(list_part(&text(site.get("/staff/queue", &staff).await).await).contains("Files changed after sending"));
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Files changed after sending"), "{review}");
 

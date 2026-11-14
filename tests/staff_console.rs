@@ -127,6 +127,7 @@ async fn the_overview_counts_what_it_says(db: PgPool) {
 
     let numbers = queries::overview(&site.db).await.unwrap();
     assert_eq!((numbers.waiting, numbers.active, numbers.active_week, numbers.auto), (2, 2, 2, 1));
+    assert_eq!((numbers.paused, numbers.test), (1, 1));
     assert_eq!((numbers.accounts, numbers.accounts_week), (4, 4));
     assert!(numbers.oldest_waiting.is_some());
 
@@ -134,6 +135,8 @@ async fn the_overview_counts_what_it_says(db: PgPool) {
     assert!(admin.contains("Claims waiting</span><span class=\"n\">2</span>"), "{admin}");
     assert!(admin.contains("Oldest 1 d 2 h"), "{admin}");
     assert!(admin.contains("Active TINs</span><span class=\"n\">2</span>"), "{admin}");
+    // The small line under it names what is paused and what is a test TIN.
+    assert!(tile(&admin, "Active TINs").contains(&breakdown(&[("", 1, "paused"), ("", 1, "test")])), "{admin}");
     assert!(admin.contains("Accounts</span><span class=\"n\">4</span>"), "{admin}");
     assert!(admin.contains("Activated automatically</span><span class=\"n\">1</span>"), "{admin}");
     // Today began at midnight in Manila: the three sends of the last seconds
@@ -142,10 +145,125 @@ async fn the_overview_counts_what_it_says(db: PgPool) {
     let sent: i64 =
         admin[start..].split("<span class=\"n\">").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
     assert!((1..=3).contains(&sent), "{sent}");
-    // Returns are an Admin's number: no staff page lists them for Support.
+    // The tile of returns is counts only, so Support sees it as well.
     let support = text(site.get("/staff", &support).await).await;
-    assert!(!support.contains("Returns sent today"), "{support}");
+    assert!(support.contains("Returns sent today"), "{support}");
     assert!(support.contains("Claims waiting</span><span class=\"n\">2</span>"), "{support}");
+}
+
+/// The Overview tile whose label is `label`: up to its closing `</div>`.
+fn tile<'a>(page: &'a str, label: &str) -> &'a str {
+    let at = page.find(label).unwrap_or_else(|| panic!("no tile {label}"));
+    &page[at..at + page[at..].find("</div>").unwrap()]
+}
+
+/// The small line of a tile as it renders: parts like `2 failed` joined by
+/// a dot, each in its own class (`bad`, `warn`, or none) with a no-break
+/// space between the number and its word.
+fn breakdown(parts: &[(&str, i64, &str)]) -> String {
+    let parts: Vec<String> =
+        parts.iter().map(|(class, n, word)| format!("<span class=\"{class}\">{n}\u{a0}{word}</span>")).collect();
+    format!("<span class=\"s\">{}</span>", parts.join(" · "))
+}
+
+/// A return in `status`: `sent_at` / `sending_since` / `created_at` as
+/// offsets (a Postgres interval, or `None`) from midnight in Manila today.
+async fn add_return(
+    db: &PgPool,
+    account: Uuid,
+    claim: Uuid,
+    status: &str,
+    sent_at: Option<&str>,
+    sending_since: Option<&str>,
+    created_at: &str,
+) {
+    const MIDNIGHT: &str = "(date_trunc('day', now() AT TIME ZONE 'Asia/Manila') AT TIME ZONE 'Asia/Manila')";
+    let at = |offset: Option<&str>| offset.map(|o| format!("{MIDNIGHT} + interval '{o}'"));
+    sqlx::query(&format!(
+        "INSERT INTO submissions (account_id, claim_id, form_type, period, filename, xml_sha256, status,
+             sent_at, sending_since, created_at)
+         VALUES ($1, $2, '2551Q', '2026-Q3', 'r.xml', '\\x00', $3, {}, {}, {})",
+        at(sent_at).unwrap_or("NULL".into()),
+        at(sending_since).unwrap_or("NULL".into()),
+        at(Some(created_at)).unwrap(),
+    ))
+    .bind(account)
+    .bind(claim)
+    .bind(status)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_returns_tile_counts_by_manila_days_for_admin_and_support(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "000123453", "approved").await;
+    // Sent: just after Manila midnight (today), just before it (yesterday),
+    // 3 days ago, the first minute of the 7-day window, one second before
+    // the window, and 8 days ago. Only the first counts for today; the
+    // first four for the week.
+    for sent in ["1 second", "-1 second", "-3 days 12 hours", "-6 days 1 minute", "-6 days -1 second", "-8 days"] {
+        add_return(&site.db, ana, claim, "sent", Some(sent), None, sent).await;
+    }
+    // Failed today (never attempted, so by creation), and failed whose last
+    // attempt is today though it was made two days ago; failed yesterday.
+    add_return(&site.db, ana, claim, "failed", None, None, "1 second").await;
+    add_return(&site.db, ana, claim, "failed", None, Some("2 seconds"), "-2 days").await;
+    add_return(&site.db, ana, claim, "failed", None, Some("-1 second"), "-1 day").await;
+    // Waiting today: queued (`ready`), `sending`, and `unknown`; and a queued one from yesterday.
+    add_return(&site.db, ana, claim, "ready", None, None, "1 second").await;
+    add_return(&site.db, ana, claim, "sending", None, Some("1 second"), "-1 hour").await;
+    add_return(&site.db, ana, claim, "unknown", None, Some("1 second"), "-1 hour").await;
+    add_return(&site.db, ana, claim, "ready", None, None, "-1 second").await;
+    // Neither sent, failed nor waiting: a dry run and an expired return.
+    add_return(&site.db, ana, claim, "dry_run", Some("2 seconds"), None, "2 seconds").await;
+    add_return(&site.db, ana, claim, "expired", None, None, "2 seconds").await;
+
+    let midnight: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT date_trunc('day', now() AT TIME ZONE 'Asia/Manila') AT TIME ZONE 'Asia/Manila'")
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+    let tile_numbers = queries::returns_tile(&site.db, midnight, midnight - time::Duration::days(6)).await.unwrap();
+    assert_eq!(tile_numbers, queries::ReturnsTile { sent_week: 4, failed: 2, waiting: 3 });
+
+    for who in [&staff, &support] {
+        let page = text(site.get("/staff", who).await).await;
+        let returns = tile(&page, "Returns sent today");
+        assert!(returns.contains("<span class=\"n\">1</span>"), "{returns}");
+        assert!(returns.contains(&breakdown(&[("bad", 2, "failed"), ("warn", 3, "waiting")])), "{returns}");
+        assert!(returns.contains("4 in the last 7 days"), "{returns}");
+        // Counts only: no TIN, name or account in the tile.
+        assert!(!returns.contains("000123453") && !returns.contains("ana@example.test"), "{returns}");
+    }
+    // No paused or test TIN here: the Active TINs tile keeps its one line.
+    let page = text(site.get("/staff", &support).await).await;
+    let active = tile(&page, "Active TINs");
+    assert!(!active.contains("paused") && !active.contains("test"), "{active}");
+    assert!(active.contains("+1 this week"), "{active}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_returns_tile_hides_a_part_that_is_zero(db: PgPool) {
+    let site = Site::new(db);
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = add_claim(&site.db, ana, "000123453", "approved").await;
+    add_return(&site.db, ana, claim, "failed", None, None, "1 second").await;
+    let page = text(site.get("/staff", &support).await).await;
+    let returns = tile(&page, "Returns sent today");
+    assert!(returns.contains(&breakdown(&[("bad", 1, "failed")])), "{returns}");
+    assert!(!returns.contains("waiting"), "{returns}");
+    assert!(returns.contains("0 in the last 7 days"), "{returns}");
+    // Nothing failed or waiting: no breakdown line at all.
+    sqlx::query("DELETE FROM submissions").execute(&site.db).await.unwrap();
+    let page = text(site.get("/staff", &support).await).await;
+    let returns = tile(&page, "Returns sent today");
+    assert!(!returns.contains("failed") && !returns.contains("waiting"), "{returns}");
 }
 
 #[sqlx::test(migrations = "./migrations")]

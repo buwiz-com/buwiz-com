@@ -644,6 +644,9 @@ a.sx-tile:hover { border-color: var(--color-line2); }
 .sx-tile .n { font: 600 var(--text-2xl) / 1.1 var(--font-heading); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 .sx-tile .s { color: var(--color-faint); font-size: var(--text-xs); }
 .sx-tile .s.hot { color: var(--color-warn); font-weight: 600; }
+.sx-tile .s { overflow-wrap: anywhere; }
+.sx-tile .s .bad { color: var(--color-bad); font-weight: 600; }
+.sx-tile .s .warn { color: var(--color-warn); font-weight: 600; }
 .sx-tile .row { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-4); }
 .sx-spark { width: 96px; height: 42px; flex: none; }
 .sx-spark rect { fill: var(--color-line2); }

@@ -250,6 +250,10 @@ pub struct Overview {
     pub active: i64,
     /// Of those, activated in the last seven days.
     pub active_week: i64,
+    /// Approved real TINs a staff member paused: they cannot send.
+    pub paused: i64,
+    /// Approved test TINs, paused or not: made up, never counted as active.
+    pub test: i64,
     pub accounts: i64,
     pub accounts_week: i64,
     /// [`unconfirmed_auto`].
@@ -266,6 +270,9 @@ pub async fn overview(db: &PgPool) -> sqlx::Result<Overview> {
                  AND tin_root <> '{test}') AS active,
              (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NULL
                  AND tin_root <> '{test}' AND decided_at > now() - interval '7 days') AS active_week,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NOT NULL
+                 AND tin_root <> '{test}') AS paused,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND tin_root = '{test}') AS test,
              (SELECT count(*) FROM accounts) AS accounts,
              (SELECT count(*) FROM accounts WHERE created_at > now() - interval '7 days') AS accounts_week,
              (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) AS auto",
@@ -276,8 +283,7 @@ pub async fn overview(db: &PgPool) -> sqlx::Result<Overview> {
 }
 
 /// Returns sent to the BIR since `since` (the start of today, Philippine
-/// time), per hour from then: (hours after `since`, count). An Admin's
-/// number: no staff page lists returns.
+/// time), per hour from then: (hours after `since`, count). Counts only.
 pub async fn sent_since(db: &PgPool, since: OffsetDateTime) -> sqlx::Result<Vec<(i32, i64)>> {
     sqlx::query_as(
         "SELECT floor(extract(epoch FROM sent_at - $1) / 3600)::int AS hour, count(*)
@@ -286,6 +292,39 @@ pub async fn sent_since(db: &PgPool, since: OffsetDateTime) -> sqlx::Result<Vec<
     )
     .bind(since)
     .fetch_all(db)
+    .await
+}
+
+/// The returns tile's other numbers; counts only, never a TIN or a name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct ReturnsTile {
+    /// Sent (`status = 'sent'`) at or after the start of the week.
+    pub sent_week: i64,
+    /// `failed`, last touched today.
+    pub failed: i64,
+    /// `ready` (queued), `sending` or `unknown`, last touched today.
+    pub waiting: i64,
+}
+
+/// [`ReturnsTile`] in one pass. `today` and `week` are the starts of today
+/// and of the 7-day window that ends with today, Philippine time. A return
+/// that was sent counts by `sent_at`; failed and waiting ones have no
+/// outcome time, so they count by their last attempt (`sending_since`), or
+/// by `created_at` when none was made. `dry_run` and `expired` rows are
+/// neither sent nor failed nor waiting. No index serves this (the table
+/// holds a few rows per sending account per period), so it scans once.
+pub async fn returns_tile(db: &PgPool, today: OffsetDateTime, week: OffsetDateTime) -> sqlx::Result<ReturnsTile> {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status = 'sent' AND sent_at >= $2) AS sent_week,
+                count(*) FILTER (WHERE status = 'failed' AND coalesce(sending_since, created_at) >= $1) AS failed,
+                count(*) FILTER (WHERE status IN ('ready', 'sending', 'unknown')
+                                 AND coalesce(sending_since, created_at) >= $1) AS waiting
+         FROM submissions
+         WHERE sent_at >= $2 OR coalesce(sending_since, created_at) >= $1",
+    )
+    .bind(today)
+    .bind(week)
+    .fetch_one(db)
     .await
 }
 

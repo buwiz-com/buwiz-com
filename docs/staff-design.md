@@ -92,6 +92,29 @@ viewer (`.sx-viewer`, radio tabs); the claim comparison (`.sx-cmp`); actions
 with a reason (`act`, `reason_act`, `reason_field`: a `<details>` without
 script, a `<dialog>` with it); the New user modal (`.sx-modal`).
 
+## The Overview's tiles
+
+Counts only, the same for Admin and Support (no TIN, name or account). "Today"
+is since midnight in Manila (UTC+8); "this week" is the last 7 days, today
+included, or for returns from midnight six days ago. Queries are in
+`src/account/staff.rs`; no index or migration is involved.
+
+- **Active TINs**: approved, not paused, not a test TIN (`000-000-000`). The
+  small line under it names `N paused` (approved real TINs a staff member
+  paused) and `N test` (approved test TINs), leaving out a zero; then
+  `+N this week` (activated in the last 7 days) always.
+- **Returns sent today**: `submissions` with `status = 'sent'` and `sent_at`
+  today, with the hourly spark. Under it, in the danger colour `N failed`
+  (`status = 'failed'`) and in the warning colour `N waiting` (`ready`, that
+  is queued, `sending`, or `unknown`), a zero left out and the line left out
+  when both are zero. Failed and waiting rows have no outcome time, so they
+  count when their last attempt (`sending_since`) or, with none, their
+  `created_at` is today. `dry_run` and `expired` are in none of the parts.
+  Last line: `N in the last 7 days`, `sent` by `sent_at`.
+
+Each sub line keeps a count and its word together (no-break space) so a
+narrow tile wraps between parts, not inside one.
+
 ## Adding a screen
 
 1. Add a `#[page("/staff/…")]` in `src/account/pages/staff.rs` (or a module

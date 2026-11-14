@@ -14,6 +14,26 @@ fn start_of_today(now: OffsetDateTime) -> OffsetDateTime {
     local(now).replace_time(time::Time::MIDNIGHT)
 }
 
+/// A count and its word, kept on one line: `2 paused`.
+fn part(count: i64, word: &str) -> String {
+    format!("{count}\u{a0}{word}")
+}
+
+/// The small line under Active TINs: `2 paused · 1 test`, a zero left out.
+fn active_breakdown(paused: i64, test: i64) -> Vec<(String, &'static str)> {
+    [(paused, "paused"), (test, "test")].into_iter().filter(|(n, _)| *n > 0).map(|(n, w)| (part(n, w), "")).collect()
+}
+
+/// The small line under Returns sent today: failed in danger, waiting in
+/// warning, a zero left out.
+fn returns_breakdown(tile: &queries::ReturnsTile) -> Vec<(String, &'static str)> {
+    [(tile.failed, "failed", "bad"), (tile.waiting, "waiting", "warn")]
+        .into_iter()
+        .filter(|(n, _, _)| *n > 0)
+        .map(|(n, w, c)| (part(n, w), c))
+        .collect()
+}
+
 /// `Saturday, November 14`, in Philippine time.
 fn day_name(at: OffsetDateTime) -> String {
     let date = local(at).date();
@@ -93,7 +113,7 @@ fn activity_words(line: &Activity) -> (&'static str, String, String) {
 
 #[page("/staff")]
 pub async fn overview_page(cx: &Cx) -> Result<impl View> {
-    let viewer = staff_member(cx, Power::Review).await?;
+    let _viewer = staff_member(cx, Power::Review).await?;
     // The queue's old address was `/staff?…`: anything that carries a query
     // (`?notice=`, `?status=`, `?open=`, `?q=`) is a queue link, kept alive.
     // Only after the staff check, so everyone else gets what they always did.
@@ -103,11 +123,14 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
     let db = &state(cx).db;
     let now = OffsetDateTime::now_utc();
     let numbers = queries::overview(db).await?;
-    // Returns are an Admin's to count: no staff page lists them.
-    let admin = viewer.role == Role::Admin;
+    // Counts only, for Admin and Support alike: no TIN, name or account.
     let today = start_of_today(now);
     let now_hour = ((now - today).whole_hours()) as i32;
-    let sent = if admin { Some(queries::sent_since(db, today).await?) } else { None };
+    let sent = queries::sent_since(db, today).await?;
+    let week_start = today - time::Duration::days(6);
+    let returns = queries::returns_tile(db, today, week_start).await?;
+    let returns_parts = returns_breakdown(&returns);
+    let active_parts = active_breakdown(numbers.paused, numbers.test);
     let longest = queries::waiting_longest(db, 3).await?;
     let activity = queries::recent_activity(db, ACTIVITY_LINES).await?;
     let lines: Vec<(&'static str, String, String, String, Uuid, OffsetDateTime)> = activity
@@ -142,6 +165,14 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                         <div class="sx-card sx-tile">
                             <span class="l">(ic("check-circle")) "Active TINs"</span>
                             <span class="n">(numbers.active.to_string())</span>
+                            if !active_parts.is_empty() {
+                                <span class="s">
+                                    for (index, (text, class)) in active_parts.into_iter().enumerate() {
+                                        if index > 0 { " · " }
+                                        <span class=(class)>(text)</span>
+                                    }
+                                </span>
+                            }
                             <span class="s">(format!("+{} this week", numbers.active_week))</span>
                         </div>
                         <a class="sx-card sx-tile" href="/staff/users">
@@ -149,15 +180,22 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                             <span class="n">(numbers.accounts.to_string())</span>
                             <span class="s">(format!("+{} this week", numbers.accounts_week))</span>
                         </a>
-                        if let Some(sent) = sent {
-                            <div class="sx-card sx-tile">
-                                <span class="l">(ic("send")) "Returns sent today"</span>
-                                <span class="row">
-                                    <span class="n">(sent.iter().map(|(_, count)| count).sum::<i64>().to_string())</span>
-                                    (spark(&sent, now_hour))
+                        <div class="sx-card sx-tile">
+                            <span class="l">(ic("send")) "Returns sent today"</span>
+                            <span class="row">
+                                <span class="n">(sent.iter().map(|(_, count)| count).sum::<i64>().to_string())</span>
+                                (spark(&sent, now_hour))
+                            </span>
+                            if !returns_parts.is_empty() {
+                                <span class="s">
+                                    for (index, (text, class)) in returns_parts.into_iter().enumerate() {
+                                        if index > 0 { " · " }
+                                        <span class=(class)>(text)</span>
+                                    }
                                 </span>
-                            </div>
-                        }
+                            }
+                            <span class="s">(format!("{} in the last 7 days", returns.sent_week))</span>
+                        </div>
                         <a class="sx-card sx-tile" href="/staff/queue?status=auto">
                             <span class="l">(ic("bolt")) "Activated automatically"</span>
                             <span class="n">(numbers.auto.to_string())</span>

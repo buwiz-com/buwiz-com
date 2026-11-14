@@ -1429,7 +1429,8 @@ async fn tries_are_kept_90_days(db: PgPool) {
         .await
         .unwrap();
     }
-    buwiz_cloud::submissions::upkeep(&db).await.unwrap();
+    let site = common::Site::new(db.clone());
+    buwiz_cloud::uptime::hourly(&site.state, OffsetDateTime::now_utc()).await;
     let left: Vec<i64> = sqlx::query_scalar(
         "SELECT (extract(epoch FROM now() - started_at) / 86400)::bigint FROM bir_tries ORDER BY started_at",
     )
@@ -1437,4 +1438,15 @@ async fn tries_are_kept_90_days(db: PgPool) {
     .await
     .unwrap();
     assert_eq!(left, [89, 0]);
+}
+
+/// The uptime tables' cleanup is its own part of the hourly upkeep: when it
+/// fails (here a table is missing) the submissions' upkeep is not failed
+/// with it, and the rest of the hour's uptime work goes on.
+#[sqlx::test]
+async fn a_failing_uptime_cleanup_does_not_fail_the_submissions_upkeep(db: PgPool) {
+    sqlx::query("DROP TABLE bir_turns").execute(&db).await.unwrap();
+    buwiz_cloud::submissions::upkeep(&db).await.unwrap();
+    let site = common::Site::new(db.clone());
+    buwiz_cloud::uptime::hourly(&site.state, OffsetDateTime::now_utc()).await;
 }

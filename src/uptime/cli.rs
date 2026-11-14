@@ -378,7 +378,11 @@ pub async fn run(
         Change::Clear(why) => notes::record_clear(db, config, &actor, why, at).await?,
     }
     line(out, "Done: the note and its audit line are written.");
-    line(out, "The running server takes it in within 30 seconds (or when it next starts), shows it and mails staff.");
+    line(out, "Now tell the running server to take it in at once: sudo systemctl kill -s USR1 buwiz.service");
+    line(
+        out,
+        "Without that it takes it in within 30 seconds while anything is happening, else within the hour (or when it next starts); then it shows it and mails staff.",
+    );
     Ok(())
 }
 

@@ -615,6 +615,13 @@ impl Alerts {
         }
     }
 
+    /// Whether any mail waits: queued, or on its way to an address it has
+    /// not reached yet.
+    pub fn waiting(&self) -> bool {
+        let queue = self.queue();
+        !queue.items.is_empty() || !queue.outbox.is_empty()
+    }
+
     /// How many alerts are queued or on their way and not yet told.
     pub fn queued(&self) -> usize {
         let queue = self.queue();

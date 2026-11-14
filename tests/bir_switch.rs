@@ -99,6 +99,7 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     result.unwrap();
     assert!(out.contains("Will: declare the BIR offline (an outage note) until"), "{out}");
     assert!(out.contains("Done: the note and its audit line are written."), "{out}");
+    assert!(out.contains("sudo systemctl kill -s USR1 buwiz.service"), "the reminder to poke the server: {out}");
     // The command ran no rule: the stored sign is the server's, only its
     // `seq` moved on.
     let (seq, stored): (i64, Value) = sqlx::query_as("SELECT seq, state FROM bir_sign").fetch_one(&db).await.unwrap();

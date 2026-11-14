@@ -42,13 +42,19 @@ const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 /// would start a send (a ticket, a submission, the relay) is answered `503
 /// restarting` with `Retry-After`, while requests already under way go on
 /// and the BIR uptime records of tries that end get written, for at most 10
-/// seconds; then the process exits at once, so blocking work (a document
-/// reading) cannot hold the restart. Connections still open (a relay send
-/// under way) end with the process, as they did when SIGTERM killed it.
+/// seconds; the BIR sign's evaluation time is written (at most 5 seconds);
+/// then the process exits at once, so blocking work (a document reading)
+/// cannot hold the restart. Connections still open (a relay send under way)
+/// end with the process, as they did when SIGTERM killed it. SIGUSR1, at
+/// any time, only makes the BIR sign take in a note the `bir` command wrote
+/// ([`uptime::poke`]).
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
+    // First of all, so a SIGUSR1 during the start (the migrations) is held
+    // for later instead of ending the process.
+    let pokes = pokes();
     let config = Config::from_env()?;
     let db = PgPoolOptions::new()
         .max_connections(10)
@@ -63,30 +69,42 @@ pub async fn run() -> anyhow::Result<()> {
         Some((url, secret)) => SenderLink::new(&url, secret),
         None => embedded_sender(&ticket_key, &config.account_origin).await?,
     };
-    tokio::spawn({
-        let db = db.clone();
-        async move {
-            loop {
-                if let Err(error) = submissions::upkeep(&db).await {
-                    tracing::error!(error = ?error, "submission upkeep failed");
-                }
-                if let Err(error) = account::verify::upkeep(&db).await {
-                    tracing::error!(error = ?error, "automatic activation upkeep failed");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            }
-        }
-    });
 
     let address = format!("{}:{}", config.host, config.port);
     let state = AppState::new(config, db, documents, ticket_key, sender);
+    #[cfg(unix)]
+    if let Some(mut pokes) = pokes {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while pokes.recv().await.is_some() {
+                uptime::poke(&state).await;
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let () = pokes;
     if let Err(error) = ocr::resume(&state).await {
         tracing::error!(error = ?error, "could not resume document readings");
     }
     let uptime = state.uptime.clone();
     // The sign only (at most 10 seconds) before the port; the day history
-    // is the ticker's, after it.
+    // is the hourly upkeep's, which runs now and then every hour.
     uptime::start(&state).await;
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            loop {
+                if let Err(error) = submissions::upkeep(&state.db).await {
+                    tracing::error!(error = ?error, "submission upkeep failed");
+                }
+                if let Err(error) = account::verify::upkeep(&state.db).await {
+                    tracing::error!(error = ?error, "automatic activation upkeep failed");
+                }
+                uptime::hourly(&state, time::OffsetDateTime::now_utc()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        }
+    });
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");
@@ -103,9 +121,22 @@ pub async fn run() -> anyhow::Result<()> {
         served = &mut serve => served?,
         _ = uptime.recorder.drain(DRAIN) => {}
     }
+    uptime::stop(&state, time::OffsetDateTime::now_utc()).await;
     tracing::info!("stopped");
     std::process::exit(0)
 }
+
+/// SIGUSR1, caught from the start of the process on.
+#[cfg(unix)]
+fn pokes() -> Option<tokio::signal::unix::Signal> {
+    use tokio::signal::unix::{SignalKind, signal};
+    signal(SignalKind::user_defined1())
+        .inspect_err(|error| tracing::error!(%error, "SIGUSR1 cannot be caught; a note is taken in within the hour"))
+        .ok()
+}
+
+#[cfg(not(unix))]
+fn pokes() {}
 
 /// The whole site: the routes and pages, behind the host rules of
 /// [`canonical`].

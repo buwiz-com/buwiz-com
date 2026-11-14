@@ -1491,3 +1491,217 @@ async fn a_panic_in_the_start_load_still_starts_the_server(db: PgPool) {
     live::tick(uptime, &db, OffsetDateTime::now_utc()).await.unwrap();
     assert!(uptime.live.sign().seq > 0);
 }
+
+/// A pool on the test's database that counts every time it is used (each
+/// query or transaction takes a connection from it).
+async fn counting_pool(db: &PgPool) -> (PgPool, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let used = std::sync::Arc::new(AtomicUsize::new(0));
+    let (connected, acquired) = (used.clone(), used.clone());
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(move |_, _| {
+            let used = connected.clone();
+            Box::pin(async move {
+                used.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .before_acquire(move |_, _| {
+            let used = acquired.clone();
+            Box::pin(async move {
+                used.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        })
+        .connect_with((*db.connect_options()).clone())
+        .await
+        .unwrap();
+    (pool, used)
+}
+
+fn uses(used: &std::sync::atomic::AtomicUsize) -> usize {
+    used.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A site on `pool` whose sign was loaded at `at` and is idle.
+async fn idle_site(pool: &PgPool, at: OffsetDateTime) -> Site {
+    let site = Site::with_sender(
+        pool.clone(),
+        "http://127.0.0.1:9",
+        "a made-up Sender secret, 32 characters or more",
+        uptime(at),
+    );
+    live::tick(&site.state.uptime, pool, at).await.unwrap();
+    site
+}
+
+/// Ticks every 30 seconds after `from`, up to and with `until`, as the
+/// ticker does: whether any touched the database.
+async fn ticks(
+    ticker: &mut buwiz_cloud::uptime::Ticker,
+    site: &Site,
+    from: OffsetDateTime,
+    until: OffsetDateTime,
+) -> bool {
+    let mut touched = false;
+    let mut at = from;
+    while at < until {
+        at = (at + Duration::seconds(30)).min(until);
+        touched |= ticker.step(&site.state, at).await;
+    }
+    touched
+}
+
+/// While the sign is idle (no try in the last 3 hours, no note, nothing to
+/// retry, both lights No recent news) the ticker touches the database not
+/// at all, so a database that sleeps when unused can: an hour of ticks is
+/// no query, the sign still ages in memory, and the hourly upkeep's one
+/// write keeps the stored time of the last evaluation. A recorded try ends
+/// idle at once.
+#[sqlx::test]
+async fn an_idle_sign_leaves_the_database_alone(db: PgPool) {
+    let (pool, used) = counting_pool(&db).await;
+    let site = idle_site(&pool, t(0)).await;
+    let uptime = &site.state.uptime;
+    let mut ticker = buwiz_cloud::uptime::Ticker::default();
+    let before = uses(&used);
+    assert!(!ticks(&mut ticker, &site, t(0), t(60)).await);
+    assert_eq!(uses(&used), before, "an hour of idle ticks used the database");
+    assert_eq!(uptime.live.sign().evaluated_at, t(60), "the sign aged in memory");
+    let stored: OffsetDateTime = sqlx::query_scalar("SELECT updated_at FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(stored, t(0));
+    // The hourly upkeep writes the time of the last evaluation, and the
+    // day history.
+    buwiz_cloud::uptime::hourly(&site.state, t(60)).await;
+    assert!(uses(&used) > before);
+    let stored: OffsetDateTime = sqlx::query_scalar("SELECT updated_at FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(stored, t(60));
+    let days: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_days").fetch_one(&db).await.unwrap();
+    assert_eq!(days, 1);
+    assert!(watch_events(&db).await.is_empty(), "no gap: it was watching");
+    let before = uses(&used);
+    assert!(!ticks(&mut ticker, &site, t(60), t(61)).await);
+    assert_eq!(uses(&used), before);
+
+    // A recorded try: the recorder runs the rules with it, and the ticker
+    // is no longer idle.
+    record(uptime, &pool, 1, 1, Ends::Landed, t(61) + Duration::seconds(10)).await;
+    assert_eq!(uptime.live.sign().upload.state, Light::Online);
+    let before = uses(&used);
+    assert!(ticker.step(&site.state, t(62)).await);
+    assert!(uses(&used) > before);
+    // It stays so while that try is in memory, 3 hours: the old behaviour,
+    // a write at least every minute.
+    let before: OffsetDateTime = sqlx::query_scalar("SELECT updated_at FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert!(ticks(&mut ticker, &site, t(62), t(64)).await);
+    let after: OffsetDateTime = sqlx::query_scalar("SELECT updated_at FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert!(after > before);
+    // Past them, and once the lights are No recent news, idle again.
+    ticks(&mut ticker, &site, t(64), t(61 + 181)).await;
+    assert_eq!(uptime.live.sign().upload.state, Light::NoRecentNews);
+    let before = uses(&used);
+    assert!(!ticks(&mut ticker, &site, t(61 + 181), t(61 + 200)).await);
+    assert_eq!(uses(&used), before);
+}
+
+/// Idle, a note the command wrote is not read every 30 seconds: SIGUSR1
+/// (the function it calls) takes it in at once, and the sign is no longer
+/// idle; without it, the hourly upkeep does. SIGUSR1 is harmless at off and
+/// before the sign is loaded.
+#[sqlx::test]
+async fn sigusr1_takes_a_note_in_while_idle(db: PgPool) {
+    let (pool, used) = counting_pool(&db).await;
+    let site = idle_site(&pool, t(0)).await;
+    let uptime = &site.state.uptime;
+    let config = &site.state.config;
+    let admin = admin(&site).await;
+    let mut ticker = buwiz_cloud::uptime::Ticker::default();
+    let new = NewNote { kind: NoteKind::Outage, text: "The BIR says its eFPS is down.", until: t(300) };
+    notes::record_set(&pool, config, &admin, new, Some("Made-up: an advisory"), t(1)).await.unwrap();
+    let before = uses(&used);
+    assert!(!ticks(&mut ticker, &site, t(0), t(5)).await);
+    assert_eq!(uses(&used), before);
+    assert_eq!(uptime.live.sign().state, Light::NoRecentNews, "not read while idle");
+    live::poke(uptime, &pool, t(5)).await.unwrap();
+    let sign = uptime.live.sign();
+    assert_eq!((sign.state, sign.source()), (Light::Offline, "staff"));
+    let change: (String, String) =
+        sqlx::query_as("SELECT to_state, cause FROM bir_events WHERE actor_id IS NULL ORDER BY id DESC LIMIT 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(change, ("offline".into(), "note_set".into()));
+    let before = uses(&used);
+    assert!(ticker.step(&site.state, t(5) + Duration::seconds(30)).await, "a note in force is not idle");
+    assert!(uses(&used) > before);
+
+    // At off, a poke does nothing.
+    let off = Site::with_sender(
+        db.clone(),
+        "http://127.0.0.1:9",
+        "a made-up Sender secret, 32 characters or more",
+        Uptime::new(Level::Off, vec![22], false, t(0)),
+    );
+    buwiz_cloud::uptime::poke(&off.state).await;
+    assert_eq!(off.state.uptime.live.sign().seq, 0);
+    // Before the load, a poke does nothing.
+    let unloaded = Site::with_sender(
+        pool.clone(),
+        "http://127.0.0.1:9",
+        "a made-up Sender secret, 32 characters or more",
+        Uptime::new(Level::Record, vec![22], false, t(20)),
+    );
+    live::poke(&unloaded.state.uptime, &pool, t(20)).await.unwrap();
+    assert_eq!(unloaded.state.uptime.live.sign().seq, 0);
+}
+
+/// Idle and not poked, a note the command wrote is taken in by the hourly
+/// upkeep's run.
+#[sqlx::test]
+async fn the_hourly_upkeep_takes_a_note_in_without_a_poke(db: PgPool) {
+    let site = idle_site(&db, t(0)).await;
+    let admin = admin(&site).await;
+    let new = NewNote { kind: NoteKind::Maintenance, text: "Planned work.", until: t(300) };
+    notes::record_set(&db, &site.state.config, &admin, new, Some("Made-up: planned"), t(1)).await.unwrap();
+    let mut ticker = buwiz_cloud::uptime::Ticker::default();
+    assert!(!ticks(&mut ticker, &site, t(0), t(59)).await);
+    assert_eq!(site.state.uptime.live.sign().state, Light::NoRecentNews);
+    buwiz_cloud::uptime::hourly(&site.state, t(60)).await;
+    let sign = site.state.uptime.live.sign();
+    assert_eq!((sign.state, sign.source()), (Light::Offline, "staff"));
+}
+
+/// A clean stop writes the time of the last evaluation once, so a start
+/// after an idle stretch shows no gap that was not there. A crash while
+/// idle overstates the gap by at most the hour since the last upkeep.
+#[sqlx::test]
+async fn a_clean_stop_after_idle_time_leaves_no_bogus_gap(db: PgPool) {
+    let (pool, used) = counting_pool(&db).await;
+    let site = idle_site(&pool, t(0)).await;
+    let mut ticker = buwiz_cloud::uptime::Ticker::default();
+    let before = uses(&used);
+    ticks(&mut ticker, &site, t(0), t(40)).await;
+    assert_eq!(uses(&used), before);
+    buwiz_cloud::uptime::stop(&site.state, t(40)).await;
+    let stored: OffsetDateTime = sqlx::query_scalar("SELECT updated_at FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(stored, t(40));
+    // Started again 2 minutes later: no gap.
+    let restarted = uptime(t(42));
+    live::tick(&restarted, &db, t(42)).await.unwrap();
+    assert!(watch_events(&db).await.is_empty(), "{:?}", watch_events(&db).await);
+    // A crash 40 idle minutes later (no stop's write): the gap starts at
+    // the last write, the restart.
+    let mut ticker = buwiz_cloud::uptime::Ticker::default();
+    let crashed = Site::with_sender(
+        db.clone(),
+        "http://127.0.0.1:9",
+        "a made-up Sender secret, 32 characters or more",
+        restarted,
+    );
+    ticks(&mut ticker, &crashed, t(42), t(82)).await;
+    let again = uptime(t(84));
+    live::tick(&again, &db, t(84)).await.unwrap();
+    let gaps = watch_events(&db).await;
+    assert_eq!((gaps[0].0, gaps[1].0), (t(42), t(84)), "overstated, as documented");
+}

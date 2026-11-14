@@ -45,6 +45,15 @@
 //! minute. Everything public reads the sign as it stood at the last
 //! 5-minute mark ([`Live::public`]).
 //!
+//! While the sign is idle ([`step`]: nothing in memory from the last 3
+//! hours, no note, no write to retry, no try or staff mail waiting, both
+//! lights No recent news) the ticker's runs age it in memory only and touch
+//! the database not at all, so a database that sleeps when unused can. The
+//! write of the evaluation time ([`heartbeat`]) then rides on the hourly
+//! upkeep and on a clean stop; a note the command wrote is taken in at
+//! once on SIGUSR1 ([`poke`]), else at that hourly run. A recorded try, a
+//! note taken in or a poke ends idle at once.
+//!
 //! Every transaction of uptime's ([`begin`]) has the server end a statement
 //! after [`STATEMENT_TIMEOUT`] and a lock wait (the sign's lock too) after
 //! [`LOCK_TIMEOUT`], so work a timeout here gave up on does not go on
@@ -168,6 +177,8 @@ struct Engine {
     sign: SignState,
     /// When the sign was last written.
     written_at: Option<OffsetDateTime>,
+    /// The last run could not be written: the next one must.
+    unwritten: bool,
 }
 
 impl Engine {
@@ -179,7 +190,21 @@ impl Engine {
             loaded_upto: 0,
             sign: SignState::new(now),
             written_at: None,
+            unwritten: false,
         }
+    }
+
+    /// Whether nothing can change the sign but a new try or a note: loaded,
+    /// nothing in memory (every try of the last 3 hours is), no note, no
+    /// write to retry, and both lights No recent news.
+    fn idle(&self) -> bool {
+        self.loaded
+            && !self.unwritten
+            && self.evidence.is_empty()
+            && self.note.is_none()
+            && self.sign.note.is_none()
+            && self.sign.dispatcher.state == Light::NoRecentNews
+            && self.sign.upload.state == Light::NoRecentNews
     }
 
     /// Takes a try in, in order of its end. One read at the load already
@@ -299,6 +324,10 @@ impl Live {
             tracing::error!("BIR uptime: too many tries wait for the rules; the oldest is dropped");
         }
         inbox.push(evidence);
+    }
+
+    fn inbox_empty(&self) -> bool {
+        self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty()
     }
 
     fn take_inbox(&self) -> Vec<Evidence> {
@@ -455,6 +484,7 @@ impl Locked<'_> {
         };
         if self.wrote {
             self.engine.written_at = Some(self.now);
+            self.engine.unwritten = false;
         }
         for alert in Alert::for_run(written, &evaluation.state) {
             self.uptime.alerts.push(alert);
@@ -500,6 +530,7 @@ impl Locked<'_> {
                 Ok(())
             }
             Err(error) => {
+                self.engine.unwritten = true;
                 if !moved(&error) {
                     self.age(evaluation);
                 }
@@ -593,9 +624,61 @@ pub async fn feed(uptime: &Uptime, db: &PgPool, evidence: Evidence, now: OffsetD
 }
 
 /// The rules with no new try: quiet hours, a note running out, the dwell,
-/// and the tries waiting in the inbox.
+/// and the tries waiting in the inbox. Reads the stored `seq` first, and
+/// writes as [`Locked::run`] says.
 pub async fn tick(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
     lock(uptime, db, now).await?.run(db).await
+}
+
+/// The ticker's run: [`tick`], unless the sign is idle ([`Engine::idle`],
+/// no try in the inbox and no staff mail waiting), when the rules run in
+/// memory only and nothing is read or written. Idle, nothing but a new try
+/// or a note can change the sign; a run that would change it anyway (a lost
+/// vote running out, a gap in watching) is a [`tick`]. Whether it touched
+/// the database.
+pub async fn step(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<bool> {
+    let mut engine = uptime.live.engine.lock().await;
+    if engine.loaded && uptime.live.inbox_empty() && !uptime.alerts.waiting() {
+        let at = engine.clock(now);
+        engine.prune(at);
+        if engine.idle() {
+            let mut locked = Locked { uptime, engine, now: at, wrote: false };
+            let evaluation = locked.evaluate(None, false);
+            if !evaluation.must_write(&locked.engine.sign) {
+                locked.show(evaluation, None, &[]);
+                return Ok(false);
+            }
+            engine = locked.engine;
+        }
+    }
+    prepare(uptime, engine, db, now).await?.run(db).await?;
+    Ok(true)
+}
+
+/// SIGUSR1 ([`super::poke`]): reads the stored note and `seq` at once and
+/// runs the rules with them, idle or not, so a note the command wrote is
+/// taken in (made, written and mailed) now. Nothing before the sign is
+/// loaded (the load reads them).
+pub async fn poke(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
+    let engine = uptime.live.engine.lock().await;
+    if !engine.loaded {
+        return Ok(());
+    }
+    prepare(uptime, engine, db, now).await?.run(db).await
+}
+
+/// The hourly upkeep's run, and a clean stop's: a [`tick`] that writes the
+/// sign (its evaluation time) whatever is due, so a restart reads idle time
+/// as watched. Nothing before the sign is loaded. Whether it wrote.
+pub async fn heartbeat(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<bool> {
+    let engine = uptime.live.engine.lock().await;
+    if !engine.loaded {
+        return Ok(false);
+    }
+    let mut locked = prepare(uptime, engine, db, now).await?;
+    locked.engine.written_at = None;
+    locked.run(db).await?;
+    Ok(true)
 }
 
 fn stage(raw: &str) -> Stage {

@@ -155,14 +155,17 @@ CREATE TABLE bir_held (
 CREATE INDEX bir_held_account ON bir_held (account_id, at DESC);
 
 -- Upload-server host keys offered to live tries, read from the SSH
--- handshake. One not pinned is a candidate; an Admin may confirm one seen
--- from 3 accounts on 3 networks.
+-- handshake the user's app relays. A sighting can be forged, so it is
+-- information only and never grounds to pin: pinning needs an Admin and a
+-- second source outside the relay (docs/relay-protocol.md §7).
 CREATE TABLE bir_host_keys (
     -- 'SHA256:…', as BIR_SSH_HOST_KEYS lists them.
     fingerprint      text PRIMARY KEY CHECK (fingerprint ~ '^SHA256:[A-Za-z0-9+/]{43}$'),
     first_seen       timestamptz NOT NULL,
     last_seen        timestamptz NOT NULL,
-    -- [{epoch, account_key, network_key}] (keys in hex), the newest 50.
+    -- [{epoch, account_key, network_key, kex_done}] (keys in hex), the
+    -- newest 50; `kex_done`: the Sender went on to complete the key
+    -- exchange in that try.
     seen             jsonb NOT NULL,
     confirmed_at     timestamptz,
     confirmed_by     uuid,

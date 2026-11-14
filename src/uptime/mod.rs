@@ -24,6 +24,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use self::keys::{DaySets, KeyRing, NetworkReader, RateLimiter};
+use self::store::{Recorder, Sightings};
 
 /// `BIR_UPTIME`: how much of BIR uptime runs. Each level adds to the one
 /// below.
@@ -151,10 +152,16 @@ pub struct Uptime {
     pub keys: KeyRing,
     pub networks: NetworkReader,
     pub day_sets: DaySets,
-    /// The public reads, per IP address (never stored).
-    pub reads_per_ip: RateLimiter<IpAddr>,
+    /// The public reads, per IP address as [`keys::ip_key`] counts it
+    /// (never stored): through [`Uptime::check_read_from`].
+    reads_per_ip: RateLimiter<IpAddr>,
     /// The signed-in reads, per account.
     pub reads_per_account: RateLimiter<Uuid>,
+    /// The records being written after their try ended.
+    pub recorder: Recorder,
+    /// The host-key sightings already written, so one that adds nothing is
+    /// not written again.
+    pub sightings: Sightings,
 }
 
 impl Uptime {
@@ -169,7 +176,14 @@ impl Uptime {
             day_sets: DaySets::default(),
             reads_per_ip: RateLimiter::new(READS_PER_IP, Duration::minutes(1)),
             reads_per_account: RateLimiter::new(READS_PER_ACCOUNT, Duration::minutes(1)),
+            recorder: Recorder::default(),
+            sightings: Sightings::default(),
         }
+    }
+
+    /// Counts a public read from `address` (an IPv6 address by its /64).
+    pub fn check_read_from(&self, address: IpAddr, now: OffsetDateTime) -> Result<(), Duration> {
+        self.reads_per_ip.check(keys::ip_key(address), now)
     }
 
     /// From `BIR_UPTIME` and `BIR_UPTIME_UPLOAD_PORTS`. Neither stops the
@@ -243,6 +257,18 @@ mod tests {
             assert_eq!(label(raw).as_deref(), kept, "{raw}");
         }
         assert_eq!(client_label(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn public_reads_count_an_ipv6_household_once() {
+        let uptime = Uptime::new(Level::Record, vec![22], false, OffsetDateTime::UNIX_EPOCH);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for host in 1..=READS_PER_IP {
+            let address: IpAddr = format!("2001:db8:7:8::{host:x}").parse().unwrap();
+            assert_eq!(uptime.check_read_from(address, now), Ok(()));
+        }
+        assert!(uptime.check_read_from("2001:db8:7:8:ffff::1".parse().unwrap(), now).is_err());
+        assert_eq!(uptime.check_read_from("2001:db8:7:9::1".parse().unwrap(), now), Ok(()));
     }
 
     #[test]

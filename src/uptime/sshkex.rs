@@ -4,8 +4,10 @@
 //! `NEWKEYS` (21) switches encryption on, so it passes in clear (RFC 4253
 //! §6, §8; RFC 5656 §4; RFC 4419 §3). This reads the server's side of the
 //! stream up to that point and gives the key's `SHA256:` fingerprint, the
-//! form `BIR_SSH_HOST_KEYS` uses. It reads at most the first 64 KB and gives
-//! up, silently, on anything it does not understand.
+//! form `BIR_SSH_HOST_KEYS` uses, over the key bytes exactly as sent. It
+//! reads at most the first 64 KB and gives up, silently, on anything it does
+//! not understand. The bytes come through the user's own app, which can
+//! forge them: what this finds is information only, never grounds to pin.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;

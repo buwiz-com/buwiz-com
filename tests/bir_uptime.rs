@@ -12,15 +12,19 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocketUpgrade};
 use axum::response::Response;
 use base64::Engine;
 use buwiz_cloud::base::crypto;
+use buwiz_cloud::base::state::AppState;
 use buwiz_cloud::relay::Control;
 use buwiz_cloud::sender::{self, Mode as RelayMode};
+use buwiz_cloud::uptime::keys::{MANILA, Network};
+use buwiz_cloud::uptime::observe::TryObserver;
+use buwiz_cloud::uptime::store::{self, RelayTry};
 use buwiz_cloud::uptime::{Level, Uptime};
 use common::{ACCOUNT_HOST, Site, TestDevice, add_claim};
 use futures_util::{SinkExt, StreamExt};
@@ -42,6 +46,8 @@ const HOME: &str = "203.0.113.7";
 #[derive(Clone, Debug)]
 enum Step {
     Text(String),
+    /// Bytes from the BIR's side on a stream: `[stream][bytes]`.
+    Binary(u8, Vec<u8>),
     /// Waits for this many frames from the bridge (each at most 2 s).
     Expect(usize),
     /// Ends the socket without a result.
@@ -85,6 +91,9 @@ async fn fake_relay(State(fake): State<FakeSender>, upgrade: WebSocketUpgrade) -
             match step {
                 Step::Text(text) => {
                     let _ = socket.send(WsMessage::Text(text.into())).await;
+                }
+                Step::Binary(stream, bytes) => {
+                    let _ = socket.send(WsMessage::Binary([&[stream], bytes.as_slice()].concat().into())).await;
                 }
                 Step::Expect(count) => {
                     for _ in 0..count {
@@ -211,28 +220,50 @@ impl World {
 struct Gatekeeper {
     base: String,
     sender: FakeSender,
+    state: AppState,
+    /// How long the last send took until the app had its `result`.
+    result_after: Mutex<Option<Duration>>,
 }
 
 impl Gatekeeper {
     async fn new(world: &World, level: Level) -> Self {
+        Self::with_ports(world, level, vec![22]).await
+    }
+
+    /// With `ports` as the upload window's.
+    async fn with_ports(world: &World, level: Level, ports: Vec<u16>) -> Self {
         let sender = FakeSender::default();
         let router =
             axum::Router::new().route("/internal/relay", axum::routing::get(fake_relay)).with_state(sender.clone());
         let sender_url = serve(router).await;
-        Self::at(world, level, &sender_url, sender).await
+        Self::at(world, Uptime::new(level, ports, false, OffsetDateTime::now_utc()), &sender_url, sender).await
     }
 
     /// With the Sender at `sender_url`.
-    async fn at(world: &World, level: Level, sender_url: &str, sender: FakeSender) -> Self {
-        let uptime = Uptime::new(level, vec![22], false, OffsetDateTime::now_utc());
+    async fn at(world: &World, uptime: Uptime, sender_url: &str, sender: FakeSender) -> Self {
         let site = Site::with_sender(world.db.clone(), sender_url, SECRET, uptime);
         let base = serve(site.router).await;
-        Self { base, sender }
+        Self { base, sender, state: site.state, result_after: Mutex::new(None) }
     }
 
     /// Opens the relay for `id` as the app does, from `ip`, answering each
-    /// `open` by its port, and gives what the app got.
+    /// `open` by its port, and gives what the app got, once the try's
+    /// record is written.
     async fn send(&self, world: &World, id: Uuid, script: Vec<Step>, answers: &[(u16, Answer)], ip: &str) -> Vec<Got> {
+        let got = self.send_only(world, id, script, answers, ip).await;
+        self.state.uptime.recorder.settled().await;
+        got
+    }
+
+    /// [`Gatekeeper::send`] without waiting for the record.
+    async fn send_only(
+        &self,
+        world: &World,
+        id: Uuid,
+        script: Vec<Step>,
+        answers: &[(u16, Answer)],
+        ip: &str,
+    ) -> Vec<Got> {
         *self.sender.script.lock().unwrap() = script;
         let answers: HashMap<u16, Answer> = answers.iter().cloned().collect();
         let path = format!("/api/submissions/{id}/relay");
@@ -245,6 +276,8 @@ impl Gatekeeper {
         for (name, value) in world.device.signature("GET", &path, b"") {
             headers.insert(name, value.parse().unwrap());
         }
+        let started = Instant::now();
+        *self.result_after.lock().unwrap() = None;
         let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         let mut got = Vec::new();
         while let Ok(Some(Ok(message))) = tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
@@ -252,6 +285,9 @@ impl Gatekeeper {
                 Message::Text(text) => {
                     got.push(Got::Text(text.to_string()));
                     let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["type"] == "result" {
+                        *self.result_after.lock().unwrap() = Some(started.elapsed());
+                    }
                     if frame["type"] != "open" {
                         continue;
                     }
@@ -339,8 +375,9 @@ async fn tries(db: &PgPool) -> Vec<TryRow> {
     .unwrap()
 }
 
-/// The rows once there are `count` (an app that went away hears no result,
-/// so its try may still be being recorded when it is done).
+/// The rows once there are `count`. An app that went away hears no result,
+/// so when it is done the bridge may still be waiting for the Sender's, and
+/// its try is not yet being recorded.
 async fn wait_for(db: &PgPool, count: usize) -> Vec<TryRow> {
     for _ in 0..100 {
         let rows = tries(db).await;
@@ -514,6 +551,38 @@ async fn each_try_leaves_one_classified_row(db: PgPool) {
             ("live", "failed", "upload", "none", "none", Some("user_network"), Some("app_gone"), false),
         ),
         (
+            "the Sender says unknown after the app went away: the user's side",
+            vec![
+                hello(RelayMode::Live),
+                open(1, "dispatcher.test", 443),
+                Step::Expect(2),
+                open(2, "upload.test", 22),
+                Step::Expect(4),
+                result(
+                    "unknown",
+                    Some(
+                        "SFTP failed during the upload: connection reset. BIR may have received this return; check for its confirmation email before sending again.",
+                    ),
+                    None,
+                ),
+            ],
+            vec![desk_ok(200), (22, Answer::Leave)],
+            ("live", "unknown", "upload", "ok", "maybe", Some("user_network"), Some("app_gone"), false),
+        ),
+        (
+            "SSH with no common algorithm: Buwiz's side",
+            vec![
+                hello(RelayMode::Live),
+                open(1, "dispatcher.test", 443),
+                Step::Expect(2),
+                open(2, "upload.test", 22),
+                Step::Expect(2),
+                result("failed", Some("SSH failed: No common key exchange algorithm"), None),
+            ],
+            landed_answers.clone(),
+            ("live", "failed", "upload", "ok", "none", Some("ours"), Some("protocol"), false),
+        ),
+        (
             "the Sender stops during the upload",
             vec![
                 hello(RelayMode::Live),
@@ -531,6 +600,12 @@ async fn each_try_leaves_one_classified_row(db: PgPool) {
             landed_script[1..].to_vec(),
             landed_answers.clone(),
             ("unknown", "sent", "uploaded", "ok", "ok", None, None, false),
+        ),
+        (
+            "no sender frame, failed: like lab, no class",
+            down_script[1..].to_vec(),
+            down_answers.clone(),
+            ("unknown", "failed", "dispatcher", "fail", "none", None, None, false),
         ),
         (
             "lab: no class",
@@ -602,18 +677,62 @@ async fn each_try_leaves_one_classified_row(db: PgPool) {
     assert_eq!(other.account_key, rows[0].account_key);
 
     // Nothing in the record says who or where.
+    assert_no_one_in_the_record(&db, &world).await;
+}
+
+/// Nothing in the record says who or where: not in its text, and not in
+/// its bytes (the bytea keys, and the hex keys of the host-key sightings,
+/// decoded): no address prefix, no account id, no TIN.
+async fn assert_no_one_in_the_record(db: &PgPool, world: &World) {
     let account = world.account.to_string();
     let dump: Vec<String> = sqlx::query_scalar(
         "SELECT to_jsonb(t)::text FROM bir_tries t UNION ALL SELECT to_jsonb(k)::text FROM bir_host_keys k",
     )
-    .fetch_all(&db)
+    .fetch_all(db)
     .await
     .unwrap();
+    assert!(!dump.is_empty());
     for row in &dump {
         for secret in
             [ROOT, EMAIL, "203.0.113", "198.51.100", "127.0.0.1", account.as_str(), "dispatcher.test", "upload.test"]
         {
             assert!(!row.contains(secret), "{secret} in {row}");
+        }
+    }
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let keys: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT account_key, network_key FROM bir_tries").fetch_all(db).await.unwrap();
+    for (account_key, network_key) in keys {
+        blobs.push(account_key);
+        blobs.extend(network_key);
+    }
+    let seen: Vec<Value> = sqlx::query_scalar("SELECT seen FROM bir_host_keys").fetch_all(db).await.unwrap();
+    for sighting in seen.iter().flat_map(|seen| seen.as_array().unwrap()) {
+        for field in ["account_key", "network_key"] {
+            let hex = sighting[field].as_str().unwrap();
+            let bytes = (0..hex.len()).step_by(2).map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap()).collect();
+            blobs.push(bytes);
+        }
+    }
+    let raw: Vec<Vec<u8>> = [
+        // The networks (the /24s and the loopback), the account id's
+        // bytes, the TIN as digits and as bytes.
+        vec![203, 0, 113],
+        vec![198, 51, 100],
+        vec![127, 0, 0],
+        world.account.as_bytes().to_vec(),
+        ROOT.as_bytes().to_vec(),
+    ]
+    .into();
+    // A raw prefix or id stored would always show; 8 random bytes hold a
+    // given 3 bytes by chance about once in a million.
+    for blob in &blobs {
+        assert_eq!(blob.len(), 8);
+        for secret in &raw {
+            let window = secret.len().clamp(3, 4);
+            for piece in secret.windows(window) {
+                assert!(!blob.windows(window).any(|part| part == piece), "{piece:?} in {blob:?}");
+            }
         }
     }
 }
@@ -632,54 +751,204 @@ async fn the_tickets_admission_is_recorded(db: PgPool) {
     assert_eq!(newest(&db).await.admission, "open");
 }
 
-/// A v1 and a v2 send get byte for byte the frames they got before this
-/// feature (`off`): the same at `record`, and at `public` the same but for
-/// `class` added at the end of a failed `result`. The `sender` frame never
-/// reaches the app.
+/// The frames the Gatekeeper sent the app before this feature, written out
+/// by hand: the Gatekeeper forwarded every Sender text and binary frame as
+/// it came (that Sender sent no `sender` frame), and ended with the
+/// `result` as `serde_json` wrote the relay's `Control` then: `type`,
+/// `status`, `error`, `receipt`, with `null` for none. Nothing here is made
+/// by the code under test.
+mod before {
+    pub const OPEN_DESK_1: &str = r#"{"type":"open","stream":1,"host":"dispatcher.test","port":443}"#;
+    pub const OPEN_DESK_2: &str = r#"{"type":"open","stream":2,"host":"dispatcher.test","port":80}"#;
+    pub const OPEN_DESK_3: &str = r#"{"type":"open","stream":3,"host":"backup.test","port":443}"#;
+    pub const OPEN_DESK_4: &str = r#"{"type":"open","stream":4,"host":"backup.test","port":80}"#;
+    pub const OPEN_UPLOAD: &str = r#"{"type":"open","stream":2,"host":"upload.test","port":22}"#;
+    pub const CLOSE_DESK: &str = r#"{"type":"close","stream":1}"#;
+    /// A TLS ClientHello's first bytes, from the Sender to the front desk.
+    pub const HELLO: &[u8] = &[0x16, 0x03, 0x01, 0x00, 0xa5, 0x01, 0x00, 0x00, 0xa1, 0x03, 0x03];
+    /// The Sender's SSH version line, to the mailbox.
+    pub const SSH_HELLO: &[u8] = b"SSH-2.0-made-up-sender\r\n";
+    pub const FAILED: &str = concat!(
+        r#"{"type":"result","status":"failed","error":"BIR's dispatcher did not answer: "#,
+        r#"https://dispatcher.test: the app refused to connect to dispatcher.test:443: Connection refused (os error 61); "#,
+        r#"http://dispatcher.test: the app refused to connect to dispatcher.test:80: Connection refused (os error 61); "#,
+        r#"https://backup.test: the app refused to connect to backup.test:443: Connection refused (os error 61); "#,
+        r#"http://backup.test: the app refused to connect to backup.test:80: Connection refused (os error 61)","receipt":null}"#
+    );
+    pub const UNKNOWN: &str = r#"{"type":"result","status":"unknown","error":"SFTP failed during the upload: connection reset. BIR may have received this return; check for its confirmation email before sending again.","receipt":null}"#;
+    /// The Gatekeeper's own words when the Sender's socket ends without a
+    /// result after a stream was opened.
+    pub const LOST: &str = r#"{"type":"result","status":"unknown","error":"the send ended without an outcome; BIR may have received this return","receipt":null}"#;
+    /// The Gatekeeper's own words when the Sender cannot be reached.
+    pub const UNREACHABLE: &str = r#"{"type":"result","status":"failed","error":"the sending service is not reachable; try again later","receipt":null}"#;
+
+    pub fn sent(receipt: &str) -> String {
+        format!(r#"{{"type":"result","status":"sent","error":null,"receipt":"{receipt}"}}"#)
+    }
+}
+
+/// One flow of the byte-identity test: the fake Sender's script, the fake
+/// app's answers, and what the app got before this feature.
+struct Flow {
+    name: &'static str,
+    script: Vec<Step>,
+    answers: Vec<(u16, Answer)>,
+    before: Vec<Got>,
+    /// The `class` added at `public`, if any.
+    class: Option<&'static str>,
+}
+
+fn text(raw: &str) -> Step {
+    Step::Text(raw.to_owned())
+}
+
+fn flows() -> Vec<Flow> {
+    use before::*;
+    let receipt = receipt();
+    let t = |raw: &str| Got::Text(raw.to_owned());
+    let b = |stream: u8, bytes: &[u8]| Got::Binary([&[stream], bytes].concat());
+    vec![
+        Flow {
+            name: "the front desk is down",
+            script: vec![
+                hello(RelayMode::Live),
+                text(OPEN_DESK_1),
+                Step::Expect(1),
+                text(OPEN_DESK_2),
+                Step::Expect(1),
+                text(OPEN_DESK_3),
+                Step::Expect(1),
+                text(OPEN_DESK_4),
+                Step::Expect(1),
+                text(FAILED),
+            ],
+            answers: vec![(443, Answer::Refuse(REFUSED, Some("refused"))), (80, Answer::Refuse(REFUSED, None))],
+            before: vec![t(OPEN_DESK_1), t(OPEN_DESK_2), t(OPEN_DESK_3), t(OPEN_DESK_4), t(FAILED)],
+            class: Some("bir"),
+        },
+        Flow {
+            name: "sent",
+            script: vec![
+                hello(RelayMode::Live),
+                text(OPEN_DESK_1),
+                Step::Expect(2),
+                Step::Binary(1, HELLO.to_vec()),
+                Step::Text(CLOSE_DESK.into()),
+                text(OPEN_UPLOAD),
+                Step::Expect(2),
+                Step::Binary(2, SSH_HELLO.to_vec()),
+                Step::Text(before::sent(&receipt)),
+            ],
+            answers: vec![(443, Answer::Open(vec![0x16; 300])), (22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec()))],
+            before: vec![
+                t(OPEN_DESK_1),
+                b(1, HELLO),
+                t(CLOSE_DESK),
+                t(OPEN_UPLOAD),
+                b(2, SSH_HELLO),
+                Got::Text(before::sent(&receipt)),
+            ],
+            class: None,
+        },
+        Flow {
+            name: "unknown",
+            script: vec![
+                hello(RelayMode::Live),
+                text(OPEN_DESK_1),
+                Step::Expect(2),
+                Step::Binary(1, HELLO.to_vec()),
+                text(OPEN_UPLOAD),
+                Step::Expect(2),
+                Step::Binary(2, SSH_HELLO.to_vec()),
+                text(UNKNOWN),
+            ],
+            answers: vec![(443, Answer::Open(vec![0x16; 300])), (22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec()))],
+            before: vec![t(OPEN_DESK_1), b(1, HELLO), t(OPEN_UPLOAD), b(2, SSH_HELLO), t(UNKNOWN)],
+            class: Some("bir"),
+        },
+        Flow {
+            name: "the Sender lost during the upload",
+            script: vec![
+                hello(RelayMode::Live),
+                text(OPEN_DESK_1),
+                Step::Expect(2),
+                Step::Binary(1, HELLO.to_vec()),
+                text(OPEN_UPLOAD),
+                Step::Expect(2),
+                Step::Binary(2, SSH_HELLO.to_vec()),
+                Step::Drop,
+            ],
+            answers: vec![(443, Answer::Open(vec![0x16; 300])), (22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec()))],
+            before: vec![t(OPEN_DESK_1), b(1, HELLO), t(OPEN_UPLOAD), b(2, SSH_HELLO), t(LOST)],
+            class: Some("ours"),
+        },
+        Flow {
+            name: "the app goes away",
+            script: vec![
+                hello(RelayMode::Live),
+                text(OPEN_DESK_1),
+                Step::Expect(2),
+                Step::Binary(1, HELLO.to_vec()),
+                text(OPEN_UPLOAD),
+                Step::Expect(4),
+                text(
+                    r#"{"type":"result","status":"failed","error":"could not reach BIR's upload server: the app disconnected","receipt":null}"#,
+                ),
+            ],
+            answers: vec![(443, Answer::Open(vec![0x16; 300])), (22, Answer::Leave)],
+            before: vec![t(OPEN_DESK_1), b(1, HELLO), t(OPEN_UPLOAD)],
+            class: None,
+        },
+    ]
+}
+
+/// A v1 and a v2 send get byte for byte the frames the Gatekeeper sent
+/// before this feature (written out in [`before`]), at `off` and `record`;
+/// at `public` the same but for `class` added at the end of a `result` that
+/// did not get in. The `sender` frame never reaches the app.
 #[sqlx::test]
-async fn apps_get_the_same_frames_but_for_the_added_fields(db: PgPool) {
+async fn apps_get_the_frames_they_got_before_but_for_the_added_fields(db: PgPool) {
     let world = World::new(db.clone()).await;
-    let mut seen: HashMap<(&str, Level, bool), Vec<Got>> = HashMap::new();
     for level in [Level::Off, Level::Record, Level::Public] {
         let gatekeeper = Gatekeeper::new(&world, level).await;
-        for (name, (script, answers)) in [("failed", front_desk_down()), ("sent", landed())] {
+        for flow in flows() {
             for v2 in [false, true] {
                 let id = if v2 { world.v2(None).await } else { world.v1().await };
-                let got = gatekeeper.send(&world, id, script.clone(), &answers, HOME).await;
-                assert!(texts(&got).iter().all(|frame| frame["type"] != "sender"));
-                seen.insert((name, level, v2), got);
+                let got = gatekeeper.send(&world, id, flow.script.clone(), &flow.answers, HOME).await;
+                let mut expected = flow.before.clone();
+                if let (Level::Public, Some(class), Some(Got::Text(last))) = (level, flow.class, expected.last_mut()) {
+                    last.truncate(last.len() - 1);
+                    last.push_str(&format!(r#","class":"{class}"}}"#));
+                }
+                assert_eq!(got, expected, "{}: {level:?}, v2 {v2}", flow.name);
             }
         }
     }
-    for name in ["failed", "sent"] {
-        let before = &seen[&(name, Level::Off, false)];
-        // What the Sender sent, in order: the opens, then the result.
-        assert!(matches!(before.last(), Some(Got::Text(text)) if text.contains(r#""type":"result""#)));
-        for v2 in [false, true] {
-            assert_eq!(&seen[&(name, Level::Off, v2)], before, "{name}: off, v2 {v2}");
-            assert_eq!(&seen[&(name, Level::Record, v2)], before, "{name}: record, v2 {v2}");
-            let public = &seen[&(name, Level::Public, v2)];
-            assert_eq!(public.len(), before.len());
-            assert_eq!(public[..public.len() - 1], before[..before.len() - 1], "{name}: public, v2 {v2}");
-            let (Got::Text(old), Got::Text(new)) = (before.last().unwrap(), public.last().unwrap()) else {
-                panic!("a result");
-            };
-            if name == "sent" {
-                assert_eq!(new, old, "nothing is added to a send that got in");
-            } else {
-                assert_eq!(new, &format!("{},\"class\":\"bir\"}}", &old[..old.len() - 1]));
-            }
-        }
+    // The Sender unreachable.
+    for level in [Level::Off, Level::Record, Level::Public] {
+        let uptime = Uptime::new(level, vec![22], false, OffsetDateTime::now_utc());
+        let gatekeeper = Gatekeeper::at(&world, uptime, "http://127.0.0.1:9", FakeSender::default()).await;
+        let got = gatekeeper.send(&world, world.v1().await, vec![], &[], HOME).await;
+        let expected = match level {
+            Level::Public => before::UNREACHABLE.replace(r#""receipt":null}"#, r#""receipt":null,"class":"ours"}"#),
+            _ => before::UNREACHABLE.to_owned(),
+        };
+        assert_eq!(got, [Got::Text(expected)], "unreachable: {level:?}");
     }
     // Off records nothing; record and public a row per try.
-    assert_eq!(tries(&db).await.len(), 8);
-    // From `public` a failed submission keeps the Sender's mode.
+    assert_eq!(wait_for(&db, 2 * 2 * flows().len() + 2).await.len(), 2 * 2 * flows().len() + 2);
+    // From `public` a failed submission keeps the Sender's mode; below it,
+    // none.
     let modes: Vec<Option<String>> =
         sqlx::query_scalar("SELECT mode FROM submissions WHERE status = 'failed' ORDER BY created_at")
             .fetch_all(&db)
             .await
             .unwrap();
-    assert_eq!(modes, [None, None, None, None, Some("live".to_owned()), Some("live".to_owned())]);
+    let live = Some("live".to_owned());
+    // Per level: two front-desk failures and two app-gone failures.
+    assert_eq!(modes[..8], [None, None, None, None, None, None, None, None]);
+    assert_eq!(modes[8..12], [live.clone(), live.clone(), live.clone(), live]);
+    assert_eq!(modes[12..], [None, None, None]);
 }
 
 /// The classes an app is told at `public`: one per side, absent for a try
@@ -735,6 +1004,12 @@ async fn at_public_the_result_says_whose_side(db: PgPool) {
         )
         .await;
     assert_eq!(the_result(&got).unwrap().get("class"), None);
+    // No `sender` frame (a Sender from before it): like lab, nothing told.
+    let (script, answers) = front_desk_down();
+    let got = gatekeeper.send(&world, world.v1().await, script[1..].to_vec(), &answers, HOME).await;
+    assert_eq!(the_result(&got).unwrap().get("class"), None);
+    let row = newest(&db).await;
+    assert_eq!((row.mode.as_str(), row.failure_class.as_deref(), row.counted), ("unknown", None, false));
 }
 
 /// `off` records nothing and still keeps the `sender` frame from the app.
@@ -781,7 +1056,8 @@ async fn a_send_concludes_when_the_record_cannot_be_written(db: PgPool) {
 async fn an_unreachable_sender_is_ours(db: PgPool) {
     let world = World::new(db.clone()).await;
     // Nothing listens on the discard port.
-    let gatekeeper = Gatekeeper::at(&world, Level::Public, "http://127.0.0.1:9", FakeSender::default()).await;
+    let uptime = Uptime::new(Level::Public, vec![22], false, OffsetDateTime::now_utc());
+    let gatekeeper = Gatekeeper::at(&world, uptime, "http://127.0.0.1:9", FakeSender::default()).await;
     let got = gatekeeper.send(&world, world.v1().await, vec![], &[], HOME).await;
     let result = the_result(&got).unwrap();
     assert_eq!(result["class"], "ours");
@@ -806,7 +1082,8 @@ async fn the_real_sender_says_its_mode(db: PgPool) {
     let uptime = Uptime::new(Level::Record, vec![22], false, OffsetDateTime::now_utc());
     let site = Site::with_sender(db.clone(), &url, &secret, uptime);
     let base = serve(site.router).await;
-    let gatekeeper = Gatekeeper { base, sender: FakeSender::default() };
+    let gatekeeper =
+        Gatekeeper { base, sender: FakeSender::default(), state: site.state, result_after: Mutex::new(None) };
     let got = gatekeeper.send(&world, world.v1().await, vec![], &[], HOME).await;
     // The made-up return does not match its file name: refused before
     // anything opens.
@@ -816,4 +1093,214 @@ async fn the_real_sender_says_its_mode(db: PgPool) {
     let row = newest(&db).await;
     assert_eq!(row.summary(), ("dry_run", "failed", "none", "none", "none", None, None, false));
     assert!(!row.touched_bir && row.opens == 0);
+}
+
+/// The app has its `result` at once, however long the record takes: the
+/// record is written after the result, off the send's path.
+#[sqlx::test]
+async fn the_result_never_waits_for_the_record(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::new(&world, Level::Record).await;
+    // Another session holds `bir_tries` for 3 seconds: every insert waits.
+    let mut lock = db.begin().await.unwrap();
+    sqlx::query("LOCK TABLE bir_tries IN ACCESS EXCLUSIVE MODE").execute(&mut *lock).await.unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        lock.rollback().await.unwrap();
+    });
+    let (script, answers) = front_desk_down();
+    let id = world.v1().await;
+    let got = gatekeeper.send_only(&world, id, script, &answers, HOME).await;
+    let after = gatekeeper.result_after.lock().unwrap().expect("a result");
+    assert!(after < Duration::from_millis(1500), "the result came after {after:?}");
+    assert_eq!(the_result(&got).unwrap()["status"], "failed");
+    assert_eq!(status(&db, id).await.0, "failed");
+    // The record is being written, and is once the table is free.
+    assert_eq!(gatekeeper.state.uptime.recorder.pending(), 1);
+    gatekeeper.state.uptime.recorder.settled().await;
+    release.await.unwrap();
+    assert_eq!(tries(&db).await.len(), 1);
+    // At shutdown, new records are refused and those written are waited for.
+    assert!(gatekeeper.state.uptime.recorder.drain(Duration::from_secs(1)).await);
+    let (script, answers) = front_desk_down();
+    gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
+    assert_eq!(tries(&db).await.len(), 1);
+}
+
+/// A try that started before Manila midnight and ends after it gets the
+/// keys of when it is recorded: the same account and network have the same
+/// keys as a try that started after midnight.
+#[sqlx::test]
+async fn keys_are_taken_when_a_try_is_recorded(db: PgPool) {
+    let manila = |hms: (u8, u8, u8), day: u8| {
+        time::Date::from_calendar_date(2026, time::Month::November, day)
+            .unwrap()
+            .with_hms(hms.0, hms.1, hms.2)
+            .unwrap()
+            .assume_offset(MANILA)
+    };
+    let uptime = Uptime::new(Level::Record, vec![22], false, manila((23, 59, 0), 11));
+    let account = Uuid::new_v4();
+    let network = Network::V4([203, 0, 113]);
+    let observed = || {
+        let mut observer = TryObserver::new(&[22]);
+        observer.sender_text(&sender::sender_frame(RelayMode::Live));
+        observer.finish("failed", Some(sender::NOT_BUILT_IN))
+    };
+    let relay = |started_at| RelayTry {
+        account_id: account,
+        network: network.clone(),
+        client: None,
+        admission: "open".into(),
+        started_at,
+    };
+    // A starts at 23:59:40; B at 00:00:05 and ends first, at 00:00:15; A
+    // ends at 00:00:30.
+    let a = relay(manila((23, 59, 40), 11));
+    let b = relay(manila((0, 0, 5), 12));
+    store::record(&uptime, &db, &b, &observed(), manila((0, 0, 15), 12)).await;
+    store::record(&uptime, &db, &a, &observed(), manila((0, 0, 30), 12)).await;
+    let rows = tries(&db).await;
+    assert_eq!(rows.len(), 2);
+    let keys = |row: &TryRow| (row.key_epoch, row.account_key.clone(), row.network_key.clone());
+    assert_eq!(keys(&rows[1]), keys(&rows[0]));
+    // Its start stays its own.
+    assert_eq!(rows[1].started_at, manila((23, 59, 0), 11));
+}
+
+/// A host key is recorded with whether the Sender went on to complete the
+/// key exchange, and its row is written only when a sighting adds
+/// something: not again for the same account and network in a key period.
+#[sqlx::test]
+async fn host_key_sightings_say_whether_the_key_exchange_completed(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::new(&world, Level::Record).await;
+    let (ssh, fingerprint) = handshake();
+    let upload = |last: Step| {
+        vec![
+            hello(RelayMode::Live),
+            open(1, "dispatcher.test", 443),
+            Step::Expect(2),
+            open(2, "upload.test", 22),
+            Step::Expect(2),
+            last,
+        ]
+    };
+    let answers = [(443, Answer::Open(vec![0x16; 200])), (22, Answer::Open(ssh.clone()))];
+    let not_pinned =
+        result("failed", Some("the SFTP server's host key is not pinned (see the log for its fingerprint)"), None);
+    gatekeeper.send(&world, world.v1().await, upload(not_pinned.clone()), &answers, HOME).await;
+    let row = || async {
+        sqlx::query_as::<_, (Value, String)>("SELECT seen, xmin::text FROM bir_host_keys WHERE fingerprint = $1")
+            .bind(&fingerprint)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+    };
+    let (seen, version) = row().await;
+    assert_eq!(seen.as_array().unwrap().len(), 1);
+    assert_eq!(seen[0]["kex_done"], false);
+    // The same again from the same account and network adds nothing: the
+    // row is not rewritten.
+    gatekeeper.send(&world, world.v1().await, upload(not_pinned.clone()), &answers, HOME).await;
+    assert_eq!(row().await, (seen.clone(), version.clone()));
+    // A try that got in completed it: a new sighting.
+    gatekeeper.send(&world, world.v1().await, upload(result("sent", None, Some(receipt()))), &answers, HOME).await;
+    let (seen, version) = row().await;
+    assert_eq!(seen.as_array().unwrap().iter().map(|s| s["kex_done"].clone()).collect::<Vec<_>>(), [false, true]);
+    // Every pinned upload from here adds nothing either.
+    for _ in 0..3 {
+        gatekeeper.send(&world, world.v1().await, upload(result("sent", None, Some(receipt()))), &answers, HOME).await;
+    }
+    assert_eq!(row().await, (seen.clone(), version.clone()));
+    // Another network in the same key period is new.
+    gatekeeper.send(&world, world.v1().await, upload(not_pinned), &answers, "198.51.100.4").await;
+    let (seen, _) = row().await;
+    assert_eq!(seen.as_array().unwrap().len(), 3);
+    let periods = store::periods(&seen);
+    assert_eq!(periods.len(), 1);
+    assert_eq!((periods[0].accounts, periods[0].networks, periods[0].kex_done_accounts), (1, 2, 1));
+
+    // The database itself does not rewrite the row for a sighting it holds
+    // (another process, or one this one has forgotten).
+    let keys = buwiz_cloud::uptime::keys::Keys { epoch: 77, account: [1; 8], network: [2; 8] };
+    let now = OffsetDateTime::now_utc();
+    store::note_host_key(&db, &fingerprint, &keys, true, now).await.unwrap();
+    let before = row().await;
+    store::note_host_key(&db, &fingerprint, &keys, true, now).await.unwrap();
+    assert_eq!(row().await, before);
+}
+
+/// `BIR_UPTIME_UPLOAD_PORTS` decides which stream is the upload: with
+/// 2222, a stream on 2222 is the mailbox and one on 22 the front desk.
+#[sqlx::test]
+async fn the_upload_window_is_on_the_ports_set(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::with_ports(&world, Level::Record, vec![2222]).await;
+    let script = |port: u16| {
+        vec![
+            hello(RelayMode::Live),
+            open(1, "dispatcher.test", 443),
+            Step::Expect(2),
+            open(2, "upload.test", port),
+            Step::Expect(2),
+            result("failed", Some("SSH failed: Disconnected"), None),
+        ]
+    };
+    let answers = [
+        (443, Answer::Open(vec![0x16; 200])),
+        (2222, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec())),
+        (22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec())),
+    ];
+    gatekeeper.send(&world, world.v1().await, script(2222), &answers, HOME).await;
+    assert_eq!(newest(&db).await.summary(), ("live", "failed", "upload", "ok", "fail", Some("bir"), Some("ssh"), true));
+    gatekeeper.send(&world, world.v1().await, script(22), &answers, HOME).await;
+    let row = newest(&db).await;
+    assert_eq!((row.stage.as_str(), row.upload.as_str()), ("dispatcher", "none"));
+}
+
+/// Why the bridge does not look at the TIN before recording: a claim's TIN
+/// always parses (the database refuses one that would not), and a test
+/// TIN's return is refused before any Sender, so it is never recorded.
+#[sqlx::test]
+async fn no_tin_that_should_not_be_recorded_reaches_the_record(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    for (root, branch) in [("00012345X", "00000"), ("00012345", "00000"), ("000123453", "0000A")] {
+        let refused = sqlx::query("UPDATE tin_claims SET tin_root = $2, branch_code = $3 WHERE id = $1")
+            .bind(world.claim)
+            .bind(root)
+            .bind(branch)
+            .execute(&db)
+            .await;
+        match refused {
+            Err(sqlx::Error::Database(error)) => assert_eq!(error.code().as_deref(), Some("23514"), "{root}"),
+            other => panic!("{root}-{branch} should break a check: {other:?}"),
+        }
+    }
+    let gatekeeper = Gatekeeper::new(&world, Level::Record).await;
+    let (script, answers) = front_desk_down();
+    gatekeeper.send(&world, world.v1().await, script.clone(), &answers, HOME).await;
+    assert_eq!(tries(&db).await.len(), 1);
+
+    let test_claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'business', '000000000', '00001', 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
+    )
+    .bind(world.account)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let id = world.v1().await;
+    sqlx::query("UPDATE submissions SET claim_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(test_claim)
+        .execute(&db)
+        .await
+        .unwrap();
+    let got = gatekeeper.send(&world, id, script, &answers, HOME).await;
+    // Refused before any Sender: the result alone.
+    assert_eq!(got.len(), 1);
+    let result = the_result(&got).unwrap();
+    assert_eq!(result["error"], buwiz_cloud::filing::gate::Standing::TestOnly.failure());
+    assert_eq!(tries(&db).await.len(), 1);
 }

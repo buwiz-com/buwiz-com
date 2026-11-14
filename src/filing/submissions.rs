@@ -519,10 +519,10 @@ async fn run_relay(
         }
         _ => anyhow::bail!("submission {id} has nothing to send"),
     };
-    // A test TIN's return is never sent, and never evidence: it is not
-    // recorded at all.
-    let test_tin = Tin::parse_any(&locked.tin_root, &locked.branch_code).map_or(true, |tin| tin.is_test());
-    let recording = context.filter(|_| !test_tin).map(|context| RelayTry {
+    // A test TIN's return never gets here (`gate::SENDABLE_SQL` keeps it
+    // from being claimed), so it is never recorded. Every return that does
+    // is a real send, whatever its TIN reads as.
+    let recording = context.map(|context| RelayTry {
         account_id,
         network: context.network,
         client: context.client,
@@ -643,9 +643,9 @@ fn with_fields(mut object: String, fields: &[(&str, Value)]) -> String {
     object
 }
 
-/// Concludes the try: records `result`, then the try's uptime row (which
-/// never fails the send), then tells the app (unless it is gone) and closes
-/// its socket.
+/// Concludes the try: records `result`, tells the app (unless it is gone)
+/// and closes its socket, then writes the try's uptime row in a task of its
+/// own ([`store::Recorder`]), which never delays or fails the send.
 #[allow(clippy::too_many_arguments)]
 async fn settle(
     state: &AppState,
@@ -654,9 +654,10 @@ async fn settle(
     v2: bool,
     result: &Control,
     observer: Option<TryObserver>,
-    recording: Option<&RelayTry>,
+    recording: Option<RelayTry>,
     app_gone: bool,
 ) -> anyhow::Result<()> {
+    let ended_at = OffsetDateTime::now_utc();
     let observed = match (observer, result) {
         (Some(observer), Control::Result { status, error, .. }) => Some(observer.finish(status, error.as_deref())),
         _ => None,
@@ -666,13 +667,16 @@ async fn settle(
         _ => Told::default(),
     };
     let text = conclude(&state.db, id, v2, result, &told).await?;
-    if let (Some(observed), Some(recording)) = (&observed, recording) {
-        store::record(&state.uptime, &state.db, recording, observed, OffsetDateTime::now_utc()).await;
-    }
+    // Taken before the app is told, so whoever waits for the records waits
+    // for this one too.
+    let slot = observed.as_ref().and(recording.as_ref()).and_then(|_| store::Recorder::slot(&state.uptime));
     if !app_gone {
         let _ = app_tx.send(Message::Text(text.into())).await;
     }
     let _ = app_tx.send(Message::Close(None)).await;
+    if let (Some(slot), Some(observed), Some(recording)) = (slot, observed, recording) {
+        slot.record(state.db.clone(), recording, observed, ended_at);
+    }
     Ok(())
 }
 
@@ -702,7 +706,7 @@ async fn bridge(
                 observer.sender_down();
             }
             let result = finish("failed", "the sending service is not reachable; try again later".into());
-            return settle(state, &mut app_tx, id, v2, &result, observer, recording.as_ref(), false).await;
+            return settle(state, &mut app_tx, id, v2, &result, observer, recording, false).await;
         }
     };
     let (mut up_tx, mut up_rx) = upstream.split();
@@ -711,13 +715,14 @@ async fn bridge(
             observer.sender_down();
         }
         let result = finish("failed", "the sending service is not reachable; try again later".into());
-        return settle(state, &mut app_tx, id, v2, &result, observer, recording.as_ref(), false).await;
+        return settle(state, &mut app_tx, id, v2, &result, observer, recording, false).await;
     }
     // Streams the Sender asked the app to open, so they can be ended if the
     // app goes away.
     let mut streams: Vec<u8> = Vec::new();
     let mut app_gone = false;
     let mut result = None;
+    let mut deadline_passed = false;
     let deadline = tokio::time::sleep(Duration::from_secs(24 * 3600));
     tokio::pin!(deadline);
     loop {
@@ -785,14 +790,18 @@ async fn bridge(
                 Some(Ok(Up::Close(_)) | Err(_)) | None => break,
                 Some(Ok(_)) => {}
             },
-            _ = &mut deadline => break,
+            _ = &mut deadline => {
+                deadline_passed = true;
+                break;
+            }
         }
     }
     let _ = up_tx.send(Up::Close(None)).await;
     if result.is_none()
         && let Some(observer) = observer.as_mut()
     {
-        observer.sender_lost();
+        // After the app went away the deadline is the 60 s outcome wait.
+        if deadline_passed && app_gone { observer.wait_expired() } else { observer.sender_lost() }
     }
     let result = result.unwrap_or_else(|| {
         if streams.is_empty() {
@@ -801,7 +810,7 @@ async fn bridge(
             finish("unknown", "the send ended without an outcome; BIR may have received this return".into())
         }
     });
-    settle(state, &mut app_tx, id, v2, &result, observer, recording.as_ref(), app_gone).await
+    settle(state, &mut app_tx, id, v2, &result, observer, recording, app_gone).await
 }
 
 /// Key id of a receipt key. See [`jws::key_id`].

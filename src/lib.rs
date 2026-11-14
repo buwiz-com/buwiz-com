@@ -73,11 +73,14 @@ pub async fn run() -> anyhow::Result<()> {
     if let Err(error) = ocr::resume(&state).await {
         tracing::error!(error = ?error, "could not resume document readings");
     }
+    let uptime = state.uptime.clone();
     let app = app(state);
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;
     tracing::info!("listening on http://{address}");
     axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
+    // The BIR uptime records still being written get a few seconds.
+    uptime.recorder.drain(std::time::Duration::from_secs(10)).await;
     Ok(())
 }
 

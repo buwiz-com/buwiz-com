@@ -112,10 +112,12 @@ impl Alert {
         Self { at, subject, line, event_id, key: None, budget: Budget::Sign }
     }
 
-    /// What one run of the rules wrote that staff hear of: a change of the
-    /// overall sign (with the windows' reasons of the same run), a window
-    /// going Offline or coming back when the overall sign did not change,
-    /// a note's line, the stored sign reset, and the relay resuming.
+    /// What one run of the rules wrote that staff hear of (the owner's rule
+    /// of 2026-11-14): the overall sign going Offline or coming back from
+    /// Offline (with the windows' reasons of the same run), a window going
+    /// Offline while a "declare Online" note is in force, a note's line,
+    /// the stored sign reset, and the relay resuming. Other changes are in
+    /// the event log only.
     pub fn for_run(written: &[Written], state: &SignState) -> Vec<Self> {
         let windows: Vec<String> = written
             .iter()
@@ -132,15 +134,29 @@ impl Alert {
             let subject = match event.scope {
                 // The first line of the history is no change.
                 Scope::Overall if event.from == "none" => continue,
+                // The owner's rule: of the sign's own changes, only going
+                // Offline and coming back from it are mailed. Notes and a
+                // reset always are.
+                Scope::Overall
+                    if !mailed_cause(event.cause)
+                        && event.from != event.to
+                        && to != Some(Light::Offline)
+                        && from != Some(Light::Offline) =>
+                {
+                    continue;
+                }
+                Scope::Overall if !mailed_cause(event.cause) && event.from == event.to => continue,
                 Scope::Overall => overall_subject(event.cause, to, from, state),
                 Scope::Relay if event.to == "paused" => "Buwiz: sending paused".to_owned(),
                 Scope::Relay => "Buwiz: sending resumed".to_owned(),
                 Scope::Dispatcher | Scope::Upload => {
-                    let leaves = from == Some(Light::Offline) && to != Some(Light::Offline);
-                    if overall_changed || !(to == Some(Light::Offline) || leaves) {
+                    // Only a window going Offline under a "declare Online"
+                    // note, which the overall sign does not show.
+                    let declared = state.note.as_ref().is_some_and(|note| note.kind == NoteKind::Online);
+                    if overall_changed || !declared || to != Some(Light::Offline) || from == Some(Light::Offline) {
                         continue;
                     }
-                    alerts.push(window_alert(written, leaves, state));
+                    alerts.push(window_alert(written, state));
                     continue;
                 }
                 Scope::Watch => continue,
@@ -250,9 +266,9 @@ impl Alert {
     }
 }
 
-/// A window went Offline or came back while the overall sign did not move
-/// (a note decides it, or the other window already did).
-fn window_alert(written: &Written, leaves: bool, state: &SignState) -> Alert {
+/// A window went Offline while a "declare Online" note keeps the overall
+/// sign Online.
+fn window_alert(written: &Written, state: &SignState) -> Alert {
     let event = &written.event;
     let side = if event.scope == Scope::Dispatcher { Side::Dispatcher } else { Side::Upload };
     let to = Light::parse(&event.to).unwrap_or(Light::NoRecentNews);
@@ -268,8 +284,14 @@ fn window_alert(written: &Written, leaves: bool, state: &SignState) -> Alert {
         sentence(&event.reason),
         word(state.state),
     );
-    let subject = if leaves { format!("BIR: {} back", side.word()) } else { format!("BIR: {} offline", side.word()) };
+    let subject = format!("BIR: {} offline", side.word());
     Alert::sign(written.at, subject, line, Some(written.id))
+}
+
+/// Causes whose overall line is always mailed: an Admin's note, a note
+/// ending, and a stored sign that could not be read.
+fn mailed_cause(cause: Cause) -> bool {
+    matches!(cause, Cause::NoteSet | Cause::NoteCleared | Cause::NoteExpired | Cause::NoteReturnGotIn | Cause::Reset)
 }
 
 fn word(light: Light) -> &'static str {

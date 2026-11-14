@@ -547,7 +547,7 @@ recorded with mode `unknown` and not counted.
 
 **Admins and Support are mailed from this release** (every Admin and
 Support account not banned, and `ADMIN_EMAILS`, through the existing mail
-transport): changes of the BIR sign, notes, five failures in a row, "the
+transport): the BIR sign going Offline and coming back from it, notes, five failures in a row, "the
 relay would pause" (nothing pauses yet), host keys that are not pinned and
 other faults on Buwiz's side, at most 48, 3 and 8 alerts a Manila day by
 kind, batched every 10 minutes ([bir-uptime.md](bir-uptime.md#157-staff-mail)).

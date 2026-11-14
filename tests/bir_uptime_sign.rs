@@ -926,19 +926,18 @@ async fn staff_mail_is_batched_every_ten_minutes(db: PgPool) {
     let config = &site.state.config;
     let uptime = uptime(t(0));
     an_outage(&uptime, &db).await;
-    // The first change mails at once ...
+    // Going Offline mails at once; Online and Busy before it are only in
+    // the event log (the owner's rule) ...
     let mail = alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap().unwrap();
-    assert_eq!(mail.subject, "BIR: online (and 2 more)");
-    assert!(mail.text.contains("10:00 AM  Online: The mailbox is online."), "{}", mail.text);
-    assert!(mail.text.contains("10:11 AM  Busy: The mailbox is busy."), "{}", mail.text);
+    assert_eq!(mail.subject, "BIR: mailbox offline");
+    assert!(!mail.text.contains("Online: The mailbox is online."), "{}", mail.text);
+    assert!(!mail.text.contains("Busy: The mailbox is busy."), "{}", mail.text);
     assert!(mail.text.contains(
         "10:12 AM  Offline: The mailbox is offline. 3 accounts on 3 networks didn't get past the mailbox within 15 min."
     ));
     let to: Vec<String> = mailer.notices().into_iter().map(|notice| notice.to).collect();
     assert_eq!(to, ["admin@example.test", STAFF, "support@example.test"], "Admins and Support, not the banned");
-    let mailed: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM bir_events WHERE mailed_at IS NOT NULL").fetch_one(&db).await.unwrap();
-    assert_eq!(mailed, 3, "the three changes of the overall sign");
+    assert_eq!(mailed(&db).await, (1, 2), "Offline mailed; Online and Busy logged only");
 
     // ... the next ones wait for the end of the 10 minutes and go together.
     record(&uptime, &db, 5, 5, Ends::Landed, t(15)).await;
@@ -987,13 +986,17 @@ async fn each_kind_of_staff_mail_has_its_own_budget(db: PgPool) {
         .map(|notice| notice.text.matches("SHA256:").count())
         .sum();
     assert_eq!(keys as u32, Budget::HostKey.per_day(), "across every fingerprint");
-    // Their budgets are spent; a change of the sign is still mailed.
+    // Their budgets are spent; the sign's own are not. Turning Online is
+    // logged only; an outage an Admin sets is mailed.
     for account in 1..=3 {
         record(&uptime, &db, account, account as u8, Ends::Landed, t(125)).await;
     }
+    let admin = admin(&site).await;
+    let outage = NewNote { kind: NoteKind::Outage, text: "Made-up outage", until: t(300) };
+    notes::set(&uptime, &db, config, &admin, outage, t(126)).await.unwrap();
     let mail = alerts::flush(&uptime, &db, &mailer, config, t(130)).await.unwrap().unwrap();
-    assert_eq!(mail.subject, "BIR: online");
-    assert_eq!(mailed(&db).await, (1, 0));
+    assert_eq!(mail.subject, "BIR: an Admin set a note");
+    assert_eq!(mailed(&db).await, (1, 1));
 }
 
 #[sqlx::test]
@@ -1005,13 +1008,13 @@ async fn a_mail_that_went_nowhere_is_tried_again_and_spends_nothing(db: PgPool) 
     mailer.fail_notices(true);
     assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap(), None);
     assert_eq!(mailed(&db).await, (0, 3), "not marked mailed");
-    // A minute later, the mailer back: the same alerts go, and only now are
-    // they marked.
+    // A minute later, the mailer back: the same alert goes, and only now is
+    // it marked.
     mailer.fail_notices(false);
     assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(12) + Duration::seconds(30)).await.unwrap(), None);
     let mail = alerts::flush(&uptime, &db, &mailer, config, t(13)).await.unwrap().unwrap();
-    assert_eq!(mail.subject, "BIR: online (and 2 more)");
-    assert_eq!(mailed(&db).await, (3, 0));
+    assert_eq!(mail.subject, "BIR: mailbox offline");
+    assert_eq!(mailed(&db).await, (1, 2));
     assert_eq!(mailer.notices().len(), 3, "one mail to each of the three");
 }
 
@@ -1040,10 +1043,38 @@ async fn a_window_change_is_mailed_under_a_declare_online_note(db: PgPool) {
         "{}",
         mail.text
     );
-    // And back.
+    // Back: logged, not mailed (the overall sign never left Online).
     record(&uptime, &db, 4, 4, Ends::Landed, t(30)).await;
-    let mail = alerts::flush(&uptime, &db, &mailer, config, t(30)).await.unwrap().unwrap();
-    assert_eq!(mail.subject, "BIR: mailbox back");
+    assert_eq!(uptime.live.sign().upload.state, Light::Online);
+    assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(30)).await.unwrap(), None);
+}
+
+/// The owner's rule: of the sign's own changes only going Offline and
+/// coming back from it are mailed; a window alone is not (but under a
+/// "declare Online" note, above).
+#[sqlx::test]
+async fn only_offline_and_back_are_mailed(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let config = &site.state.config;
+    let uptime = uptime(t(0));
+    an_outage(&uptime, &db).await;
+    alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap().unwrap();
+    // Back to Online: mailed after the 10 minutes.
+    record(&uptime, &db, 5, 5, Ends::Landed, t(15)).await;
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(22)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: back online");
+    // An hour of quiet later: No recent news, logged only.
+    alerts::flush(&uptime, &db, &mailer, config, t(80)).await.unwrap();
+    buwiz_cloud::uptime::live::tick(&uptime, &db, t(90)).await.unwrap();
+    assert_eq!(uptime.live.sign().state, Light::NoRecentNews);
+    assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(100)).await.unwrap(), None);
+    let unmailed: Vec<String> = sqlx::query_scalar(
+        "SELECT to_state FROM bir_events WHERE scope = 'overall' AND mailed_at IS NULL AND from_state <> 'none' ORDER BY id",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(unmailed, ["online", "busy", "no_recent_news"]);
 }
 
 #[sqlx::test]

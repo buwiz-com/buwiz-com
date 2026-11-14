@@ -1086,10 +1086,13 @@ plain text; logged with `MAIL_TRANSPORT=log`), to every Admin and Support
 not banned and every address in `ADMIN_EMAILS`. This release mails them.
 What is mailed:
 
-- every change of the overall sign (with the windows' reasons), a window
-  going Offline or coming back when the overall sign does not change (a
-  "declare Online" note in force, say), every note set, cleared or ended,
-  and a reset of the stored sign;
+- the overall sign going Offline, and coming back from Offline to anything
+  else (with the windows' reasons); a window going Offline while a "declare
+  Online" note is in force (the overall sign does not show it); every note
+  set, cleared or ended; and a reset of the stored sign. Other changes of
+  the sign (Online, Busy and No recent news among themselves) and of a
+  window alone are in the event log only, not mailed (the owner's rule of
+  2026-11-14);
 - 5 failures in a row, and a return that got in during maintenance;
 - "the relay would pause" (at most once a day while it holds);
 - a missing `CF-Connecting-IP` in production (at most once an hour);

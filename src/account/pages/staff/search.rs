@@ -75,76 +75,76 @@ pub async fn search_page(cx: &Cx) -> Result<impl View> {
                         <p class="sx-empty">"Type an email, a registered or trade name, or a TIN's digits."</p>
                     } else {
                         if people_part {
-                        <section class="sx-results" aria-labelledby="sx-found-people">
-                            <h2 id="sx-found-people">"People" <span class="sx-count">(people_count.to_string())</span></h2>
-                            if people.is_empty() {
-                                <p class="sx-card sx-empty big">"No accounts match that search."</p>
-                            } else {
-                                <div class="sx-card sx-tablewrap">
-                                    <table class="sx-table users">
-                                        <colgroup><col class="c-acct"><col><col class="c-tins"></colgroup>
-                                        <thead>
-                                            <tr><th scope="col">"Account"</th><th scope="col">"Registered name"</th><th scope="col">"TINs"</th></tr>
-                                        </thead>
-                                        <tbody>
-                                            for (user, names, live, badge) in people {
-                                                <tr data-id=(user.id.to_string())>
-                                                    <td class="a-main">
-                                                        <span class="sx-acct">
-                                                            avatar(email: user.email.clone(), size: "sm")
-                                                            <a class="sx-rowlink" href=(format!("/staff/users/{}", user.id))>(user.email.clone())</a>
-                                                            if let Some((label, _)) = badge {
-                                                                sx_pill(label: label, sym: "shield", tone: "info")
-                                                            }
-                                                            if user.test_account {
-                                                                sx_pill(label: "Test", sym: "flask", tone: "test")
-                                                            }
-                                                            if user.banned_at.is_some() {
-                                                                sx_pill(label: "Banned", sym: "ban", tone: "bad")
-                                                            }
-                                                        </span>
-                                                    </td>
-                                                    <td class="m cut a-sub">(if names.is_empty() { "No TIN added".to_owned() } else { names })</td>
-                                                    <td class="m a-side">(format!("{live} TIN{}", if live == 1 { "" } else { "s" }))</td>
-                                                </tr>
-                                            }
-                                        </tbody>
-                                    </table>
-                                </div>
-                            }
-                        </section>
+                            <section class="sx-results" aria-labelledby="sx-found-people">
+                                <h2 id="sx-found-people">"People" <span class="sx-count">(people_count.to_string())</span></h2>
+                                if people.is_empty() {
+                                    <p class="sx-card sx-empty big">"No accounts match that search."</p>
+                                } else {
+                                    <div class="sx-card sx-tablewrap">
+                                        <table class="sx-table users">
+                                            <colgroup><col class="c-acct"><col><col class="c-tins"></colgroup>
+                                            <thead>
+                                                <tr><th scope="col">"Account"</th><th scope="col">"Registered name"</th><th scope="col">"TINs"</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                for (user, names, live, badge) in people {
+                                                    <tr data-id=(user.id.to_string())>
+                                                        <td class="a-main">
+                                                            <span class="sx-acct">
+                                                                avatar(email: user.email.clone(), size: "sm")
+                                                                <a class="sx-rowlink" href=(format!("/staff/users/{}", user.id))>(user.email.clone())</a>
+                                                                if let Some((label, _)) = badge {
+                                                                    sx_pill(label: label, sym: "shield", tone: "info")
+                                                                }
+                                                                if user.test_account {
+                                                                    sx_pill(label: "Test", sym: "flask", tone: "test")
+                                                                }
+                                                                if user.banned_at.is_some() {
+                                                                    sx_pill(label: "Banned", sym: "ban", tone: "bad")
+                                                                }
+                                                            </span>
+                                                        </td>
+                                                        <td class="m cut a-sub">(if names.is_empty() { "No TIN added".to_owned() } else { names })</td>
+                                                        <td class="m a-side">(format!("{live} TIN{}", if live == 1 { "" } else { "s" }))</td>
+                                                    </tr>
+                                                }
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                }
+                            </section>
                         }
                         if claims_part {
-                        <section class="sx-results" aria-labelledby="sx-found-claims">
-                            <h2 id="sx-found-claims">"TIN claims" <span class="sx-count">(claim_count.to_string())</span></h2>
-                            if claims.is_empty() {
-                                <p class="sx-card sx-empty big">"No claims match that search."</p>
-                            } else {
-                                <div class="sx-card sx-tablewrap">
-                                    <table class="sx-table">
-                                        <colgroup><col class="c-tin"><col><col class="sx-col-wide"><col class="c-status"></colgroup>
-                                        <thead>
-                                            <tr><th scope="col">"TIN"</th><th scope="col">"Name"</th><th scope="col" class="sx-col-wide">"Email"</th><th scope="col">"Status"</th></tr>
-                                        </thead>
-                                        <tbody>
-                                            for claim in claims {
-                                                <tr data-id=(claim.id.to_string())>
-                                                    <td class="a-main">
-                                                        <span class="sx-cell-tin">
-                                                            kind_icon(kind: claim.kind.clone())
-                                                            <a class="sx-rowlink" href=(format!("/staff/claims/{}", claim.id))>(claim.tin().to_string())</a>
-                                                        </span>
-                                                    </td>
-                                                    <td class="b cut a-sub">(claim.registered_name.clone())</td>
-                                                    <td class="m cut sx-col-wide">(claim.email.clone())</td>
-                                                    <td class="a-side">status_pill(status: claim.shown_status().to_owned())</td>
-                                                </tr>
-                                            }
-                                        </tbody>
-                                    </table>
-                                </div>
-                            }
-                        </section>
+                            <section class="sx-results" aria-labelledby="sx-found-claims">
+                                <h2 id="sx-found-claims">"TIN claims" <span class="sx-count">(claim_count.to_string())</span></h2>
+                                if claims.is_empty() {
+                                    <p class="sx-card sx-empty big">"No claims match that search."</p>
+                                } else {
+                                    <div class="sx-card sx-tablewrap">
+                                        <table class="sx-table">
+                                            <colgroup><col class="c-tin"><col><col class="sx-col-wide"><col class="c-status"></colgroup>
+                                            <thead>
+                                                <tr><th scope="col">"TIN"</th><th scope="col">"Name"</th><th scope="col" class="sx-col-wide">"Email"</th><th scope="col">"Status"</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                for claim in claims {
+                                                    <tr data-id=(claim.id.to_string())>
+                                                        <td class="a-main">
+                                                            <span class="sx-cell-tin">
+                                                                kind_icon(kind: claim.kind.clone())
+                                                                <a class="sx-rowlink" href=(format!("/staff/claims/{}", claim.id))>(claim.tin().to_string())</a>
+                                                            </span>
+                                                        </td>
+                                                        <td class="b cut a-sub">(claim.registered_name.clone())</td>
+                                                        <td class="m cut sx-col-wide">(claim.email.clone())</td>
+                                                        <td class="a-side">status_pill(status: claim.shown_status().to_owned())</td>
+                                                    </tr>
+                                                }
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                }
+                            </section>
                         }
                         <p class="sx-fine">(format!("Up to {} of each show; add more of the email, name or TIN to narrow.", queries::SEARCH_LIMIT))</p>
                     }

@@ -769,7 +769,7 @@ mod tests {
         // NUL is dropped, never sent to Postgres.
         assert_eq!(contains("a\0b").as_deref(), Some("%ab%"));
         assert_eq!(contains("\0"), None);
-        assert_eq!(tin_digits("12\03").as_deref(), Some("%123%"));
+        assert_eq!(tin_digits("12\u{0}3").as_deref(), Some("%123%"));
         assert_eq!(search_text("a\0b\0"), "ab");
     }
 

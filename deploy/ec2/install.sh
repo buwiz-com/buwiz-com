@@ -78,7 +78,13 @@ systemctl enable buwiz-sender.service buwiz.service cloudflared-buwiz.service
 systemctl restart buwiz-sender.service
 systemctl restart buwiz.service
 systemctl restart cloudflared-buwiz.service
-sleep 6
+# Start-up can take a while (the BIR sign loads for up to 10 s before the
+# port opens): wait up to 45 s for the app; the check below still fails if
+# it never answers.
+for _ in $(seq 45); do
+  curl -fs -o /dev/null http://127.0.0.1:8080/ && break
+  sleep 1
+done
 systemctl is-active buwiz-sender.service buwiz.service cloudflared-buwiz.service || true
 journalctl -u buwiz-sender.service -n 5 --no-pager -o cat
 curl -fsS -o /dev/null -w 'local app: HTTP %{http_code}\n' http://127.0.0.1:8080/

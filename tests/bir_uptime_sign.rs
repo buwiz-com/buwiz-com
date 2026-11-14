@@ -162,7 +162,10 @@ async fn recorded_tries_move_the_sign_and_every_change_is_an_event(db: PgPool) {
         assert!(!reason.contains("198.51") && !reason.contains("0000"), "{reason}");
     }
     assert_eq!(stored_seq(&db).await, sign.seq);
-    assert_eq!(sign.seq, 4, "the first line, then Online, Busy and Offline");
+    // The first line, then Online, Busy and Offline: one more each time, and
+    // never below the change's 5-minute mark in Unix seconds.
+    let mark = t(10).unix_timestamp();
+    assert_eq!(sign.seq, mark + 1, "Busy at 10:11 moves to the 10:10 mark; Offline one more");
 
     // The user's own network moves nothing.
     for account in 21..=26 {
@@ -193,12 +196,17 @@ async fn a_try_whose_row_and_run_fail_still_reaches_the_sign(db: PgPool) {
     for (offset, account) in (11..=13).enumerate() {
         record(&uptime, &gone, account, account as u8, Ends::MailboxRefused, t(2 + offset as i64)).await;
     }
-    assert_eq!(uptime.live.sign().state, Light::Online, "nothing could be written, so nothing is shown");
+    // Nothing could be written, but the sign shows what the tries say (it
+    // keeps aging in memory while the database is down) ...
+    assert_eq!(uptime.live.sign().state, Light::Offline);
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_tries").fetch_one(&db).await.unwrap();
     assert_eq!(rows, 3, "their rows are lost");
+    assert_ne!(events(&db).await.pop().unwrap().2, "offline", "not written yet");
+    // ... and the next run that can write writes the change.
     live::tick(&uptime, &db, t(5)).await.unwrap();
     assert_eq!(uptime.live.sign().state, Light::Offline);
     assert_eq!(events(&db).await.pop().unwrap().2, "offline");
+    assert_eq!(stored_seq(&db).await, uptime.live.sign().seq);
 }
 
 /// What a restart must keep of a light: everything but the account ids,
@@ -219,7 +227,8 @@ async fn the_sign_survives_a_restart_in_every_state(db: PgPool) {
     let second = uptime(t(13));
     live::tick(&second, &db, t(13)).await.unwrap();
     let after = second.live.sign();
-    assert_eq!((after.seq, after.state, after.since), (before.seq, before.state, before.since));
+    assert_eq!((after.state, after.since), (before.state, before.since));
+    assert!(after.seq > before.seq, "every start moves seq on once");
     assert_eq!(kept(&after.upload), kept(&before.upload));
     assert_eq!(kept(&after.dispatcher), kept(&before.dispatcher));
     assert_eq!(events(&db).await.len(), lines, "nothing changed by the restart");
@@ -228,7 +237,7 @@ async fn the_sign_survives_a_restart_in_every_state(db: PgPool) {
     assert_eq!(second.live.sign().state, Light::Offline);
     record(&second, &db, 5, 5, Ends::Landed, t(15)).await;
     assert_eq!(second.live.sign().state, Light::Online);
-    assert_eq!(second.live.sign().seq, before.seq + 1);
+    assert_eq!(second.live.sign().seq, t(15).unix_timestamp(), "the landing at 10:15, a new mark");
 
     // Busy, with its dwell, across a restart.
     let third = uptime(t(16));
@@ -253,8 +262,8 @@ async fn the_sign_survives_a_restart_in_every_state(db: PgPool) {
     let seq = fifth.live.sign().seq;
     let sixth = uptime(t(201));
     live::tick(&sixth, &db, t(201)).await.unwrap();
-    assert_eq!(sixth.live.sign().seq, seq);
-    assert_eq!(stored_seq(&db).await, seq);
+    assert!(sixth.live.sign().seq > seq);
+    assert_eq!(stored_seq(&db).await, sixth.live.sign().seq);
 }
 
 /// Tries from before a restart cannot be compared with tries after it (the
@@ -304,7 +313,7 @@ async fn a_stored_sign_that_cannot_be_read_starts_again_with_a_higher_seq(db: Pg
     let uptime = uptime(t(0));
     live::tick(&uptime, &db, t(0)).await.unwrap();
     let sign = uptime.live.sign();
-    assert_eq!(sign.seq, 43, "the reset, then the gap since its last write");
+    assert_eq!(sign.seq, t(0).unix_timestamp() + 1, "the reset at the start's mark, then the gap since its last write");
     assert_eq!((sign.upload.state, sign.dispatcher.state), (Light::NoRecentNews, Light::NoRecentNews));
     assert_eq!(sign.state, Light::Offline, "the outage note in force");
     assert_eq!(
@@ -324,7 +333,7 @@ async fn a_stored_sign_that_cannot_be_read_starts_again_with_a_higher_seq(db: Pg
         ]
     );
     record(&uptime, &db, 1, 1, Ends::Landed, t(1)).await;
-    assert_eq!(stored_seq(&db).await, 44);
+    assert_eq!(stored_seq(&db).await, sign.seq + 1);
 }
 
 /// A stored sign written by another release (a field missing, one more)
@@ -1115,4 +1124,203 @@ async fn nothing_is_mailed_or_judged_at_off(db: PgPool) {
         .expect("the ticker returns at once at off");
     let events: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
     assert_eq!(events, 0);
+}
+
+/// The `buwiz-cloud bir` command (another process) writes only the note,
+/// its audit line and the sign's `seq`: it cannot end an Offline, cannot
+/// write over what the server holds and has not shown (the told-once
+/// flags, the lost votes, the times), and the server makes the change and
+/// mails it. A note set while no server runs takes effect, and is mailed,
+/// when one starts.
+#[sqlx::test]
+async fn the_command_never_runs_the_rules(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let config = &site.state.config;
+    let admin = admin(&site).await;
+    let server = uptime(t(0));
+    // An outage a landing ends (three lost votes), then another, and five
+    // failures in a row since the landing (told once).
+    an_outage(&server, &db).await;
+    record(&server, &db, 4, 4, Ends::Landed, t(15)).await;
+    for (offset, account) in (21..=25).enumerate() {
+        record(&server, &db, account, account as u8, Ends::MailboxRefused, t(20 + offset as i64)).await;
+    }
+    let before = server.live.sign();
+    assert_eq!((before.state, before.upload.state), (Light::Offline, Light::Offline));
+    assert_eq!(before.vote_losses.len(), 3);
+    assert!(before.streak_told.is_some());
+    alerts::flush(&server, &db, &mailer, config, t(24)).await.unwrap();
+    let stored: serde_json::Value = sqlx::query_scalar("SELECT state FROM bir_sign").fetch_one(&db).await.unwrap();
+    let lines = events(&db).await.len();
+
+    // Declare Online through the command's path.
+    let declared = NewNote { kind: NoteKind::Online, text: "Made-up: the BIR says it is fine", until: t(200) };
+    notes::record_set(&db, config, &admin, declared, Some("Made-up reason"), t(25)).await.unwrap();
+    let after: serde_json::Value = sqlx::query_scalar("SELECT state FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(after, stored, "the stored sign is the server's own");
+    assert!(stored_seq(&db).await > before.seq);
+    let audit = events(&db).await;
+    assert_eq!(audit.len(), lines + 1, "the audit line only");
+    let audit = audit.last().unwrap();
+    assert_eq!((audit.1.as_str(), audit.2.as_str(), audit.3.as_str()), ("offline", "offline", "note_set"));
+    assert_eq!(audit.5.as_deref(), Some(STAFF));
+
+    // The server takes it in: Online overall, its window still Offline,
+    // and nothing it held is lost.
+    live::tick(&server, &db, t(25) + Duration::seconds(30)).await.unwrap();
+    let sign = server.live.sign();
+    assert_eq!((sign.state, sign.upload.state), (Light::Online, Light::Offline));
+    assert_eq!(sign.upload.since, before.upload.since);
+    assert_eq!(sign.upload.quorum, before.upload.quorum);
+    assert_eq!(sign.vote_losses, before.vote_losses, "account ids and all");
+    assert!(sign.vote_losses.iter().all(|loss| loss.account_id.is_some()));
+    assert_eq!(sign.streak_told, before.streak_told);
+    assert!(sign.seq > stored_seq_of(&stored));
+    let mail = alerts::flush(&server, &db, &mailer, config, t(35)).await.unwrap().unwrap();
+    assert!(
+        mail.text.contains("Online: An Admin declared the BIR online, ignoring evidence: Made-up: the BIR says it is fine (why: Made-up reason)"),
+        "{}",
+        mail.text
+    );
+
+    // Cleared through the command: the window was never ended, so the sign
+    // is Offline again.
+    notes::record_clear(&db, config, &admin, "Made-up: not fine after all", t(36)).await.unwrap();
+    live::tick(&server, &db, t(36) + Duration::seconds(30)).await.unwrap();
+    assert_eq!(server.live.sign().state, Light::Offline);
+    assert_eq!(server.live.sign().upload.since, before.upload.since);
+
+    // With the server stopped, a maintenance note; the next start shows it
+    // and mails it.
+    watch(&server, &db, t(40)).await;
+    let planned = NewNote { kind: NoteKind::Maintenance, text: "Made-up planned work", until: t(300) };
+    notes::record_set(&db, config, &admin, planned, Some("Made-up: announced"), t(41)).await.unwrap();
+    let restarted = uptime(t(42));
+    live::tick(&restarted, &db, t(42)).await.unwrap();
+    let sign = restarted.live.sign();
+    assert_eq!(sign.note.as_ref().map(|note| note.kind), Some(NoteKind::Maintenance));
+    let mail = alerts::flush(&restarted, &db, &mailer, config, t(42)).await.unwrap().unwrap();
+    assert!(mail.text.contains("An Admin set a planned maintenance note (why: Made-up: announced)"), "{}", mail.text);
+}
+
+fn stored_seq_of(state: &serde_json::Value) -> i64 {
+    state["seq"].as_i64().unwrap()
+}
+
+/// Every path takes the sign's lock before any note row: a server run that
+/// holds it and ends a note never waits on a note change that holds the
+/// note's row (no deadlock), and the change, once it gets the lock, finds
+/// the note ended.
+#[sqlx::test]
+async fn note_changes_and_the_server_take_their_locks_in_one_order(db: PgPool) {
+    let site = Site::new(db.clone());
+    let config = site.state.config.clone();
+    let admin = admin(&site).await;
+    let server = uptime(t(0));
+    live::tick(&server, &db, t(0)).await.unwrap();
+    let outage = NewNote { kind: NoteKind::Outage, text: "Made-up outage", until: t(600) };
+    for in_process in [true, false] {
+        notes::record_set(&db, &config, &admin, outage, None, t(1)).await.unwrap();
+        // The server, mid-write: it holds the sign's lock.
+        let mut server_tx = db.begin().await.unwrap();
+        live::lock_sign(&mut server_tx).await.unwrap();
+        let clear = {
+            let (db, config, admin) = (db.clone(), config.clone(), admin.clone());
+            let uptime = uptime(t(2));
+            tokio::spawn(async move {
+                if in_process {
+                    notes::clear(&uptime, &db, &config, &admin, "Made-up reason", t(2)).await
+                } else {
+                    notes::record_clear(&db, &config, &admin, "Made-up reason", t(2)).await
+                }
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // It ends the note: the change must not hold that row.
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query("UPDATE bir_notes SET cleared_at = $1, cleared_how = 'expired' WHERE cleared_at IS NULL")
+                .bind(t(2))
+                .execute(&mut *server_tx),
+        )
+        .await
+        .expect("the server's write waited on a note change");
+        ended.unwrap();
+        server_tx.commit().await.unwrap();
+        let cleared = clear.await.unwrap();
+        assert!(matches!(cleared, Err(NoteError::NoNote)), "{in_process}: {cleared:?}");
+    }
+}
+
+/// A restart of under 5 minutes writes no gap; a stored sign from a clock
+/// that was ahead is read as now; a clock that jumps a year ahead writes
+/// one gap of 31 days at most.
+#[sqlx::test]
+async fn restarts_and_clocks_are_not_trusted_blindly(db: PgPool) {
+    let first = uptime(t(0));
+    for account in 1..=3 {
+        record(&first, &db, account, account as u8, Ends::Landed, t(0)).await;
+    }
+    for second in (30..600).step_by(30) {
+        live::tick(&first, &db, t(0) + Duration::seconds(second)).await.unwrap();
+    }
+    let stopped = first.live.sign().evaluated_at;
+    // Back 4 min 59 s after the last run: no gap, though the stored time is
+    // to the minute.
+    let second = uptime(stopped + Duration::seconds(299));
+    live::tick(&second, &db, stopped + Duration::seconds(299)).await.unwrap();
+    assert!(watch_events(&db).await.is_empty(), "{:?}", watch_events(&db).await);
+    assert_eq!(second.live.sign().state, Light::Online);
+
+    // A stored sign whose times are a month ahead: read as now, no gap, and
+    // the clock runs on from there.
+    sqlx::query(
+        "UPDATE bir_sign SET state = jsonb_set(jsonb_set(state, '{evaluated_at}', '\"2026-12-11T02:00:00Z\"'),
+                                               '{since}', '\"2026-12-11T02:00:00Z\"')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let third = uptime(t(12));
+    live::tick(&third, &db, t(12)).await.unwrap();
+    let sign = third.live.sign();
+    assert!(sign.evaluated_at <= t(12) && sign.since <= t(12), "{sign:?}");
+    assert!(watch_events(&db).await.is_empty());
+    watch(&third, &db, t(61)).await;
+    live::tick(&third, &db, t(61)).await.unwrap();
+    assert_eq!(third.live.sign().state, Light::NoRecentNews, "the quiet hour came, the clock was not held");
+    assert!(watch_events(&db).await.is_empty());
+
+    // A clock a year ahead: one gap, 31 days long.
+    let ahead = t(61) + Duration::days(365);
+    live::tick(&third, &db, ahead).await.unwrap();
+    let gaps = watch_events(&db).await;
+    assert_eq!(gaps.len(), 2);
+    assert_eq!(gaps[1].0 - gaps[0].0, Duration::days(31));
+}
+
+/// A try fed while another run holds the rules never waits for them and is
+/// never dropped: the next run takes it in.
+#[sqlx::test]
+async fn a_try_never_waits_for_the_rules(db: PgPool) {
+    let uptime = uptime(t(0));
+    live::tick(&uptime, &db, t(0)).await.unwrap();
+    let held = live::lock(&uptime, &db, t(0)).await.unwrap();
+    let relay = RelayTry {
+        account_id: Uuid::from_u128(1),
+        network: Network::V4([198, 51, 1]),
+        client: None,
+        admission: "open".into(),
+        started_at: t(1) - Duration::seconds(20),
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        store::record(&uptime, &db, &relay, &observed(Ends::Landed), t(1)),
+    )
+    .await
+    .expect("the try did not wait for the rules");
+    assert_eq!(uptime.live.sign().state, Light::NoRecentNews, "not run yet");
+    drop(held);
+    live::tick(&uptime, &db, t(1) + Duration::seconds(30)).await.unwrap();
+    assert_eq!(uptime.live.sign().state, Light::Online);
 }

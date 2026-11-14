@@ -75,8 +75,25 @@ pub const WRITE_EVERY: Duration = Duration::seconds(60);
 pub const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The lock every write of the sign holds, across processes ("birsign" in
-/// ASCII).
+/// ASCII). Every path takes it before it touches a note row, so no two
+/// writers can wait on each other.
 const SIGN_LOCK: i64 = 0x0062_6972_7369_676e;
+
+/// A clock this far behind the last run stepped back: the rules go on from
+/// it rather than wait for it to catch up.
+pub const CLOCK_STEP: Duration = Duration::minutes(2);
+
+/// How far the stored evaluation time can lag the last real run (it is
+/// written at least every minute, to the minute): a restart this much past
+/// [`sign::WATCH_GAP`] writes no gap, so a stop of under 5 minutes never
+/// does.
+pub const RESTART_SLACK: Duration = Duration::minutes(2);
+
+/// Takes [`SIGN_LOCK`] for the rest of `tx`.
+pub async fn lock_sign(tx: &mut Transaction<'_, Postgres>) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(SIGN_LOCK).execute(&mut **tx).await?;
+    Ok(())
+}
 
 /// A write found that another process changed the sign since this engine
 /// read it: nothing was written, and the next run takes the other's in.
@@ -139,6 +156,25 @@ impl Engine {
         let at = self.evidence.partition_point(|item| item.at <= evidence.at);
         self.evidence.insert(at, evidence);
         self.prune(now);
+    }
+
+    /// The clock of a run at `now`: never before the last run (a try fed
+    /// with its end may come just after a tick), but a clock that stepped
+    /// back further does not hold the rules until it catches up: the
+    /// sign's and the tries' times are brought back to it.
+    fn clock(&mut self, now: OffsetDateTime) -> OffsetDateTime {
+        if now + CLOCK_STEP >= self.sign.evaluated_at {
+            return now.max(self.sign.evaluated_at);
+        }
+        tracing::warn!(
+            back_s = (self.sign.evaluated_at - now).whole_seconds(),
+            "BIR uptime: the clock stepped back; the sign goes on from the clock's time"
+        );
+        self.sign.clamp_to(now);
+        for item in &mut self.evidence {
+            item.at = item.at.min(now);
+        }
+        now
     }
 
     fn prune(&mut self, now: OffsetDateTime) {
@@ -220,14 +256,27 @@ pub struct Locked<'a> {
 /// Locks the engine (loading it from the record first, once) for a run at
 /// `now` (never before the last run), and takes in the tries waiting.
 pub async fn lock<'a>(uptime: &'a Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<Locked<'a>> {
-    let mut engine = uptime.live.engine.lock().await;
-    if engine.loaded {
-        bounded(refresh(uptime, &mut engine, db, now)).await?;
+    let engine = uptime.live.engine.lock().await;
+    prepare(uptime, engine, db, now).await
+}
+
+async fn prepare<'a>(
+    uptime: &'a Uptime,
+    mut engine: MutexGuard<'a, Engine>,
+    db: &PgPool,
+    now: OffsetDateTime,
+) -> sqlx::Result<Locked<'a>> {
+    if engine.loaded
+        && let Err(error) = bounded(refresh(&mut engine, db, now)).await
+    {
+        // The run goes on from memory, so the sign still ages; its write
+        // checks the stored `seq` under the lock all the same.
+        tracing::warn!(%error, "BIR uptime: the stored sign could not be read; the rules run from memory");
     }
     if !engine.loaded {
         bounded(load(&mut engine, db, now)).await?;
     }
-    let now = now.max(engine.sign.evaluated_at);
+    let now = engine.clock(now);
     for evidence in uptime.live.take_inbox() {
         engine.take(evidence, now);
     }
@@ -270,7 +319,7 @@ impl Locked<'_> {
         evaluation: &Evaluation,
         actor: Option<&Account>,
     ) -> sqlx::Result<Vec<Written>> {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(SIGN_LOCK).execute(&mut **tx).await?;
+        lock_sign(tx).await?;
         // Another process wrote since this engine read the sign, unless the
         // write found is this very run's (its commit landed, its
         // acknowledgement was lost): the same `seq` and `revision`.
@@ -294,6 +343,9 @@ impl Locked<'_> {
                 reason,
             };
             let minutes = (to_minute(to) - to_minute(from)).whole_minutes();
+            if to - from >= sign::MAX_GAP {
+                tracing::error!("BIR uptime: a gap in watching is 31 days or more (a clock that jumped?); written as 31 days");
+            }
             rows.push((from, event("watched", "not_watched", "Buwiz stopped watching".into()), None));
             rows.push((to, event("not_watched", "watched", format!("Buwiz was not watching for {minutes} min")), None));
         }
@@ -342,29 +394,71 @@ impl Locked<'_> {
 
     /// One run with the open note as the record has it: written when
     /// something changed (or a minute after the last write), then shown.
+    /// A run that cannot be written is shown all the same (the next run
+    /// that can write makes and writes the same change), so the sign keeps
+    /// aging while the database is down; one another process wrote over is
+    /// not.
     async fn run(mut self, db: &PgPool) -> sqlx::Result<()> {
         let note = self.engine.note.clone();
         let evaluation = self.evaluate(note.as_ref(), false);
         let due = self.engine.written_at.is_none_or(|at| self.now - at >= WRITE_EVERY || self.now < at);
-        let written = if evaluation.must_write(&self.engine.sign) || due {
-            let work = async {
-                let mut tx = db.begin().await?;
-                let written = self.write(&mut tx, &evaluation, None).await?;
-                tx.commit().await?;
-                Ok(written)
-            };
-            bounded(work).await?
-        } else {
-            Vec::new()
+        if !evaluation.must_write(&self.engine.sign) && !due {
+            self.show(evaluation, note, &[]);
+            return Ok(());
+        }
+        let work = async {
+            let mut tx = db.begin().await?;
+            let written = self.write(&mut tx, &evaluation, None).await?;
+            tx.commit().await?;
+            Ok(written)
         };
-        self.show(evaluation, note, &written);
-        Ok(())
+        match bounded(work).await {
+            Ok(mut written) => {
+                // A note another process set or cleared: staff read its
+                // Admin's own words, from its audit line.
+                for written in written.iter_mut().filter(|written| written.event.cause.by_staff()) {
+                    if let Ok(Some(reason)) = bounded(audit_reason(db, written.event.cause)).await {
+                        written.event.reason = reason;
+                    }
+                }
+                self.show(evaluation, note, &written);
+                Ok(())
+            }
+            Err(error) => {
+                if !moved(&error) {
+                    self.age(evaluation);
+                }
+                Err(error)
+            }
+        }
     }
+
+    /// Shows a run that could not be written, without taking it as the
+    /// sign the next run starts from (that run makes the same change and
+    /// writes it). Its evaluation time is kept, unless the run was to write
+    /// a gap in watching, which must not be lost.
+    fn age(mut self, evaluation: Evaluation) {
+        if evaluation.not_watched.is_none() {
+            self.engine.sign.evaluated_at = evaluation.state.evaluated_at;
+        }
+        *self.uptime.live.last_ten.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = evaluation.last_ten;
+        self.uptime.live.show(evaluation.state);
+    }
+}
+
+/// The newest audit line (an Admin's, with their reason) of `cause`.
+async fn audit_reason(db: &PgPool, cause: Cause) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT reason FROM bir_events WHERE cause = $1 AND actor_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+    )
+    .bind(cause.as_str())
+    .fetch_optional(db)
+    .await
 }
 
 /// One `bir_events` row, once: written again for the same `seq` and place,
 /// it is the row already there.
-async fn insert_event(
+pub(super) async fn insert_event(
     tx: &mut Transaction<'_, Postgres>,
     at: OffsetDateTime,
     event: &Event,
@@ -412,7 +506,12 @@ async fn write_sign(tx: &mut Transaction<'_, Postgres>, state: &SignState) -> sq
 /// fails leaves the try in memory for the next.
 pub async fn feed(uptime: &Uptime, db: &PgPool, evidence: Evidence, now: OffsetDateTime) -> sqlx::Result<()> {
     uptime.live.offer(evidence);
-    lock(uptime, db, now).await?.run(db).await
+    // Never waits for the rules: when another run holds them, the try
+    // stays in the inbox for it or for the next tick (at most 30 seconds).
+    let Ok(engine) = uptime.live.engine.try_lock() else {
+        return Ok(());
+    };
+    prepare(uptime, engine, db, now).await?.run(db).await
 }
 
 /// The rules with no new try: quiet hours, a note running out, the dwell,
@@ -464,6 +563,13 @@ type TryRow = (
     Option<Vec<u8>>,
 );
 
+/// The newest row read: the largest id, whatever order the rows came in
+/// (they come by end time), so a try fed after the load is never there
+/// twice.
+fn newest_id(rows: &[TryRow]) -> i64 {
+    rows.iter().map(|row| row.0).max().unwrap_or(0)
+}
+
 /// A `bir_tries` row as the engine reads it.
 fn evidence_of(row: TryRow) -> Evidence {
     let (
@@ -502,9 +608,10 @@ fn evidence_of(row: TryRow) -> Evidence {
 
 /// The stored sign, as far as it reads. One a later release wrote (more
 /// fields) or an older one (fewer) reads whole; a time it lacks is its last
-/// write's (never 1970). One that cannot be read at
-/// all starts again, keeping its note and its `seq` (which only grows), and
-/// its last write as the start of a gap in watching.
+/// write's (never 1970), and a time after `now` is `now` (logged). One that
+/// cannot be read at all starts again, keeping its note and its `seq` (the
+/// load moves it on), and its last write as the start of a gap in
+/// watching.
 fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTime) -> (SignState, bool) {
     match serde_json::from_value::<SignState>(value.clone()) {
         Ok(mut state) => {
@@ -516,6 +623,9 @@ fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTi
                     *at = written;
                 }
             }
+            if state.clamp_to(now) {
+                tracing::error!("BIR uptime: the stored sign has times after now (a clock that was ahead?); read as now");
+            }
             if state.relay.paused {
                 // Nothing in this release resumes it.
                 tracing::warn!("BIR uptime: the stored sign says the relay is paused; this release never pauses it");
@@ -526,33 +636,11 @@ fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTi
         Err(error) => {
             tracing::error!(%error, "BIR uptime: the stored sign could not be read; starting from No recent news");
             let note = value.get("note").and_then(|note| serde_json::from_value::<Note>(note.clone()).ok());
-            let mut state = SignState { seq: seq + 1, note, evaluated_at: updated_at.min(now), ..SignState::new(now) };
+            let mut state = SignState { seq, note, evaluated_at: updated_at.min(now), ..SignState::new(now) };
             let in_force = state.note.as_ref().filter(|note| note.in_force(now));
             state.state = sign::overall(Light::NoRecentNews, Light::NoRecentNews, in_force);
             (state, true)
         }
-    }
-}
-
-/// The account ids a sign read back from the record lacks (they are never
-/// written), from the sign this engine held: a voter or a lost vote is the
-/// same account when they share a key.
-fn keep_account_ids(held: &SignState, read: &mut SignState) {
-    for (old, new) in [(&held.dispatcher, &mut read.dispatcher), (&held.upload, &mut read.upload)] {
-        for voter in &mut new.quorum {
-            voter.account_id = old
-                .quorum
-                .iter()
-                .find(|known| known.keys.iter().any(|keys| voter.keys.contains(keys)))
-                .and_then(|known| known.account_id);
-        }
-    }
-    for loss in &mut read.vote_losses {
-        loss.account_id = held
-            .vote_losses
-            .iter()
-            .find(|known| known.side == loss.side && known.keys.iter().any(|keys| loss.keys.contains(keys)))
-            .and_then(|known| known.account_id);
     }
 }
 
@@ -568,7 +656,7 @@ pub async fn stored(db: &PgPool, now: OffsetDateTime) -> sqlx::Result<Option<(Si
 }
 
 /// The newest note the record has not cleared.
-async fn open_note(db: &PgPool) -> sqlx::Result<Option<Note>> {
+async fn open_note<'e>(db: impl sqlx::PgExecutor<'e>) -> sqlx::Result<Option<Note>> {
     let note: Option<(Uuid, String, String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
         "SELECT id, kind, text, starts_at, until FROM bir_notes WHERE cleared_at IS NULL
           ORDER BY starts_at DESC LIMIT 1",
@@ -580,52 +668,36 @@ async fn open_note(db: &PgPool) -> sqlx::Result<Option<Note>> {
     }))
 }
 
-/// Takes in what another process wrote (a note set or cleared with the
-/// `buwiz-cloud bir` command): when the stored `seq` is higher than this
-/// engine's, its sign and the open note replace this engine's (the tries in
-/// memory stay), and the staff mail hears of its events not mailed yet. A
-/// stored sign that cannot be read is loaded again from the start.
-async fn refresh(uptime: &Uptime, engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
-    let stored: Option<i64> = sqlx::query_scalar("SELECT seq FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
-    let Some(stored) = stored.filter(|stored| *stored > engine.sign.seq) else {
+/// Takes in what the `buwiz-cloud bir` command wrote ([`super::notes::record_set`]):
+/// a note set or cleared, its audit line and a higher stored `seq`. Only the
+/// open note and the `seq` are taken: this engine's own sign (its times, the
+/// told-once flags, the lost votes) stays as it is, and the run that follows
+/// makes the note's change, writes it and mails staff. A stored sign that
+/// cannot be read is loaded again from the start.
+async fn refresh(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
+    let stored: Option<(i64, Value)> =
+        sqlx::query_as("SELECT seq, state FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
+    let Some((seq, value)) = stored.filter(|(seq, _)| *seq > engine.sign.seq) else {
         return Ok(());
     };
-    let (seq, value, updated_at): (i64, Value, OffsetDateTime) =
-        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_one(db).await?;
-    let (mut state, reset) = restore(seq, value, updated_at, now);
-    if reset {
+    if serde_json::from_value::<SignState>(value).is_err() {
+        tracing::error!("BIR uptime: the stored sign could not be read; loading it again");
         engine.loaded = false;
         return Ok(());
     }
-    keep_account_ids(&engine.sign, &mut state);
-    let rows: Vec<(i64, OffsetDateTime, String, String, String, String, String)> = sqlx::query_as(
-        "SELECT id, at, scope, from_state, to_state, cause, reason FROM bir_events
-          WHERE sign_seq > $1 AND sign_seq <= $2 AND mailed_at IS NULL ORDER BY sign_seq, ord",
-    )
-    .bind(engine.sign.seq)
-    .bind(seq)
-    .fetch_all(db)
-    .await?;
-    let written: Vec<Written> = rows
-        .into_iter()
-        .filter_map(|(id, at, scope, from, to, cause, reason)| {
-            let event = Event { scope: Scope::parse(&scope)?, from, to, cause: Cause::parse(&cause)?, reason };
-            Some(Written { id, at, event })
-        })
-        .collect();
     engine.note = open_note(db).await?;
-    for alert in Alert::for_run(&written, &state) {
-        uptime.alerts.push(alert);
-    }
-    tracing::info!(from = engine.sign.seq, to = stored, "BIR uptime: took in a sign another process wrote");
-    engine.sign = state.clone();
-    uptime.live.show(state);
+    tracing::info!(from = engine.sign.seq, to = seq, at = %now, "BIR uptime: took in a note another process wrote");
+    engine.sign.seq = seq;
     Ok(())
 }
 
+/// Loads the engine at a start (or after a reset): the stored sign as it
+/// was, the `live` tries of the last 3 hours and the open note. Under the
+/// sign's lock, in one transaction: the reset or first-start line, and the
+/// sign with its `seq` moved on once (every start does), so a database
+/// restored from an older backup passes any `seq` handed out before. A
+/// stored evaluation within [`RESTART_SLACK`] of a gap writes none.
 async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
-    let row: Option<(i64, Value, OffsetDateTime)> =
-        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
     let rows: Vec<TryRow> = sqlx::query_as(
         "SELECT id, ended_at, source, outcome, stage, dispatcher, upload, failure_kind, counted, late, admission,
                 key_epoch, account_key, network_key
@@ -634,55 +706,58 @@ async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Re
     .bind(to_minute(now - sign::EVIDENCE_KEPT))
     .fetch_all(db)
     .await?;
-    let note = open_note(db).await?;
-    let state = match row {
+    let mut tx = db.begin().await?;
+    lock_sign(&mut tx).await?;
+    let row: Option<(i64, Value, OffsetDateTime)> =
+        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(&mut *tx).await?;
+    let note = open_note(&mut *tx).await?;
+    let (mut state, line) = match row {
         Some((seq, value, updated_at)) => {
             let (state, reset) = restore(seq, value, updated_at, now);
-            if reset {
-                let mut tx = db.begin().await?;
-                let event = Event {
-                    scope: Scope::Overall,
-                    from: "unknown".into(),
-                    to: state.state.as_str().into(),
-                    cause: Cause::Reset,
-                    reason: "The stored sign could not be read; it starts again from what the note in force says, or No recent news".into(),
-                };
-                insert_event(&mut tx, to_minute(now), &event, None, state.seq, 0).await?;
-                write_sign(&mut tx, &state).await?;
-                tx.commit().await?;
-            }
-            state
+            let line = reset.then(|| Event {
+                scope: Scope::Overall,
+                from: "unknown".into(),
+                to: state.state.as_str().into(),
+                cause: Cause::Reset,
+                reason: "The stored sign could not be read; it starts again from what the note in force says, or No recent news".into(),
+            });
+            (state, line)
         }
         None => {
             // The first start: nothing known, and the history begins here.
-            let mut state = SignState { seq: 1, ..SignState::new(now) };
+            let mut state = SignState::new(now);
             let (success, news): (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
                 "SELECT max(ended_at) FILTER (WHERE source = 'relay' AND outcome = 'sent'), max(ended_at)
                    FROM bir_tries WHERE counted",
             )
-            .fetch_one(db)
+            .fetch_one(&mut *tx)
             .await?;
             state.last_success_at = success;
             state.last_news_at = news;
-            let mut tx = db.begin().await?;
-            let event = Event {
+            let line = Event {
                 scope: Scope::Overall,
                 from: "none".into(),
                 to: state.state.as_str().into(),
                 cause: Cause::Rule,
                 reason: "Buwiz began keeping the sign".into(),
             };
-            insert_event(&mut tx, to_minute(now), &event, None, state.seq, 0).await?;
-            write_sign(&mut tx, &state).await?;
-            tx.commit().await?;
-            state
+            (state, Some(line))
         }
     };
-    engine.loaded_upto = rows.last().map_or(0, |row| row.0);
+    state.seq = sign::next_seq(state.seq, now);
+    if now - state.evaluated_at <= sign::WATCH_GAP + RESTART_SLACK {
+        state.evaluated_at = state.evaluated_at.max(now);
+    }
+    if let Some(line) = &line {
+        insert_event(&mut tx, to_minute(now), line, None, state.seq, 0).await?;
+    }
+    write_sign(&mut tx, &state).await?;
+    tx.commit().await?;
+    engine.loaded_upto = newest_id(&rows);
     engine.evidence = rows.into_iter().map(evidence_of).collect();
     engine.note = note;
     engine.sign = state;
-    engine.written_at = None;
+    engine.written_at = Some(now);
     engine.loaded = true;
     Ok(())
 }
@@ -741,6 +816,39 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_row_is_the_largest_id_not_the_last_to_end() {
+        let row = |id: i64, at: OffsetDateTime| -> TryRow {
+            let text = || "none".to_owned();
+            (id, at, "relay".into(), "failed".into(), text(), text(), text(), None, true, false, "open".into(), 1, vec![0; 8], None)
+        };
+        let now = datetime!(2026-11-11 05:00 UTC);
+        // By end time: row 9 ended first, row 4 (written earlier) after it.
+        let rows = [row(9, now - Duration::minutes(3)), row(4, now - Duration::minutes(1))];
+        assert_eq!(newest_id(&rows), 9);
+        assert_eq!(newest_id(&[]), 0);
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_does_not_hold_the_rules() {
+        let now = datetime!(2026-11-11 05:00 UTC);
+        let mut engine = Engine::new(now);
+        engine.sign.evaluated_at = now;
+        engine.sign.upload.last_evidence_at = Some(now - Duration::seconds(10));
+        engine.take(evidence(now - Duration::seconds(10), None), now);
+        // A try fed with its end, just before the last tick: the tick's time.
+        assert_eq!(engine.clock(now - Duration::seconds(20)), now);
+        // The clock stepped back an hour: the rules go on from it, and no
+        // time the sign or a try holds is after it.
+        let back = now - Duration::hours(1);
+        assert_eq!(engine.clock(back), back);
+        assert_eq!(engine.sign.evaluated_at, back);
+        assert_eq!(engine.sign.upload.last_evidence_at, Some(back));
+        assert!(engine.evidence.iter().all(|item| item.at <= back));
+        // And then forward with it.
+        assert_eq!(engine.clock(back + Duration::seconds(30)), back + Duration::seconds(30));
+    }
+
+    #[test]
     fn the_inbox_never_waits_and_drops_only_past_its_cap() {
         let live = Live::new(datetime!(2026-11-11 05:00 UTC));
         for n in 0..(MAX_INBOX + 3) {
@@ -762,7 +870,7 @@ mod tests {
         let (state, reset) =
             restore(41, serde_json::json!({ "state": 12, "note": note }), now - Duration::hours(2), now);
         assert!(reset);
-        assert_eq!(state.seq, 42);
+        assert_eq!(state.seq, 41, "kept: the load moves it on");
         assert_eq!(state.state, Light::Offline, "the outage note in force");
         assert_eq!(state.note.map(|note| note.kind), Some(NoteKind::Outage));
         assert_eq!(state.evaluated_at, now - Duration::hours(2), "the gap starts at its last write");
@@ -779,5 +887,12 @@ mod tests {
         paused.relay.paused = true;
         let (state, reset) = restore(3, serde_json::to_value(&paused).unwrap(), now, now);
         assert!(!reset && !state.relay.paused);
+        // One a clock ahead wrote: its times are read as now.
+        let mut ahead = SignState::new(now + Duration::days(30));
+        ahead.upload.last_ok_at = Some(now + Duration::days(30));
+        ahead.last_success_at = Some(now + Duration::days(30));
+        let (state, _) = restore(3, serde_json::to_value(&ahead).unwrap(), now + Duration::days(30), now);
+        assert_eq!((state.evaluated_at, state.since, state.upload.since), (now, now, now));
+        assert_eq!((state.upload.last_ok_at, state.last_success_at), (Some(now), Some(now)));
     }
 }

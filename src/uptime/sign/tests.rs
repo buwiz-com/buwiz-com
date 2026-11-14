@@ -232,7 +232,7 @@ fn the_first_landing_after_quiet_says_online() {
     let scopes: Vec<&str> = events.iter().map(|event| event.scope.as_str()).collect();
     assert_eq!(scopes, ["dispatcher", "upload", "overall"]);
     assert_eq!(events[1].reason, "1 of the last 1 got in");
-    assert_eq!(sim.state.seq, 1);
+    assert_eq!(sim.state.seq, T0.unix_timestamp(), "the 5-minute mark of the change, in Unix seconds");
     // Exact in memory; stored to the minute.
     assert_eq!(sim.state.last_success_at, Some(ts(0, 17)));
     assert_eq!(sim.state.upload.last_ok_at, Some(ts(0, 17)));
@@ -1132,9 +1132,14 @@ fn a_gap_in_watching_is_its_own_change() {
     assert_eq!(evaluation.not_watched, None);
     let evaluation = sim.evaluation(ts(5, 1), false);
     assert_eq!(evaluation.not_watched, Some((t(0), ts(5, 1))));
-    assert_eq!(evaluation.state.seq, seq + 1);
+    assert_eq!(evaluation.state.seq, next_seq(seq, ts(5, 1)));
+    assert!(evaluation.state.seq > seq);
     assert!(evaluation.events.is_empty(), "no state was changed by it");
     assert!(evaluation.must_write(&sim.state));
+    // A clock that jumps a year ahead writes one gap of 31 days at most.
+    let ahead = t(0) + Duration::days(365);
+    let evaluation = sim.evaluation(ahead, false);
+    assert_eq!(evaluation.not_watched, Some((ahead - MAX_GAP, ahead)));
 }
 
 /// Each state, as a restart finds it: the stored sign read back, the tries
@@ -1292,7 +1297,7 @@ fn the_revision_follows_what_a_reader_sees() {
 }
 
 #[test]
-fn seq_grows_by_one_with_every_change() {
+fn seq_grows_with_every_change_and_never_below_the_5_minute_mark() {
     let mut sim = Sim::new();
     let mut last = sim.state.seq;
     let mut rng = StdRng::seed_from_u64(5);
@@ -1304,9 +1309,21 @@ fn seq_grows_by_one_with_every_change() {
             _ => desk_down(t(minute), account, account),
         };
         let events = if rng.random_bool(0.8) { sim.feed(item) } else { sim.tick(t(minute)) };
-        assert_eq!(sim.state.seq, last + i64::from(!events.is_empty()));
+        if events.is_empty() {
+            assert_eq!(sim.state.seq, last);
+        } else {
+            let mark = t(minute).unix_timestamp() / 300 * 300;
+            assert_eq!(sim.state.seq, (last + 1).max(mark), "minute {minute}");
+        }
         last = sim.state.seq;
     }
+    // Within one mark it grows by one; a new mark jumps to it; and it only
+    // ever grows, whatever the clock says.
+    assert_eq!(next_seq(T0.unix_timestamp(), ts(4, 59)), T0.unix_timestamp() + 1);
+    assert_eq!(next_seq(T0.unix_timestamp() + 7, t(5)), T0.unix_timestamp() + 300);
+    assert_eq!(next_seq(T0.unix_timestamp() + 400, t(5)), T0.unix_timestamp() + 401);
+    assert_eq!(next_seq(41, T0 - Duration::days(400)), T0.unix_timestamp() - 400 * 86_400);
+    assert_eq!(next_seq(i64::MAX, T0), i64::MAX);
 }
 
 /// Property: Offline ends only on a relay try that got past that window,

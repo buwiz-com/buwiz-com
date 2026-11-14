@@ -99,10 +99,17 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_notes").fetch_one(&db).await.unwrap();
     assert_eq!(notes, 0);
     // An Admin, while the server runs.
+    let stored_before: Value = sqlx::query_scalar("SELECT state FROM bir_sign").fetch_one(&db).await.unwrap();
+    let seq_before = server.state.uptime.live.sign().seq;
     let (result, out) = run(declare(STAFF, Until::Hours(6))).await;
     result.unwrap();
     assert!(out.contains("Will: declare the BIR offline (an outage note) until"), "{out}");
-    assert!(out.contains("Done. The sign now:\n  Offline since"), "{out}");
+    assert!(out.contains("Done: the note and its audit line are written."), "{out}");
+    // The command ran no rule: the stored sign is the server's, only its
+    // `seq` moved on.
+    let (seq, stored): (i64, Value) = sqlx::query_as("SELECT seq, state FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(stored, stored_before);
+    assert!(seq > seq_before);
     let audit: (String, String, Option<String>) = sqlx::query_as(
         "SELECT cause, reason, actor_email FROM bir_events WHERE cause = 'note_set' ORDER BY id DESC LIMIT 1",
     )
@@ -124,8 +131,22 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     let status = json(get(&server, "/api/bir/status", &[]).await).await;
     assert_eq!((status["state"].as_str(), status["source"].as_str()), (Some("offline"), Some("staff")));
     assert_eq!(status["note"]["text"], "The BIR says its eFPS is down.");
-    // The staff mail hears of it from the server.
-    assert!(server.state.uptime.alerts.queued() >= 1);
+    // The server made the change and mails it, with the Admin's reason.
+    let change: (String, String, String) = sqlx::query_as(
+        "SELECT from_state, to_state, cause FROM bir_events WHERE scope = 'overall' AND actor_id IS NULL
+          ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(change, ("online".into(), "offline".into(), "note_set".into()));
+    let mailer = buwiz_cloud::account::mail::Mailer::recording("http://localhost:3008");
+    let mail = buwiz_cloud::uptime::alerts::flush(&server.state.uptime, &db, &mailer, &config, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mail.subject, "BIR: an Admin set a note");
+    assert!(mail.text.contains("Offline: An Admin set an outage note (why: Made-up: the BIR posted an advisory)"), "{}", mail.text);
     // Its own next write does not overwrite the note, nor lose an event.
     let events: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
     live::tick(&server.state.uptime, &db, OffsetDateTime::now_utc() + Duration::minutes(2)).await.unwrap();
@@ -159,8 +180,9 @@ async fn the_switch_reaches_a_running_server(db: PgPool) {
     assert!(matches!(off, Err(cli::CliError::Refused(ref why)) if why.contains("off")));
 }
 
-/// A change the server wrote while the command held an older sign is not
-/// overwritten: the command's write finds the sign moved and tries again.
+/// Two processes each holding an engine never write over each other: the
+/// one whose sign is older finds it moved, writes nothing and bumps no
+/// `seq`.
 #[sqlx::test]
 async fn two_processes_never_write_over_each_other(db: PgPool) {
     let server = site(&db, Level::Public);
@@ -185,15 +207,20 @@ async fn two_processes_never_write_over_each_other(db: PgPool) {
     )
     .await
     .unwrap();
-    // The other's write, from the sign it read, is refused.
-    let evaluation = locked.evaluate(None, false);
+    let (seq, state): (i64, Value) = sqlx::query_as("SELECT seq, state FROM bir_sign").fetch_one(&db).await.unwrap();
+    let lines: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
+    // The other's write, from the sign it read, is refused ...
+    let mut evaluation = locked.evaluate(None, false);
+    evaluation.state.seq = seq + 1_000;
     let mut tx = db.begin().await.unwrap();
     let error = locked.write(&mut tx, &evaluation, None).await.unwrap_err();
     assert!(live::moved(&error));
-    drop(tx);
+    tx.commit().await.unwrap();
     drop(locked);
-    // Its next run takes the server's sign in.
-    live::tick(&other, &db, OffsetDateTime::now_utc()).await.unwrap();
-    assert_eq!(other.live.sign().note.as_ref().map(|note| note.kind), Some(NoteKind::Maintenance));
-    assert_eq!(other.live.sign().seq, server.state.uptime.live.sign().seq);
+    // ... and leaves no trace: the same seq, the same sign, no line.
+    let after: (i64, Value) = sqlx::query_as("SELECT seq, state FROM bir_sign").fetch_one(&db).await.unwrap();
+    assert_eq!(after, (seq, state));
+    let lines_after: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
+    assert_eq!(lines_after, lines);
+    assert_eq!(server.state.uptime.live.sign().seq, seq);
 }

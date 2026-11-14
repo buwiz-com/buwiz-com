@@ -24,7 +24,8 @@ use uuid::Uuid;
 
 use super::Uptime;
 use super::live::{self, Locked};
-use super::sign::{Cause, Evaluation, Event, Note, NoteKind, Scope};
+use super::store::to_minute;
+use super::sign::{self, Cause, Evaluation, Event, Note, NoteKind, Scope};
 use crate::account::accounts::Account;
 use crate::account::roles::{self, Power, Staff};
 use crate::base::config::Config;
@@ -54,6 +55,8 @@ pub enum NoteError {
     NotPaused,
     #[error("the sign changed meanwhile (another process wrote it); nothing was written: try again")]
     Moved,
+    #[error("no sign is kept yet: start the server with BIR_UPTIME at record or above first")]
+    NoSign,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -67,13 +70,6 @@ pub struct NewNote<'a> {
     pub until: OffsetDateTime,
 }
 
-/// Serialises note changes across processes, for the rest of the
-/// transaction.
-async fn lock_notes(tx: &mut Transaction<'_, Postgres>) -> sqlx::Result<()> {
-    // "birnotes" in ASCII.
-    sqlx::query("SELECT pg_advisory_xact_lock(7091318736213665139)").execute(&mut **tx).await?;
-    Ok(())
-}
 
 /// The actor as the database stands now, if an Admin: their account with
 /// the email read now (a share lock holds it to the end of `tx`).
@@ -127,7 +123,7 @@ fn with_audit(mut evaluation: Evaluation, cause: Cause, reason: &str, previous_s
                 cause,
                 reason: reason.into(),
             });
-            evaluation.state.seq = previous_seq + 1;
+            evaluation.state.seq = sign::next_seq(previous_seq, evaluation.state.evaluated_at);
         }
     }
     evaluation
@@ -178,56 +174,16 @@ pub async fn set_with_reason(
     let mut locked = live::lock(uptime, db, now).await?;
     let now = locked.now();
     let mut tx = db.begin().await?;
-    lock_notes(&mut tx).await?;
+    // The sign's lock before any note row, as every path takes them.
+    live::lock_sign(&mut tx).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
-    let text = note_text(new.text)?;
-    if new.until <= now {
-        return Err(NoteError::EndsInThePast);
-    }
-    if new.until > now + MAX_AHEAD {
-        return Err(NoteError::EndsTooFar);
-    }
-    let open: Vec<(Uuid, OffsetDateTime)> =
-        sqlx::query_as("SELECT id, until FROM bir_notes WHERE cleared_at IS NULL FOR UPDATE")
-            .fetch_all(&mut *tx)
-            .await?;
-    if open.iter().any(|(_, until)| *until > now) {
-        return Err(NoteError::NoteInForce);
-    }
-    // Notes that ran out with no run to mark them end at their own time,
-    // each with its line in the log.
-    let expired: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE bir_notes SET cleared_at = until, cleared_how = 'expired' WHERE cleared_at IS NULL RETURNING id",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO bir_notes (kind, text, starts_at, until, set_by, set_by_email)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-    )
-    .bind(new.kind.as_str())
-    .bind(&text)
-    .bind(now)
-    .bind(new.until)
-    .bind(admin.id)
-    .bind(&admin.email)
-    .fetch_one(&mut *tx)
-    .await?;
-    let note = Note { id, kind: new.kind, text, starts_at: now, until: new.until };
+    let (note, expired) = insert_note(&mut tx, &admin, new, now).await?;
     let previous_seq = locked.previous().seq;
     let evaluation = locked.evaluate(Some(&note), false);
-    let reason = match new.kind {
-        NoteKind::Outage => "An Admin set an outage note".to_owned(),
-        NoteKind::Maintenance => "An Admin set a planned maintenance note".to_owned(),
-        NoteKind::Online => format!("An Admin declared the BIR online, ignoring evidence: {}", note.text),
-    };
-    let reason = match why {
-        Some(why) => format!("{reason} (why: {why})"),
-        None => reason,
-    };
+    let reason = set_reason(&note, why.as_deref());
     let mut evaluation = with_audit(evaluation, Cause::NoteSet, &reason, previous_seq);
     let state = previous_state(&evaluation);
-    for _ in &expired {
+    for _ in 0..expired {
         evaluation.events.insert(
             0,
             Event {
@@ -242,6 +198,62 @@ pub async fn set_with_reason(
     finish(locked, tx, evaluation, Some(note.clone()), &admin).await?;
     tracing::info!(actor = %admin.id, kind = note.kind.as_str(), "BIR note set");
     Ok(note)
+}
+
+/// Checks a new note and writes its row, marking ended the notes that ran
+/// out with no run to mark them (at their own end): refused while one is
+/// in force. The new note and how many ran out.
+async fn insert_note(
+    tx: &mut Transaction<'_, Postgres>,
+    admin: &Account,
+    new: NewNote<'_>,
+    now: OffsetDateTime,
+) -> Result<(Note, usize), NoteError> {
+    let text = note_text(new.text)?;
+    if new.until <= now {
+        return Err(NoteError::EndsInThePast);
+    }
+    if new.until > now + MAX_AHEAD {
+        return Err(NoteError::EndsTooFar);
+    }
+    let open: Vec<(Uuid, OffsetDateTime)> =
+        sqlx::query_as("SELECT id, until FROM bir_notes WHERE cleared_at IS NULL FOR UPDATE")
+            .fetch_all(&mut **tx)
+            .await?;
+    if open.iter().any(|(_, until)| *until > now) {
+        return Err(NoteError::NoteInForce);
+    }
+    let expired: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE bir_notes SET cleared_at = until, cleared_how = 'expired' WHERE cleared_at IS NULL RETURNING id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO bir_notes (kind, text, starts_at, until, set_by, set_by_email)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(new.kind.as_str())
+    .bind(&text)
+    .bind(now)
+    .bind(new.until)
+    .bind(admin.id)
+    .bind(&admin.email)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((Note { id, kind: new.kind, text, starts_at: now, until: new.until }, expired.len()))
+}
+
+/// The audit line's sentence for a note set, with the Admin's reason.
+fn set_reason(note: &Note, why: Option<&str>) -> String {
+    let reason = match note.kind {
+        NoteKind::Outage => "An Admin set an outage note".to_owned(),
+        NoteKind::Maintenance => "An Admin set a planned maintenance note".to_owned(),
+        NoteKind::Online => format!("An Admin declared the BIR online, ignoring evidence: {}", note.text),
+    };
+    match why {
+        Some(why) => format!("{reason} (why: {why})"),
+        None => reason,
+    }
 }
 
 /// The overall state before the run: where its first overall line starts.
@@ -283,8 +295,25 @@ pub async fn clear(
     let mut locked = live::lock(uptime, db, now).await?;
     let now = locked.now();
     let mut tx = db.begin().await?;
-    lock_notes(&mut tx).await?;
+    live::lock_sign(&mut tx).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
+    clear_note(&mut tx, &admin, &reason, now).await?;
+    let previous_seq = locked.previous().seq;
+    let evaluation = locked.evaluate(None, false);
+    let evaluation =
+        with_audit(evaluation, Cause::NoteCleared, &format!("An Admin cleared the note: {reason}"), previous_seq);
+    finish(locked, tx, evaluation, None, &admin).await?;
+    tracing::info!(actor = %admin.id, "BIR note cleared");
+    Ok(())
+}
+
+/// Marks the note in force cleared by `admin`, with `reason`.
+async fn clear_note(
+    tx: &mut Transaction<'_, Postgres>,
+    admin: &Account,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<(), NoteError> {
     let cleared = sqlx::query(
         "UPDATE bir_notes SET cleared_at = $1, cleared_by = $2, cleared_by_email = $3, cleared_how = 'staff',
                               cleared_reason = $4
@@ -293,18 +322,105 @@ pub async fn clear(
     .bind(now)
     .bind(admin.id)
     .bind(&admin.email)
-    .bind(&reason)
-    .execute(&mut *tx)
+    .bind(reason)
+    .execute(&mut **tx)
     .await?;
     if cleared.rows_affected() == 0 {
         return Err(NoteError::NoNote);
     }
-    let previous_seq = locked.previous().seq;
-    let evaluation = locked.evaluate(None, false);
-    let evaluation =
-        with_audit(evaluation, Cause::NoteCleared, &format!("An Admin cleared the note: {reason}"), previous_seq);
-    finish(locked, tx, evaluation, None, &admin).await?;
-    tracing::info!(actor = %admin.id, "BIR note cleared");
+    Ok(())
+}
+
+/// For a process that is not the server (the `buwiz-cloud bir` command):
+/// an Admin sets a note as [`set_with_reason`] checks it, but only the note
+/// row, its audit line and the sign's `seq` are written, under the sign's
+/// lock. The rules are not run here: the running server takes the note in
+/// at its next run (or when it next starts), makes the change, writes it
+/// and mails staff. So this can neither end an Offline nor write over what
+/// the server holds and has not written yet.
+pub async fn record_set(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    new: NewNote<'_>,
+    reason: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Note, NoteError> {
+    admin_first(db, config, actor).await?;
+    let why = reason.map(note_text).transpose()?;
+    let mut tx = db.begin().await?;
+    live::lock_sign(&mut tx).await?;
+    let admin = admin_in(&mut tx, config, actor).await?;
+    let (seq, state) = stored_seq(&mut tx).await?;
+    let (note, expired) = insert_note(&mut tx, &admin, new, now).await?;
+    let seq = sign::next_seq(seq, now);
+    let line = |cause: Cause, reason: String| Event {
+        scope: Scope::Overall,
+        from: state.clone(),
+        to: state.clone(),
+        cause,
+        reason,
+    };
+    let mut lines: Vec<(Event, Option<&Account>)> = (0..expired)
+        .map(|_| (line(Cause::NoteExpired, "A note ran out before Buwiz saw it end".into()), None))
+        .collect();
+    lines.push((line(Cause::NoteSet, set_reason(&note, why.as_deref())), Some(&admin)));
+    record_lines(&mut tx, &lines, seq, now).await?;
+    tx.commit().await?;
+    tracing::info!(actor = %admin.id, kind = note.kind.as_str(), "BIR note recorded for the server");
+    Ok(note)
+}
+
+/// For a process that is not the server: an Admin clears the note in force
+/// as [`clear`] checks it, writing only the note row, its audit line and
+/// the sign's `seq` (see [`record_set`]).
+pub async fn record_clear(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<(), NoteError> {
+    admin_first(db, config, actor).await?;
+    let reason = note_text(reason)?;
+    let mut tx = db.begin().await?;
+    live::lock_sign(&mut tx).await?;
+    let admin = admin_in(&mut tx, config, actor).await?;
+    let (seq, state) = stored_seq(&mut tx).await?;
+    clear_note(&mut tx, &admin, &reason, now).await?;
+    let line = Event {
+        scope: Scope::Overall,
+        from: state.clone(),
+        to: state,
+        cause: Cause::NoteCleared,
+        reason: format!("An Admin cleared the note: {reason}"),
+    };
+    record_lines(&mut tx, &[(line, Some(&admin))], sign::next_seq(seq, now), now).await?;
+    tx.commit().await?;
+    tracing::info!(actor = %admin.id, "BIR note cleared for the server");
+    Ok(())
+}
+
+/// The stored sign's `seq` and overall state, under the sign's lock.
+async fn stored_seq(tx: &mut Transaction<'_, Postgres>) -> Result<(i64, String), NoteError> {
+    let row: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT seq, state->>'state' FROM bir_sign WHERE id = 1").fetch_optional(&mut **tx).await?;
+    let (seq, state) = row.ok_or(NoteError::NoSign)?;
+    Ok((seq, state.unwrap_or_else(|| "no_recent_news".into())))
+}
+
+/// Writes `lines` under `seq` (their places in order) and moves the stored
+/// `seq` to it, leaving the stored sign itself as the server wrote it.
+async fn record_lines(
+    tx: &mut Transaction<'_, Postgres>,
+    lines: &[(Event, Option<&Account>)],
+    seq: i64,
+    now: OffsetDateTime,
+) -> Result<(), NoteError> {
+    for (ord, (event, actor)) in lines.iter().enumerate() {
+        live::insert_event(tx, to_minute(now), event, *actor, seq, ord).await?;
+    }
+    sqlx::query("UPDATE bir_sign SET seq = GREATEST(seq, $1) WHERE id = 1").bind(seq).execute(&mut **tx).await?;
     Ok(())
 }
 

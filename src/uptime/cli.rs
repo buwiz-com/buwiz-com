@@ -2,13 +2,13 @@
 //! before the staff page exists. See [`USAGE`] and `docs/deploy.md`.
 //!
 //! - `bir declare online|offline|maintenance`: sets a hand-set note ("declare
-//!   Online", an outage, planned maintenance) through the same function the
-//!   staff page will call ([`notes::set_with_reason`]): Admins only, checked
+//!   Online", an outage, planned maintenance) with the same checks the
+//!   staff page's function makes ([`notes::set_with_reason`]): Admins only, checked
 //!   on the database as it stands, text public (1 to 200 characters), an end
 //!   in the future and at most 72 hours ahead, refused while another note is
 //!   in force, and the same audit line (`bir_events`, with the Admin's id
 //!   and email and the reason).
-//! - `bir clear`: ends the note in force ([`notes::clear`]), with a reason.
+//! - `bir clear`: ends the note in force, with a reason.
 //! - `bir status`: prints the stored sign and the note; writes nothing.
 //!
 //! It runs on the instance with the service's own settings (`DATABASE_URL`,
@@ -18,10 +18,14 @@
 //! sign as it then stands. It never prints a TIN (nothing it reads holds
 //! one).
 //!
-//! The running server takes the change in by itself, without a restart:
-//! every run of its rules (at least every 30 seconds) reads the stored
-//! sign's `seq`, and a higher one, written by this command, replaces its
-//! sign and note ([`super::live`]). The server also mails staff about it.
+//! It writes only the note row, its audit line and the sign's `seq`, under
+//! the sign's lock ([`notes::record_set`]), and runs no rule: the running
+//! server takes the note in by itself, without a restart (every run of its
+//! rules, at least every 30 seconds, reads the stored `seq`), makes the
+//! change, writes it and mails staff ([`super::live`]). With no server
+//! running, the note takes effect when one starts. `--as` names the Admin
+//! for the audit line; it is not authentication: whoever can run the
+//! command on the server, with its settings, is trusted.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -35,7 +39,7 @@ use super::live;
 use super::notes::{self, MAX_AHEAD, NewNote, NoteError};
 use super::public::{self, Times};
 use super::sign::{Note, NoteKind, SignState};
-use super::{DEFAULT_UPLOAD_PORTS, Level, Uptime};
+use super::Level;
 use crate::account::accounts::{self, Account};
 use crate::account::roles::{self, Power, Staff};
 use crate::base::config::Config;
@@ -49,7 +53,8 @@ Run it with the server's own settings (DATABASE_URL, ADMIN_EMAILS, BIR_UPTIME): 
   declare online       the sign reads Online whatever the tries say (the lights are still kept)
   declare offline      an outage: the sign reads Offline until it ends or a return gets in
   declare maintenance  planned maintenance: the sign reads Offline until it ends
-  --as E               an Admin's login; the audit line names it
+  --as E               an Admin's login; the audit line names it (not a password: whoever
+                       can run this on the server is trusted)
   --reason R           why, 1 to 200 characters: staff only (the audit line and staff mail)
   --until T            when it ends: 2026-11-14T18:00 (Manila) or RFC 3339; at most 72 hours ahead
   --hours N            or N whole hours from now, 1 to 72
@@ -279,10 +284,6 @@ async fn admin(db: &PgPool, config: &Config, email: &str) -> Result<Staff, CliEr
     }
 }
 
-/// How many times a change is tried when the running server wrote the sign
-/// in between.
-const TRIES: usize = 3;
-
 fn line(out: &mut dyn Write, text: impl AsRef<str>) {
     let _ = writeln!(out, "{}", text.as_ref());
     let _ = out.flush();
@@ -296,12 +297,13 @@ enum Change<'a> {
 }
 
 /// Runs `command` on `db` with the server's `config` and `level`, at
-/// `now`, telling `out` what it does.
+/// `now`, telling `out` what it does. `_production` is kept for callers:
+/// the command runs no engine, so it no longer reads it.
 pub async fn run(
     db: &PgPool,
     config: &Config,
     level: Level,
-    production: bool,
+    _production: bool,
     command: Command,
     now: OffsetDateTime,
     out: &mut dyn Write,
@@ -365,31 +367,21 @@ pub async fn run(
         Command::Status => unreachable!("answered above"),
     };
     line(out, format!("  Reason (staff only, in the audit line): \"{reason}\""));
-    for attempt in 1..=TRIES {
-        // An engine of this process's own, loaded from the record each time.
-        let uptime = Uptime::new(level, DEFAULT_UPLOAD_PORTS.to_vec(), production, now);
-        let at = OffsetDateTime::now_utc().max(now);
-        let made = match change {
-            Change::Set(new, why) => {
-                notes::set_with_reason(&uptime, db, config, &actor, new, Some(why), at).await.map(drop)
-            }
-            Change::Clear(why) => notes::clear(&uptime, db, config, &actor, why, at).await,
-        };
-        match made {
-            Ok(()) => {
-                line(out, "Done. The sign now:");
-                let sign = uptime.live.sign();
-                describe(&sign, sign.note.as_ref()).into_iter().for_each(|text| line(out, format!("  {text}")));
-                line(out, "The running server shows it within 30 seconds and mails staff about it.");
-                return Ok(());
-            }
-            Err(NoteError::Moved) if attempt < TRIES => {
-                line(out, "The server changed the sign meanwhile; trying again.")
-            }
-            Err(error) => return Err(error.into()),
-        }
+    if stored.is_none() {
+        return Err(NoteError::NoSign.into());
     }
-    Err(CliError::Refused("the sign kept changing; nothing was written: run it again".into()))
+    // Only the note, its audit line and the sign's `seq`: the server runs
+    // the rules, so this never writes over what it holds.
+    let at = OffsetDateTime::now_utc().max(now);
+    match change {
+        Change::Set(new, why) => {
+            notes::record_set(db, config, &actor, new, Some(why), at).await?;
+        }
+        Change::Clear(why) => notes::record_clear(db, config, &actor, why, at).await?,
+    }
+    line(out, "Done: the note and its audit line are written.");
+    line(out, "The running server takes it in within 30 seconds (or when it next starts), shows it and mails staff.");
+    Ok(())
 }
 
 /// `bir status`: the stored sign and the last changes. Writes nothing.

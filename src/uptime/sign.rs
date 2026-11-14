@@ -81,8 +81,22 @@ pub const PAUSE_WITHIN: Duration = Duration::minutes(60);
 pub const STREAK_FAILURES: usize = 5;
 /// A sign not evaluated for longer than this: Buwiz was not watching.
 pub const WATCH_GAP: Duration = Duration::minutes(5);
+/// The longest one gap in watching is written as: a clock that jumps
+/// forward writes no absurd span.
+pub const MAX_GAP: Duration = Duration::days(31);
 /// How far back the engine is given tries.
 pub const EVIDENCE_KEPT: Duration = Duration::hours(3);
+/// `seq` never falls below the current mark of this many seconds.
+pub const SEQ_MARK_SECONDS: i64 = 300;
+
+/// The `seq` after `previous`, at `now`: one more, and never below the
+/// current 5-minute mark in Unix seconds. So a database restored from an
+/// older backup passes, at its next start, any `seq` an app has stored,
+/// and a `seq` tells nothing finer than 5 minutes about when it moved.
+pub fn next_seq(previous: i64, now: OffsetDateTime) -> i64 {
+    let seconds = now.unix_timestamp();
+    previous.saturating_add(1).max(seconds - seconds.rem_euclid(SEQ_MARK_SECONDS))
+}
 /// The most vote losses kept.
 pub const MAX_VOTE_LOSSES: usize = 2_000;
 /// The most keys one vote loss holds.
@@ -600,6 +614,50 @@ impl SignState {
             Side::Dispatcher => &mut self.dispatcher,
             Side::Upload => &mut self.upload,
         }
+    }
+
+    /// Brings every past time it holds back to `now` at the latest (a lost
+    /// vote's end to 24 hours after it): a sign written by a clock that was
+    /// ahead, or kept while the clock stepped back. `true` if one moved.
+    pub fn clamp_to(&mut self, now: OffsetDateTime) -> bool {
+        let mut moved = false;
+        let mut clamp = |at: &mut OffsetDateTime| {
+            if *at > now {
+                *at = now;
+                moved = true;
+            }
+        };
+        clamp(&mut self.since);
+        clamp(&mut self.evaluated_at);
+        for lamp in [&mut self.dispatcher, &mut self.upload] {
+            clamp(&mut lamp.since);
+            for at in [&mut lamp.last_ok_at, &mut lamp.last_evidence_at, &mut lamp.fresh_from].into_iter().flatten() {
+                clamp(at);
+            }
+            for voter in &mut lamp.quorum {
+                clamp(&mut voter.at);
+            }
+        }
+        for at in [
+            &mut self.last_success_at,
+            &mut self.last_news_at,
+            &mut self.waking_since,
+            &mut self.streak_told,
+            &mut self.relay.since,
+            &mut self.relay.resumed_at,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            clamp(at);
+        }
+        for loss in &mut self.vote_losses {
+            if loss.until > now + VOTE_LOST_FOR {
+                loss.until = now + VOTE_LOST_FOR;
+                moved = true;
+            }
+        }
+        moved
     }
 
     /// `staff` while a hand-set note is in force, else `tries`.
@@ -1224,7 +1282,8 @@ pub fn evaluate(previous: &SignState, inputs: &Inputs<'_>) -> Evaluation {
     next.evaluated_at = now;
     let mut events = Vec::new();
     let mut notices = Vec::new();
-    let not_watched = (now - previous.evaluated_at > WATCH_GAP).then_some((previous.evaluated_at, now));
+    let not_watched =
+        (now - previous.evaluated_at > WATCH_GAP).then(|| (previous.evaluated_at.max(now - MAX_GAP), now));
 
     // The times of news, from every try given (a run that failed, or a
     // restart, reads the same).
@@ -1435,7 +1494,7 @@ pub fn evaluate(previous: &SignState, inputs: &Inputs<'_>) -> Evaluation {
     }
 
     if !events.is_empty() || not_watched.is_some() {
-        next.seq = previous.seq + 1;
+        next.seq = next_seq(previous.seq, now);
     }
     if next.visible() != previous.visible() {
         let millis = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX);

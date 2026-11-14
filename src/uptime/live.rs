@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use super::Uptime;
+use super::alerts::Alert;
 use super::classify::{Kind, Outcome, Stage, Window};
 use super::keys::Keys;
 use super::sign::{self, Admission, Evaluation, Event, Evidence, Note, NoteKind, SignState, Source};
@@ -181,13 +182,16 @@ impl Locked<'_> {
     }
 
     /// Shows `evaluation` once it is written, with `note` the open note it
-    /// was run with.
-    pub fn show(mut self, evaluation: Evaluation, note: Option<Note>, _written: &[Written]) {
+    /// was run with, and queues the staff mail for what changed.
+    pub fn show(mut self, evaluation: Evaluation, note: Option<Note>, written: &[Written]) {
         self.engine.fresh = 0;
         self.engine.note = match evaluation.note_ended {
             Some((id, _)) if note.as_ref().is_some_and(|note| note.id == id) => None,
             _ => note,
         };
+        for alert in Alert::for_run(written, &evaluation.state) {
+            self.uptime.alerts.push(alert);
+        }
         self.uptime.live.show(evaluation.state);
     }
 

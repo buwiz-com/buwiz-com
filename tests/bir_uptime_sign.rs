@@ -1,14 +1,16 @@
 //! BIR uptime's sign with its database: tries recorded through the
 //! recorder move it, every change leaves an event, the sign survives a
-//! restart, notes and the relay resume are Admin-only and audited, and the
-//! day history adds up across midnight and a restart. Made-up data, a
-//! made-up clock, and the local test database only: nothing else is
-//! connected to.
+//! restart, notes and the relay resume are Admin-only and audited, the day
+//! history adds up across midnight and a restart, and staff mail is
+//! batched, capped and carries no personal data. Made-up data, a made-up
+//! clock, and the local test database only: nothing else is connected to.
 
 mod common;
 
 use buwiz_cloud::account::accounts::Account;
+use buwiz_cloud::account::mail::Mailer;
 use buwiz_cloud::account::roles::{self, Role, Staff};
+use buwiz_cloud::uptime::alerts::{self, Alert, PER_DAY};
 use buwiz_cloud::uptime::days;
 use buwiz_cloud::uptime::keys::{Network, manila_day};
 use buwiz_cloud::uptime::live;
@@ -18,6 +20,7 @@ use buwiz_cloud::uptime::sign::{Light, NoteKind};
 use buwiz_cloud::uptime::store::{self, RelayTry};
 use buwiz_cloud::uptime::{Level, Uptime};
 use common::{STAFF, Site};
+use http::HeaderMap;
 use sqlx::PgPool;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -559,4 +562,112 @@ async fn retention_keeps_the_history_and_prunes_the_rest(db: PgPool) {
     assert_eq!(count("bir_held").await, 1);
     assert_eq!(count("bir_days").await, 1, "the day history is kept forever");
     assert_eq!(count("bir_events").await, 1, "and the events");
+}
+
+/// A site's mailer that keeps what it sends, and staff to send to.
+async fn mail_site(db: &PgPool) -> (Site, Mailer) {
+    let site = Site::new(db.clone());
+    site.staff_with_role("admin@example.test", "admin").await;
+    site.staff_with_role("support@example.test", "support").await;
+    let (banned, _) = site.staff_with_role("gone@example.test", "support").await;
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Made-up' WHERE id = $1")
+        .bind(banned)
+        .execute(db)
+        .await
+        .unwrap();
+    site.person("filer@example.test").await;
+    (site, Mailer::recording("http://localhost:3008"))
+}
+
+#[sqlx::test]
+async fn staff_mail_is_batched_every_ten_minutes(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let config = &site.state.config;
+    let uptime = uptime(t(0));
+    an_outage(&uptime, &db).await;
+    // The first change mails at once ...
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(12)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: online (and 1 more)");
+    assert!(mail.text.contains("10:00 AM  Online: The mailbox is online."), "{}", mail.text);
+    assert!(mail.text.contains(
+        "10:12 AM  Offline: The mailbox is offline. 3 accounts on 3 networks didn't get past the mailbox within 15 min."
+    ));
+    let to: Vec<String> = mailer.notices().into_iter().map(|notice| notice.to).collect();
+    assert_eq!(to, ["admin@example.test", STAFF, "support@example.test"], "Admins and Support, not the banned");
+    let mailed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM bir_events WHERE mailed_at IS NOT NULL").fetch_one(&db).await.unwrap();
+    assert_eq!(mailed, 2, "the two changes of the overall sign");
+
+    // ... the next ones wait for the end of the 10 minutes and go together.
+    record(&uptime, &db, 5, 5, Ends::Landed, t(15)).await;
+    assert!(alerts::flush(&uptime, &db, &mailer, config, t(15)).await.unwrap().is_none());
+    uptime.alerts.push(Alert::host_key("SHA256:madeupmadeupmadeupmadeupmadeupmadeupmadeup0", t(16)));
+    // The same key again is told once.
+    uptime.alerts.push(Alert::host_key("SHA256:madeupmadeupmadeupmadeupmadeupmadeupmadeup0", t(17)));
+    assert!(alerts::flush(&uptime, &db, &mailer, config, t(21)).await.unwrap().is_none());
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(22)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: back online (and 1 more)");
+    assert!(mail.text.contains("relay-reported, unverified: do not pin from this mail"));
+    assert_eq!(mail.text.matches("SHA256:").count(), 1);
+    assert_eq!(mailer.notices().len(), 6);
+}
+
+#[sqlx::test]
+async fn at_most_24_mails_a_day(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let uptime = uptime(t(0));
+    let mut sent = 0;
+    for step in 0..40 {
+        let at = t(step * 10);
+        uptime.alerts.push(Alert::missing_header(at));
+        if let Some(mail) = alerts::flush(&uptime, &db, &mailer, &site.state.config, at).await.unwrap() {
+            sent += 1;
+            if sent == PER_DAY {
+                assert!(mail.text.contains("This is the 24th mail today."));
+            }
+        }
+    }
+    assert_eq!(sent, PER_DAY);
+    // A new Manila day starts the count again (midnight is 16:00 UTC).
+    let tomorrow = OffsetDateTime::parse("2026-11-11T16:05:00Z", &Rfc3339).unwrap();
+    uptime.alerts.push(Alert::missing_header(tomorrow));
+    assert!(alerts::flush(&uptime, &db, &mailer, &site.state.config, tomorrow).await.unwrap().is_some());
+}
+
+#[sqlx::test]
+async fn staff_mail_names_nobody_who_filed(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let uptime = Uptime::new(Level::Record, vec![22], true, t(0));
+    an_outage(&uptime, &db).await;
+    record(&uptime, &db, 9, 9, Ends::HostKey, t(13)).await;
+    // Production without CF-Connecting-IP.
+    uptime.networks.network(&HeaderMap::new(), t(13));
+    let mut texts = Vec::new();
+    for minute in [14, 30, 50] {
+        if let Some(mail) = alerts::flush(&uptime, &db, &mailer, &site.state.config, t(minute)).await.unwrap() {
+            texts.push(format!("{}\n{}", mail.subject, mail.text));
+        }
+    }
+    let all = texts.join("\n");
+    assert!(all.contains("without CF-Connecting-IP"), "{all}");
+    for personal in ["filer@example.test", "000123453", "198.51.", "127.0.0.1", "00000000-0000"] {
+        assert!(!all.contains(personal), "{personal} in {all}");
+    }
+    for notice in mailer.notices() {
+        assert_ne!(notice.to, "filer@example.test");
+    }
+}
+
+#[sqlx::test]
+async fn nothing_is_mailed_or_judged_at_off(db: PgPool) {
+    let (site, mailer) = mail_site(&db).await;
+    let uptime = Uptime::new(Level::Off, vec![22], false, t(0));
+    uptime.alerts.push(Alert::missing_header(t(0)));
+    assert!(alerts::flush(&uptime, &db, &mailer, &site.state.config, t(1)).await.unwrap().is_none());
+    assert!(mailer.notices().is_empty());
+    // The ticker does nothing either: it returns at once.
+    let off = Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up secret", uptime);
+    buwiz_cloud::uptime::run_ticker(off.state.clone()).await;
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events").fetch_one(&db).await.unwrap();
+    assert_eq!(events, 0);
 }

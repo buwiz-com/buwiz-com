@@ -15,7 +15,9 @@
 //! - [`live`]: the sign in memory, rebuilt on start, written on change.
 //! - [`notes`]: what an Admin sets by hand.
 //! - [`days`]: the day history and the tables' retention.
+//! - [`alerts`]: staff mail.
 
+pub mod alerts;
 pub mod classify;
 pub mod days;
 pub mod keys;
@@ -32,6 +34,7 @@ use http::HeaderMap;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+use self::alerts::Alerts;
 use self::keys::{DaySets, KeyRing, NetworkReader, RateLimiter};
 use self::live::Live;
 use self::store::{Recorder, Sightings};
@@ -175,6 +178,8 @@ pub struct Uptime {
     pub sightings: Sightings,
     /// The sign, in memory ([`live`]).
     pub live: Live,
+    /// Staff mail not sent yet ([`alerts`]).
+    pub alerts: Alerts,
 }
 
 impl Uptime {
@@ -192,6 +197,7 @@ impl Uptime {
             recorder: Recorder::default(),
             sightings: Sightings::default(),
             live: Live::new(now),
+            alerts: Alerts::default(),
         }
     }
 
@@ -217,9 +223,9 @@ impl Uptime {
 pub const ROLL_UP_EVERY: Duration = Duration::minutes(10);
 
 /// From `record` up, for as long as the server runs: loads the sign, then
-/// every 30 seconds runs the rules for what the clock alone changes, and
-/// every 10 minutes (and after each Manila midnight) rewrites the day
-/// history. Nothing at `off`.
+/// every 30 seconds runs the rules for what the clock alone changes and
+/// sends the staff mail that is due, and every 10 minutes (and after each
+/// Manila midnight) rewrites the day history. Nothing at `off`.
 pub async fn run_ticker(state: AppState) {
     let uptime = state.uptime.clone();
     if !uptime.level.records() {
@@ -230,6 +236,9 @@ pub async fn run_ticker(state: AppState) {
         let now = OffsetDateTime::now_utc();
         if let Err(error) = live::tick(&uptime, &state.db, now).await {
             tracing::error!(%error, "BIR uptime: the rules could not run");
+        }
+        if let Err(error) = alerts::flush(&uptime, &state.db, &state.mailer, &state.config, now).await {
+            tracing::error!(%error, "BIR uptime: staff mail could not be sent");
         }
         let day = keys::manila_day(now);
         if rolled.is_none_or(|(at, rolled_day)| now - at >= ROLL_UP_EVERY || rolled_day != day) {

@@ -126,6 +126,23 @@ pub fn is_staff_sql(account: &str, list: &str) -> String {
     format!("({account}.banned_at IS NULL AND ({account}.role IS NOT NULL OR {account}.email = ANY({list})))")
 }
 
+/// Every staff address, for staff mail: accounts that are staff
+/// ([`is_staff_sql`]: not banned, with a role or in `admin_emails`), and
+/// addresses in `admin_emails` with no account yet. Sorted.
+pub async fn staff_emails(db: &PgPool, admin_emails: &[String]) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(&format!(
+        "SELECT email FROM accounts a WHERE {}
+         UNION
+         SELECT listed FROM unnest($1::text[]) AS listed
+          WHERE NOT EXISTS (SELECT 1 FROM accounts b WHERE b.email = listed)
+         ORDER BY 1",
+        is_staff_sql("a", "$1")
+    ))
+    .bind(admin_emails)
+    .fetch_all(db)
+    .await
+}
+
 /// [`of`], given whether the email is in `ADMIN_EMAILS`.
 pub fn effective(in_admin_emails: bool, role: Option<&str>, banned: bool) -> Option<(Role, bool)> {
     if banned {

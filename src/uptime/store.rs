@@ -23,7 +23,8 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::Uptime;
-use super::classify::Mode;
+use super::alerts::Alert;
+use super::classify::{Kind, Mode};
 use super::keys::{Keys, Network, TryKeys};
 use super::live;
 use super::observe::Observed;
@@ -197,6 +198,16 @@ pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &O
         Ok(Err(error)) => return tracing::error!(%error, "BIR uptime: could not record a try"),
         Err(_) => return tracing::error!("BIR uptime: recording a try took too long; it is lost"),
     };
+    // A fault on Buwiz's side that needs a person.
+    match (observed.kind, &observed.host_key) {
+        (Some(Kind::HostKey), Some(fingerprint)) => uptime.alerts.push(Alert::host_key(fingerprint, ended_at)),
+        (Some(kind), _) => {
+            if let Some(alert) = Alert::ours(kind, ended_at) {
+                uptime.alerts.push(alert);
+            }
+        }
+        (None, _) => {}
+    }
     // The rules, with this try. Only `live` tries are evidence.
     if observed.mode != Mode::Live {
         return;

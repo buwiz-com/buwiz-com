@@ -1,4 +1,7 @@
-//! Sends sign-in codes.
+//! Sends sign-in codes, and short plain-text notices to staff (BIR uptime's
+//! alerts, [`crate::uptime::alerts`]).
+
+use std::sync::Mutex;
 
 use anyhow::Context;
 use serde_json::json;
@@ -14,6 +17,16 @@ pub struct Mailer {
     /// not show WebP or SVG reliably).
     logo_url: String,
     http: reqwest::Client,
+    /// Tests only ([`Mailer::recording`]): notices are kept here, not sent.
+    outbox: Option<Mutex<Vec<Notice>>>,
+}
+
+/// A staff notice as sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub to: String,
+    pub subject: String,
+    pub text: String,
 }
 
 impl Mailer {
@@ -22,6 +35,47 @@ impl Mailer {
             config,
             logo_url: format!("{site_origin}/assets/brand/buwiz_wordmark_email.png"),
             http: reqwest::Client::new(),
+            outbox: None,
+        }
+    }
+
+    /// A mailer for tests: notices are kept in memory ([`Mailer::notices`])
+    /// and nothing goes out; sign-in codes are logged.
+    pub fn recording(site_origin: &str) -> Self {
+        Self { outbox: Some(Mutex::new(Vec::new())), ..Self::new(MailConfig::Log, site_origin) }
+    }
+
+    /// The notices a [`Mailer::recording`] kept, oldest first.
+    pub fn notices(&self) -> Vec<Notice> {
+        self.outbox
+            .as_ref()
+            .map_or_else(Vec::new, |outbox| outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// A short plain-text notice to one staff address.
+    pub async fn send_notice(&self, to: &str, subject: &str, text: &str) -> anyhow::Result<()> {
+        if let Some(outbox) = &self.outbox {
+            let notice = Notice { to: to.into(), subject: subject.into(), text: text.into() };
+            outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(notice);
+            return Ok(());
+        }
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(to, subject, text, "staff notice (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .bearer_auth(api_key)
+                    .json(&json!({ "from": from, "to": [to], "subject": subject, "text": text }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
         }
     }
 

@@ -54,6 +54,9 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/home.css", get(home_stylesheet))
         .route("/assets/account.css", get(account_stylesheet))
         .route("/assets/account.js", get(account_script))
+        .route("/assets/staff.css", get(staff_stylesheet))
+        .route("/assets/staff.js", get(staff_script))
+        .route("/assets/staff-icons.svg", get(staff_icons))
         .route("/assets/screens/{name}", get(screenshot))
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
@@ -160,6 +163,18 @@ async fn account_stylesheet() -> Response {
 
 async fn account_script() -> Response {
     text(include_str!("account.js"), "text/javascript; charset=utf-8")
+}
+
+async fn staff_stylesheet() -> Response {
+    css(include_str!("staff.css"))
+}
+
+async fn staff_script() -> Response {
+    text(include_str!("staff.js"), "text/javascript; charset=utf-8")
+}
+
+async fn staff_icons() -> Response {
+    text(include_str!("staff-icons.svg"), "image/svg+xml")
 }
 
 async fn demo_script() -> Response {

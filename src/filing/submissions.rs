@@ -40,6 +40,10 @@ use crate::filing::jws;
 use crate::filing::tickets::{self, TicketError};
 use crate::relay::{Control, Frame};
 use crate::sender::{Job, identity};
+use crate::uptime::classify::{Class, Mode};
+use crate::uptime::keys::Network;
+use crate::uptime::observe::{self, TryObserver};
+use crate::uptime::store::{self, RelayTry};
 
 const MAX_XML_BYTES: usize = 2 * 1024 * 1024;
 pub const BODY_LIMIT: usize = 3 * MAX_XML_BYTES;
@@ -352,12 +356,18 @@ pub async fn relay(
             return Err(ApiError::forbidden("ticket_mismatch", "this return was sealed on another device"));
         }
     }
+    // Where the try comes from, for its uptime record: the network and the
+    // app's version, in memory only.
+    let context = state.uptime.level.records().then(|| TryContext {
+        network: state.uptime.networks.network(&parts.headers, OffsetDateTime::now_utc()),
+        client: crate::uptime::client_label(&parts.headers),
+    });
     let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &state)
         .await
         .map_err(|_| ApiError::bad_request("websocket_required", "open this path as a WebSocket"))?;
     let account_id = bearer.account.id;
     Ok(upgrade.on_upgrade(move |socket| async move {
-        if let Err(error) = run_relay(state, socket, account_id, id).await {
+        if let Err(error) = run_relay(state, socket, account_id, id, context).await {
             tracing::error!(submission = %id, error = ?error, "relay failed");
         }
     }))
@@ -375,6 +385,14 @@ pub struct Locked {
     ticket: Option<String>,
     tin_root: String,
     branch_code: String,
+    /// The ticket's admission (`tickets.bir_admission`), if any.
+    admission: Option<String>,
+}
+
+/// What the uptime record of a relay try knows from its request.
+struct TryContext {
+    network: Network,
+    client: Option<String>,
 }
 
 /// What the relay does with a submission when the app connects.
@@ -402,7 +420,8 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
            AND (s.device_id IS NULL OR EXISTS (SELECT 1 FROM devices d WHERE d.id = s.device_id AND d.revoked_at IS NULL))
          RETURNING s.form_type, s.period, s.filename, s.xml_nonce, s.xml_ciphertext, s.envelope,
                    (SELECT t.jws FROM tickets t WHERE t.jti = s.ticket_jti) AS ticket,
-                   c.tin_root, c.branch_code",
+                   c.tin_root, c.branch_code,
+                   (SELECT t.bir_admission FROM tickets t WHERE t.jti = s.ticket_jti) AS admission",
         gate::SENDABLE_SQL
     ))
     .bind(id)
@@ -464,7 +483,13 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
     Ok(RelayStart::Answer(Control::Result { status, error, receipt }))
 }
 
-async fn run_relay(state: AppState, mut socket: WebSocket, account_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+async fn run_relay(
+    state: AppState,
+    mut socket: WebSocket,
+    account_id: Uuid,
+    id: Uuid,
+    context: Option<TryContext>,
+) -> anyhow::Result<()> {
     let locked = match claim_for_relay(&state.db, account_id, id).await? {
         RelayStart::Send(locked) => locked,
         RelayStart::Answer(result) => {
@@ -494,11 +519,23 @@ async fn run_relay(state: AppState, mut socket: WebSocket, account_id: Uuid, id:
         }
         _ => anyhow::bail!("submission {id} has nothing to send"),
     };
-    bridge(&state, socket, &job, id, v2).await?;
+    // A test TIN's return is never sent, and never evidence: it is not
+    // recorded at all.
+    let test_tin = Tin::parse_any(&locked.tin_root, &locked.branch_code).map_or(true, |tin| tin.is_test());
+    let recording = context.filter(|_| !test_tin).map(|context| RelayTry {
+        account_id,
+        network: context.network,
+        client: context.client,
+        admission: locked.admission.clone().unwrap_or_else(|| "open".to_owned()),
+        started_at: OffsetDateTime::now_utc(),
+    });
+    bridge(&state, socket, &job, id, v2, recording).await?;
     Ok(())
 }
 
 /// Stores the outcome of one send.
+/// `mode` (from `BIR_UPTIME=public`): the Sender's mode, kept on a failed
+/// or unknown send too.
 async fn record(
     db: &PgPool,
     id: Uuid,
@@ -506,6 +543,7 @@ async fn record(
     status: &str,
     error: Option<&str>,
     receipt: Option<&str>,
+    mode: Option<&str>,
 ) -> anyhow::Result<()> {
     match (status, receipt) {
         ("sent" | "dry_run", Some(receipt)) => {
@@ -529,25 +567,27 @@ async fn record(
         // A v1 submission may be tried again; a v2 one needs a new ticket.
         ("failed", _) => {
             sqlx::query(
-                "UPDATE submissions SET status = 'failed', error = $2,
+                "UPDATE submissions SET status = 'failed', error = $2, mode = coalesce($4, mode),
                      envelope = NULL, purged_at = CASE WHEN $3 THEN now() ELSE purged_at END
                  WHERE id = $1",
             )
             .bind(id)
             .bind(error)
             .bind(v2)
+            .bind(mode)
             .execute(db)
             .await?;
             tracing::warn!(submission = %id, reason = error.unwrap_or_default(), "submission not sent");
         }
         _ => {
             sqlx::query(
-                "UPDATE submissions SET status = 'unknown', error = $2, xml_nonce = NULL, xml_ciphertext = NULL,
-                     envelope = NULL, purged_at = now()
+                "UPDATE submissions SET status = 'unknown', error = $2, mode = coalesce($3, mode),
+                     xml_nonce = NULL, xml_ciphertext = NULL, envelope = NULL, purged_at = now()
                  WHERE id = $1",
             )
             .bind(id)
             .bind(error.unwrap_or("the send ended without an outcome"))
+            .bind(mode)
             .execute(db)
             .await?;
             tracing::error!(submission = %id, "submission may have reached BIR; not retrying");
@@ -559,43 +599,119 @@ async fn record(
 /// How long to wait for the Sender's outcome after the app is gone.
 const OUTCOME_WAIT: Duration = Duration::from_secs(60);
 
+/// What the app is told of a try beyond the `Control` (from
+/// `BIR_UPTIME=public`), and the mode the submission keeps.
+#[derive(Default)]
+struct Told {
+    class: Option<Class>,
+    mode: Option<Mode>,
+}
+
 /// Records `result`; the app hears it only after that, so the submission
-/// reads the same when it asks.
-async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control) -> anyhow::Result<String> {
+/// reads the same when it asks. The text is `result` as the `Control`
+/// serializes it, byte for byte, with the added fields after its own.
+async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control, told: &Told) -> anyhow::Result<String> {
     let Control::Result { status, error, receipt } = result else {
         anyhow::bail!("not a result");
     };
     let receipt = receipt.as_ref().and_then(Value::as_str);
-    record(db, id, v2, status, error.as_deref(), receipt).await?;
-    Ok(serde_json::to_string(result)?)
+    let mode = told.mode.filter(|mode| *mode != Mode::Unknown).map(Mode::as_str);
+    record(db, id, v2, status, error.as_deref(), receipt, mode).await?;
+    let mut added = Vec::new();
+    if let Some(class) = told.class {
+        added.push(("class", Value::from(class.as_str())));
+    }
+    Ok(with_fields(serde_json::to_string(result)?, &added))
+}
+
+/// `object` (a serialized JSON object) with `fields` added at its end, so
+/// what was there before reads byte for byte the same.
+fn with_fields(mut object: String, fields: &[(&str, Value)]) -> String {
+    if fields.is_empty() || !object.ends_with('}') {
+        return object;
+    }
+    object.pop();
+    for (name, value) in fields {
+        if !object.ends_with('{') {
+            object.push(',');
+        }
+        object.push_str(&Value::from(*name).to_string());
+        object.push(':');
+        object.push_str(&value.to_string());
+    }
+    object.push('}');
+    object
+}
+
+/// Concludes the try: records `result`, then the try's uptime row (which
+/// never fails the send), then tells the app (unless it is gone) and closes
+/// its socket.
+#[allow(clippy::too_many_arguments)]
+async fn settle(
+    state: &AppState,
+    app_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    id: Uuid,
+    v2: bool,
+    result: &Control,
+    observer: Option<TryObserver>,
+    recording: Option<&RelayTry>,
+    app_gone: bool,
+) -> anyhow::Result<()> {
+    let observed = match (observer, result) {
+        (Some(observer), Control::Result { status, error, .. }) => Some(observer.finish(status, error.as_deref())),
+        _ => None,
+    };
+    let told = match &observed {
+        Some(observed) if state.uptime.level.is_public() => Told { class: observed.class(), mode: Some(observed.mode) },
+        _ => Told::default(),
+    };
+    let text = conclude(&state.db, id, v2, result, &told).await?;
+    if let (Some(observed), Some(recording)) = (&observed, recording) {
+        store::record(&state.uptime, &state.db, recording, observed, OffsetDateTime::now_utc()).await;
+    }
+    if !app_gone {
+        let _ = app_tx.send(Message::Text(text.into())).await;
+    }
+    let _ = app_tx.send(Message::Close(None)).await;
+    Ok(())
 }
 
 /// Hands `job` to the Sender and forwards frames between it and the app
-/// until the Sender's `result`, which it records, then passes on.
-async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bool) -> anyhow::Result<()> {
+/// until the Sender's `result`, which it records, then passes on. The
+/// Sender's `sender` frame stops here. With `recording`, the try's frames
+/// are watched for its uptime record ([`crate::uptime::observe`]).
+async fn bridge(
+    state: &AppState,
+    socket: WebSocket,
+    job: &Job,
+    id: Uuid,
+    v2: bool,
+    recording: Option<RelayTry>,
+) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message as Up;
 
     let (mut app_tx, mut app_rx) = socket.split();
+    let mut observer = recording.as_ref().map(|_| TryObserver::new(&state.uptime.upload_ports));
     let finish =
         |status: &str, error: String| Control::Result { status: status.to_owned(), error: Some(error), receipt: None };
     let upstream = match state.sender.open().await {
         Ok(upstream) => upstream,
         Err(error) => {
             tracing::error!(error = ?error, "the Sender is not reachable");
+            if let Some(observer) = observer.as_mut() {
+                observer.sender_down();
+            }
             let result = finish("failed", "the sending service is not reachable; try again later".into());
-            let text = conclude(&state.db, id, v2, &result).await?;
-            let _ = app_tx.send(Message::Text(text.into())).await;
-            let _ = app_tx.send(Message::Close(None)).await;
-            return Ok(());
+            return settle(state, &mut app_tx, id, v2, &result, observer, recording.as_ref(), false).await;
         }
     };
     let (mut up_tx, mut up_rx) = upstream.split();
     if up_tx.send(Up::Text(serde_json::to_string(job).expect("json").into())).await.is_err() {
+        if let Some(observer) = observer.as_mut() {
+            observer.sender_down();
+        }
         let result = finish("failed", "the sending service is not reachable; try again later".into());
-        let text = conclude(&state.db, id, v2, &result).await?;
-        let _ = app_tx.send(Message::Text(text.into())).await;
-        let _ = app_tx.send(Message::Close(None)).await;
-        return Ok(());
+        return settle(state, &mut app_tx, id, v2, &result, observer, recording.as_ref(), false).await;
     }
     // Streams the Sender asked the app to open, so they can be ended if the
     // app goes away.
@@ -608,13 +724,26 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bo
         tokio::select! {
             message = app_rx.next(), if !app_gone => {
                 let forward = match message {
-                    Some(Ok(Message::Text(text))) => Some(Up::Text(text.as_str().into())),
-                    Some(Ok(Message::Binary(bytes))) => Some(Up::Binary(bytes)),
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(observer) = observer.as_mut() {
+                            observer.app_text(text.as_str());
+                        }
+                        Some(Up::Text(text.as_str().into()))
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if let Some(observer) = observer.as_mut() {
+                            observer.app_binary(&bytes);
+                        }
+                        Some(Up::Binary(bytes))
+                    }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
                     Some(Ok(Message::Close(_)) | Err(_)) | None => {
                         // Tell the Sender every stream is gone, then wait
                         // for its own verdict.
                         app_gone = true;
+                        if let Some(observer) = observer.as_mut() {
+                            observer.app_gone();
+                        }
                         for &stream in &streams {
                             let refused = Control::Refused { stream, reason: "the app disconnected".into() };
                             for control in [refused, Control::Close { stream }] {
@@ -631,6 +760,11 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bo
             }
             message = up_rx.next() => match message {
                 Some(Ok(Up::Text(text))) => {
+                    // The `sender` frame (its mode) is for this side only.
+                    let forward = match observer.as_mut() {
+                        Some(observer) => observer.sender_text(&text),
+                        None => !observe::is_sender_frame(&text),
+                    };
                     match Frame::decode_text(&text) {
                         Some(Frame::Control(Control::Open { stream, .. })) => streams.push(stream),
                         Some(Frame::Control(outcome @ Control::Result { .. })) => {
@@ -639,7 +773,7 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bo
                         }
                         _ => {}
                     }
-                    if !app_gone {
+                    if forward && !app_gone {
                         let _ = app_tx.send(Message::Text(text.as_str().into())).await;
                     }
                 }
@@ -655,6 +789,11 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bo
         }
     }
     let _ = up_tx.send(Up::Close(None)).await;
+    if result.is_none()
+        && let Some(observer) = observer.as_mut()
+    {
+        observer.sender_lost();
+    }
     let result = result.unwrap_or_else(|| {
         if streams.is_empty() {
             finish("failed", "the sending service stopped before connecting to BIR".into())
@@ -662,12 +801,7 @@ async fn bridge(state: &AppState, socket: WebSocket, job: &Job, id: Uuid, v2: bo
             finish("unknown", "the send ended without an outcome; BIR may have received this return".into())
         }
     });
-    let text = conclude(&state.db, id, v2, &result).await?;
-    if !app_gone {
-        let _ = app_tx.send(Message::Text(text.into())).await;
-    }
-    let _ = app_tx.send(Message::Close(None)).await;
-    Ok(())
+    settle(state, &mut app_tx, id, v2, &result, observer, recording.as_ref(), app_gone).await
 }
 
 /// Key id of a receipt key. See [`jws::key_id`].
@@ -751,6 +885,18 @@ mod tests {
         ] {
             assert!(parse_filename(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn added_fields_go_after_the_controls_own() {
+        let result = Control::Result { status: "failed".into(), error: Some("x".into()), receipt: None };
+        let plain = serde_json::to_string(&result).unwrap();
+        assert_eq!(with_fields(plain.clone(), &[]), plain);
+        let added = with_fields(plain.clone(), &[("class", json!("bir")), ("bir", json!({"v": 1}))]);
+        assert_eq!(added, format!("{},\"class\":\"bir\",\"bir\":{{\"v\":1}}}}", &plain[..plain.len() - 1]));
+        // Still the same Control to every reader.
+        assert_eq!(Frame::decode_text(&added), Some(Frame::Control(result)));
+        assert_eq!(with_fields("{}".into(), &[("a", json!(1))]), r#"{"a":1}"#);
     }
 
     #[test]

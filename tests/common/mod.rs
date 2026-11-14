@@ -12,6 +12,7 @@ use buwiz_cloud::base::crypto;
 use buwiz_cloud::base::state::AppState;
 use buwiz_cloud::base::storage::DocumentStore;
 use buwiz_cloud::filing::link::SenderLink;
+use buwiz_cloud::uptime::Uptime;
 use serde_json::Value;
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -79,6 +80,16 @@ impl Site {
         Self::configured_with(db, store, downloads_url, admin_emails, Verification::from_env())
     }
 
+    /// A site whose Sender is at `sender_url` (a test's own fake, or
+    /// nothing) with `secret`, and BIR uptime as `uptime` says.
+    pub fn with_sender(db: PgPool, sender_url: &str, secret: &str, uptime: Uptime) -> Self {
+        let config = test_config(NO_DOWNLOADS, vec![STAFF.into()]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let sender = SenderLink::new(sender_url, Zeroizing::new(secret.into()));
+        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender).with_uptime(uptime);
+        Self { db, router: buwiz_cloud::app(state.clone()), state }
+    }
+
     fn configured_with(
         db: PgPool,
         store: DocumentStore,
@@ -86,22 +97,7 @@ impl Site {
         admin_emails: Vec<String>,
         verification: Verification,
     ) -> Self {
-        let config = Config {
-            host: "127.0.0.1".into(),
-            port: 0,
-            database_url: String::new(),
-            account_origin: ORIGIN.into(),
-            extra_origins: Vec::new(),
-            secure_cookies: false,
-            document_key: [7; 32],
-            admin_emails,
-            mail: MailConfig::Log,
-            trust_list: None,
-            downloads_url: downloads_url.into(),
-            forms_origin: FORMS.into(),
-            // Nothing listens there: the star count is unknown.
-            github_api_url: "http://127.0.0.1:9".into(),
-        };
+        let config = test_config(downloads_url, admin_emails);
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         // The account site never reaches the Sender in these tests.
         let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
@@ -230,6 +226,26 @@ impl Site {
     }
 }
 
+/// The settings of every test site.
+fn test_config(downloads_url: &str, admin_emails: Vec<String>) -> Config {
+    Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        database_url: String::new(),
+        account_origin: ORIGIN.into(),
+        extra_origins: Vec::new(),
+        secure_cookies: false,
+        document_key: [7; 32],
+        admin_emails,
+        mail: MailConfig::Log,
+        trust_list: None,
+        downloads_url: downloads_url.into(),
+        forms_origin: FORMS.into(),
+        // Nothing listens there: the star count is unknown.
+        github_api_url: "http://127.0.0.1:9".into(),
+    }
+}
+
 pub enum Part {
     Text(&'static str),
     File(&'static str, &'static [u8]),
@@ -329,32 +345,40 @@ impl TestDevice {
         Self { token, device_id, key }
     }
 
-    /// A request signed with the device key, a fresh nonce and the time now.
-    pub async fn post(&self, site: &Site, path: &str, body: &Value) -> Response {
+    /// The device headers of a request signed with the device key, a fresh
+    /// nonce and the time now.
+    pub fn signature(&self, method: &str, path: &str, body: &[u8]) -> Vec<(&'static str, String)> {
         use base64::Engine;
         use ed25519_dalek::Signer;
-        let body = body.to_string();
         let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
         let nonce = Uuid::new_v4().simple().to_string();
         let input = buwiz_cloud::filing::devices::signing_input(
-            "POST",
+            method,
             path,
-            &crypto::hex(&crypto::sha256(body.as_bytes())),
+            &crypto::hex(&crypto::sha256(body)),
             timestamp,
             &nonce,
         );
         let signature =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.key.sign(input.as_bytes()).to_bytes());
-        let request = Request::post(path)
+        vec![
+            ("buwiz-device", self.device_id.to_string()),
+            ("buwiz-timestamp", timestamp.to_string()),
+            ("buwiz-nonce", nonce),
+            ("buwiz-signature", signature),
+        ]
+    }
+
+    /// A request signed with the device key, a fresh nonce and the time now.
+    pub async fn post(&self, site: &Site, path: &str, body: &Value) -> Response {
+        let body = body.to_string();
+        let mut request = Request::post(path)
             .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("buwiz-device", self.device_id.to_string())
-            .header("buwiz-timestamp", timestamp.to_string())
-            .header("buwiz-nonce", nonce)
-            .header("buwiz-signature", signature)
-            .body(Body::from(body))
-            .unwrap();
-        site.send(request).await
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in self.signature("POST", path, body.as_bytes()) {
+            request = request.header(name, value);
+        }
+        site.send(request.body(Body::from(body)).unwrap()).await
     }
 }
 

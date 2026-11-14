@@ -9,14 +9,17 @@
 //! - [`classify`]: names a try's stage, windows, class and kind.
 //! - [`sshkex`]: reads the upload server's host key from the clear SSH
 //!   handshake.
+//! - [`store`]: writes a try's row and its host key.
 
 pub mod classify;
 pub mod keys;
 pub mod observe;
 pub mod sshkex;
+pub mod store;
 
 use std::net::IpAddr;
 
+use http::HeaderMap;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -24,7 +27,7 @@ use self::keys::{DaySets, KeyRing, NetworkReader, RateLimiter};
 
 /// `BIR_UPTIME`: how much of BIR uptime runs. Each level adds to the one
 /// below.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Level {
     /// Nothing new runs. The Sender's `sender` frame is still dropped.
     Off,
@@ -97,6 +100,26 @@ pub fn parse_upload_ports(raw: Option<&str>) -> Result<Vec<u16>, String> {
     Ok(ports)
 }
 
+/// The header new apps send on every request: `<app>/<version>`.
+pub const CLIENT_HEADER: &str = "buwiz-client";
+
+/// The `buwiz-client` header as the record keeps it: lowercase
+/// `<app>/<version>` of at most 40 characters, in the letters versions use,
+/// with no run of more than 4 digits (so no TIN, phone number or other
+/// number a person might put there). Anything else is not kept.
+pub fn client_label(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(CLIENT_HEADER)?.to_str().ok()?.trim().to_ascii_lowercase();
+    let (app, version) = raw.split_once('/')?;
+    let app_ok = (1..=20).contains(&app.len())
+        && app.starts_with(|ch: char| ch.is_ascii_lowercase())
+        && app.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let version_ok = !version.is_empty()
+        && version.starts_with(|ch: char| ch.is_ascii_digit())
+        && version.bytes().all(|byte| byte.is_ascii_alphanumeric() || b".+-".contains(&byte));
+    let digit_runs_ok = raw.split(|ch: char| !ch.is_ascii_digit()).all(|run| run.len() <= 4);
+    (raw.len() <= 40 && app_ok && version_ok && digit_runs_ok).then_some(raw)
+}
+
 /// Requests per minute per IP address on the public reads.
 pub const READS_PER_IP: u32 = 120;
 /// Requests per minute per account on the signed-in reads.
@@ -159,6 +182,32 @@ mod tests {
         assert!(!Level::Off.records());
         assert!(Level::Record.records() && !Level::Record.is_public());
         assert!(Level::Public.is_public() && Level::Enforce.is_public());
+    }
+
+    #[test]
+    fn the_client_header_is_kept_only_as_app_and_version() {
+        let label = |raw: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CLIENT_HEADER, raw.parse().unwrap());
+            client_label(&headers)
+        };
+        for (raw, kept) in [
+            ("desktop/0.2.0", Some("desktop/0.2.0")),
+            ("Mini/0.4.0", Some("mini/0.4.0")),
+            ("buwiz-forms/1.5.0-beta.2", Some("buwiz-forms/1.5.0-beta.2")),
+            (" desktop/2026.11.1 ", Some("desktop/2026.11.1")),
+            ("desktop", None),
+            ("desktop/", None),
+            ("desktop/beta", None),
+            ("desktop/0.2.0 (juan@example.test)", None),
+            ("desktop/123456789000", None),
+            ("desktop/0.2.0-123456789", None),
+            ("a/1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0", None),
+            ("9desk/1.0", None),
+        ] {
+            assert_eq!(label(raw).as_deref(), kept, "{raw}");
+        }
+        assert_eq!(client_label(&HeaderMap::new()), None);
     }
 
     #[test]

@@ -112,8 +112,10 @@ included, or for returns from midnight six days ago. Queries are in
 `src/account/staff.rs`; no index or migration is involved.
 
 - **Active TINs**: approved, not paused, not a test TIN (`000-000-000`). The
-  small line under it names `N paused` (approved real TINs a staff member
-  paused) and `N test` (approved test TINs), leaving out a zero; then
+  small line under it names `N paused` (approved real TINs whose sending is
+  paused, whether a staff member paused them or Buwiz did itself: an
+  automatic activation nobody confirmed in time) and `N test` (approved test
+  TINs), leaving out a zero; then
   `+N this week` (activated in the last 7 days) always.
 - **Returns sent today**: `submissions` with `status = 'sent'` and `sent_at`
   today, with the hourly spark. Under it, in the danger colour `N failed`

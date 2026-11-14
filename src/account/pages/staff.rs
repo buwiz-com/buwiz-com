@@ -202,7 +202,7 @@ pub async fn claims_page(cx: &Cx) -> Result<impl View> {
     // The tabs' counts are the sidebar's, read once for the page.
     let counts = *staff_counts(cx).await?;
     let (waiting, sent_back, unconfirmed_auto) = (counts.waiting, counts.sent_back, counts.auto);
-    let oldest_first = matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack);
+    let oldest_first = filter.oldest_first();
     let tabs: Vec<(QueueFilter, String, Option<i64>)> = QueueFilter::ALL
         .into_iter()
         .map(|tab| {

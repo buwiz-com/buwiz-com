@@ -257,6 +257,55 @@ async fn the_returns_tile_counts_by_manila_days_for_admin_and_support(db: PgPool
     assert!(active.contains("+1 this week"), "{active}");
 }
 
+/// The Activated automatically tab says oldest first and lists them so.
+#[sqlx::test(migrations = "./migrations")]
+async fn automatic_activations_list_oldest_first(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let newer = add_claim(&site.db, ana, "000123451", "approved").await;
+    let older = add_claim(&site.db, ana, "000123452", "approved").await;
+    for (claim, ago) in [(newer, "1 hour"), (older, "3 days")] {
+        sqlx::query("UPDATE tin_claims SET verified_by = 'auto', decided_at = now() - $2::interval WHERE id = $1")
+            .bind(claim)
+            .bind(ago)
+            .execute(&site.db)
+            .await
+            .unwrap();
+    }
+    let page = text(site.get("/staff/queue?status=auto", &staff).await).await;
+    assert!(page.contains("<p>Activated automatically · oldest first</p>"), "{page}");
+    let list = before_inspector(&page);
+    let (at_older, at_newer) = (
+        list.find(&format!("<tr data-id=\"{older}\"")).unwrap(),
+        list.find(&format!("<tr data-id=\"{newer}\"")).unwrap(),
+    );
+    assert!(at_older < at_newer, "{list}");
+}
+
+/// "Paused" counts every approved real TIN that cannot send: one a staff
+/// member paused, and one Buwiz paused itself.
+#[sqlx::test(migrations = "./migrations")]
+async fn paused_counts_what_staff_and_buwiz_paused(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let by_staff = add_claim(&site.db, ana, "000123451", "approved").await;
+    site.post(&format!("/staff/claims/{by_staff}/pause"), &staff, "reason=A+complaint").await;
+    let by_buwiz = add_claim(&site.db, ana, "000123452", "approved").await;
+    sqlx::query(
+        "UPDATE tin_claims SET verified_by = 'auto', paused_at = now(), paused_by = NULL, pause_reason = 'Not confirmed'
+         WHERE id = $1",
+    )
+    .bind(by_buwiz)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    assert_eq!(queries::overview(&site.db).await.unwrap().paused, 2);
+    let page = text(site.get("/staff", &staff).await).await;
+    assert!(tile(&page, "Active TINs").contains("2\u{a0}paused"), "{page}");
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn the_returns_tile_hides_a_part_that_is_zero(db: PgPool) {
     let site = Site::new(db);

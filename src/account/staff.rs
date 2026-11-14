@@ -113,8 +113,6 @@ impl QueueFilter {
         }
     }
 
-    /// Open claims oldest first, so nobody waits longest; decided ones
-    /// newest first.
     /// Whether the tab holds paused TINs, not paused ones, or either.
     fn paused(self) -> Option<bool> {
         match self {
@@ -127,6 +125,13 @@ impl QueueFilter {
     /// Whether the tab holds only automatic activations nobody confirmed.
     fn unconfirmed_auto(self) -> Option<bool> {
         (self == Self::Auto).then_some(true)
+    }
+
+    /// Open claims oldest first, so nobody waits longest, and so are
+    /// automatic activations waiting for a person (oldest activation first:
+    /// Buwiz pauses the ones left too long); decided ones newest first.
+    pub fn oldest_first(self) -> bool {
+        matches!(self, Self::Waiting | Self::SentBack | Self::Auto)
     }
 
     fn order(self) -> &'static str {
@@ -242,7 +247,9 @@ pub struct Overview {
     pub active: i64,
     /// Of those, activated in the last seven days.
     pub active_week: i64,
-    /// Approved real TINs a staff member paused: they cannot send.
+    /// Approved real TINs whose sending is paused: by a staff member, or by
+    /// Buwiz itself (an automatic activation nobody confirmed in time,
+    /// `paused_by` empty). They cannot send.
     pub paused: i64,
     /// Approved test TINs, paused or not: made up, never counted as active.
     pub test: i64,
@@ -772,5 +779,15 @@ mod tests {
         assert_eq!(QueueFilter::parse(Some("sent_back")), QueueFilter::SentBack);
         assert_eq!(QueueFilter::parse(Some("<x>")), QueueFilter::Waiting);
         assert_eq!(UserFilter::parse(None), UserFilter::Everyone);
+    }
+
+    #[test]
+    fn open_and_automatic_lists_run_oldest_first() {
+        for filter in QueueFilter::ALL {
+            let oldest = matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack | QueueFilter::Auto);
+            assert_eq!(filter.oldest_first(), oldest, "{filter:?}");
+            // The label and the SQL agree.
+            assert_eq!(!filter.order().contains("DESC"), oldest, "{filter:?}");
+        }
     }
 }

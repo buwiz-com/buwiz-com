@@ -197,8 +197,8 @@ pub struct Uptime {
     pub history: history::Cache,
     /// How often the ticker runs ([`live::TICK`]; tests run it faster).
     pub tick_every: std::time::Duration,
-    /// Tests only: how many runs of the ticker's rules panic, to prove the
-    /// ticker goes on.
+    /// Tests only: how many runs of the rules (the start's load, then the
+    /// ticker's) panic, to prove the server starts and the ticker goes on.
     #[doc(hidden)]
     pub panics: std::sync::atomic::AtomicU32,
 }
@@ -275,23 +275,37 @@ pub const START_LOAD: std::time::Duration = std::time::Duration::from_secs(10);
 /// aged by the clock (a restart's gap written as "not watched"), so nothing
 /// reads the stored sign as it was. At most [`START_LOAD`]: past it, or on
 /// a failure (logged), the server starts with No recent news and `seq` 0,
-/// which claims nothing, and the ticker tries again. Nothing at `off`. The
-/// day history is not written here: the ticker does it, in the background,
-/// once its rules have run.
+/// which claims nothing, and the ticker tries again; so does a panic in
+/// the load (logged). Nothing at `off`. The day history is not written
+/// here: the ticker does it, in the background, once its rules have run.
 pub async fn start(state: &AppState) {
     let uptime = &state.uptime;
     if !uptime.level.records() {
         return;
     }
     let now = OffsetDateTime::now_utc();
-    match tokio::time::timeout(START_LOAD, live::tick(uptime, &state.db, now)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::error!(%error, "BIR uptime: the sign could not be loaded at start; No recent news until the ticker can")
+    guarded("the start's load of the sign", async {
+        test_panic(uptime);
+        match tokio::time::timeout(START_LOAD, live::tick(uptime, &state.db, now)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "BIR uptime: the sign could not be loaded at start; No recent news until the ticker can")
+            }
+            Err(_) => {
+                tracing::error!(
+                    "BIR uptime: loading the sign took too long at start; No recent news until the ticker can"
+                )
+            }
         }
-        Err(_) => {
-            tracing::error!("BIR uptime: loading the sign took too long at start; No recent news until the ticker can")
-        }
+    })
+    .await;
+}
+
+/// Tests only: panics while [`Uptime::panics`] says so.
+fn test_panic(uptime: &Uptime) {
+    if uptime.panics.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        uptime.panics.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("a made-up panic in the rules");
     }
 }
 
@@ -312,10 +326,7 @@ pub async fn run_ticker(state: AppState) {
         let now = OffsetDateTime::now_utc();
         let mut ruled = false;
         guarded("the rules", async {
-            if uptime.panics.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                uptime.panics.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                panic!("a made-up panic in the rules");
-            }
+            test_panic(&uptime);
             match live::tick(&uptime, &state.db, now).await {
                 Ok(()) => ruled = true,
                 Err(error) => tracing::error!(%error, "BIR uptime: the rules could not run"),

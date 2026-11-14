@@ -1473,3 +1473,21 @@ async fn uptime_never_waits_on_a_lock_without_a_bound(db: PgPool) {
     holder.rollback().await.unwrap();
     live::tick(&uptime, &db, t(0)).await.unwrap();
 }
+
+/// A panic while the sign loads at start is logged, and the server starts
+/// all the same, at No recent news with `seq` 0, which claims nothing; the
+/// next run loads it.
+#[sqlx::test]
+async fn a_panic_in_the_start_load_still_starts_the_server(db: PgPool) {
+    let uptime = Uptime::new(Level::Record, vec![22], false, OffsetDateTime::now_utc());
+    uptime.panics.store(1, std::sync::atomic::Ordering::SeqCst);
+    let site =
+        Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up Sender secret, 32 characters or more", uptime);
+    buwiz_cloud::uptime::start(&site.state).await;
+    let uptime = &site.state.uptime;
+    assert_eq!(uptime.panics.load(std::sync::atomic::Ordering::SeqCst), 0, "the load did panic");
+    let sign = uptime.live.sign();
+    assert_eq!((sign.state, sign.seq), (Light::NoRecentNews, 0));
+    live::tick(uptime, &db, OffsetDateTime::now_utc()).await.unwrap();
+    assert!(uptime.live.sign().seq > 0);
+}

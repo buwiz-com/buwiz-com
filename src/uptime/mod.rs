@@ -5,8 +5,15 @@
 //!
 //! - [`keys`]: day keys, network and account keys, rate limiters, the day's
 //!   distinct accounts and networks.
+//! - [`observe`]: watches one relay try's frames in the Gatekeeper's bridge.
+//! - [`classify`]: names a try's stage, windows, class and kind.
+//! - [`sshkex`]: reads the upload server's host key from the clear SSH
+//!   handshake.
 
+pub mod classify;
 pub mod keys;
+pub mod observe;
+pub mod sshkex;
 
 use std::net::IpAddr;
 

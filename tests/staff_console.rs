@@ -1085,7 +1085,7 @@ async fn a_decision_lands_on_the_queue_with_its_notice(db: PgPool) {
 async fn non_staff_get_what_they_always_got_at_the_staff_address(db: PgPool) {
     let site = Site::new(db);
     let (_, ana) = site.person("ana@example.test").await;
-    for path in ["/staff", "/staff?notice=claim_decided", "/staff?status=waiting", "/staff/queue"] {
+    for path in ["/staff", "/staff?notice=claim_decided", "/staff?status=waiting", "/staff/queue", "/staff/overview"] {
         let response = site.get(path, &ana).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         let response = site.get(path, "").await;

@@ -25,7 +25,7 @@ mod search;
 pub(crate) mod shell;
 pub(crate) mod ui;
 
-pub use overview::overview_page;
+pub use overview::{old_overview_page, overview_page};
 pub use search::search_page;
 
 /// A small note on a queue row or in the checks list: (tone, icon, text).

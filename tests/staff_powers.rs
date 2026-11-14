@@ -225,10 +225,19 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         site.hit("/staff/claims");
         let moved = site.get("/staff/claims", &cookie).await;
         assert_eq!((moved.status(), location(&moved)), (StatusCode::PERMANENT_REDIRECT, "/staff/queue".to_owned()));
-        // The Overview's earlier address leads to /staff, for everyone.
+        // The Overview's earlier address leads staff to /staff; everyone else
+        // gets what /staff gives them, checked first.
         site.hit("/staff/overview");
         let moved = site.get("/staff/overview", &cookie).await;
-        assert_eq!((moved.status(), location(&moved)), (StatusCode::TEMPORARY_REDIRECT, "/staff".to_owned()));
+        match who {
+            Who::SignedOut => {
+                assert!(
+                    location(&moved).starts_with("/login?") && location(&moved).contains("next=%2Fstaff%2Foverview")
+                )
+            }
+            Who::User => assert_eq!(moved.status(), StatusCode::NOT_FOUND),
+            _ => assert_eq!((moved.status(), location(&moved)), (StatusCode::TEMPORARY_REDIRECT, "/staff".to_owned())),
+        }
         let t = target(site, n as u32).await;
         let user = format!("/staff/users/{}", t.account);
 

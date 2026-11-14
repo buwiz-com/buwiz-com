@@ -57,13 +57,15 @@ an address of its own.
 | `/staff` | The Overview. Staff only (Support and Admins). |
 | `/staff?…` (any query at all) | Old queue links: staff are redirected (307) to `/staff/queue?…` with the whole query kept, so `?notice=`, `?status=`, `?open=` and `?q=` links, bookmarks and emails still work. Checked after the staff check, so non-staff get what they get for `/staff`. |
 | `/staff/queue` | The review queue, with `?status=`, `?q=`, `?open=` and `?notice=`. Every decision, delete and revoke redirects here with its notice. |
-| `/staff/overview` | Redirects (307) to `/staff`. |
-| `/staff/claims`, `/admin`, `/admin/claims` | Redirect (308) to `/staff/queue`. |
+| `/staff/overview` | Staff are redirected (307) to `/staff`; checked after the staff check, as `/staff` is. |
+| `/staff/claims`, `/admin`, `/admin/claims` | Redirect (308) to `/staff/queue` for everyone, before any check (old addresses, so old forms still post); the queue then checks. |
 | `/staff/claims/{id}` | A claim's own page (its "back" link is the queue). |
 
-Non-staff see a 404 on all of these (signed-out visitors are sent to
+Non-staff see a 404 on `/staff`, `/staff?…`, `/staff/overview`,
+`/staff/queue` and a claim's page (signed-out visitors are sent to
 `/login?next=…`, and after signing in with `next=/staff` staff land on the
-Overview). In the navigation, `aria-current` marks Overview on `/staff` and
+Overview); the three old addresses redirect first and the queue answers
+them the same way. In the navigation, `aria-current` marks Overview on `/staff` and
 Queue (the sidebar's Waiting, Sent back and Activated automatically, the
 rail's icons, the phone's Queue tab) on `/staff/queue` and on a claim's page.
 

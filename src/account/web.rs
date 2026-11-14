@@ -120,7 +120,6 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/tins/claims/{claim_id}/documents/{document_id}/remove", post(remove_document))
         // Staff. Everyone else gets a 404 (see `require_staff`).
         .route("/staff/claims", get(|| async { Redirect::permanent("/staff/queue") }))
-        .route("/staff/overview", get(|| async { Redirect::temporary("/staff") }))
         .route("/staff/claims/{claim_id}/decision", post(decide_claim))
         .route("/staff/claims/{claim_id}/delete", post(staff_delete_claim))
         .route("/staff/claims/{claim_id}/revoke", post(revoke_claim))

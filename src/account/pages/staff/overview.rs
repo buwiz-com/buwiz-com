@@ -263,6 +263,17 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
     .boxed())
 }
 
+/// The Overview's earlier address. Staff go on to `/staff` (307); everyone
+/// else gets what any staff address gives them, checked first: a 404, or
+/// sign-in for a visitor.
+#[page("/staff/overview")]
+pub async fn old_overview_page(cx: &Cx) -> Result<impl View> {
+    staff_member(cx, Power::Review).await?;
+    let moved: Result<()> = Err(redirect("/staff").into());
+    moved?;
+    Ok(view! {})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

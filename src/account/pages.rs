@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .page(tins::claim_id::files_page)
         .page(tins::claim_id::verify_page)
         .page(staff::overview_page)
+        .page(staff::old_overview_page)
         .page(staff::search_page)
         .page(staff::claims_page)
         .page(staff::claim_id::claim_page)

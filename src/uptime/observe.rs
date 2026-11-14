@@ -11,8 +11,18 @@
 //! leniently: a frame is known by its `type` alone, and any other field of
 //! an unexpected type reads as absent, so a `refused` with an odd `kind` is
 //! still a refusal and a `sender` frame with an odd `mode` still stops here.
+//!
+//! A text frame longer than [`MAX_OBSERVED_TEXT`] is not looked at (an app
+//! may send one of up to 64 MiB, and every control frame is far shorter):
+//! the bridge forwards it exactly as before, and the observer reads nothing
+//! from it.
 
+use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
+
+/// The longest text frame the observer reads, in bytes. Every control frame
+/// of the relay is under 1 KB.
+pub const MAX_OBSERVED_TEXT: usize = 4096;
 
 use super::classify::{self, Answer, Class, Classified, Kind, Mode, Seen, StreamFacts};
 use super::sshkex::HostKeyReader;
@@ -48,6 +58,37 @@ fn raw(text: &str) -> Option<RawFrame> {
 /// the app.
 pub fn is_sender_frame(text: &str) -> bool {
     raw(text).is_some_and(|frame| frame.frame == "sender")
+}
+
+/// [`is_sender_frame`] for a frame too long to observe, read the same way
+/// without building it: only its `type` is kept, every other value is
+/// skipped as it is read.
+fn is_sender_frame_unbuilt(text: &str) -> bool {
+    struct TypeOnly;
+    impl<'de> Visitor<'de> for TypeOnly {
+        type Value = Option<Value>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut frame = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "type" {
+                    frame = Some(map.next_value::<Value>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(frame)
+        }
+    }
+    let mut reader = serde_json::Deserializer::from_str(text);
+    let Ok(frame) = (&mut reader).deserialize_map(TypeOnly) else {
+        return false;
+    };
+    reader.end().is_ok() && frame.as_ref().and_then(Value::as_str) == Some("sender")
 }
 
 struct Stream {
@@ -125,8 +166,12 @@ impl TryObserver {
     }
 
     /// A text frame from the Sender. `false` for its `sender` frame, which
-    /// the bridge does not forward; any other frame goes on to the app.
+    /// the bridge does not forward; any other frame goes on to the app. One
+    /// longer than [`MAX_OBSERVED_TEXT`] changes nothing here.
     pub fn sender_text(&mut self, text: &str) -> bool {
+        if text.len() > MAX_OBSERVED_TEXT {
+            return !is_sender_frame_unbuilt(text);
+        }
         let Some(frame) = raw(text) else {
             return true;
         };
@@ -154,8 +199,12 @@ impl TryObserver {
         }
     }
 
-    /// A text frame from the app (forwarded unchanged by the bridge).
+    /// A text frame from the app (forwarded unchanged by the bridge). One
+    /// longer than [`MAX_OBSERVED_TEXT`] is not read.
     pub fn app_text(&mut self, text: &str) {
+        if text.len() > MAX_OBSERVED_TEXT {
+            return;
+        }
         let Some(frame) = raw(text) else {
             return;
         };
@@ -940,5 +989,43 @@ mod tests {
         observer.app_binary(&[9, 1, 2, 3]);
         let observed = observer.finish("failed", Some(crate::sender::NOT_BUILT_IN));
         assert_eq!((observed.opens, observed.kind), (0, Some(Kind::NotBuiltIn)));
+    }
+
+    /// A text frame longer than 4096 bytes, from either side, is not read:
+    /// a multi-megabyte `opened` answers nothing and a multi-megabyte `open`
+    /// opens nothing, while the bridge's forwarding stays as it was (only a
+    /// `sender` frame stops there, whatever its length).
+    #[test]
+    fn frames_longer_than_4096_bytes_are_not_read() {
+        let pad = "x".repeat(3 << 20);
+        let padded = |frame: &str| format!(r#"{{{frame},"pad":"{pad}"}}"#);
+        let mut observer = TryObserver::new(&[22]);
+        assert!(!observer.sender_text(r#"{"type":"sender","mode":"live"}"#));
+        assert!(observer.sender_text(r#"{"type":"open","stream":1,"host":"dispatcher.test","port":443}"#));
+        observer.app_text(&padded(r#""type":"opened","stream":1"#));
+        assert!(observer.sender_text(&padded(r#""type":"open","stream":2,"port":22"#)));
+        assert_eq!(observer.streams.len(), 1, "the long open was not read");
+        assert!(observer.streams[0].answer.is_none(), "the long opened was not read");
+        // Just under the limit, the same frame is read.
+        let short = format!(r#"{{"type":"opened","stream":1,"pad":"{}"}}"#, "x".repeat(4050));
+        assert!(short.len() <= MAX_OBSERVED_TEXT);
+        observer.app_text(&short);
+        assert!(observer.streams[0].answer.is_some());
+        // What is forwarded does not depend on the length: a long `sender`
+        // frame still stops, anything else long still goes on.
+        let mut observer = TryObserver::new(&[22]);
+        assert!(!observer.sender_text(&padded(r#""type":"sender","mode":"live""#)));
+        assert_eq!(observer.mode, None, "not read for the mode");
+        for long in [
+            padded(r#""type":"result","status":"failed""#),
+            padded(r#""type":["sender"]"#),
+            format!("[\"sender\",\"{pad}\"]"),
+            format!("{} trailing", padded(r#""type":"sender""#)),
+            format!("{{\"type\":\"sender\",\"pad\":\"{pad}"),
+        ] {
+            assert_eq!(observer.sender_text(&long), !is_sender_frame(&long));
+            assert!(observer.sender_text(&long));
+        }
+        assert!(!observer.sender_text(&format!(r#"{{"pad":"{pad}","type":"open","type":"sender"}}"#)));
     }
 }

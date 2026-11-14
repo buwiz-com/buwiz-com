@@ -124,6 +124,8 @@ enum Answer {
     /// Connected; the far end then sends these bytes.
     Open(Vec<u8>),
     Refuse(&'static str, Option<&'static str>),
+    /// Connected, said in an `opened` frame padded to this many bytes.
+    Long(usize),
     /// Goes away instead of answering.
     Leave,
 }
@@ -311,6 +313,9 @@ impl Gatekeeper {
                             }
                             socket.send(Message::Text(refused.to_string().into())).await.unwrap();
                         }
+                        Answer::Long(length) => {
+                            socket.send(Message::Text(long_opened(stream, length).into())).await.unwrap();
+                        }
                         Answer::Leave => {
                             let _ = socket.close(None).await;
                             break;
@@ -324,6 +329,12 @@ impl Gatekeeper {
         }
         got
     }
+}
+
+/// An `opened` frame for `stream`, padded to `length` bytes.
+fn long_opened(stream: u8, length: usize) -> String {
+    let frame = format!(r#"{{"type":"opened","stream":{stream},"pad":""}}"#);
+    frame.replace(r#""pad":"""#, &format!(r#""pad":"{}""#, "x".repeat(length - frame.len())))
 }
 
 /// A row of `bir_tries`, as the tests read it.
@@ -1148,6 +1159,31 @@ async fn the_result_never_waits_for_the_record(db: PgPool) {
     assert!(gatekeeper.state.uptime.recorder.drain(Duration::from_secs(1)).await);
     let (script, answers) = front_desk_down();
     gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
+    assert_eq!(tries(&db).await.len(), 1);
+}
+
+/// A text frame of several megabytes from the app goes to the Sender
+/// exactly as it came, and the observer does not read it: the `opened` it
+/// holds answers nothing in the record, which is still written.
+#[sqlx::test]
+async fn a_text_frame_of_megabytes_is_forwarded_and_not_read(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::new(&world, Level::Record).await;
+    let script = vec![
+        hello(RelayMode::Live),
+        open(1, "dispatcher.test", 443),
+        Step::Expect(1),
+        result("failed", Some(&front_desk_down_words()), None),
+    ];
+    let length = 3 << 20;
+    let id = world.v1().await;
+    let got = gatekeeper.send(&world, id, script, &[(443, Answer::Long(length))], HOME).await;
+    assert_eq!(the_result(&got).unwrap()["status"], "failed");
+    let heard = gatekeeper.sender.heard.lock().unwrap().clone();
+    assert_eq!(heard, [long_opened(1, length)], "forwarded untouched");
+    let row = newest(&db).await;
+    assert_eq!((row.opens, row.touched_bir), (1, false), "its `opened` was not read: {row:?}");
+    assert_eq!((row.mode.as_str(), row.outcome.as_str()), ("live", "failed"));
     assert_eq!(tries(&db).await.len(), 1);
 }
 

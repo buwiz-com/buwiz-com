@@ -911,6 +911,11 @@ try is lost.
 | No `result` within 60 s after the app went away | The outcome wait expired: the app's side, not the Sender's. |
 | Sender `result` | The outcome and its error text. |
 
+A text frame longer than 4096 bytes, from either side, is not read at all:
+it is forwarded exactly as before, and the observer neither builds it nor
+takes anything from it. Every control frame is under 1 KB, while an app may
+send a text frame of up to 64 MiB.
+
 ### 14.2 Classes and kinds
 
 Precedence: `sent` wins; then an `unknown` result from the Sender (the

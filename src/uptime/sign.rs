@@ -668,6 +668,12 @@ pub enum Scope {
 }
 
 impl Scope {
+    pub const ALL: [Scope; 5] = [Self::Overall, Self::Dispatcher, Self::Upload, Self::Relay, Self::Watch];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.as_str() == raw)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Overall => "overall",
@@ -706,6 +712,25 @@ pub enum Cause {
 }
 
 impl Cause {
+    pub const ALL: [Cause; 12] = [
+        Self::Rule,
+        Self::Scout,
+        Self::TryAnyway,
+        Self::NoteSet,
+        Self::NoteCleared,
+        Self::NoteExpired,
+        Self::NoteReturnGotIn,
+        Self::Quiet,
+        Self::RelayPaused,
+        Self::RelayResumed,
+        Self::NotWatched,
+        Self::Reset,
+    ];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.as_str() == raw)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rule => "rule",
@@ -767,6 +792,13 @@ pub enum Notice {
     LandedInMaintenance,
 }
 
+/// How many of a window's last 10 got in: "7 of the last 10 got in".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub got_in: usize,
+    pub of: usize,
+}
+
 /// The next sign, what changed, and a note that ended by itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Evaluation {
@@ -777,6 +809,9 @@ pub struct Evaluation {
     /// last evaluation.
     pub not_watched: Option<(OffsetDateTime, OffsetDateTime)>,
     pub notices: Vec<Notice>,
+    /// Each window's last 10 as this run read them (front desk, mailbox),
+    /// before its change: for the signed-in detail.
+    pub last_ten: [Tally; 2],
 }
 
 /// Which tries are the same account: tries that share a key of one key
@@ -1196,9 +1231,11 @@ pub fn evaluate(previous: &SignState, inputs: &Inputs<'_>) -> Evaluation {
 
     // Each window.
     let accounts = same_accounts(evidence);
-    for side in Side::BOTH {
+    let mut last_ten = [Tally::default(); 2];
+    for (slot, side) in Side::BOTH.into_iter().enumerate() {
         let lamp = next.lamp(side).clone();
         let reading = read(side, &lamp, inputs, &accounts, &next.vote_losses);
+        last_ten[slot] = Tally { got_in: reading.oks, of: reading.last.len() };
         let voters = || reading.quorum.iter().map(|index| Voter::of(&evidence[*index])).collect::<Vec<_>>();
         let Some(change) = step(side, &lamp, &reading, evidence, now) else {
             // Offline, and a landing came that the failures after it still
@@ -1380,7 +1417,7 @@ pub fn evaluate(previous: &SignState, inputs: &Inputs<'_>) -> Evaluation {
         let millis = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX);
         next.revision = (previous.revision + 1).max(millis);
     }
-    Evaluation { state: next, events, note_ended, not_watched, notices }
+    Evaluation { state: next, events, note_ended, not_watched, notices, last_ten }
 }
 
 /// The pause's trigger, if met: 3 tries of the pausing kinds within 60

@@ -52,6 +52,8 @@ pub enum NoteError {
     NoNote,
     #[error("sending is not paused")]
     NotPaused,
+    #[error("the sign changed meanwhile (another process wrote it); nothing was written: try again")]
+    Moved,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -138,7 +140,10 @@ async fn finish(
     note: Option<Note>,
     actor: &Account,
 ) -> Result<(), NoteError> {
-    let written = locked.write(&mut tx, &evaluation, Some(actor)).await?;
+    let written = locked
+        .write(&mut tx, &evaluation, Some(actor))
+        .await
+        .map_err(|error| if live::moved(&error) { NoteError::Moved } else { error.into() })?;
     tx.commit().await?;
     locked.show(evaluation, note, &written);
     Ok(())
@@ -154,7 +159,22 @@ pub async fn set(
     new: NewNote<'_>,
     now: OffsetDateTime,
 ) -> Result<Note, NoteError> {
+    set_with_reason(uptime, db, config, actor, new, None, now).await
+}
+
+/// [`set`], with `reason` (staff only, 1 to 200 characters) in the audit
+/// line after its fixed sentence.
+pub async fn set_with_reason(
+    uptime: &Uptime,
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    new: NewNote<'_>,
+    reason: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Note, NoteError> {
     admin_first(db, config, actor).await?;
+    let why = reason.map(note_text).transpose()?;
     let mut locked = live::lock(uptime, db, now).await?;
     let now = locked.now();
     let mut tx = db.begin().await?;
@@ -200,6 +220,10 @@ pub async fn set(
         NoteKind::Outage => "An Admin set an outage note".to_owned(),
         NoteKind::Maintenance => "An Admin set a planned maintenance note".to_owned(),
         NoteKind::Online => format!("An Admin declared the BIR online, ignoring evidence: {}", note.text),
+    };
+    let reason = match why {
+        Some(why) => format!("{reason} (why: {why})"),
+        None => reason,
     };
     let mut evaluation = with_audit(evaluation, Cause::NoteSet, &reason, previous_seq);
     let state = previous_state(&evaluation);

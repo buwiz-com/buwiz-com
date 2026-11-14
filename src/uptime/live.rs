@@ -23,6 +23,16 @@
 //! Buwiz was not watching (stopped, or the sign not evaluated for more than
 //! 5 minutes) is written as its own pair of `watch` events.
 //!
+//! Another process may change the sign too: the `buwiz-cloud bir` command
+//! sets and clears notes through [`super::notes`] with an engine of its
+//! own. Every run first reads the stored `seq`; one higher than this
+//! engine's means another process wrote, and its sign, its open note and
+//! its events (for the staff mail) are taken in before the rules run, the
+//! tries in memory and the account ids of the lost votes kept. Every write
+//! holds a lock on the sign and checks the stored `seq` again, so two
+//! processes never write over each other: the one that finds it moved
+//! writes nothing ([`Moved`]) and its next run takes the other's in.
+//!
 //! A change is written first and shown after: if the write fails, the
 //! sign stays as it was, and the next run makes the same change. Events are
 //! keyed by the sign's `seq` and their place in the run, so a run whose
@@ -44,7 +54,7 @@ use super::alerts::Alert;
 use super::classify::{Kind, Outcome, Stage, Window};
 use super::keys::Keys;
 use super::sign::{
-    self, Admission, Cause, Evaluation, Event, Evidence, Light, Note, NoteKind, Scope, SignState, Source,
+    self, Admission, Cause, Evaluation, Event, Evidence, Light, Note, NoteKind, Scope, SignState, Source, Tally,
 };
 use super::store::to_minute;
 use crate::account::accounts::Account;
@@ -64,9 +74,26 @@ pub const WRITE_EVERY: Duration = Duration::seconds(60);
 /// How long the database work of one run (or the load) may take.
 pub const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The lock every write of the sign holds, across processes ("birsign" in
+/// ASCII).
+const SIGN_LOCK: i64 = 0x0062_6972_7369_676e;
+
+/// A write found that another process changed the sign since this engine
+/// read it: nothing was written, and the next run takes the other's in.
+#[derive(Debug, thiserror::Error)]
+#[error("the BIR sign was changed by another process; nothing was written")]
+pub struct Moved;
+
+/// Whether `error` is [`Moved`].
+pub fn moved(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<Moved>()))
+}
+
 /// The live sign.
 pub struct Live {
     sign: RwLock<Arc<SignState>>,
+    /// Each window's last 10 at the last run (front desk, mailbox).
+    last_ten: RwLock<[Tally; 2]>,
     engine: Mutex<Engine>,
     /// Tries recorded and not yet taken in by a run.
     inbox: std::sync::Mutex<Vec<Evidence>>,
@@ -134,6 +161,7 @@ impl Live {
     pub fn new(now: OffsetDateTime) -> Self {
         Self {
             sign: RwLock::new(Arc::new(SignState::new(now))),
+            last_ten: RwLock::new([Tally::default(); 2]),
             engine: Mutex::new(Engine::new(now)),
             inbox: std::sync::Mutex::new(Vec::new()),
         }
@@ -147,6 +175,11 @@ impl Live {
 
     fn show(&self, state: SignState) {
         *self.sign.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(state);
+    }
+
+    /// How many of the mailbox's last 10 got in, at the last run.
+    pub fn last_ten(&self) -> Tally {
+        self.last_ten.read().unwrap_or_else(|poisoned| poisoned.into_inner())[1]
     }
 
     /// Puts a recorded try in the inbox, for the next run: never waits.
@@ -188,6 +221,9 @@ pub struct Locked<'a> {
 /// `now` (never before the last run), and takes in the tries waiting.
 pub async fn lock<'a>(uptime: &'a Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<Locked<'a>> {
     let mut engine = uptime.live.engine.lock().await;
+    if engine.loaded {
+        bounded(refresh(uptime, &mut engine, db, now)).await?;
+    }
     if !engine.loaded {
         bounded(load(&mut engine, db, now)).await?;
     }
@@ -234,6 +270,20 @@ impl Locked<'_> {
         evaluation: &Evaluation,
         actor: Option<&Account>,
     ) -> sqlx::Result<Vec<Written>> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(SIGN_LOCK).execute(&mut **tx).await?;
+        // Another process wrote since this engine read the sign, unless the
+        // write found is this very run's (its commit landed, its
+        // acknowledgement was lost): the same `seq` and `revision`.
+        let stored: Option<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT seq, (state->>'revision')::bigint FROM bir_sign WHERE id = 1")
+                .fetch_optional(&mut **tx)
+                .await?;
+        let ours = |seq: i64, revision: Option<i64>| {
+            seq == evaluation.state.seq && revision == Some(evaluation.state.revision)
+        };
+        if stored.is_some_and(|(seq, revision)| seq > self.engine.sign.seq && !ours(seq, revision)) {
+            return Err(sqlx::Error::Io(std::io::Error::other(Moved)));
+        }
         let mut rows: Vec<(OffsetDateTime, Event, Option<&Account>)> = Vec::new();
         if let Some((from, to)) = evaluation.not_watched {
             let event = |from: &str, to: &str, reason: String| Event {
@@ -285,6 +335,7 @@ impl Locked<'_> {
         for notice in &evaluation.notices {
             self.uptime.alerts.push(Alert::notice(notice, self.now));
         }
+        *self.uptime.live.last_ten.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = evaluation.last_ten;
         self.engine.sign = evaluation.state.clone();
         self.uptime.live.show(evaluation.state);
     }
@@ -483,6 +534,95 @@ fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTi
     }
 }
 
+/// The account ids a sign read back from the record lacks (they are never
+/// written), from the sign this engine held: a voter or a lost vote is the
+/// same account when they share a key.
+fn keep_account_ids(held: &SignState, read: &mut SignState) {
+    for (old, new) in [(&held.dispatcher, &mut read.dispatcher), (&held.upload, &mut read.upload)] {
+        for voter in &mut new.quorum {
+            voter.account_id = old
+                .quorum
+                .iter()
+                .find(|known| known.keys.iter().any(|keys| voter.keys.contains(keys)))
+                .and_then(|known| known.account_id);
+        }
+    }
+    for loss in &mut read.vote_losses {
+        loss.account_id = held
+            .vote_losses
+            .iter()
+            .find(|known| known.side == loss.side && known.keys.iter().any(|keys| loss.keys.contains(keys)))
+            .and_then(|known| known.account_id);
+    }
+}
+
+/// The sign as stored, read as a start would read it, and the newest note
+/// not cleared; nothing is written. `None` before the first start.
+pub async fn stored(db: &PgPool, now: OffsetDateTime) -> sqlx::Result<Option<(SignState, Option<Note>)>> {
+    let row: Option<(i64, Value, OffsetDateTime)> =
+        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
+    let Some((seq, value, updated_at)) = row else {
+        return Ok(None);
+    };
+    Ok(Some((restore(seq, value, updated_at, now).0, open_note(db).await?)))
+}
+
+/// The newest note the record has not cleared.
+async fn open_note(db: &PgPool) -> sqlx::Result<Option<Note>> {
+    let note: Option<(Uuid, String, String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
+        "SELECT id, kind, text, starts_at, until FROM bir_notes WHERE cleared_at IS NULL
+          ORDER BY starts_at DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(note.and_then(|(id, kind, text, starts_at, until)| {
+        Some(Note { id, kind: NoteKind::parse(&kind)?, text, starts_at, until })
+    }))
+}
+
+/// Takes in what another process wrote (a note set or cleared with the
+/// `buwiz-cloud bir` command): when the stored `seq` is higher than this
+/// engine's, its sign and the open note replace this engine's (the tries in
+/// memory stay), and the staff mail hears of its events not mailed yet. A
+/// stored sign that cannot be read is loaded again from the start.
+async fn refresh(uptime: &Uptime, engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
+    let stored: Option<i64> = sqlx::query_scalar("SELECT seq FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
+    let Some(stored) = stored.filter(|stored| *stored > engine.sign.seq) else {
+        return Ok(());
+    };
+    let (seq, value, updated_at): (i64, Value, OffsetDateTime) =
+        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_one(db).await?;
+    let (mut state, reset) = restore(seq, value, updated_at, now);
+    if reset {
+        engine.loaded = false;
+        return Ok(());
+    }
+    keep_account_ids(&engine.sign, &mut state);
+    let rows: Vec<(i64, OffsetDateTime, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, at, scope, from_state, to_state, cause, reason FROM bir_events
+          WHERE sign_seq > $1 AND sign_seq <= $2 AND mailed_at IS NULL ORDER BY sign_seq, ord",
+    )
+    .bind(engine.sign.seq)
+    .bind(seq)
+    .fetch_all(db)
+    .await?;
+    let written: Vec<Written> = rows
+        .into_iter()
+        .filter_map(|(id, at, scope, from, to, cause, reason)| {
+            let event = Event { scope: Scope::parse(&scope)?, from, to, cause: Cause::parse(&cause)?, reason };
+            Some(Written { id, at, event })
+        })
+        .collect();
+    engine.note = open_note(db).await?;
+    for alert in Alert::for_run(&written, &state) {
+        uptime.alerts.push(alert);
+    }
+    tracing::info!(from = engine.sign.seq, to = stored, "BIR uptime: took in a sign another process wrote");
+    engine.sign = state.clone();
+    uptime.live.show(state);
+    Ok(())
+}
+
 async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
     let row: Option<(i64, Value, OffsetDateTime)> =
         sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
@@ -494,12 +634,7 @@ async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Re
     .bind(to_minute(now - sign::EVIDENCE_KEPT))
     .fetch_all(db)
     .await?;
-    let note: Option<(Uuid, String, String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
-        "SELECT id, kind, text, starts_at, until FROM bir_notes WHERE cleared_at IS NULL
-          ORDER BY starts_at DESC LIMIT 1",
-    )
-    .fetch_optional(db)
-    .await?;
+    let note = open_note(db).await?;
     let state = match row {
         Some((seq, value, updated_at)) => {
             let (state, reset) = restore(seq, value, updated_at, now);
@@ -545,9 +680,7 @@ async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Re
     };
     engine.loaded_upto = rows.last().map_or(0, |row| row.0);
     engine.evidence = rows.into_iter().map(evidence_of).collect();
-    engine.note = note.and_then(|(id, kind, text, starts_at, until)| {
-        Some(Note { id, kind: NoteKind::parse(&kind)?, text, starts_at, until })
-    });
+    engine.note = note;
     engine.sign = state;
     engine.written_at = None;
     engine.loaded = true;

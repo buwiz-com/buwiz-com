@@ -895,7 +895,9 @@ handshake, which passes in clear before encryption starts, and
 `src/uptime/store.rs` writes one row. Recording never fails or delays a
 send: the app gets its `result` first, and the row is written afterwards
 in a task of its own (a stopping server still takes and waits up to 10 s
-for those, §15.3). An error is logged without the try's details and the
+for those, §15.3). Its place among the records being written is taken
+only once the result was sent, so an app that stops reading holds none: no
+stop waits for it, and many such apps cannot use up the places. An error is logged without the try's details and the
 try is lost.
 
 ### 14.1 What the observer reads

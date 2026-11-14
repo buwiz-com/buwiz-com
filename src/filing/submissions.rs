@@ -652,7 +652,9 @@ fn with_fields(mut object: String, fields: &[(&str, Value)]) -> String {
 
 /// Concludes the try: records `result`, tells the app (unless it is gone)
 /// and closes its socket, then writes the try's uptime row in a task of its
-/// own ([`store::Recorder`]), which never delays or fails the send.
+/// own ([`store::Recorder`]), which never delays or fails the send. The
+/// record's place is taken only once the app was told, so an app that
+/// stops reading holds none (and no stop waits for it).
 #[allow(clippy::too_many_arguments)]
 async fn settle(
     state: &AppState,
@@ -685,14 +687,13 @@ async fn settle(
         _ => Told::default(),
     };
     let text = conclude(&state.db, id, v2, result, &told).await?;
-    // Taken before the app is told, so whoever waits for the records waits
-    // for this one too.
-    let slot = observed.as_ref().and(recording.as_ref()).and_then(|_| store::Recorder::slot(&state.uptime));
     if !app_gone {
         let _ = app_tx.send(Message::Text(text.into())).await;
     }
     let _ = app_tx.send(Message::Close(None)).await;
-    if let (Some(slot), Some(observed), Some(recording)) = (slot, observed, recording) {
+    if let (Some(observed), Some(recording)) = (observed, recording)
+        && let Some(slot) = store::Recorder::slot(&state.uptime)
+    {
         slot.record(state.db.clone(), recording, observed, ended_at);
     }
     Ok(())

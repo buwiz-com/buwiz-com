@@ -257,6 +257,26 @@ impl Gatekeeper {
         got
     }
 
+    /// Opens the relay for `id` as the app does, from `ip`.
+    async fn connect(
+        &self,
+        world: &World,
+        id: Uuid,
+        ip: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        let path = format!("/api/submissions/{id}/relay");
+        let mut request = format!("{}{path}", self.base.replacen("http", "ws", 1)).into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert("host", ACCOUNT_HOST.parse().unwrap());
+        headers.insert("authorization", format!("Bearer {}", world.device.token).parse().unwrap());
+        headers.insert("cf-connecting-ip", ip.parse().unwrap());
+        headers.insert("buwiz-client", "desktop/0.2.0".parse().unwrap());
+        for (name, value) in world.device.signature("GET", &path, b"") {
+            headers.insert(name, value.parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
     /// [`Gatekeeper::send`] without waiting for the record.
     async fn send_only(
         &self,
@@ -268,19 +288,9 @@ impl Gatekeeper {
     ) -> Vec<Got> {
         *self.sender.script.lock().unwrap() = script;
         let answers: HashMap<u16, Answer> = answers.iter().cloned().collect();
-        let path = format!("/api/submissions/{id}/relay");
-        let mut request = format!("{}{path}", self.base.replacen("http", "ws", 1)).into_client_request().unwrap();
-        let headers = request.headers_mut();
-        headers.insert("host", ACCOUNT_HOST.parse().unwrap());
-        headers.insert("authorization", format!("Bearer {}", world.device.token).parse().unwrap());
-        headers.insert("cf-connecting-ip", ip.parse().unwrap());
-        headers.insert("buwiz-client", "desktop/0.2.0".parse().unwrap());
-        for (name, value) in world.device.signature("GET", &path, b"") {
-            headers.insert(name, value.parse().unwrap());
-        }
         let started = Instant::now();
         *self.result_after.lock().unwrap() = None;
-        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let mut socket = self.connect(world, id, ip).await;
         let mut got = Vec::new();
         while let Ok(Some(Ok(message))) = tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
             match message {
@@ -1160,6 +1170,44 @@ async fn the_result_never_waits_for_the_record(db: PgPool) {
     let (script, answers) = front_desk_down();
     gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
     assert_eq!(tries(&db).await.len(), 1);
+}
+
+/// An app that stops reading holds no record's place: the result is sent
+/// first (here 5.5 MiB, just under what the Sender may send and more than
+/// an unread socket buffers, so the send waits for the app), and only then is the record's place taken, so a stop does not
+/// wait for such an app, and 256 of them cannot switch recording off. Once
+/// the app reads, it has its result and the try is recorded.
+#[sqlx::test]
+async fn an_app_that_stops_reading_holds_no_record(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::new(&world, Level::Record).await;
+    let error = format!("BIR's dispatcher did not answer: {}", "x".repeat(11 << 19));
+    *gatekeeper.sender.script.lock().unwrap() = vec![hello(RelayMode::Live), result("failed", Some(&error), None)];
+    let id = world.v1().await;
+    let mut socket = gatekeeper.connect(&world, id, HOME).await;
+    // The result is recorded on the submission, and is on its way to the
+    // app, which does not read.
+    for _ in 0..200 {
+        if status(&db, id).await.0 == "failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status(&db, id).await.0, "failed");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(gatekeeper.state.uptime.recorder.pending(), 0, "no place is held while the app does not read");
+    assert!(tries(&db).await.is_empty());
+    // The app reads: its result, then the record.
+    let mut result = None;
+    while let Ok(Some(Ok(message))) = tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+        if let Message::Text(text) = message {
+            result = Some(serde_json::from_str::<Value>(&text).unwrap());
+        }
+    }
+    let result = result.expect("the result");
+    assert_eq!((result["type"].as_str(), result["status"].as_str()), (Some("result"), Some("failed")));
+    assert_eq!(result["error"].as_str().map(str::len), Some(error.len()));
+    assert_eq!(wait_for(&db, 1).await.len(), 1);
 }
 
 /// A text frame of several megabytes from the app goes to the Sender

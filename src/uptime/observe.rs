@@ -88,6 +88,10 @@ pub struct Observed {
     /// Whether the Sender went on to complete the key exchange with that
     /// key ([`classify::key_exchange_done`]).
     pub key_exchange_done: bool,
+    /// The port of the last stream the Sender asked for. Held in memory
+    /// for the rule engine's inputs (a later release tells a device its
+    /// network blocks the upload port); not written to the record.
+    pub port: Option<u16>,
 }
 
 impl Observed {
@@ -262,6 +266,7 @@ impl TryObserver {
             counted: classify::counted(mode, &classified),
             key_exchange_done: self.host_key.is_some() && classify::key_exchange_done(&seen),
             host_key: self.host_key,
+            port: self.streams.last().map(|stream| stream.port),
             classified,
         }
     }

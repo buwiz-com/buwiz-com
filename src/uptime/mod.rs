@@ -10,10 +10,12 @@
 //! - [`sshkex`]: reads the upload server's host key from the clear SSH
 //!   handshake.
 //! - [`store`]: writes a try's row and its host key.
+//! - [`sign`]: the rule engine, pure.
 
 pub mod classify;
 pub mod keys;
 pub mod observe;
+pub mod sign;
 pub mod sshkex;
 pub mod store;
 

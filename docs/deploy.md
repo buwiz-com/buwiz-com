@@ -549,8 +549,9 @@ recorded with mode `unknown` and not counted.
 - `BIR_UPTIME_UPLOAD_PORTS`: leave it unset (`22`).
 
 **Admins and Support are mailed from this release** (every Admin and
-Support account not banned, and `ADMIN_EMAILS`, through the existing mail
-transport): the BIR sign going Offline and coming back from it, notes, five failures in a row, "the
+Support account not banned that has signed in at least once, and every
+address in `ADMIN_EMAILS`, through the existing mail transport, so staff
+mail shares the mail provider's quota with sign-in codes): the BIR sign going Offline and coming back from it, notes, five failures in a row, "the
 relay would pause" (nothing pauses yet), host keys that are not pinned and
 other faults on Buwiz's side, at most 48 (the sign and notes), 3 (host
 keys) and 8 (everything else) alerts a Manila day, batched every 10

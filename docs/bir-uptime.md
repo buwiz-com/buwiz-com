@@ -1269,7 +1269,10 @@ turns a day after they were given. `bir_days`, `bir_events`, `bir_notes`,
 
 `src/uptime/alerts.rs`, through the existing mailer (`Mailer::send_notice`,
 plain text; logged with `MAIL_TRANSPORT=log`), to every Admin and Support
-not banned and every address in `ADMIN_EMAILS`. This release mails them.
+not banned who has signed in at least once (a role given to an address
+nobody has proved is theirs mails nobody) and every address in
+`ADMIN_EMAILS`. This release mails them. It goes through the same mail
+provider as sign-in codes and shares its quota.
 What is mailed:
 
 - the overall sign going Offline, and coming back from Offline to anything

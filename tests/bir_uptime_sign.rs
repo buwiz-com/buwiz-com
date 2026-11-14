@@ -1114,6 +1114,41 @@ async fn staff_mail_names_nobody_who_filed(db: PgPool) {
     }
 }
 
+/// Staff mail goes to staff who have signed in at least once, and to every
+/// address in `ADMIN_EMAILS`: a role given to an address nobody has proved
+/// is theirs mails nobody.
+#[sqlx::test]
+async fn staff_mail_goes_only_to_staff_who_signed_in(db: PgPool) {
+    let site = Site::with_admins(db.clone(), &["boss@example.test", "listed@example.test", "out@example.test"]);
+    site.staff_with_role("admin@example.test", "admin").await;
+    site.staff_with_role("support@example.test", "support").await;
+    site.person("filer@example.test").await;
+    for (email, role) in [("unproved@example.test", Some("admin")), ("boss@example.test", None)] {
+        sqlx::query("INSERT INTO accounts (email, role) VALUES ($1, $2)")
+            .bind(email)
+            .bind(role)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    let (out, _) = site.person("out@example.test").await;
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = id, ban_reason = 'Made-up' WHERE id = $1")
+        .bind(out)
+        .execute(&db)
+        .await
+        .unwrap();
+    let to = roles::staff_emails(&db, &site.state.config.admin_emails).await.unwrap();
+    assert_eq!(to, ["admin@example.test", "boss@example.test", "listed@example.test", "support@example.test"]);
+    // Once the unproved address signs in, it is mailed.
+    let unproved: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE email = 'unproved@example.test'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    site.person_session(unproved).await;
+    let to = roles::staff_emails(&db, &site.state.config.admin_emails).await.unwrap();
+    assert!(to.contains(&"unproved@example.test".to_owned()), "{to:?}");
+}
+
 #[sqlx::test]
 async fn nothing_is_mailed_or_judged_at_off(db: PgPool) {
     let (site, mailer) = mail_site(&db).await;

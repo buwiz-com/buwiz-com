@@ -222,10 +222,34 @@ impl Uptime {
 /// How often the day history is rewritten.
 pub const ROLL_UP_EVERY: Duration = Duration::minutes(10);
 
-/// From `record` up, for as long as the server runs: loads the sign, then
-/// every 30 seconds runs the rules for what the clock alone changes and
+/// How long [`start`] may take for the day history.
+const START_ROLL_UP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// From `record` up, before the server takes requests: the sign loaded and
+/// aged by the clock (a restart's gap written as "not watched"), so nothing
+/// reads the stored sign as it was, and every day line since the last
+/// final one. Nothing at `off`. A failure is logged; the ticker tries again.
+pub async fn start(state: &AppState) {
+    let uptime = &state.uptime;
+    if !uptime.level.records() {
+        return;
+    }
+    let now = OffsetDateTime::now_utc();
+    if let Err(error) = live::tick(uptime, &state.db, now).await {
+        tracing::error!(%error, "BIR uptime: the sign could not be loaded at start");
+    }
+    match tokio::time::timeout(START_ROLL_UP, days::roll_up_recent(uptime, &state.db, now)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "BIR uptime: the day history could not be written at start"),
+        Err(_) => tracing::error!("BIR uptime: the day history took too long at start; the ticker goes on"),
+    }
+}
+
+/// From `record` up, for as long as the server runs: every 30 seconds runs
+/// the rules for what the clock alone changes (and the tries waiting) and
 /// sends the staff mail that is due, and every 10 minutes (and after each
-/// Manila midnight) rewrites the day history. Nothing at `off`.
+/// Manila midnight) rewrites every day line not final yet. Nothing at
+/// `off`.
 pub async fn run_ticker(state: AppState) {
     let uptime = state.uptime.clone();
     if !uptime.level.records() {

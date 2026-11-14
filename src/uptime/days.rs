@@ -8,7 +8,14 @@
 //! It is rewritten every 10 minutes while the day lasts and once more after
 //! it ends, then marked final and never computed again (the tries it was
 //! counted from are deleted after 90 days). Computing it twice gives the
-//! same line.
+//! same line. On start every day since the last final line is computed, so
+//! a day the server was down for still gets its line.
+//!
+//! Time Buwiz was not watching (the `watch` events: stopped, or the sign
+//! not evaluated for more than 5 minutes) is its own value: `w` in the
+//! hours when a whole hour was not watched, `unwatched_minutes`, and in no
+//! other count. It is never given to a BIR state, never extends the state
+//! before it, and splits any outage it falls in.
 //!
 //! Distinct accounts and networks across a restart: the raw sets are in
 //! memory only, so a restart starts them again. The line keeps the largest
@@ -24,6 +31,7 @@ use time::{Date, Duration, OffsetDateTime};
 use super::Uptime;
 use super::keys::{DaySets, manila_day, manila_midnight};
 use super::sign::{Light, NoteKind, Side};
+use super::store::to_minute;
 
 /// A day is final this long after it ends.
 pub const FINAL_AFTER: Duration = Duration::minutes(10);
@@ -31,7 +39,8 @@ pub const FINAL_AFTER: Duration = Duration::minutes(10);
 /// Days of `bir_held` kept (for proofs of outage).
 pub const HELD_KEPT_DAYS: i32 = 90;
 
-/// One window's offline stretch, or a hand-set outage or maintenance.
+/// One window's offline stretch, or a hand-set outage or maintenance, to
+/// the minute.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Outage {
     #[serde(with = "time::serde::rfc3339")]
@@ -62,10 +71,13 @@ pub struct DayStates {
     pub offline_minutes: i32,
     pub quiet_minutes: i32,
     pub note_minutes: i32,
+    /// Buwiz was not watching: in no other count.
+    pub unwatched_minutes: i32,
     /// `online`, `busy`, `offline`, `no_recent_news`, or `none` (no data).
     pub worst: &'static str,
     /// One letter per Manila hour: `o` online, `b` busy, `x` offline, `m` a
-    /// hand-set outage or maintenance, `n` no recent news, `-` no data.
+    /// hand-set outage or maintenance, `n` no recent news, `w` not watched
+    /// at all, `-` no data.
     pub hours: String,
     pub outages: Vec<Outage>,
     /// The front desk's and the mailbox's own day.
@@ -80,17 +92,21 @@ pub type Changes = [(OffsetDateTime, Option<Light>)];
 /// A note's span: (kind, from, to).
 pub type NoteSpan = (NoteKind, OffsetDateTime, OffsetDateTime);
 
+/// A span Buwiz was not watching: (from, to).
+pub type Gap = (OffsetDateTime, OffsetDateTime);
+
 fn at(changes: &Changes, instant: OffsetDateTime) -> Option<Light> {
     changes.iter().rev().find(|(at, _)| *at <= instant).and_then(|(_, state)| *state)
 }
 
 fn letter_rank(letter: char) -> u8 {
     match letter {
-        'x' => 5,
-        'm' => 4,
-        'b' => 3,
-        'o' => 2,
-        'n' => 1,
+        'x' => 6,
+        'm' => 5,
+        'b' => 4,
+        'o' => 3,
+        'n' => 2,
+        'w' => 1,
         _ => 0,
     }
 }
@@ -115,12 +131,13 @@ pub fn day_states(
     overall: &Changes,
     windows: [&Changes; 2],
     notes: &[NoteSpan],
+    gaps: &[Gap],
     now: OffsetDateTime,
 ) -> DayStates {
     let start = manila_midnight(day);
     let end = (start + Duration::DAY).min(now);
     let mut hours = vec!['-'; 24];
-    let mut seconds = [0i64; 5];
+    let mut seconds = [0i64; 6];
     let mut worst = None;
     let mut side_seconds = [[0i64; 4]; 2];
     let mut side_worst = [None; 2];
@@ -130,7 +147,8 @@ pub fn day_states(
         cuts.push(end);
         let changes = overall.iter().chain(windows[0]).chain(windows[1]).map(|(at, _)| *at);
         let note_edges = notes.iter().flat_map(|(_, from, to)| [*from, *to]);
-        cuts.extend(changes.chain(note_edges).filter(|at| *at > start && *at < end));
+        let gap_edges = gaps.iter().flat_map(|(from, to)| [*from, *to]);
+        cuts.extend(changes.chain(note_edges).chain(gap_edges).filter(|at| *at > start && *at < end));
         cuts.retain(|at| *at <= end);
         cuts.sort();
         cuts.dedup();
@@ -138,6 +156,16 @@ pub fn day_states(
             let (from, to) = (pair[0], pair[1]);
             if from >= end {
                 break;
+            }
+            let length = (to - from).whole_seconds();
+            let hour = usize::try_from((from - start).whole_hours()).unwrap_or(0).min(23);
+            if gaps.iter().any(|(begin, finish)| *begin <= from && from < *finish) {
+                // Not watched: its own value, and nothing else.
+                if letter_rank('w') > letter_rank(hours[hour]) {
+                    hours[hour] = 'w';
+                }
+                seconds[5] += length;
+                continue;
             }
             let state = at(overall, from);
             let sides = [at(windows[0], from), at(windows[1], from)];
@@ -147,7 +175,6 @@ pub fn day_states(
                 .map(|(kind, ..)| *kind)
                 .collect();
             let holding = notes_now.iter().any(|kind| kind.holds());
-            let length = (to - from).whole_seconds();
             let letter = match state {
                 None => '-',
                 Some(Light::Offline) if sides.contains(&Some(Light::Offline)) || !holding => 'x',
@@ -156,7 +183,6 @@ pub fn day_states(
                 Some(Light::Online) => 'o',
                 Some(Light::NoRecentNews) => 'n',
             };
-            let hour = usize::try_from((from - start).whole_hours()).unwrap_or(0).min(23);
             if letter_rank(letter) > letter_rank(hours[hour]) {
                 hours[hour] = letter;
             }
@@ -205,6 +231,11 @@ pub fn day_states(
             }
         }
     }
+    for outage in &mut outages {
+        outage.from = to_minute(outage.from);
+        outage.to = to_minute(outage.to);
+    }
+    outages.retain(|outage| outage.to > outage.from);
     outages.sort_by_key(|outage| outage.from);
     let window_day = |index: usize| WindowDay {
         worst: side_worst[index].map_or("none", Light::as_str),
@@ -221,6 +252,7 @@ pub fn day_states(
         offline_minutes: minutes(seconds[2]),
         quiet_minutes: minutes(seconds[3]),
         note_minutes: minutes(seconds[4]),
+        unwatched_minutes: minutes(seconds[5]),
         worst: worst.map_or("none", Light::as_str),
         hours: hours.into_iter().collect(),
         outages,
@@ -251,6 +283,39 @@ async fn changes(
         .await?,
     );
     Ok(rows.into_iter().map(|(at, state)| (at, Light::parse(&state))).collect())
+}
+
+/// The spans Buwiz was not watching that touch `start` to `end`, from the
+/// `watch` events.
+async fn gaps(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Vec<Gap>> {
+    let mut rows: Vec<(OffsetDateTime, String)> = sqlx::query_as(
+        "SELECT at, to_state FROM bir_events WHERE scope = 'watch' AND at < $1 ORDER BY at DESC, id DESC LIMIT 1",
+    )
+    .bind(start)
+    .fetch_all(db)
+    .await?;
+    rows.extend(
+        sqlx::query_as::<_, (OffsetDateTime, String)>(
+            "SELECT at, to_state FROM bir_events WHERE scope = 'watch' AND at >= $1 AND at < $2 ORDER BY at, id",
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(db)
+        .await?,
+    );
+    let mut gaps = Vec::new();
+    let mut open = None;
+    for (at, state) in rows {
+        if state == "not_watched" {
+            open = open.or(Some(at));
+        } else if let Some(from) = open.take() {
+            gaps.push((from, at));
+        }
+    }
+    if let Some(from) = open {
+        gaps.push((from, end));
+    }
+    Ok(gaps)
 }
 
 /// Computes and writes the line of `day` (Manila), up to `now`. A final
@@ -285,7 +350,8 @@ pub async fn roll_up(
     .await?;
     let notes: Vec<NoteSpan> =
         notes.into_iter().filter_map(|(kind, from, to)| Some((NoteKind::parse(&kind)?, from, to))).collect();
-    let states = day_states(day, &overall, [&dispatcher, &upload], &notes, now);
+    let gaps = gaps(db, start, end).await?;
+    let states = day_states(day, &overall, [&dispatcher, &upload], &notes, &gaps, now);
 
     let (tries, got_in, failed, maybe, ours, user_network): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE counted), count(*) FILTER (WHERE counted AND outcome = 'sent'),
@@ -322,8 +388,8 @@ pub async fn roll_up(
     sqlx::query(
         "INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
                                online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst,
-                               hours, outages, windows, final)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                               hours, outages, windows, final, unwatched_minutes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
          ON CONFLICT (day) DO UPDATE SET
              tries = EXCLUDED.tries, got_in = EXCLUDED.got_in, failed = EXCLUDED.failed, maybe = EXCLUDED.maybe,
              ours = EXCLUDED.ours, user_network = EXCLUDED.user_network, held = EXCLUDED.held,
@@ -332,7 +398,8 @@ pub async fn roll_up(
              online_minutes = EXCLUDED.online_minutes, busy_minutes = EXCLUDED.busy_minutes,
              offline_minutes = EXCLUDED.offline_minutes, quiet_minutes = EXCLUDED.quiet_minutes,
              note_minutes = EXCLUDED.note_minutes, worst = EXCLUDED.worst, hours = EXCLUDED.hours,
-             outages = EXCLUDED.outages, windows = EXCLUDED.windows, final = EXCLUDED.final
+             outages = EXCLUDED.outages, windows = EXCLUDED.windows, final = EXCLUDED.final,
+             unwatched_minutes = EXCLUDED.unwatched_minutes
          WHERE NOT bir_days.final",
     )
     .bind(day)
@@ -355,19 +422,37 @@ pub async fn roll_up(
     .bind(outages)
     .bind(windows)
     .bind(is_final)
+    .bind(states.unwatched_minutes)
     .execute(db)
     .await?;
     Ok(Some(states))
 }
 
-/// Yesterday's line (until it is final) and today's.
+/// The most days one roll-up computes (ten years), however long the server
+/// was down.
+pub const MAX_DAYS: i64 = 3_660;
+
+/// Every line not final yet: from the day after the last final line (or the
+/// day the history began) through today, so no day is skipped however long
+/// the server was down. Usually yesterday's (until it is final) and today's.
 pub async fn roll_up_recent(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
     let today = manila_day(now);
-    if let Some(yesterday) = today.previous_day() {
-        roll_up(db, &uptime.day_sets, yesterday, now).await?;
+    let last_final: Option<Date> =
+        sqlx::query_scalar("SELECT max(day) FROM bir_days WHERE final").fetch_one(db).await?;
+    let began: Option<OffsetDateTime> = sqlx::query_scalar("SELECT min(at) FROM bir_events").fetch_one(db).await?;
+    let mut day = match (last_final, began) {
+        (Some(last), _) => last.next_day().unwrap_or(today),
+        (None, Some(began)) => manila_day(began),
+        (None, None) => today,
+    };
+    day = day.max(today - Duration::days(MAX_DAYS)).min(today);
+    loop {
+        roll_up(db, &uptime.day_sets, day, now).await?;
+        match day.next_day() {
+            Some(next) if next <= today => day = next,
+            _ => return Ok(()),
+        }
     }
-    roll_up(db, &uptime.day_sets, today, now).await?;
-    Ok(())
 }
 
 /// The hourly upkeep of the uptime tables but `bir_tries` (whose rows go

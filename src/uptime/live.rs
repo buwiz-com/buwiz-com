@@ -2,25 +2,40 @@
 //! `bir_sign` and `bir_events` on every change. The rules are
 //! [`super::sign`]'s; this runs them after each recorded try ([`feed`],
 //! from the recorder, after the app has its result) and every 30 seconds
-//! for the changes the clock alone makes ([`tick`]).
+//! for the changes the clock alone makes ([`tick`]). One Gatekeeper
+//! process is assumed: two would each keep their own sign.
 //!
-//! On start it rebuilds from the record: the sign (with its `seq`, the
-//! dwell timers and the lost votes) from `bir_sign`, the `live` tries of the
-//! last 3 hours from `bir_tries`, and the open note from `bir_notes`. Tries
-//! read back carry only the key they were recorded under: a restart loses
-//! the previous day key and every account id, so a quorum then needs fresh
-//! evidence, and a lost vote is known only by the keys it was lost under.
+//! No try is lost on the way in: a recorded try is put in [`Live`]'s inbox
+//! before the engine's lock is waited for, the next run takes it in, and it
+//! stays in memory (3 hours, [`MAX_EVIDENCE`] at most) whatever happens to
+//! that run. A run reads all of it again, so one that failed is simply run
+//! again. Only the database work is bounded by a timeout.
+//!
+//! On start (D4 of the plan's amendments): the very first start is No
+//! recent news everywhere. A restart restores the stored sign as it was,
+//! with its "since" times, the dwell timers and the lost votes, reads the
+//! `live` tries of the last 3 hours and the open note, and ages it by the
+//! clock with the ordinary rules before anything can read it. Tries read
+//! back carry only the key they were recorded under, of a key period no
+//! longer in memory: they keep the times of news and can end an Offline,
+//! but count in no last 10 and no quorum, so a restart never turns Offline
+//! into Online or Online into Offline, and a quorum needs fresh tries. Time
+//! Buwiz was not watching (stopped, or the sign not evaluated for more than
+//! 5 minutes) is written as its own pair of `watch` events.
 //!
 //! A change is written first and shown after: if the write fails, the
-//! sign stays as it was and the tries that were new stay new, so the next
-//! run makes the same change.
+//! sign stays as it was, and the next run makes the same change. Events are
+//! keyed by the sign's `seq` and their place in the run, so a run whose
+//! commit landed but whose acknowledgement was lost adds nothing twice. The
+//! times of news and of the evaluation alone are written at most once a
+//! minute.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -28,22 +43,35 @@ use super::Uptime;
 use super::alerts::Alert;
 use super::classify::{Kind, Outcome, Stage, Window};
 use super::keys::Keys;
-use super::sign::{self, Admission, Evaluation, Event, Evidence, Note, NoteKind, SignState, Source};
+use super::sign::{
+    self, Admission, Cause, Evaluation, Event, Evidence, Light, Note, NoteKind, Scope, SignState, Source,
+};
+use super::store::to_minute;
 use crate::account::accounts::Account;
 
 /// The most tries the engine holds.
 pub const MAX_EVIDENCE: usize = 20_000;
 
+/// The most tries waiting in the inbox; past it the oldest go (logged).
+pub const MAX_INBOX: usize = 20_000;
+
 /// How often the clock's own changes are looked for.
 pub const TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The times of news and of the evaluation alone are written this often.
+pub const WRITE_EVERY: Duration = Duration::seconds(60);
+
+/// How long the database work of one run (or the load) may take.
+pub const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The live sign.
 pub struct Live {
     sign: RwLock<Arc<SignState>>,
     engine: Mutex<Engine>,
+    /// Tries recorded and not yet taken in by a run.
+    inbox: std::sync::Mutex<Vec<Evidence>>,
 }
 
-#[derive(Default)]
 struct Engine {
     loaded: bool,
     /// Oldest first by exact end time.
@@ -53,6 +81,45 @@ struct Engine {
     /// The newest `bir_tries` row read at the load: a try recorded before
     /// it and fed after it is there already.
     loaded_upto: i64,
+    /// The sign as last written (or loaded): what the next run starts from.
+    sign: SignState,
+    /// When the sign was last written.
+    written_at: Option<OffsetDateTime>,
+}
+
+impl Engine {
+    fn new(now: OffsetDateTime) -> Self {
+        Self {
+            loaded: false,
+            evidence: VecDeque::new(),
+            note: None,
+            loaded_upto: 0,
+            sign: SignState::new(now),
+            written_at: None,
+        }
+    }
+
+    /// Takes a try in, in order of its end. One read at the load already
+    /// (it was written before) is replaced by this copy, with its account
+    /// id and both keys.
+    fn take(&mut self, evidence: Evidence, now: OffsetDateTime) {
+        if let Some(id) = evidence.id
+            && id <= self.loaded_upto
+            && let Some(at) = self.evidence.iter().position(|item| item.id == Some(id))
+        {
+            self.evidence.remove(at);
+        }
+        let at = self.evidence.partition_point(|item| item.at <= evidence.at);
+        self.evidence.insert(at, evidence);
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: OffsetDateTime) {
+        let oldest = now - sign::EVIDENCE_KEPT;
+        while self.evidence.front().is_some_and(|item| item.at < oldest) || self.evidence.len() > MAX_EVIDENCE {
+            self.evidence.pop_front();
+        }
+    }
 }
 
 /// An event as written, with its id.
@@ -65,16 +132,46 @@ pub struct Written {
 
 impl Live {
     pub fn new(now: OffsetDateTime) -> Self {
-        Self { sign: RwLock::new(Arc::new(SignState::new(now))), engine: Mutex::new(Engine::default()) }
+        Self {
+            sign: RwLock::new(Arc::new(SignState::new(now))),
+            engine: Mutex::new(Engine::new(now)),
+            inbox: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
-    /// The current sign, from memory.
+    /// The current sign, from memory. Before the first run after start it
+    /// is No recent news with `seq` 0, which claims nothing.
     pub fn sign(&self) -> Arc<SignState> {
         self.sign.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     fn show(&self, state: SignState) {
         *self.sign.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(state);
+    }
+
+    /// Puts a recorded try in the inbox, for the next run: never waits.
+    pub fn offer(&self, evidence: Evidence) {
+        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inbox.len() >= MAX_INBOX {
+            inbox.remove(0);
+            tracing::error!("BIR uptime: too many tries wait for the rules; the oldest is dropped");
+        }
+        inbox.push(evidence);
+    }
+
+    fn take_inbox(&self) -> Vec<Evidence> {
+        std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+}
+
+/// `work`, given at most [`DB_TIMEOUT`].
+pub async fn bounded<T>(work: impl Future<Output = sqlx::Result<T>>) -> sqlx::Result<T> {
+    match tokio::time::timeout(DB_TIMEOUT, work).await {
+        Ok(result) => result,
+        Err(_) => Err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "BIR uptime: the database took too long",
+        ))),
     }
 }
 
@@ -84,19 +181,22 @@ pub struct Locked<'a> {
     uptime: &'a Uptime,
     engine: MutexGuard<'a, Engine>,
     now: OffsetDateTime,
+    wrote: bool,
 }
 
 /// Locks the engine (loading it from the record first, once) for a run at
-/// `now` (never before the last run).
+/// `now` (never before the last run), and takes in the tries waiting.
 pub async fn lock<'a>(uptime: &'a Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<Locked<'a>> {
     let mut engine = uptime.live.engine.lock().await;
     if !engine.loaded {
-        load(uptime, &mut engine, db, now).await?;
+        bounded(load(&mut engine, db, now)).await?;
     }
-    let now = now.max(uptime.live.sign().evaluated_at);
-    let mut locked = Locked { uptime, engine, now };
-    locked.prune();
-    Ok(locked)
+    let now = now.max(engine.sign.evaluated_at);
+    for evidence in uptime.live.take_inbox() {
+        engine.take(evidence, now);
+    }
+    engine.prune(now);
+    Ok(Locked { uptime, engine, now, wrote: false })
 }
 
 impl Locked<'_> {
@@ -109,26 +209,9 @@ impl Locked<'_> {
         self.engine.note.as_ref()
     }
 
-    fn prune(&mut self) {
-        let oldest = self.now - sign::EVIDENCE_KEPT;
-        let engine = &mut *self.engine;
-        while engine.evidence.front().is_some_and(|item| item.at < oldest) || engine.evidence.len() > MAX_EVIDENCE {
-            engine.evidence.pop_front();
-        }
-    }
-
-    fn push(&mut self, evidence: Evidence) {
-        // Read at the load already (it was written before): this copy, with
-        // its account id and both keys, replaces that one.
-        if let Some(id) = evidence.id
-            && id <= self.engine.loaded_upto
-            && let Some(at) = self.engine.evidence.iter().position(|item| item.id == Some(id))
-        {
-            self.engine.evidence.remove(at);
-        }
-        let at = self.engine.evidence.partition_point(|item| item.at <= evidence.at);
-        self.engine.evidence.insert(at, evidence);
-        self.prune();
+    /// The sign the next run starts from.
+    pub fn previous(&self) -> &SignState {
+        &self.engine.sign
     }
 
     /// The rules, with `note` as the open note and whether an Admin resumes
@@ -136,37 +219,41 @@ impl Locked<'_> {
     pub fn evaluate(&mut self, note: Option<&Note>, resume_relay: bool) -> Evaluation {
         let (current, previous) = self.uptime.keys.epochs(self.now);
         let periods: Vec<i32> = std::iter::once(current).chain(previous).collect();
-        let evidence = self.engine.evidence.make_contiguous();
+        let engine = &mut *self.engine;
+        let evidence = engine.evidence.make_contiguous();
         let inputs = sign::Inputs { evidence, periods: &periods, note, resume_relay, now: self.now };
-        sign::evaluate(&self.uptime.live.sign(), &inputs)
+        sign::evaluate(&engine.sign, &inputs)
     }
 
-    /// Writes what `evaluation` changed: its events (an Admin's with
-    /// `actor`, the audit line), a note that ended, and the sign.
+    /// Writes what `evaluation` changed: a gap in watching, its events (an
+    /// Admin's with `actor`, the audit line), a note that ended, and the
+    /// sign.
     pub async fn write(
-        &self,
+        &mut self,
         tx: &mut Transaction<'_, Postgres>,
         evaluation: &Evaluation,
         actor: Option<&Account>,
     ) -> sqlx::Result<Vec<Written>> {
-        let mut written = Vec::new();
+        let mut rows: Vec<(OffsetDateTime, Event, Option<&Account>)> = Vec::new();
+        if let Some((from, to)) = evaluation.not_watched {
+            let event = |from: &str, to: &str, reason: String| Event {
+                scope: Scope::Watch,
+                from: from.into(),
+                to: to.into(),
+                cause: Cause::NotWatched,
+                reason,
+            };
+            let minutes = (to_minute(to) - to_minute(from)).whole_minutes();
+            rows.push((from, event("watched", "not_watched", "Buwiz stopped watching".into()), None));
+            rows.push((to, event("not_watched", "watched", format!("Buwiz was not watching for {minutes} min")), None));
+        }
         for event in &evaluation.events {
-            let actor = actor.filter(|_| event.cause.by_staff());
-            let id: i64 = sqlx::query_scalar(
-                "INSERT INTO bir_events (at, scope, from_state, to_state, cause, reason, actor_id, actor_email)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-            )
-            .bind(self.now)
-            .bind(event.scope.as_str())
-            .bind(&event.from)
-            .bind(&event.to)
-            .bind(event.cause.as_str())
-            .bind(&event.reason)
-            .bind(actor.map(|actor| actor.id))
-            .bind(actor.map(|actor| actor.email.as_str()))
-            .fetch_one(&mut **tx)
-            .await?;
-            written.push(Written { id, at: self.now, event: event.clone() });
+            rows.push((self.now, event.clone(), actor.filter(|_| event.cause.by_staff())));
+        }
+        let mut written = Vec::new();
+        for (ord, (at, event, actor)) in rows.into_iter().enumerate() {
+            let id = insert_event(tx, to_minute(at), &event, actor, evaluation.state.seq, ord).await?;
+            written.push(Written { id, at: to_minute(at), event });
         }
         if let Some((id, how)) = evaluation.note_ended {
             sqlx::query("UPDATE bir_notes SET cleared_at = $2, cleared_how = $3 WHERE id = $1 AND cleared_at IS NULL")
@@ -177,42 +264,81 @@ impl Locked<'_> {
                 .await?;
         }
         write_sign(tx, &evaluation.state).await?;
+        self.wrote = true;
         Ok(written)
     }
 
-    /// Shows `evaluation` once it is written, with `note` the open note it
-    /// was run with, and queues the staff mail for what changed.
+    /// Shows `evaluation` once it is written (or needed no write), with
+    /// `note` the open note it was run with, and queues the staff mail for
+    /// what changed.
     pub fn show(mut self, evaluation: Evaluation, note: Option<Note>, written: &[Written]) {
         self.engine.note = match evaluation.note_ended {
             Some((id, _)) if note.as_ref().is_some_and(|note| note.id == id) => None,
             _ => note,
         };
+        if self.wrote {
+            self.engine.written_at = Some(self.now);
+        }
         for alert in Alert::for_run(written, &evaluation.state) {
             self.uptime.alerts.push(alert);
         }
         for notice in &evaluation.notices {
             self.uptime.alerts.push(Alert::notice(notice, self.now));
         }
+        self.engine.sign = evaluation.state.clone();
         self.uptime.live.show(evaluation.state);
     }
 
     /// One run with the open note as the record has it: written when
-    /// something changed, then shown.
+    /// something changed (or a minute after the last write), then shown.
     async fn run(mut self, db: &PgPool) -> sqlx::Result<()> {
         let note = self.engine.note.clone();
         let evaluation = self.evaluate(note.as_ref(), false);
-        let previous = self.uptime.live.sign();
-        let written = if evaluation.must_write(&previous) {
-            let mut tx = db.begin().await?;
-            let written = self.write(&mut tx, &evaluation, None).await?;
-            tx.commit().await?;
-            written
+        let due = self.engine.written_at.is_none_or(|at| self.now - at >= WRITE_EVERY || self.now < at);
+        let written = if evaluation.must_write(&self.engine.sign) || due {
+            let work = async {
+                let mut tx = db.begin().await?;
+                let written = self.write(&mut tx, &evaluation, None).await?;
+                tx.commit().await?;
+                Ok(written)
+            };
+            bounded(work).await?
         } else {
             Vec::new()
         };
         self.show(evaluation, note, &written);
         Ok(())
     }
+}
+
+/// One `bir_events` row, once: written again for the same `seq` and place,
+/// it is the row already there.
+async fn insert_event(
+    tx: &mut Transaction<'_, Postgres>,
+    at: OffsetDateTime,
+    event: &Event,
+    actor: Option<&Account>,
+    seq: i64,
+    ord: usize,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO bir_events (at, scope, from_state, to_state, cause, reason, actor_id, actor_email, sign_seq, ord)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (sign_seq, ord) DO UPDATE SET sign_seq = EXCLUDED.sign_seq
+         RETURNING id",
+    )
+    .bind(at)
+    .bind(event.scope.as_str())
+    .bind(&event.from)
+    .bind(&event.to)
+    .bind(event.cause.as_str())
+    .bind(&event.reason)
+    .bind(actor.map(|actor| actor.id))
+    .bind(actor.map(|actor| actor.email.as_str()))
+    .bind(seq)
+    .bind(i16::try_from(ord).unwrap_or(i16::MAX))
+    .fetch_one(&mut **tx)
+    .await
 }
 
 async fn write_sign(tx: &mut Transaction<'_, Postgres>, state: &SignState) -> sqlx::Result<()> {
@@ -224,21 +350,22 @@ async fn write_sign(tx: &mut Transaction<'_, Postgres>, state: &SignState) -> sq
     )
     .bind(state.seq)
     .bind(value)
-    .bind(state.evaluated_at)
+    .bind(to_minute(state.evaluated_at))
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
-/// A try just recorded: the rules run with it. Called by the recorder, after
-/// the app has its result.
+/// A try just recorded: into the inbox at once, then the rules run with
+/// it. Called by the recorder, after the app has its result. A run that
+/// fails leaves the try in memory for the next.
 pub async fn feed(uptime: &Uptime, db: &PgPool, evidence: Evidence, now: OffsetDateTime) -> sqlx::Result<()> {
-    let mut locked = lock(uptime, db, now).await?;
-    locked.push(evidence);
-    locked.run(db).await
+    uptime.live.offer(evidence);
+    lock(uptime, db, now).await?.run(db).await
 }
 
-/// The rules with no new try: quiet hours, a note running out, the dwell.
+/// The rules with no new try: quiet hours, a note running out, the dwell,
+/// and the tries waiting in the inbox.
 pub async fn tick(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
     lock(uptime, db, now).await?.run(db).await
 }
@@ -322,30 +449,49 @@ fn evidence_of(row: TryRow) -> Evidence {
     }
 }
 
-async fn load(uptime: &Uptime, engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
-    let row: Option<(i64, Value)> =
-        sqlx::query_as("SELECT seq, state FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
-    let first = row.is_none();
-    let mut state = match row {
-        Some((seq, value)) => match serde_json::from_value::<SignState>(value) {
-            Ok(mut state) => {
-                state.seq = state.seq.max(seq);
-                state
+/// The stored sign, as far as it reads. One a later release wrote (more
+/// fields) or an older one (fewer) reads whole; a time it lacks is its last
+/// write's (never 1970). One that cannot be read at
+/// all starts again, keeping its note and its `seq` (which only grows), and
+/// its last write as the start of a gap in watching.
+fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTime) -> (SignState, bool) {
+    match serde_json::from_value::<SignState>(value.clone()) {
+        Ok(mut state) => {
+            state.seq = state.seq.max(seq);
+            let written = updated_at.min(now);
+            for at in [&mut state.since, &mut state.evaluated_at, &mut state.dispatcher.since, &mut state.upload.since]
+            {
+                if *at == OffsetDateTime::UNIX_EPOCH {
+                    *at = written;
+                }
             }
-            Err(error) => {
-                // The sign starts again, but its number still only grows.
-                tracing::error!(%error, "BIR uptime: the stored sign could not be read; starting from No recent news");
-                SignState { seq: seq + 1, ..SignState::new(now) }
+            if state.relay.paused {
+                // Nothing in this release resumes it.
+                tracing::warn!("BIR uptime: the stored sign says the relay is paused; this release never pauses it");
+                state.relay.paused = false;
             }
-        },
-        None => SignState::new(now),
-    };
+            (state, false)
+        }
+        Err(error) => {
+            tracing::error!(%error, "BIR uptime: the stored sign could not be read; starting from No recent news");
+            let note = value.get("note").and_then(|note| serde_json::from_value::<Note>(note.clone()).ok());
+            let mut state = SignState { seq: seq + 1, note, evaluated_at: updated_at.min(now), ..SignState::new(now) };
+            let in_force = state.note.as_ref().filter(|note| note.in_force(now));
+            state.state = sign::overall(Light::NoRecentNews, Light::NoRecentNews, in_force);
+            (state, true)
+        }
+    }
+}
+
+async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
+    let row: Option<(i64, Value, OffsetDateTime)> =
+        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
     let rows: Vec<TryRow> = sqlx::query_as(
         "SELECT id, ended_at, source, outcome, stage, dispatcher, upload, failure_kind, counted, late, admission,
                 key_epoch, account_key, network_key
            FROM bir_tries WHERE mode = 'live' AND ended_at >= $1 ORDER BY ended_at, id",
     )
-    .bind(now - sign::EVIDENCE_KEPT)
+    .bind(to_minute(now - sign::EVIDENCE_KEPT))
     .fetch_all(db)
     .await?;
     let note: Option<(Uuid, String, String, OffsetDateTime, OffsetDateTime)> = sqlx::query_as(
@@ -354,46 +500,151 @@ async fn load(uptime: &Uptime, engine: &mut Engine, db: &PgPool, now: OffsetDate
     )
     .fetch_optional(db)
     .await?;
-    if first {
-        // The first start: the times of news from the whole record.
-        let (dispatcher_ok, upload_ok, success, news): (
-            Option<OffsetDateTime>,
-            Option<OffsetDateTime>,
-            Option<OffsetDateTime>,
-            Option<OffsetDateTime>,
-        ) = sqlx::query_as(
-            "SELECT max(ended_at) FILTER (WHERE source = 'relay' AND dispatcher = 'ok'),
-                    max(ended_at) FILTER (WHERE source = 'relay' AND upload = 'ok'),
-                    max(ended_at) FILTER (WHERE source = 'relay' AND outcome = 'sent'),
-                    max(ended_at)
-               FROM bir_tries WHERE counted",
-        )
-        .fetch_one(db)
-        .await?;
-        state.dispatcher.last_ok_at = dispatcher_ok;
-        state.upload.last_ok_at = upload_ok;
-        state.last_success_at = success;
-        state.last_news_at = news;
-        state.seq = 1;
-        // The first line of the history: from here the sign is known.
-        let mut tx = db.begin().await?;
-        sqlx::query(
-            "INSERT INTO bir_events (at, scope, from_state, to_state, cause, reason)
-             VALUES ($1, 'overall', 'none', $2, 'rule', 'Buwiz began keeping the sign')",
-        )
-        .bind(now)
-        .bind(state.state.as_str())
-        .execute(&mut *tx)
-        .await?;
-        write_sign(&mut tx, &state).await?;
-        tx.commit().await?;
-    }
+    let state = match row {
+        Some((seq, value, updated_at)) => {
+            let (state, reset) = restore(seq, value, updated_at, now);
+            if reset {
+                let mut tx = db.begin().await?;
+                let event = Event {
+                    scope: Scope::Overall,
+                    from: "unknown".into(),
+                    to: state.state.as_str().into(),
+                    cause: Cause::Reset,
+                    reason: "The stored sign could not be read; it starts again from what the note in force says, or No recent news".into(),
+                };
+                insert_event(&mut tx, to_minute(now), &event, None, state.seq, 0).await?;
+                write_sign(&mut tx, &state).await?;
+                tx.commit().await?;
+            }
+            state
+        }
+        None => {
+            // The first start: nothing known, and the history begins here.
+            let mut state = SignState { seq: 1, ..SignState::new(now) };
+            let (success, news): (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+                "SELECT max(ended_at) FILTER (WHERE source = 'relay' AND outcome = 'sent'), max(ended_at)
+                   FROM bir_tries WHERE counted",
+            )
+            .fetch_one(db)
+            .await?;
+            state.last_success_at = success;
+            state.last_news_at = news;
+            let mut tx = db.begin().await?;
+            let event = Event {
+                scope: Scope::Overall,
+                from: "none".into(),
+                to: state.state.as_str().into(),
+                cause: Cause::Rule,
+                reason: "Buwiz began keeping the sign".into(),
+            };
+            insert_event(&mut tx, to_minute(now), &event, None, state.seq, 0).await?;
+            write_sign(&mut tx, &state).await?;
+            tx.commit().await?;
+            state
+        }
+    };
     engine.loaded_upto = rows.last().map_or(0, |row| row.0);
     engine.evidence = rows.into_iter().map(evidence_of).collect();
     engine.note = note.and_then(|(id, kind, text, starts_at, until)| {
         Some(Note { id, kind: NoteKind::parse(&kind)?, text, starts_at, until })
     });
+    engine.sign = state;
+    engine.written_at = None;
     engine.loaded = true;
-    uptime.live.show(state);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+
+    use super::*;
+    use crate::uptime::classify::{Outcome, Stage, Window};
+
+    fn evidence(at: OffsetDateTime, id: Option<i64>) -> Evidence {
+        Evidence {
+            id,
+            at,
+            source: Source::Relay,
+            admission: Admission::Open,
+            outcome: Outcome::Failed,
+            stage: Stage::Upload,
+            dispatcher: Window::Ok,
+            upload: Window::Fail,
+            kind: None,
+            counted: true,
+            late: false,
+            keys: Vec::new(),
+            account_id: None,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn the_engine_keeps_tries_in_order_of_their_end_and_at_most_max_evidence() {
+        let now = datetime!(2026-11-11 05:00 UTC);
+        let mut engine = Engine::new(now);
+        // Out of order: kept by when they ended.
+        for seconds in [30, 10, 20, 10] {
+            engine.take(evidence(now - Duration::seconds(seconds), None), now);
+        }
+        let ats: Vec<i64> = engine.evidence.iter().map(|item| (now - item.at).whole_seconds()).collect();
+        assert_eq!(ats, [30, 20, 10, 10]);
+        // Older than 3 hours goes.
+        engine.take(evidence(now - sign::EVIDENCE_KEPT - Duration::seconds(1), None), now);
+        assert_eq!(engine.evidence.len(), 4);
+        // A try read at the load and fed after it is there once.
+        engine.loaded_upto = 7;
+        engine.take(evidence(now - Duration::minutes(5), Some(7)), now);
+        engine.take(evidence(now - Duration::minutes(5), Some(7)), now);
+        assert_eq!(engine.evidence.iter().filter(|item| item.id == Some(7)).count(), 1);
+        // At most MAX_EVIDENCE: the oldest go first.
+        for n in 0..(MAX_EVIDENCE + 10) {
+            engine.take(evidence(now - Duration::minutes(60) + Duration::milliseconds(n as i64), None), now);
+        }
+        assert_eq!(engine.evidence.len(), MAX_EVIDENCE);
+        assert_eq!(engine.evidence.back().unwrap().at, now - Duration::seconds(10));
+        assert!(engine.evidence.iter().all(|item| item.at >= now - Duration::minutes(60)));
+    }
+
+    #[test]
+    fn the_inbox_never_waits_and_drops_only_past_its_cap() {
+        let live = Live::new(datetime!(2026-11-11 05:00 UTC));
+        for n in 0..(MAX_INBOX + 3) {
+            live.offer(evidence(datetime!(2026-11-11 05:00 UTC), Some(n as i64)));
+        }
+        let taken = live.take_inbox();
+        assert_eq!(taken.len(), MAX_INBOX);
+        assert_eq!(taken[0].id, Some(3));
+        assert!(live.take_inbox().is_empty());
+    }
+
+    #[test]
+    fn a_stored_sign_that_cannot_be_read_keeps_its_note_and_seq() {
+        let now = datetime!(2026-11-11 05:00 UTC);
+        let note = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000abc", "kind": "outage", "text": "Made-up",
+            "starts_at": "2026-11-11T04:00:00Z", "until": "2026-11-11T08:00:00Z"
+        });
+        let (state, reset) =
+            restore(41, serde_json::json!({ "state": 12, "note": note }), now - Duration::hours(2), now);
+        assert!(reset);
+        assert_eq!(state.seq, 42);
+        assert_eq!(state.state, Light::Offline, "the outage note in force");
+        assert_eq!(state.note.map(|note| note.kind), Some(NoteKind::Outage));
+        assert_eq!(state.evaluated_at, now - Duration::hours(2), "the gap starts at its last write");
+        // One with every field missing reads, its times from its last write.
+        let (state, reset) = restore(5, serde_json::json!({}), now - Duration::minutes(3), now);
+        assert!(!reset);
+        assert_eq!(
+            (state.seq, state.since, state.evaluated_at),
+            (5, now - Duration::minutes(3), now - Duration::minutes(3))
+        );
+        assert_eq!(state.upload.since, now - Duration::minutes(3));
+        // One a later release paused: never paused here.
+        let mut paused = SignState::new(now);
+        paused.relay.paused = true;
+        let (state, reset) = restore(3, serde_json::to_value(&paused).unwrap(), now, now);
+        assert!(!reset && !state.relay.paused);
+    }
 }

@@ -65,23 +65,34 @@ CREATE TABLE bir_tries (
     CHECK ((source = 'direct') = (report_id IS NOT NULL))
 );
 CREATE INDEX bir_tries_started ON bir_tries (started_at DESC);
+-- The rules' load and the day history read tries by when they ended.
+CREATE INDEX bir_tries_ended ON bir_tries (ended_at);
 
--- Every change of the sign, a note or the relay pause. Kept forever.
+-- Every change of the sign, a note or the relay pause, and when Buwiz was
+-- not watching (scope `watch`: `not_watched` from a stop, `watched` again
+-- from a start). Kept forever. Times to the minute.
 CREATE TABLE bir_events (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    scope       text NOT NULL CHECK (scope IN ('overall', 'dispatcher', 'upload', 'relay')),
+    at          timestamptz NOT NULL DEFAULT date_trunc('minute', clock_timestamp())
+                CHECK (at = date_trunc('minute', at)),
+    scope       text NOT NULL CHECK (scope IN ('overall', 'dispatcher', 'upload', 'relay', 'watch')),
     from_state  text NOT NULL,
     to_state    text NOT NULL,
     cause       text NOT NULL CHECK (cause IN ('rule', 'scout', 'try_anyway', 'note_set', 'note_cleared',
                                                'note_expired', 'note_return_got_in', 'quiet',
-                                               'relay_paused', 'relay_resumed')),
+                                               'relay_paused', 'relay_resumed', 'not_watched', 'reset')),
     -- A fixed sentence with counts only.
     reason      text NOT NULL,
     -- The Admin, for note_* and relay_resumed.
     actor_id    uuid,
     actor_email text,
-    mailed_at   timestamptz
+    mailed_at   timestamptz,
+    -- The sign's `seq` the event belongs to and its place among that run's
+    -- events: a run written again (its commit's acknowledgement lost) adds
+    -- nothing twice.
+    sign_seq    bigint,
+    ord         smallint,
+    UNIQUE (sign_seq, ord)
 );
 CREATE INDEX bir_events_at ON bir_events (at DESC);
 
@@ -109,6 +120,8 @@ CREATE TABLE bir_notes (
     cleared_by       uuid,
     cleared_by_email text,
     cleared_how      text CHECK (cleared_how IN ('staff', 'expired', 'return_got_in')),
+    -- The Admin's reason for clearing it (staff only).
+    cleared_reason   text CHECK (length(cleared_reason) BETWEEN 1 AND 200),
     CHECK (until > starts_at AND until <= starts_at + interval '72 hours')
 );
 
@@ -194,8 +207,12 @@ CREATE TABLE bir_days (
     offline_minutes integer NOT NULL,
     quiet_minutes   integer NOT NULL,
     note_minutes    integer NOT NULL,
+    -- Minutes Buwiz was not watching (stopped, or the sign not evaluated
+    -- for more than 5 minutes): in no other count.
+    unwatched_minutes integer NOT NULL DEFAULT 0,
     worst           text NOT NULL CHECK (worst IN ('online', 'busy', 'offline', 'no_recent_news', 'none')),
-    hours           text NOT NULL CHECK (hours ~ '^[obxmn-]{24}$'),
+    -- `w`: an hour Buwiz did not watch at all.
+    hours           text NOT NULL CHECK (hours ~ '^[obxmnw-]{24}$'),
     -- [{from, to, window, source}]
     outages         jsonb NOT NULL DEFAULT '[]',
     -- Each window's own day: {"dispatcher": {worst, online_minutes,
@@ -236,28 +253,29 @@ DO $$
 BEGIN
     IF to_regclass('rollback_archive.bir_days') IS NOT NULL THEN
         INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
-                              online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst,
-                              hours, outages, windows, final)
+                              online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes,
+                              unwatched_minutes, worst, hours, outages, windows, final)
             SELECT DISTINCT ON (day) day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
-                   online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst, hours,
-                   outages, windows, final
+                   online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, unwatched_minutes,
+                   worst, hours, outages, windows, final
               FROM rollback_archive.bir_days ORDER BY day, archived_at DESC;
         DROP TABLE rollback_archive.bir_days;
     END IF;
     IF to_regclass('rollback_archive.bir_events') IS NOT NULL THEN
-        INSERT INTO bir_events (id, at, scope, from_state, to_state, cause, reason, actor_id, actor_email, mailed_at)
+        INSERT INTO bir_events (id, at, scope, from_state, to_state, cause, reason, actor_id, actor_email, mailed_at,
+                                sign_seq, ord)
             OVERRIDING SYSTEM VALUE
             SELECT DISTINCT ON (id) id, at, scope, from_state, to_state, cause, reason, actor_id, actor_email,
-                   mailed_at
+                   mailed_at, sign_seq, ord
               FROM rollback_archive.bir_events ORDER BY id, archived_at DESC;
         PERFORM setval(pg_get_serial_sequence('bir_events', 'id'), max(id)) FROM bir_events HAVING count(*) > 0;
         DROP TABLE rollback_archive.bir_events;
     END IF;
     IF to_regclass('rollback_archive.bir_notes') IS NOT NULL THEN
         INSERT INTO bir_notes (id, kind, text, starts_at, until, set_by, set_by_email, cleared_at, cleared_by,
-                               cleared_by_email, cleared_how)
+                               cleared_by_email, cleared_how, cleared_reason)
             SELECT DISTINCT ON (id) id, kind, text, starts_at, until, set_by, set_by_email, cleared_at, cleared_by,
-                   cleared_by_email, cleared_how
+                   cleared_by_email, cleared_how, cleared_reason
               FROM rollback_archive.bir_notes ORDER BY id, archived_at DESC;
         DROP TABLE rollback_archive.bir_notes;
     END IF;

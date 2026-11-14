@@ -105,7 +105,7 @@ fn with_audit(mut evaluation: Evaluation, cause: Cause, reason: &str, previous_s
 }
 
 async fn finish(
-    locked: Locked<'_>,
+    mut locked: Locked<'_>,
     mut tx: Transaction<'_, Postgres>,
     evaluation: Evaluation,
     note: Option<Note>,
@@ -163,7 +163,7 @@ pub async fn set(
     .fetch_one(&mut *tx)
     .await?;
     let note = Note { id, kind: new.kind, text, starts_at: now, until: new.until };
-    let previous_seq = uptime.live.sign().seq;
+    let previous_seq = locked.previous().seq;
     let evaluation = locked.evaluate(Some(&note), false);
     let evaluation = with_audit(evaluation, Cause::NoteSet, "An Admin set a note", previous_seq);
     finish(locked, tx, evaluation, Some(note.clone()), actor).await?;
@@ -210,7 +210,7 @@ pub async fn clear(
     if cleared.rows_affected() == 0 {
         return Err(NoteError::NoNote);
     }
-    let previous_seq = uptime.live.sign().seq;
+    let previous_seq = locked.previous().seq;
     let evaluation = locked.evaluate(None, false);
     let evaluation = with_audit(evaluation, Cause::NoteCleared, "An Admin cleared the note", previous_seq);
     finish(locked, tx, evaluation, None, actor).await?;
@@ -231,7 +231,7 @@ pub async fn resume_relay(
     let mut locked = live::lock(uptime, db, now).await?;
     let mut tx = db.begin().await?;
     admin_only(&mut tx, config, actor).await?;
-    if !uptime.live.sign().relay.paused {
+    if !locked.previous().relay.paused {
         return Err(NoteError::NotPaused);
     }
     let note = locked.note().cloned();

@@ -41,7 +41,8 @@ pub const TRIES_KEPT_DAYS: i32 = 90;
 /// logged), so a database that hangs cannot pile tasks up.
 pub const MAX_PENDING: usize = 256;
 
-/// How long one record may take before it is given up.
+/// How long writing one record's row may take before it is given up (the
+/// try still goes to the rules).
 const RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A relay try, from the moment the bridge hands the job to the Sender.
@@ -174,7 +175,8 @@ impl Sightings {
 /// Records a finished relay try, under the keys of `ended_at`, when it is
 /// recorded (keys never turn back, so a try that started before midnight
 /// and ends after it gets the new day's). Never fails the send: an error is
-/// logged (without the try's details) and the try is lost.
+/// logged (without the try's details). A row that cannot be written is
+/// lost, but a `live` try still goes to the rules, in memory.
 pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &Observed, ended_at: OffsetDateTime) {
     let keys = uptime.keys.keys(relay.account_id, &relay.network, ended_at);
     if observed.counted {
@@ -194,9 +196,15 @@ pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &O
         Ok::<i64, sqlx::Error>(id)
     };
     let id = match tokio::time::timeout(RECORD_TIMEOUT, insert).await {
-        Ok(Ok(id)) => id,
-        Ok(Err(error)) => return tracing::error!(%error, "BIR uptime: could not record a try"),
-        Err(_) => return tracing::error!("BIR uptime: recording a try took too long; it is lost"),
+        Ok(Ok(id)) => Some(id),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "BIR uptime: could not record a try");
+            None
+        }
+        Err(_) => {
+            tracing::error!("BIR uptime: recording a try took too long; its row is lost");
+            None
+        }
     };
     // A fault on Buwiz's side that needs a person.
     match (observed.kind, &observed.host_key) {
@@ -212,16 +220,16 @@ pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &O
     if observed.mode != Mode::Live {
         return;
     }
-    let evidence = evidence(relay, observed, &keys, ended_at, Some(id));
-    match tokio::time::timeout(RECORD_TIMEOUT, live::feed(uptime, db, evidence, ended_at)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!(%error, "BIR uptime: the rules could not run after a try"),
-        Err(_) => tracing::error!("BIR uptime: the rules took too long after a try; the next run takes it in"),
+    // Into the rules' inbox before their lock is waited for: a run that
+    // fails or times out leaves it for the next.
+    let evidence = evidence(relay, observed, &keys, ended_at, id);
+    if let Err(error) = live::feed(uptime, db, evidence, ended_at).await {
+        tracing::error!(%error, "BIR uptime: the rules could not run after a try; the next run takes it in");
     }
 }
 
-/// A `live` try as the rules read it: what the row holds, with both keys
-/// and the account id (in memory only).
+/// A `live` try as the rules read it: what the row holds, with both keys,
+/// the account id and its exact end (in memory only).
 pub fn evidence(
     relay: &RelayTry,
     observed: &Observed,

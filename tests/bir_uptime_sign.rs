@@ -260,16 +260,128 @@ async fn fresh_failures_after_a_restart_are_no_quorum_with_older_ones(db: PgPool
 
 #[sqlx::test]
 async fn a_stored_sign_that_cannot_be_read_starts_again_with_a_higher_seq(db: PgPool) {
-    sqlx::query("INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, '{}', now())")
+    sqlx::query("INSERT INTO bir_sign (id, seq, state, updated_at) VALUES (1, 41, $1, $2)")
+        .bind(serde_json::json!({
+            "state": "glowing",
+            "note": { "id": "00000000-0000-0000-0000-000000000abc", "kind": "outage", "text": "Made-up",
+                      "starts_at": "2026-11-11T01:00:00Z", "until": "2026-11-11T05:00:00Z" }
+        }))
+        .bind(t(-30))
         .execute(&db)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO bir_notes (id, kind, text, starts_at, until, set_by, set_by_email)
+         VALUES ('00000000-0000-0000-0000-000000000abc', 'outage', 'Made-up', $1, $2, gen_random_uuid(), 'admin@example.test')",
+    )
+    .bind(t(-60))
+    .bind(t(180))
+    .execute(&db)
+    .await
+    .unwrap();
     let uptime = uptime(t(0));
     live::tick(&uptime, &db, t(0)).await.unwrap();
-    assert_eq!(uptime.live.sign().seq, 42);
-    assert_eq!(uptime.live.sign().state, Light::NoRecentNews);
+    let sign = uptime.live.sign();
+    assert_eq!(sign.seq, 43, "the reset, then the gap since its last write");
+    assert_eq!((sign.upload.state, sign.dispatcher.state), (Light::NoRecentNews, Light::NoRecentNews));
+    assert_eq!(sign.state, Light::Offline, "the outage note in force");
+    assert_eq!(
+        sign.note.as_ref().map(|note| note.text.as_str()),
+        Some("Made-up"),
+        "the note is kept: no new note event"
+    );
+    let lines: Vec<(String, String, String, String)> =
+        events(&db).await.into_iter().map(|(scope, from, to, cause, ..)| (scope, from, to, cause)).collect();
+    let expect = |scope: &str, from: &str, to: &str, cause: &str| (scope.into(), from.into(), to.into(), cause.into());
+    assert_eq!(
+        lines,
+        [
+            expect("overall", "unknown", "offline", "reset"),
+            expect("watch", "watched", "not_watched", "not_watched"),
+            expect("watch", "not_watched", "watched", "not_watched"),
+        ]
+    );
     record(&uptime, &db, 1, 1, Ends::Landed, t(1)).await;
-    assert_eq!(stored_seq(&db).await, 43);
+    assert_eq!(stored_seq(&db).await, 44);
+}
+
+/// A stored sign written by another release (a field missing, one more)
+/// reads as it is, and the tries read back keep the times of news, so the
+/// light neither resets nor flaps between Online and No recent news as the
+/// clock runs on.
+#[sqlx::test]
+async fn a_sign_from_another_release_and_its_tries_load_without_flapping(db: PgPool) {
+    let first = uptime(t(0));
+    for account in 1..=3 {
+        record(&first, &db, account, account as u8, Ends::Landed, t(0)).await;
+    }
+    watch(&first, &db, t(10)).await;
+    sqlx::query(
+        "UPDATE bir_sign SET state = jsonb_set(state - 'revision' - 'vote_losses' - 'streak_told',
+                                              '{a_later_field}', '\"made-up\"')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let before = first.live.sign();
+    let lines = events(&db).await.len();
+    let second = uptime(t(10));
+    let mut seen = Vec::new();
+    for minute in (10..=90).step_by(2) {
+        live::tick(&second, &db, t(minute)).await.unwrap();
+        seen.push((minute, second.live.sign().state));
+    }
+    let sign = second.live.sign();
+    assert_eq!(sign.since, t(60));
+    assert_eq!(
+        (sign.upload.last_ok_at, sign.upload.last_evidence_at),
+        (before.upload.last_ok_at, before.upload.last_evidence_at)
+    );
+    let changes: Vec<(i64, Light)> =
+        seen.windows(2).filter(|pair| pair[0].1 != pair[1].1).map(|pair| pair[1]).collect();
+    assert_eq!(changes, [(60, Light::NoRecentNews)], "{seen:?}");
+    assert_eq!(events(&db).await.len(), lines + 3, "the quiet hour only: no reset, no gap");
+}
+
+/// An event is written once: a run written again (its commit's
+/// acknowledgement lost) adds nothing twice. The times of news alone are
+/// written at most once a minute.
+#[sqlx::test]
+async fn writes_are_idempotent_and_times_alone_wait_a_minute(db: PgPool) {
+    let uptime = uptime(t(0));
+    record(&uptime, &db, 1, 1, Ends::Landed, t(0)).await;
+    let lines = events(&db).await.len();
+    // A run with changes, written, then written again from the same sign.
+    let mut locked = live::lock(&uptime, &db, t(1)).await.unwrap();
+    let note = buwiz_cloud::uptime::sign::Note {
+        id: Uuid::from_u128(0xabc),
+        kind: NoteKind::Outage,
+        text: "Made-up".into(),
+        starts_at: t(1),
+        until: t(30),
+    };
+    let evaluation = locked.evaluate(Some(&note), false);
+    assert_eq!(evaluation.events.len(), 1);
+    for _ in 0..2 {
+        let mut tx = db.begin().await.unwrap();
+        locked.write(&mut tx, &evaluation, None).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    drop(locked);
+    assert_eq!(events(&db).await.len(), lines + 1);
+
+    // A landing 40 seconds after a write moves only the times of news: not
+    // written until a minute has passed.
+    let other = Uptime::new(Level::Record, vec![22], false, t(2));
+    live::tick(&other, &db, t(2)).await.unwrap();
+    let updated = || async {
+        sqlx::query_scalar::<_, OffsetDateTime>("SELECT updated_at FROM bir_sign").fetch_one(&db).await.unwrap()
+    };
+    assert_eq!(updated().await, t(2));
+    record(&other, &db, 2, 2, Ends::Landed, t(2) + Duration::seconds(40)).await;
+    assert_eq!(updated().await, t(2));
+    live::tick(&other, &db, t(3)).await.unwrap();
+    assert_eq!(updated().await, t(3));
 }
 
 #[sqlx::test]
@@ -507,8 +619,10 @@ async fn the_day_history_adds_up_across_midnight_and_a_restart(db: PgPool) {
     assert_eq!(row.hours, format!("{}xo{}", "-".repeat(10), "-".repeat(12)));
     assert!(!row.is_final);
 
-    // A restart at 12:00: the raw day sets start again. Two of the same
-    // accounts and one new one file afterwards.
+    // A quick restart at 12:00 (watched until just before): the raw day
+    // sets start again. Two of the same accounts and one new one file
+    // afterwards.
+    watch(&first, &db, t(121)).await;
     let second = uptime(t(120));
     for (account, minute) in [(1, 121), (2, 122), (30, 123)] {
         record(&second, &db, account, account as u8, Ends::Landed, t(minute)).await;
@@ -535,15 +649,16 @@ async fn the_day_history_adds_up_across_midnight_and_a_restart(db: PgPool) {
     days::roll_up_recent(&second, &db, after).await.unwrap();
     let line = day_row(&db, day).await;
     assert!(line.is_final);
-    // No data before 10:00; Offline from 10:12; Online from 11:00 until an
-    // hour after the last landing at 12:03; quiet; the maintenance from
-    // 22:00 to 23:30.
+    // No data before 10:00; Busy at 10:11, Offline from 10:12; Online from
+    // 11:00, quiet at 12:00 (an hour without news), Online again from the
+    // landing at 12:01 until an hour after the last at 12:03; quiet; the
+    // maintenance from 22:00 to 23:30.
     assert_eq!(line.hours, format!("{}xooo{}mm", "-".repeat(10), "n".repeat(8)));
     assert_eq!(line.worst, "offline");
     // online, busy, offline, quiet, note minutes.
     assert_eq!(
         (line.online_minutes, line.busy_minutes, line.offline_minutes, line.quiet_minutes, line.note_minutes),
-        (11 + 123, 1, 48 + 90, 537 + 30, 90)
+        (11 + 60 + 62, 1, 48 + 90, 1 + 537 + 30, 90)
     );
     days::roll_up_recent(&second, &db, after + Duration::hours(1)).await.unwrap();
     assert_eq!(day_row(&db, day).await, line);
@@ -561,6 +676,101 @@ async fn the_day_history_adds_up_across_midnight_and_a_restart(db: PgPool) {
     assert_eq!(row.worst, "no_recent_news");
     assert_eq!(row.hours, "n".repeat(24));
     assert!(row.is_final);
+}
+
+/// (at, scope, from, to, cause, reason) of the `watch` events.
+async fn watch_events(db: &PgPool) -> Vec<(OffsetDateTime, String, String, String)> {
+    sqlx::query_as("SELECT at, from_state, to_state, reason FROM bir_events WHERE scope = 'watch' ORDER BY id")
+        .fetch_all(db)
+        .await
+        .unwrap()
+}
+
+/// Time Buwiz was not watching is a gap: written as its own events and its
+/// own value in the day line, never given to a BIR state, never extending
+/// the one before, in no count, splitting an outage. `BIR_UPTIME=off` and
+/// on again is the same as a restart after a gap.
+#[sqlx::test]
+async fn downtime_is_a_gap_in_the_history_and_no_state(db: PgPool) {
+    let day = manila_day(t(0));
+    // 10:00 Manila: Offline at 10:12 (Busy at 10:11), watched until 10:30,
+    // then the server stops.
+    let first = uptime(t(0));
+    an_outage(&first, &db).await;
+    watch(&first, &db, t(31)).await;
+    let stopped_at = first.live.sign().evaluated_at;
+    assert_eq!(stopped_at, t(28));
+    // Started again at off: nothing runs, nothing is written.
+    let off = Uptime::new(Level::Off, vec![22], false, t(40));
+    let site = Site::with_sender(db.clone(), "http://127.0.0.1:9", "a made-up secret", off);
+    buwiz_cloud::uptime::start(&site.state).await;
+    assert!(watch_events(&db).await.is_empty());
+    // On again at 11:30 Manila: the sign is restored (Offline holds: no 3
+    // quiet hours yet), and the gap is written.
+    let second = uptime(t(90));
+    live::tick(&second, &db, t(90)).await.unwrap();
+    let sign = second.live.sign();
+    assert_eq!((sign.state, sign.upload.state), (Light::Offline, Light::Offline));
+    assert_eq!(sign.upload.since, t(12), "its own since, as it was");
+    let gaps = watch_events(&db).await;
+    assert_eq!(
+        gaps,
+        [
+            (t(28), "watched".into(), "not_watched".into(), "Buwiz stopped watching".into()),
+            (t(90), "not_watched".into(), "watched".into(), "Buwiz was not watching for 62 min".into()),
+        ]
+    );
+    // The front desk's quiet hour ran out in the gap: it changes at the
+    // restart, not before.
+    assert_eq!(sign.dispatcher.state, Light::NoRecentNews);
+    assert_eq!(sign.dispatcher.since, t(90));
+    // Run again: no second gap.
+    live::tick(&second, &db, t(91)).await.unwrap();
+    assert_eq!(watch_events(&db).await.len(), 2);
+
+    // A landing at 12:00 ends it; the day line so far.
+    watch(&second, &db, t(120)).await;
+    record(&second, &db, 4, 4, Ends::Landed, t(120)).await;
+    let states = days::roll_up(&db, &second.day_sets, day, t(130)).await.unwrap().unwrap();
+    // 10:00 to 10:28 watched (Online, Busy a minute, Offline from 10:12);
+    // 10:28 to 11:30 not watched; Offline again to 12:00; Online to 12:10.
+    assert_eq!(states.unwatched_minutes, 62);
+    assert_eq!(
+        (states.online_minutes, states.busy_minutes, states.offline_minutes, states.quiet_minutes),
+        (11 + 10, 1, 16 + 30, 0)
+    );
+    assert_eq!(states.hours, format!("{}xxo{}", "-".repeat(10), "-".repeat(11)));
+    let outages: Vec<(i64, i64, &str)> = states
+        .outages
+        .iter()
+        .map(|outage| ((outage.from - t0()).whole_minutes(), (outage.to - t0()).whole_minutes(), outage.window))
+        .collect();
+    assert_eq!(outages, [(12, 28, "upload"), (90, 120, "upload")], "the gap splits the outage");
+    let row: (i32, String) = sqlx::query_as("SELECT unwatched_minutes, hours FROM bir_days WHERE day = $1")
+        .bind(day)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(row, (62, states.hours.clone()));
+    // Stored times are to the minute.
+    let odd: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_events WHERE at <> date_trunc('minute', at)")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(odd, 0);
+
+    // A whole day down: the next start rolls it up, every hour `w`.
+    let third = uptime(t(60 * 50));
+    live::tick(&third, &db, t(60 * 50)).await.unwrap();
+    days::roll_up_recent(&third, &db, t(60 * 50)).await.unwrap();
+    let next = day.next_day().unwrap();
+    let row: (i32, String, String, bool) =
+        sqlx::query_as("SELECT unwatched_minutes, hours, worst, final FROM bir_days WHERE day = $1")
+            .bind(next)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(row, (24 * 60, "w".repeat(24), "none".into(), true));
 }
 
 #[sqlx::test]

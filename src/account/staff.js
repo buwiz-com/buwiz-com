@@ -192,12 +192,23 @@ document.documentElement.classList.add("js");
     }
     if (modal) untrapSheet = trap(inspector);
   }
-  function markRow(href) {
-    const id = new URL(href, window.location.href).searchParams.get("open");
+  // The rows' marks as the server drew them for the inspector's URL: `sel`
+  // on the row it shows (with `auto` when nobody chose it) and
+  // aria-current on that row's link, every other row unmarked.
+  function markRows(doc) {
+    const drawn = new Map(Array.from(doc.querySelectorAll("tr[data-id]"), (row) => [row.dataset.id, row]));
     for (const row of document.querySelectorAll("tr[data-id]")) {
-      row.classList.toggle("sel", row.dataset.id === id);
+      const from = drawn.get(row.dataset.id);
+      row.className = from ? from.className : "";
+      const link = row.querySelector("a[data-open]");
+      if (!link) continue;
+      const fromLink = from && from.querySelector("a[data-open]");
+      if (fromLink && fromLink.hasAttribute("aria-current")) link.setAttribute("aria-current", fromLink.getAttribute("aria-current"));
+      else link.removeAttribute("aria-current");
     }
   }
+  // Swaps in the inspector of the page at `href` (a row chosen with ?open=,
+  // or the list without it) and marks the rows as that page does.
   async function showInInspector(href, push) {
     const inspector = document.getElementById("inspector");
     if (!inspector) {
@@ -213,7 +224,8 @@ document.documentElement.classList.add("js");
       window.location.href = href;
       return;
     }
-    const next = new DOMParser().parseFromString(html, "text/html").getElementById("inspector");
+    const page = new DOMParser().parseFromString(html, "text/html");
+    const next = page.getElementById("inspector");
     if (!next) {
       window.location.href = href;
       return;
@@ -222,20 +234,25 @@ document.documentElement.classList.add("js");
     inspector.setAttribute("aria-label", next.getAttribute("aria-label") || "");
     enhance(inspector);
     if (push) history.pushState({ inspector: true }, "", href);
-    markRow(href);
-    sheetMode(inspector, true);
+    markRows(page);
+    const open = next.classList.contains("is-open");
+    sheetMode(inspector, open);
+    const body = inspector.querySelector(".sx-insp-b");
+    if (body) body.scrollTop = 0;
+    if (!open) return;
     const heading = inspector.querySelector(".sx-insp-h h2");
     if (heading) {
       heading.tabIndex = -1;
       heading.focus({ preventScroll: true });
     }
-    inspector.querySelector(".sx-insp-b").scrollTop = 0;
   }
   function closeInspector(link) {
     const inspector = document.getElementById("inspector");
     sheetMode(inspector, false);
     history.pushState({ inspector: true }, "", link.href);
     if (sheetOpener && document.contains(sheetOpener)) sheetOpener.focus();
+    // The list without a choice: its own panel and marks.
+    showInInspector(link.href, false);
   }
   document.addEventListener("click", (event) => {
     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -259,12 +276,14 @@ document.documentElement.classList.add("js");
       if (link) link.click();
     }
   });
+  // Back and forward: the inspector and the marks follow the URL, with or
+  // without ?open= (without it, the list's own first row, unchosen).
   window.addEventListener("popstate", () => {
     const inspector = document.getElementById("inspector");
     if (!inspector) return;
     const url = new URL(window.location.href);
-    if (url.searchParams.get("open")) showInInspector(url.href, false);
-    else sheetMode(inspector, false);
+    if (!url.searchParams.get("open")) sheetMode(inspector, false);
+    showInInspector(url.href, false);
   });
   // The queue's "More" menu closes on a click elsewhere or Escape.
   const closeMenus = (except) => {

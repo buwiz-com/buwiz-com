@@ -147,6 +147,8 @@ pub enum Kind {
     // The user's own connection.
     Local,
     AppGone,
+    /// The app never answered an `open` (every app answers within 10 s).
+    NoAnswer,
     // Buwiz's side.
     HostKey,
     UnknownHost,
@@ -161,7 +163,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 22] = [
+    pub const ALL: [Kind; 23] = [
         Self::Dns,
         Self::Refused,
         Self::Timeout,
@@ -174,6 +176,7 @@ impl Kind {
         Self::NoService,
         Self::Local,
         Self::AppGone,
+        Self::NoAnswer,
         Self::HostKey,
         Self::UnknownHost,
         Self::Protocol,
@@ -200,6 +203,7 @@ impl Kind {
             Self::NoService => "no_service",
             Self::Local => "local",
             Self::AppGone => "app_gone",
+            Self::NoAnswer => "no_answer",
             Self::HostKey => "host_key",
             Self::UnknownHost => "unknown_host",
             Self::Protocol => "protocol",
@@ -229,7 +233,7 @@ impl Kind {
             | Self::Login
             | Self::Cut
             | Self::NoService => Class::Bir,
-            Self::Local | Self::AppGone => Class::UserNetwork,
+            Self::Local | Self::AppGone | Self::NoAnswer => Class::UserNetwork,
             Self::HostKey
             | Self::UnknownHost
             | Self::Protocol
@@ -248,9 +252,40 @@ fn has(text: &str, any: &[&str]) -> bool {
     any.iter().any(|needle| text.contains(needle))
 }
 
+/// The number of an OS error as Rust words it, `… (os error N)`. The same
+/// on every OS and in every language the OS speaks.
+fn os_error(reason: &str) -> Option<i32> {
+    let (_, rest) = reason.rsplit_once("(os error ")?;
+    rest.strip_suffix(')').or_else(|| rest.split_once(')').map(|(code, _)| code))?.trim().parse().ok()
+}
+
+/// An OS connect error by its number: the macOS, Linux and Windows
+/// (Winsock) numbers of each. `None` for one it does not know.
+fn os_error_kind(code: i32) -> Option<Kind> {
+    Some(match code {
+        // ECONNREFUSED.
+        61 | 111 | 10061 => Kind::Refused,
+        // ETIMEDOUT.
+        60 | 110 | 10060 => Kind::Timeout,
+        // EHOSTUNREACH, EHOSTDOWN: the BIR's side, as the user reached
+        // Buwiz, so their network works.
+        65 | 113 | 10065 | 64 | 112 | 10064 => Kind::Refused,
+        // ECONNRESET.
+        54 | 104 | 10054 => Kind::Reset,
+        // ENETUNREACH, ENETDOWN: the user's own network.
+        51 | 101 | 10051 | 50 | 100 | 10050 => Kind::Local,
+        // EACCES, EPERM: the user's own system refused.
+        13 | 1 | 10013 => Kind::Local,
+        // WSAHOST_NOT_FOUND, WSATRY_AGAIN, WSANO_DATA.
+        11001 | 11002 | 11004 => Kind::Dns,
+        _ => return None,
+    })
+}
+
 /// What an app's `refused` says: its `kind` when it sent one it knows,
-/// else its `reason` (an OS connect error, or a trust-list refusal). A
-/// reason it cannot read is the user's own side: such a try never counts.
+/// else a trust-list refusal, else the OS error's number, else its words
+/// (the OS's connect errors in English). A reason it cannot read is the
+/// user's own side: such a try never counts.
 pub fn refusal_kind(reason: &str, kind: Option<&str>) -> Kind {
     match kind {
         Some("dns") => return Kind::Dns,
@@ -262,42 +297,45 @@ pub fn refusal_kind(reason: &str, kind: Option<&str>) -> Kind {
     }
     let reason = reason.to_ascii_lowercase();
     if has(&reason, &["is not on the signed trust list", "is not a bir server"]) {
-        Kind::TrustList
-    } else if has(
+        return Kind::TrustList;
+    }
+    if let Some(kind) = os_error(&reason).and_then(os_error_kind) {
+        return kind;
+    }
+    if has(
         &reason,
         &[
             // The user's own system refused.
             "permission denied",
-            "access permissions",
+            "forbidden by its access permissions",
             "operation not permitted",
             // The user's own network is down.
             "network is unreachable",
             "unreachable network",
-            "network unreachable",
+            "network is down",
         ],
     ) {
         Kind::Local
-    } else if has(&reason, &["no route to host", "unreachable host", "host is unreachable", "host unreachable"]) {
+    } else if has(&reason, &["no route to host", "unreachable host", "host is unreachable", "host is down"]) {
         // The BIR's side: the user reached Buwiz, so their network works.
         Kind::Refused
-    } else if has(&reason, &["refused"]) {
+    } else if has(&reason, &["connection refused", "actively refused"]) {
         Kind::Refused
-    } else if has(&reason, &["timed out", "did not properly respond", "timeout"]) {
+    } else if has(&reason, &["connection timed out", "operation timed out", "did not properly respond"]) {
         Kind::Timeout
     } else if has(
         &reason,
         &[
-            "lookup",
-            "nodename nor servname",
+            "failed to lookup address information",
+            "nodename nor servname provided",
             "name or service not known",
-            "no such host",
-            "name resolution",
-            "no address associated",
-            "not known",
+            "no such host is known",
+            "temporary failure in name resolution",
+            "no address associated with hostname",
         ],
     ) {
         Kind::Dns
-    } else if has(&reason, &["reset"]) {
+    } else if has(&reason, &["connection reset"]) {
         Kind::Reset
     } else {
         Kind::Local
@@ -316,7 +354,8 @@ fn pipe_kind(reason: &str) -> Option<Kind> {
         return Some(refusal_kind(os, None));
     }
     if reason.contains("the app did not connect to ") && reason.contains("in time") {
-        return Some(Kind::Timeout);
+        // The app never answered the `open`.
+        return Some(Kind::NoAnswer);
     }
     None
 }
@@ -391,6 +430,14 @@ pub fn upload_kind(error: &str) -> Option<Kind> {
     let lower = error.to_ascii_lowercase();
     if lower.contains("host key is not pinned") {
         Some(Kind::HostKey)
+    } else if lower.contains("no common") && lower.contains("algorithm") {
+        // The Sender and the server share no algorithm: Buwiz's own SSH
+        // settings, which still touched the BIR.
+        Some(Kind::Protocol)
+    } else if lower.contains("invalid ssh version string") {
+        // What answered is not an SSH server: something on the user's way
+        // (a proxy, a captive portal) took the connection.
+        Some(Kind::Local)
     } else if lower.contains("sftp login was refused") {
         Some(Kind::Login)
     } else if lower.contains("sftp timed out") {
@@ -468,6 +515,10 @@ pub struct Seen<'a> {
     /// The Sender's socket ended without a result; the outcome is the
     /// Gatekeeper's own.
     pub sender_lost: bool,
+    /// The app went away and the Sender's outcome did not come within the
+    /// 60 s the Gatekeeper waits for it; the outcome is the Gatekeeper's
+    /// own.
+    pub wait_expired: bool,
 }
 
 /// What the record keeps of a try.
@@ -490,8 +541,9 @@ impl Classified {
 }
 
 /// Names a try (docs/bir-uptime.md §14.2). Precedence: `sent`; an
-/// `unknown` result from the Sender (even when the app also went away); the
-/// Sender lost; the app gone; the table.
+/// `unknown` result from the Sender (the user's side when the app also went
+/// away); the Sender lost (the app's side when the outcome wait expired
+/// after the app went away); the app gone; the table.
 pub fn classify(seen: &Seen<'_>) -> Classified {
     let outcome = Outcome::parse(seen.status);
     let streams = seen.streams;
@@ -529,15 +581,22 @@ pub fn classify(seen: &Seen<'_>) -> Classified {
         opened,
     };
 
+    let lost = seen.sender_lost || seen.wait_expired;
     match outcome {
         Outcome::Sent => return made(None, answered_desk, Window::Ok),
         Outcome::DryRun => return made(None, Window::None, Window::None),
-        Outcome::Unknown if !seen.sender_lost => return made(Some(Kind::Cut), answered_desk, Window::Maybe),
+        // The Sender's own `unknown`: the upload broke midway. When the
+        // app went away it broke on the user's side.
+        Outcome::Unknown if !lost => {
+            let kind = if seen.app_gone { Kind::AppGone } else { Kind::Cut };
+            return made(Some(kind), answered_desk, Window::Maybe);
+        }
         _ => {}
     }
-    if seen.sender_lost {
+    if lost {
         let upload = if upload_opened { Window::Maybe } else { Window::None };
-        return made(Some(Kind::SenderDown), Window::None, upload);
+        let kind = if seen.wait_expired && seen.app_gone { Kind::AppGone } else { Kind::SenderDown };
+        return made(Some(kind), Window::None, upload);
     }
     if seen.app_gone {
         return made(Some(Kind::AppGone), Window::None, Window::None);
@@ -550,12 +609,22 @@ pub fn classify(seen: &Seen<'_>) -> Classified {
         let kind = if streams.is_empty() { unopened_kind(seen.error) } else { Kind::Other };
         return made(Some(kind), Window::None, Window::None);
     }
-    let refused = |wanted: Kind| streams.iter().any(|stream| stream.answer == Answer::Refused(wanted));
-    if refused(Kind::TrustList) {
-        return made(Some(Kind::TrustList), Window::None, Window::None);
-    }
-    if refused(Kind::Local) {
-        return made(Some(Kind::Local), Window::None, Window::None);
+    // A refusal that is local or from the trust list decides the try only
+    // when no later stream got further (opened, or was the upload).
+    let decisive =
+        |stream: &StreamFacts| matches!(stream.answer, Answer::Refused(Kind::TrustList) | Answer::Refused(Kind::Local));
+    let got_further = streams
+        .iter()
+        .rposition(decisive)
+        .is_some_and(|at| streams[at + 1..].iter().any(|stream| stream.upload || stream.answer == Answer::Opened));
+    if !got_further {
+        let refused = |wanted: Kind| streams.iter().any(|stream| stream.answer == Answer::Refused(wanted));
+        if refused(Kind::TrustList) {
+            return made(Some(Kind::TrustList), Window::None, Window::None);
+        }
+        if refused(Kind::Local) {
+            return made(Some(Kind::Local), Window::None, Window::None);
+        }
     }
     if let Some(at) = first_upload {
         // The last upload stream decides (there is one).
@@ -563,10 +632,10 @@ pub fn classify(seen: &Seen<'_>) -> Classified {
         return match stream.answer {
             Answer::Refused(kind) if kind.class() == Class::Bir => made(Some(kind), answered_desk, Window::Fail),
             Answer::Refused(kind) => made(Some(kind), answered_desk, Window::None),
-            Answer::NoAnswer => made(Some(Kind::Timeout), answered_desk, Window::Fail),
+            Answer::NoAnswer => made(Some(Kind::NoAnswer), answered_desk, Window::None),
             Answer::Opened => match upload_kind(seen.error) {
-                Some(Kind::HostKey) => made(Some(Kind::HostKey), answered_desk, Window::None),
-                Some(kind) => made(Some(kind), answered_desk, Window::Fail),
+                Some(kind) if kind.class() == Class::Bir => made(Some(kind), answered_desk, Window::Fail),
+                Some(kind) => made(Some(kind), answered_desk, Window::None),
                 None => made(Some(Kind::Other), answered_desk, Window::None),
             },
         };
@@ -577,7 +646,16 @@ pub fn classify(seen: &Seen<'_>) -> Classified {
         return made(Some(Kind::UnknownHost), front_desk_ok(streams.len()), Window::None);
     }
     let attempts = dispatcher_attempts(seen.error);
-    let words: Vec<Kind> = attempts.iter().map(|(_, reason)| dispatcher_kind(reason)).collect();
+    // "No service" and "not understood" are evidence only over TLS: on
+    // plain HTTP the answer may come from a middlebox on the user's way, so
+    // it is read as the user's side.
+    let words: Vec<Kind> = attempts
+        .iter()
+        .map(|(tls, reason)| match dispatcher_kind(reason) {
+            Kind::NoService | Kind::Protocol if !tls => Kind::Local,
+            kind => kind,
+        })
+        .collect();
     if words.contains(&Kind::NoService) {
         return made(Some(Kind::NoService), Window::None, Window::None);
     }
@@ -585,18 +663,23 @@ pub fn classify(seen: &Seen<'_>) -> Classified {
         return made(Some(Kind::Protocol), Window::None, Window::None);
     }
     // Each stream's own kind: from its answer, or for one that opened from
-    // its attempt's words when they line up one for one.
+    // its attempt's words when they line up one for one. A local or
+    // trust-list refusal that a later stream got past says nothing.
     let lined_up =
         attempts.len() == streams.len() && attempts.iter().zip(streams).all(|((tls, _), stream)| *tls == stream.tls);
     let kinds: Vec<(bool, Kind)> = streams
         .iter()
         .enumerate()
+        .filter(|(_, stream)| !(got_further && decisive(stream)))
         .map(|(index, stream)| {
             let kind = match stream.answer {
                 Answer::Refused(kind) => kind,
-                Answer::NoAnswer => Kind::Timeout,
+                Answer::NoAnswer => Kind::NoAnswer,
                 Answer::Opened if lined_up => words[index],
-                Answer::Opened => dispatcher_kind_anywhere(&lower),
+                Answer::Opened => match dispatcher_kind_anywhere(&lower) {
+                    Kind::NoService | Kind::Protocol if !stream.tls => Kind::Local,
+                    kind => kind,
+                },
             };
             (stream.tls, kind)
         })
@@ -607,6 +690,19 @@ pub fn classify(seen: &Seen<'_>) -> Classified {
         return made(Some(pick), Window::None, Window::None);
     }
     made(Some(pick), if tls_tried { Window::Fail } else { Window::None }, Window::None)
+}
+
+/// Whether the Sender went on to complete the SSH key exchange in this try,
+/// from its outcome: a try that got in, broke during the upload (the
+/// Sender's own `unknown`) or reached the login did; "host key is not
+/// pinned", "wrong server signature" and every earlier failure did not.
+pub fn key_exchange_done(seen: &Seen<'_>) -> bool {
+    match Outcome::parse(seen.status) {
+        Outcome::Sent => true,
+        Outcome::Unknown => !(seen.sender_lost || seen.wait_expired),
+        Outcome::DryRun => false,
+        Outcome::Failed => upload_kind(seen.error) == Some(Kind::Login),
+    }
 }
 
 /// Whether a try moves the sign: a `live` try that got in, or failed on
@@ -645,6 +741,7 @@ mod tests {
             ("unknown_host", Class::Ours),
             ("protocol", Class::Ours),
             ("local", Class::UserNetwork),
+            ("no_answer", Class::UserNetwork),
             ("other", Class::Ours),
         ] {
             assert_eq!(Kind::parse(name).map(Kind::class), Some(class), "{name}");
@@ -687,12 +784,55 @@ mod tests {
                 Kind::Local,
             ),
             ("Operation not permitted (os error 1)", Kind::Local),
+            ("Host is down (os error 64)", Kind::Refused),
+            ("Host is down (os error 112)", Kind::Refused),
+            ("Host is down", Kind::Refused),
+            ("Network is down (os error 50)", Kind::Local),
             ("dispatcher.test:443 is not on the signed trust list", Kind::TrustList),
             ("dispatcher.test:443 is not a BIR server", Kind::TrustList),
             ("something no OS says", Kind::Local),
             ("", Kind::Local),
         ] {
             assert_eq!(refusal_kind(reason, None), kind, "{reason}");
+        }
+    }
+
+    /// The OS error's number reads the same in any language the OS speaks.
+    #[test]
+    fn os_error_numbers_win_over_words() {
+        for (reason, kind) in [
+            (
+                "Es konnte keine Verbindung hergestellt werden, da der Zielcomputer die Verbindung verweigerte. (os error 10061)",
+                Kind::Refused,
+            ),
+            ("Ein Verbindungsversuch ist fehlgeschlagen. (os error 10060)", Kind::Timeout),
+            ("Ce h\u{f4}te est inconnu. (os error 11001)", Kind::Dns),
+            ("Le r\u{e9}seau est inaccessible (os error 10051)", Kind::Local),
+            ("Conexi\u{f3}n rehusada (os error 111)", Kind::Refused),
+            ("Tiempo de espera agotado (os error 110)", Kind::Timeout),
+            ("No hay ruta hacia el host (os error 113)", Kind::Refused),
+            ("Conexi\u{f3}n reinicializada por la m\u{e1}quina remota (os error 104)", Kind::Reset),
+            ("Permiso denegado (os error 13)", Kind::Local),
+            // A number it does not know falls back to the words.
+            ("Connection refused (os error 9999)", Kind::Refused),
+            ("(os error 9999)", Kind::Local),
+            ("(os error x)", Kind::Local),
+        ] {
+            assert_eq!(refusal_kind(reason, None), kind, "{reason}");
+        }
+    }
+
+    /// Words an app's own text might hold are not read as an OS's.
+    #[test]
+    fn loose_words_are_not_read_as_a_connect_error() {
+        for reason in [
+            "the app refused this host",
+            "timeout waiting for the person",
+            "lookup of the trust list is off",
+            "not known to this app",
+            "reset by the person",
+        ] {
+            assert_eq!(refusal_kind(reason, None), Kind::Local, "{reason}");
         }
     }
 
@@ -732,7 +872,7 @@ mod tests {
             ("dispatcher request failed: connection closed before message completed", Kind::Http),
             ("TLS: Connection reset by peer (os error 54)", Kind::Reset),
             ("the app disconnected", Kind::AppGone),
-            ("the app did not connect to dispatcher.test:443 in time", Kind::Timeout),
+            ("the app did not connect to dispatcher.test:443 in time", Kind::NoAnswer),
             (
                 "the app refused to connect to dispatcher.test:443: failed to lookup address information: Name or service not known",
                 Kind::Dns,
@@ -751,6 +891,9 @@ mod tests {
             ("SFTP login was refused", Some(Kind::Login)),
             ("SFTP failed before the upload started: channel closed", Some(Kind::Ssh)),
             ("SFTP timed out before the upload started", Some(Kind::Timeout)),
+            ("SSH failed: No common key exchange algorithm", Some(Kind::Protocol)),
+            ("SSH failed: no common cipher algorithm found", Some(Kind::Protocol)),
+            ("SSH failed: invalid SSH version string", Some(Kind::Local)),
             ("something else", None),
         ] {
             assert_eq!(upload_kind(error), kind, "{error}");

@@ -3,22 +3,22 @@
 //! record keeps of it. A pure state machine: it is fed the raw frames and
 //! touches nothing.
 //!
-//! It reads the frames as raw JSON with its own small types, so the relay's
-//! [`crate::relay::Control`] stays as it is: the Sender's first frame
-//! `{"type":"sender","mode":…}`, its `open{stream,port}` (never the host),
-//! the app's `opened` and `refused{reason[,kind]}`, and the app's data. On
-//! an upload stream the data goes to [`sshkex`] until it has the host key or
-//! gives up.
+//! It reads the frames as raw JSON, so the relay's [`crate::relay::Control`]
+//! stays as it is: the Sender's first frame `{"type":"sender","mode":…}`,
+//! its `open{stream,port}` (never the host), the app's `opened` and
+//! `refused{reason[,kind]}`, and the app's data. On an upload stream the
+//! data goes to [`sshkex`] until it has the host key or gives up. It reads
+//! leniently: a frame is known by its `type` alone, and any other field of
+//! an unexpected type reads as absent, so a `refused` with an odd `kind` is
+//! still a refusal and a `sender` frame with an odd `mode` still stops here.
 
-use serde::Deserialize;
+use serde_json::Value;
 
 use super::classify::{self, Answer, Class, Classified, Kind, Mode, Seen, StreamFacts};
 use super::sshkex::HostKeyReader;
 
 /// The fields of a relay text frame the observer reads. Others are ignored.
-#[derive(Deserialize)]
 struct RawFrame {
-    #[serde(rename = "type")]
     frame: String,
     stream: Option<u8>,
     port: Option<u16>,
@@ -27,8 +27,21 @@ struct RawFrame {
     kind: Option<String>,
 }
 
+/// A text frame: a JSON object with a string `type`, its other fields each
+/// read on its own.
 fn raw(text: &str) -> Option<RawFrame> {
-    serde_json::from_str(text).ok()
+    let value: Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object()?;
+    let text_of = |name: &str| object.get(name).and_then(Value::as_str).map(str::to_owned);
+    let number = |name: &str| object.get(name).and_then(Value::as_u64);
+    Some(RawFrame {
+        frame: text_of("type")?,
+        stream: number("stream").and_then(|stream| u8::try_from(stream).ok()),
+        port: number("port").and_then(|port| u16::try_from(port).ok()),
+        mode: text_of("mode"),
+        reason: text_of("reason"),
+        kind: text_of("kind"),
+    })
 }
 
 /// Whether a Sender text frame is its `sender` frame, which never goes to
@@ -53,6 +66,7 @@ pub struct TryObserver {
     app_gone: bool,
     sender_down: bool,
     sender_lost: bool,
+    wait_expired: bool,
     host_key: Option<String>,
 }
 
@@ -68,8 +82,12 @@ pub struct Observed {
     /// A stream reached a server, and not in `lab`.
     pub touched_bir: bool,
     pub counted: bool,
-    /// The upload server's host key, if the try was offered one.
+    /// The upload server's host key, if the try was offered one. Read from
+    /// bytes the user's app relays, so it can be forged: information only.
     pub host_key: Option<String>,
+    /// Whether the Sender went on to complete the key exchange with that
+    /// key ([`classify::key_exchange_done`]).
+    pub key_exchange_done: bool,
 }
 
 impl Observed {
@@ -88,6 +106,7 @@ impl TryObserver {
             app_gone: false,
             sender_down: false,
             sender_lost: false,
+            wait_expired: false,
             host_key: None,
         }
     }
@@ -187,9 +206,16 @@ impl TryObserver {
         self.sender_down = true;
     }
 
-    /// The Sender's socket ended (or the wait ran out) without a result.
+    /// The Sender's socket ended (or the 24-hour bound ran out) without a
+    /// result.
     pub fn sender_lost(&mut self) {
         self.sender_lost = true;
+    }
+
+    /// The app went away and the Sender's outcome did not come within the
+    /// 60 s the bridge waits for it.
+    pub fn wait_expired(&mut self) {
+        self.wait_expired = true;
     }
 
     /// The result the app is told: its `status` and `error`.
@@ -216,11 +242,17 @@ impl TryObserver {
             app_gone: self.app_gone,
             sender_down: self.sender_down,
             sender_lost: self.sender_lost,
+            wait_expired: self.wait_expired,
         };
         let classified = classify::classify(&seen);
         let kind = match mode {
+            Mode::Live => classified.kind,
             Mode::Lab | Mode::DryRun => None,
-            Mode::Live | Mode::Unknown => classified.kind,
+            // No `sender` frame (a Sender from before it): like lab, no
+            // class and nothing told. A Sender that could not be reached
+            // at all is Buwiz's side whatever its mode.
+            Mode::Unknown if self.sender_down => classified.kind,
+            Mode::Unknown => None,
         };
         Observed {
             mode,
@@ -228,6 +260,7 @@ impl TryObserver {
             opens: u16::try_from(self.streams.len()).unwrap_or(u16::MAX),
             touched_bir: classified.opened && mode != Mode::Lab,
             counted: classify::counted(mode, &classified),
+            key_exchange_done: self.host_key.is_some() && classify::key_exchange_done(&seen),
             host_key: self.host_key,
             classified,
         }
@@ -254,6 +287,7 @@ mod tests {
         AppGone,
         SenderLost,
         SenderDown,
+        WaitExpired,
     }
     use Step::*;
 
@@ -283,6 +317,7 @@ mod tests {
                 AppGone => observer.app_gone(),
                 SenderLost => observer.sender_lost(),
                 SenderDown => observer.sender_down(),
+                WaitExpired => observer.wait_expired(),
             }
         }
         observer.finish(status, (!error.is_empty()).then_some(error))
@@ -385,7 +420,27 @@ mod tests {
                 (O::Sent, S::Uploaded, W::None, W::Ok, None, true, true),
             ),
             ("unknown: cut", desk_then_upload(), "unknown", cut.into(), (O::Unknown, S::Upload, W::Ok, W::Maybe, Some(K::Cut), true, true)),
-            ("unknown wins over the app going away", app_gone.clone(), "unknown", cut.into(), (O::Unknown, S::Upload, W::Ok, W::Maybe, Some(K::Cut), true, true)),
+            (
+                "unknown stays when the app went away, but on the user's side",
+                app_gone.clone(),
+                "unknown",
+                cut.into(),
+                (O::Unknown, S::Upload, W::Ok, W::Maybe, Some(K::AppGone), false, true),
+            ),
+            (
+                "the outcome wait expired after the app went away",
+                [app_gone.clone(), vec![WaitExpired]].concat(),
+                "unknown",
+                "the send ended without an outcome; BIR may have received this return".into(),
+                (O::Unknown, S::Upload, W::None, W::Maybe, Some(K::AppGone), false, true),
+            ),
+            (
+                "the outcome wait expired before any upload",
+                vec![Says("live"), Open(1, 443), Opened(1), AppGone, WaitExpired],
+                "unknown",
+                "the send ended without an outcome; BIR may have received this return".into(),
+                (O::Unknown, S::Dispatcher, W::None, W::None, Some(K::AppGone), false, true),
+            ),
             (
                 "the app went away",
                 app_gone,
@@ -415,10 +470,17 @@ mod tests {
                 (O::Failed, S::Dispatcher, W::Fail, W::None, Some(K::Dns), true, false),
             ),
             (
-                "the front desk never answered",
+                "the app never answered: the user's side",
                 vec![Says("live"), Open(1, 443), Open(2, 80), Open(3, 443), Open(4, 80)],
                 "failed",
                 all_four("the app did not connect to dispatcher.test:443 in time"),
+                (O::Failed, S::Dispatcher, W::None, W::None, Some(K::NoAnswer), false, false),
+            ),
+            (
+                "the front desk timed out, as the app says",
+                four_refused("Connection timed out (os error 110)", None),
+                "failed",
+                all_four("the app refused to connect to dispatcher.test:443: Connection timed out (os error 110)"),
                 (O::Failed, S::Dispatcher, W::Fail, W::None, Some(K::Timeout), true, false),
             ),
             (
@@ -471,11 +533,11 @@ mod tests {
                 (O::Failed, S::Upload, W::Ok, W::Fail, Some(K::Refused), true, true),
             ),
             (
-                "the mailbox never answered",
+                "the app never answered the mailbox's open",
                 upload_no_answer,
                 "failed",
                 upload_late.into(),
-                (O::Failed, S::Upload, W::Ok, W::Fail, Some(K::Timeout), true, true),
+                (O::Failed, S::Upload, W::Ok, W::None, Some(K::NoAnswer), false, true),
             ),
             (
                 "a host key that is not pinned",
@@ -485,6 +547,89 @@ mod tests {
                 (O::Failed, S::Upload, W::Ok, W::None, Some(K::HostKey), false, true),
             ),
             ("SSH failed", desk_then_upload(), "failed", "SSH failed: Disconnected".into(), (O::Failed, S::Upload, W::Ok, W::Fail, Some(K::Ssh), true, true)),
+            (
+                "no common SSH algorithm: Buwiz's own settings",
+                desk_then_upload(),
+                "failed",
+                "SSH failed: No common key exchange algorithm".into(),
+                (O::Failed, S::Upload, W::Ok, W::None, Some(K::Protocol), false, true),
+            ),
+            (
+                "not an SSH server answered: the user's side",
+                desk_then_upload(),
+                "failed",
+                "SSH failed: invalid SSH version string".into(),
+                (O::Failed, S::Upload, W::Ok, W::None, Some(K::Local), false, true),
+            ),
+            (
+                "no service said over plain HTTP proves nothing; the TLS stream decides",
+                vec![
+                    Says("live"),
+                    Open(1, 443),
+                    Refused(1, REFUSED, None),
+                    Open(2, 80),
+                    Opened(2),
+                    Bytes(2, vec![1; 200]),
+                ],
+                "failed",
+                "BIR's dispatcher did not answer: https://dispatcher.test: the app refused to connect to dispatcher.test:443: Connection refused (os error 61); \
+                 http://dispatcher.test: dispatcher has no upload server for this TIN (mode 0)"
+                    .into(),
+                (O::Failed, S::Dispatcher, W::Fail, W::None, Some(K::Refused), true, true),
+            ),
+            (
+                "an answer not understood over plain HTTP only: the user's side",
+                vec![Says("live"), Open(1, 80), Opened(1), Bytes(1, vec![1; 200])],
+                "failed",
+                "BIR's dispatcher did not answer: http://dispatcher.test: dispatcher answer was not understood: expected value".into(),
+                (O::Failed, S::Dispatcher, W::None, W::None, Some(K::Local), false, true),
+            ),
+            (
+                "a local refusal, then a later stream got to the mailbox",
+                vec![
+                    Says("live"),
+                    Open(1, 443),
+                    Refused(1, "Permission denied (os error 13)", None),
+                    Open(2, 443),
+                    Opened(2),
+                    Bytes(2, vec![1; 200]),
+                    Open(3, 22),
+                    Refused(3, REFUSED, Some("refused")),
+                ],
+                "failed",
+                upload_refused.into(),
+                (O::Failed, S::Upload, W::Ok, W::Fail, Some(K::Refused), true, true),
+            ),
+            (
+                "a trust-list refusal, then a later front desk answered",
+                vec![
+                    Says("live"),
+                    Open(1, 443),
+                    Refused(1, "dispatcher.test:443 is not on the signed trust list", None),
+                    Open(2, 443),
+                    Opened(2),
+                    Bytes(2, vec![1; 40]),
+                ],
+                "failed",
+                "BIR's dispatcher did not answer: https://dispatcher.test: the app refused to connect to dispatcher.test:443: dispatcher.test:443 is not on the signed trust list; \
+                 https://backup.test: TLS: invalid peer certificate: UnknownIssuer"
+                    .into(),
+                (O::Failed, S::Dispatcher, W::Fail, W::None, Some(K::Tls), true, true),
+            ),
+            (
+                "a local refusal after the last stream that got anywhere decides",
+                vec![
+                    Says("live"),
+                    Open(1, 443),
+                    Opened(1),
+                    Bytes(1, vec![1; 40]),
+                    Open(2, 443),
+                    Refused(2, "Permission denied (os error 13)", None),
+                ],
+                "failed",
+                String::new(),
+                (O::Failed, S::Dispatcher, W::None, W::None, Some(K::Local), false, true),
+            ),
             ("login refused", desk_then_upload(), "failed", "SFTP login was refused".into(), (O::Failed, S::Upload, W::Ok, W::Fail, Some(K::Login), true, true)),
             (
                 "failed before the upload",
@@ -628,11 +773,18 @@ mod tests {
                 (O::Sent, S::Uploaded, W::Ok, W::Ok, None, false, true),
             ),
             (
-                "no sender frame, failed: classified, not counted",
+                "no sender frame, failed: like lab, no class, not counted",
                 desk_then_upload()[1..].to_vec(),
                 "failed",
                 "SSH failed: Disconnected".into(),
-                (O::Failed, S::Upload, W::Ok, W::Fail, Some(K::Ssh), false, true),
+                (O::Failed, S::Upload, W::Ok, W::Fail, None, false, true),
+            ),
+            (
+                "no sender frame, the Sender stopped: no class",
+                [desk_then_upload()[1..].to_vec(), vec![SenderLost]].concat(),
+                "unknown",
+                "the send ended without an outcome; BIR may have received this return".into(),
+                (O::Unknown, S::Upload, W::None, W::Maybe, None, false, true),
             ),
         ];
         for (name, steps, status, error, expected) in cases {
@@ -646,15 +798,44 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_unanswered_before_the_next_open_timed_out() {
+    fn a_stream_unanswered_before_the_next_open_is_the_apps_side() {
         // Stream 1 got no answer before the Sender moved on; stream 2 was
-        // refused. The first TLS stream's kind decides: a timeout.
+        // refused. The first TLS stream's kind decides: no answer, which is
+        // the user's side (every app answers within 10 s) and not counted.
         let steps = [Says("live"), Open(1, 443), Open(2, 80), Refused(2, REFUSED, None)];
         let observed = observe(&steps, "failed", "BIR's dispatcher did not answer: …");
-        assert_eq!(observed.kind, Some(Kind::Timeout));
-        // A late answer for a stream already timed out changes nothing.
+        assert_eq!(
+            (observed.kind, observed.class(), observed.counted),
+            (Some(Kind::NoAnswer), Some(Class::UserNetwork), false)
+        );
+        // A late answer for a stream already unanswered changes nothing.
         let steps = [Says("live"), Open(1, 443), Open(2, 80), Opened(1), Refused(2, REFUSED, None)];
-        assert_eq!(observe(&steps, "failed", "").kind, Some(Kind::Timeout));
+        assert_eq!(observe(&steps, "failed", "").kind, Some(Kind::NoAnswer));
+    }
+
+    #[test]
+    fn frames_are_known_by_their_type_whatever_their_other_fields() {
+        let mut observer = TryObserver::new(&[22]);
+        // A `sender` frame with a mode that is not a string still stops
+        // here; its mode is unknown.
+        for odd in [r#"{"type":"sender","mode":5}"#, r#"{"type":"sender","mode":null,"v":"x"}"#] {
+            assert!(!observer.sender_text(odd), "{odd}");
+            assert!(is_sender_frame(odd), "{odd}");
+        }
+        assert!(!is_sender_frame(r#"{"type":5,"mode":"live"}"#));
+        assert!(!is_sender_frame(r#"["sender"]"#));
+        // A `refused` whose `kind` is not a string is still a refusal, read
+        // from its words.
+        assert!(observer.sender_text(r#"{"type":"open","stream":1,"host":"dispatcher.test","port":443}"#));
+        observer.app_text(r#"{"type":"refused","stream":1,"reason":"Connection refused (os error 61)","kind":7}"#);
+        assert!(observer.sender_text(r#"{"type":"open","stream":2,"port":443,"host":["odd"]}"#));
+        observer.app_text(r#"{"type":"refused","stream":2,"reason":{"odd":true},"kind":"refused"}"#);
+        let observed = observer.finish("failed", Some("BIR's dispatcher did not answer: …"));
+        assert_eq!(observed.mode, Mode::Unknown);
+        assert_eq!(observed.opens, 2);
+        assert_eq!(observed.classified.kind, Some(Kind::Refused));
+        // Mode unknown: nothing told.
+        assert_eq!(observed.kind, None);
     }
 
     #[test]
@@ -719,6 +900,23 @@ mod tests {
             observe(&steps, "failed", "the SFTP server's host key is not pinned (see the log for its fingerprint)");
         assert_eq!(observed.host_key, Some(sshkex::fingerprint(&blob)));
         assert_eq!(observed.kind, Some(Kind::HostKey));
+        // A key that is not pinned: the Sender stopped before completing
+        // the key exchange.
+        assert!(!observed.key_exchange_done);
+        // The Sender completes it in a try that reaches the login or the
+        // upload, never in one that fails before.
+        for (status, error, done) in [
+            ("sent", "", true),
+            ("unknown", "SFTP failed during the upload: connection reset.", true),
+            ("failed", "SFTP login was refused", true),
+            ("failed", "SSH failed: wrong server signature", false),
+            ("failed", "SSH failed: Disconnected", false),
+            ("failed", "SFTP timed out before the upload started", false),
+        ] {
+            assert_eq!(observe(&steps, status, error).key_exchange_done, done, "{status} {error}");
+        }
+        let lost = [steps.clone(), vec![SenderLost]].concat();
+        assert!(!observe(&lost, "unknown", "the send ended without an outcome").key_exchange_done);
         // The same bytes on a front-desk stream are not read.
         let steps = [Says("live"), Open(1, 443), Opened(1), Bytes(1, handshake.clone())];
         assert_eq!(observe(&steps, "failed", "").host_key, None);

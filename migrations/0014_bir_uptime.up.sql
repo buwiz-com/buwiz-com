@@ -22,8 +22,10 @@ SET LOCAL lock_timeout = '10s';
 
 -- One try. `counted` is `mode = 'live' AND (outcome = 'sent' OR
 -- failure_class = 'bir') AND failure_kind IS DISTINCT FROM 'no_service'`,
--- stored so the rules read one column. Tries in `lab` and `dry_run` carry
--- no class or kind; every other try that did not get in carries a class.
+-- stored so the rules read one column. Tries in `lab`, `dry_run` and
+-- `unknown` (no `sender` frame) carry no class or kind, but for a Sender
+-- that could not be reached at all (`ours`/`sender_down`); every `live` try
+-- that did not get in carries a class. Kept 90 days (the hourly upkeep).
 CREATE TABLE bir_tries (
     id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     started_at    timestamptz NOT NULL CHECK (started_at = date_trunc('minute', started_at)),
@@ -53,6 +55,7 @@ CREATE TABLE bir_tries (
     CHECK (ended_at >= started_at),
     CHECK ((failure_class IS NULL) = (failure_kind IS NULL)),
     CHECK (CASE WHEN mode IN ('lab', 'dry_run') THEN failure_class IS NULL
+                WHEN mode = 'unknown' THEN failure_class IS NULL OR failure_kind = 'sender_down'
                 ELSE (outcome IN ('sent', 'dry_run')) = (failure_class IS NULL) END),
     CHECK (NOT counted OR mode = 'live'),
     CHECK ((source = 'direct') = (report_id IS NOT NULL))

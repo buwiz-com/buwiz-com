@@ -1052,10 +1052,14 @@ async fn a_window_change_is_mailed_under_a_declare_online_note(db: PgPool) {
         "{}",
         mail.text
     );
-    // Back: logged, not mailed (the overall sign never left Online).
+    // Back: mailed as its going Offline was (the overall sign never left
+    // Online, so nothing else tells staff).
     record(&uptime, &db, 4, 4, Ends::Landed, t(30)).await;
     assert_eq!(uptime.live.sign().upload.state, Light::Online);
-    assert_eq!(alerts::flush(&uptime, &db, &mailer, config, t(30)).await.unwrap(), None);
+    let mail = alerts::flush(&uptime, &db, &mailer, config, t(30)).await.unwrap().unwrap();
+    assert_eq!(mail.subject, "BIR: mailbox back");
+    assert!(mail.text.contains("The mailbox is online: A return got in past the mailbox."), "{}", mail.text);
+    assert!(mail.text.contains("The sign shows Online, as an Admin declared."), "{}", mail.text);
 }
 
 /// The owner's rule: of the sign's own changes only going Offline and

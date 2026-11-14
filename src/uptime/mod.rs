@@ -234,7 +234,8 @@ impl Uptime {
 pub const ROLL_UP_EVERY: Duration = Duration::minutes(10);
 
 /// How long one round of staff mail may take in the ticker (each request
-/// is bounded too, [`crate::account::mail`]); one cut short is sent again.
+/// is bounded too, [`crate::account::mail`]); a round cut short counts as
+/// failed for the addresses it did not reach.
 pub const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long [`start`] may take for the day history.
@@ -284,7 +285,11 @@ pub async fn run_ticker(state: AppState) {
             match tokio::time::timeout(FLUSH_TIMEOUT, flush).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => tracing::error!(%error, "BIR uptime: staff mail could not be sent"),
-                Err(_) => tracing::error!("BIR uptime: staff mail took too long; it is sent again"),
+                Err(_) => {
+                    // Whom it reached is kept; the rest wait their backoff.
+                    uptime.alerts.timed_out(now);
+                    tracing::error!("BIR uptime: staff mail took too long; the addresses not reached are tried later");
+                }
             }
         })
         .await;

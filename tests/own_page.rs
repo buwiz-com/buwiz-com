@@ -81,12 +81,15 @@ async fn an_admin_opens_their_own_page_and_acts_on_their_own_tins(db: PgPool) {
         location(&site.post(&path, &cookie, "decision=reject").await),
         format!("/staff/claims/{rejected}?notice=reject_needs_note")
     );
-    assert_eq!(location(&site.post(&path, &cookie, "decision=reject&note=Typo").await), "/staff?notice=claim_decided");
+    assert_eq!(
+        location(&site.post(&path, &cookie, "decision=reject&note=Typo").await),
+        "/staff/queue?notice=claim_decided"
+    );
     let fix = papers(&site, &cookie, "000123453").await;
     let path = format!("/staff/claims/{fix}/decision");
     assert_eq!(
         location(&site.post(&path, &cookie, "decision=fix&reasons=blurry").await),
-        "/staff?notice=claim_sent_back"
+        "/staff/queue?notice=claim_sent_back"
     );
 
     // Deleting their own claim is the owner's, on My TINs.
@@ -202,8 +205,8 @@ async fn an_admin_confirms_the_automatic_activation_of_their_own_tin(db: PgPool)
     );
     let page = text(site.get(&path, &cookie).await).await;
     assert!(page.contains(SELF_ACTIVATED), "{page}");
-    let queue = text(site.get("/staff?status=approved", &cookie).await).await;
-    assert!(queue.contains(SELF_ACTIVATED), "{queue}");
+    let queue = text(site.get("/staff/queue?status=approved", &cookie).await).await;
+    assert!(list_part(&queue).contains(SELF_ACTIVATED), "{queue}");
 }
 
 /// An Admin approving their own claim writes why, as one activating it
@@ -225,7 +228,7 @@ async fn an_admin_approving_their_own_claim_writes_why_and_it_is_flagged(db: PgP
     let page = text(site.get(&format!("{path}?notice=own_needs_reason"), &cookie).await).await;
     assert!(page.contains("This is your own TIN: write why you make it active."), "{page}");
     let response = site.post(&format!("{path}/decision"), &cookie, "decision=approve&note=Checked+my+own+ID").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     assert_eq!(site.claim_status(own).await, "approved");
     assert_eq!(
         claim_audit_lines(&site.db, boss).await,
@@ -239,8 +242,8 @@ async fn an_admin_approving_their_own_claim_writes_why_and_it_is_flagged(db: PgP
     );
     let page = text(site.get(&path, &cookie).await).await;
     assert!(page.contains(SELF_ACTIVATED), "{page}");
-    let queue = text(site.get("/staff?status=approved", &cookie).await).await;
-    assert!(queue.contains(SELF_ACTIVATED), "{queue}");
+    let queue = text(site.get("/staff/queue?status=approved", &cookie).await).await;
+    assert!(list_part(&queue).contains(SELF_ACTIVATED), "{queue}");
     let history = text(site.get(&format!("/staff/users/{boss}"), &cookie).await).await;
     assert!(
         history.contains("Staff boss@example.test approved their own claim on ***-***-457-00000: Checked my own ID"),
@@ -251,7 +254,7 @@ async fn an_admin_approving_their_own_claim_writes_why_and_it_is_flagged(db: PgP
     let (_, ana_cookie) = site.person("ana@example.test").await;
     let theirs = papers(&site, &ana_cookie, "000123458").await;
     let response = site.post(&format!("/staff/claims/{theirs}/decision"), &cookie, "decision=approve").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     let page = text(site.get(&format!("/staff/claims/{theirs}"), &cookie).await).await;
     assert!(!page.contains(SELF_ACTIVATED), "{page}");
 }

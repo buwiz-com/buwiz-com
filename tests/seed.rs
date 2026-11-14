@@ -804,7 +804,7 @@ async fn a_rerun_does_not_bring_back_a_tin_ended_on_the_website(db: PgPool) {
     let response = site.post(&format!("/staff/claims/{active}/revoke"), &staff, "reason=Not+hers").await;
     assert_eq!(location(&response), format!("/staff/claims/{active}?notice=ownership_revoked"));
     let response = site.post(&format!("/staff/claims/{unverified}/delete"), &staff, "reason=Typo").await;
-    assert_eq!(location(&response), "/staff?notice=claim_deleted");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_deleted");
 
     let before = counts(db).await;
     let problem = refused(seed(db, EXAMPLE, &opts).await);
@@ -1121,8 +1121,27 @@ async fn the_seed_activating_its_own_admins_tin_is_flagged(db: PgPool) {
     assert!(page.contains("Activated by its owner, an admin"), "{page}");
     let page = text(site.get(&format!("/staff/claims/{jos}"), &other_admin).await).await;
     assert!(!page.contains("Activated by its owner, an admin"), "{page}");
-    let queue = text(site.get("/staff?status=approved", &other_admin).await).await;
-    assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+    let queue = text(site.get("/staff/queue?status=approved", &other_admin).await).await;
+    assert!(list_part(&queue).contains("Activated by its owner, an admin"), "{queue}");
+}
+
+/// The Overview's feed reads a TIN the seed saved without papers as that,
+/// not as "changed".
+#[sqlx::test(migrations = "./migrations")]
+async fn the_overview_words_a_tin_the_seed_saved_without_papers(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let file = "[[login]]\nemail = \"jo@example.test\"\n[[login.tin]]\ntin = \"000-123-459\"\nkind = \"personal\"\nname = \"J O\"\nstate = \"not_verified\"\n";
+    seed(&site.db, file, &listing(STAFF, false, &[STAFF])).await.unwrap();
+    let page = text(site.get("/staff", &staff).await).await;
+    assert!(
+        page.contains(&format!(
+            "<b>{STAFF} (seed tool)</b> added <a class=\"w\" href=\"/staff/users/{}\">***-***-459-00000 to jo@example.test without papers</a>",
+            account(&site.db, "jo@example.test").await.0
+        )),
+        "{page}"
+    );
+    assert!(!page.contains("changed ***"), "{page}");
 }
 
 /// A test TIN goes in only when its entry says `test_tin = true`, active,

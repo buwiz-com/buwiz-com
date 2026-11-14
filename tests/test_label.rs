@@ -30,7 +30,7 @@ async fn test_accounts_are_labelled_and_filtered_and_send_as_usual(db: PgPool) {
     let list = text(site.get("/staff/users?filter=test", &staff).await).await;
     assert!(list.contains("ana@example.test") && !list.contains("bob@example.test"), "{list}");
     assert!(list.contains(">Test<"), "{list}");
-    let queue = text(site.get("/staff?status=approved", &staff).await).await;
+    let queue = text(site.get("/staff/queue?status=approved", &staff).await).await;
     assert!(queue.contains(">Test<"), "{queue}");
 
     // Sends as usual.

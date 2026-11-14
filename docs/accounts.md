@@ -152,7 +152,7 @@ the person already has it.
 
 ### Staff review
 
-Staff review each claim by hand at `/staff` (`src/account/staff.rs`). They can:
+Staff review each claim by hand at `/staff/queue` (`src/account/staff.rs`). They can:
 - approve it;
 - reject it;
 - send it back with reasons. The person fixes it from My TINs (`/tins`) and resends it.

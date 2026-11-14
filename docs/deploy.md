@@ -388,7 +388,7 @@ one is refused.
    (waiting for review, sent back, or saved without papers), which can no
    longer be approved. The dry run names that account; the real run says
    "another account". If it refuses, fix
-   the file (or the database, on `/staff`) and dry-run again. Its last
+   the file (or the database, on `/staff/queue`) and dry-run again. Its last
    line is the rest of the real run's command:
    `--target <host:port/name> --expect <digest>`.
 4. The real run: the same command, the same `--as`, with that line in
@@ -837,5 +837,5 @@ BUWIZ_SERVER_URL=https://api.buwiz.com BUWIZ_ACCOUNT_URL=https://account.buwiz.c
 ```
 
 Sign in from the app, add your TIN at `/tins/new`, approve it as staff
-(Support, an Admin, or someone in `ADMIN_EMAILS`) at `/staff`, and the
+(Support, an Admin, or someone in `ADMIN_EMAILS`) at `/staff/queue`, and the
 licence gate opens.

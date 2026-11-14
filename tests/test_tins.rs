@@ -64,14 +64,14 @@ async fn an_admin_adds_a_test_tin_to_a_test_account_and_every_list_marks_it(db: 
     let page = text(site.get(&user, &staff).await).await;
     // In the TINs section itself, on the TIN's own row (not the History
     // line, nor the add form's default value).
-    let tins = page.split("<h2>TINs</h2>").nth(1).and_then(|rest| rest.split("</section>").next()).unwrap();
-    let row = tins.split("class=\"user-tin\"").find(|row| row.contains("000-000-000-00000")).unwrap();
+    let tins = page.split("id=\"tab-tins\"").nth(1).and_then(|rest| rest.split("Identity documents").next()).unwrap();
+    let row = tins.split("class=\"sx-tinrow\"").skip(1).find(|row| row.contains("000-000-000-00000")).unwrap();
     let row = row.split("Open claim").next().unwrap();
-    assert!(row.contains("tagpill status-unverified") && row.contains("Test TIN"), "{row}");
+    assert!(row.contains("sx-pill testtin") && row.contains("Test TIN"), "{row}");
     assert!(page.contains("Test TIN 000-000-000-00000 added, active"), "{page}");
     let list = text(site.get("/staff/users", &staff).await).await;
     assert!(list.contains("000-000-000-00000 · test"), "{list}");
-    let queue = text(site.get("/staff?status=approved", &staff).await).await;
+    let queue = text(site.get("/staff/queue?status=approved", &staff).await).await;
     assert!(queue.contains("Test TIN: never sends"), "{queue}");
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Test TIN: Buwiz never sends returns for it"), "{review}");

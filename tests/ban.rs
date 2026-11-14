@@ -139,7 +139,7 @@ async fn a_ban_closes_every_website_session_door(db: PgPool) {
     assert_eq!(text(consent).await, "Sign in first.");
     let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM tin_claims").fetch_one(&site.db).await.unwrap();
     assert_eq!(claims, 0);
-    for page in ["/tins", "/tins/new", "/device", "/staff", "/staff/users"] {
+    for page in ["/tins", "/tins/new", "/device", "/staff", "/staff/queue", "/staff/users"] {
         let response = site.get(page, &staff_cookie).await;
         assert!(location(&response).starts_with("/login?"), "{page}: {}", response.status());
     }

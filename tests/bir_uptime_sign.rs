@@ -1,14 +1,16 @@
 //! BIR uptime's sign with its database: tries recorded through the
 //! recorder move it, every change leaves an event, the sign survives a
-//! restart, and notes and the relay resume are Admin-only and audited.
-//! Made-up data, a made-up clock, and the local test database only:
-//! nothing else is connected to.
+//! restart, notes and the relay resume are Admin-only and audited, and the
+//! day history adds up across midnight and a restart. Made-up data, a
+//! made-up clock, and the local test database only: nothing else is
+//! connected to.
 
 mod common;
 
 use buwiz_cloud::account::accounts::Account;
 use buwiz_cloud::account::roles::{self, Role, Staff};
-use buwiz_cloud::uptime::keys::Network;
+use buwiz_cloud::uptime::days;
+use buwiz_cloud::uptime::keys::{Network, manila_day};
 use buwiz_cloud::uptime::live;
 use buwiz_cloud::uptime::notes::{self, NewNote, NoteError};
 use buwiz_cloud::uptime::observe::{Observed, TryObserver};
@@ -414,4 +416,147 @@ async fn a_return_that_gets_in_ends_an_outage_note(db: PgPool) {
     assert_eq!(note_rows(&db).await[0].2.as_deref(), Some("return_got_in"));
     let ended = events(&db).await.pop().unwrap();
     assert_eq!(ended.3, "note_return_got_in");
+}
+
+/// A `bir_days` line.
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct DayRow {
+    tries: i32,
+    got_in: i32,
+    failed: i32,
+    accounts: i32,
+    networks: i32,
+    online_minutes: i32,
+    busy_minutes: i32,
+    offline_minutes: i32,
+    quiet_minutes: i32,
+    note_minutes: i32,
+    worst: String,
+    hours: String,
+    #[sqlx(rename = "final")]
+    is_final: bool,
+}
+
+async fn day_row(db: &PgPool, day: time::Date) -> DayRow {
+    sqlx::query_as(
+        "SELECT tries, got_in, failed, accounts, networks, online_minutes, busy_minutes, offline_minutes,
+                quiet_minutes, note_minutes, worst, hours, final FROM bir_days WHERE day = $1",
+    )
+    .bind(day)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn the_day_history_adds_up_across_midnight_and_a_restart(db: PgPool) {
+    let site = Site::new(db.clone());
+    let first = uptime(t(0));
+    let day = manila_day(t(0));
+    // 10:00 Manila: three accounts get in; 10:10 to 10:12 the mailbox
+    // refuses three more; 11:00 a landing ends it.
+    an_outage(&first, &db).await;
+    record(&first, &db, 4, 4, Ends::Landed, t(60)).await;
+    // While the day lasts: a line so far, hours after now not known.
+    days::roll_up(&db, &first.day_sets, day, t(65)).await.unwrap().unwrap();
+    let row = day_row(&db, day).await;
+    assert_eq!((row.tries, row.got_in, row.failed), (7, 4, 3));
+    assert_eq!((row.accounts, row.networks), (7, 7));
+    // Before 10:00 nothing was known (the history's first line); 10:00 to
+    // 11:00 was Offline at worst; 11:00 Online; later hours not yet.
+    assert_eq!(row.hours, format!("{}xo{}", "-".repeat(10), "-".repeat(12)));
+    assert!(!row.is_final);
+
+    // A restart at 12:00: the raw day sets start again. Two of the same
+    // accounts and one new one file afterwards.
+    let second = uptime(t(120));
+    for (account, minute) in [(1, 121), (2, 122), (30, 123)] {
+        record(&second, &db, account, account as u8, Ends::Landed, t(minute)).await;
+    }
+    days::roll_up(&db, &second.day_sets, day, t(125)).await.unwrap();
+    let row = day_row(&db, day).await;
+    assert_eq!(row.tries, 10);
+    assert_eq!((row.accounts, row.networks), (7, 7), "a lower bound: the larger of before and after the restart");
+    // The clock runs (the ticker does this every 30 seconds).
+    for minute in 124..720 {
+        live::tick(&second, &db, t(minute)).await.unwrap();
+    }
+
+    // An Admin's maintenance from 22:00 to 23:30 Manila.
+    let admin = admin(&site).await;
+    let maintenance = NewNote { kind: NoteKind::Maintenance, text: "Planned work", until: t(810) };
+    notes::set(&second, &db, &site.state.config, &admin, maintenance, t(720)).await.unwrap();
+    for minute in 721..=840 {
+        live::tick(&second, &db, t(minute)).await.unwrap();
+    }
+
+    // After midnight: final, and the same line however often it runs.
+    let after = t(14 * 60 + 30);
+    days::roll_up_recent(&second, &db, after).await.unwrap();
+    let line = day_row(&db, day).await;
+    assert!(line.is_final);
+    // No data before 10:00; Offline from 10:12; Online from 11:00 until an
+    // hour after the last landing at 12:03; quiet; the maintenance from
+    // 22:00 to 23:30.
+    assert_eq!(line.hours, format!("{}xooo{}mm", "-".repeat(10), "n".repeat(8)));
+    assert_eq!(line.worst, "offline");
+    // online, busy, offline, quiet, note minutes.
+    assert_eq!(
+        (line.online_minutes, line.busy_minutes, line.offline_minutes, line.quiet_minutes, line.note_minutes),
+        (12 + 123, 0, 48 + 90, 537 + 30, 90)
+    );
+    days::roll_up_recent(&second, &db, after + Duration::hours(1)).await.unwrap();
+    assert_eq!(day_row(&db, day).await, line);
+    // A final line is never computed again, even once its tries are gone.
+    sqlx::query("DELETE FROM bir_tries").execute(&db).await.unwrap();
+    days::roll_up(&db, &second.day_sets, day, after + Duration::days(3)).await.unwrap();
+    assert_eq!(day_row(&db, day).await, line);
+
+    // A day with no tries at all: No recent news, every hour.
+    let quiet = day.next_day().unwrap().next_day().unwrap();
+    days::roll_up(&db, &second.day_sets, quiet, after + Duration::days(3)).await.unwrap();
+    let row = day_row(&db, quiet).await;
+    assert_eq!((row.tries, row.accounts, row.networks), (0, 0, 0));
+    assert_eq!(row.quiet_minutes, 24 * 60);
+    assert_eq!(row.worst, "no_recent_news");
+    assert_eq!(row.hours, "n".repeat(24));
+    assert!(row.is_final);
+}
+
+#[sqlx::test]
+async fn retention_keeps_the_history_and_prunes_the_rest(db: PgPool) {
+    let site = Site::new(db.clone());
+    let (account, _) = site.person("filer@example.test").await;
+    let claim = common::add_claim(&db, account, "000123453", "approved").await;
+    sqlx::query(
+        "INSERT INTO bir_held (at, account_id, claim_id, form, period, code)
+         VALUES (now() - interval '91 days', $1, $2, '1601C', '2026-10', 'bir_offline'),
+                (now() - interval '89 days', $1, $2, '1601C', '2026-10', 'bir_offline')",
+    )
+    .bind(account)
+    .bind(claim)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
+             online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst, hours, final)
+         VALUES ('2020-01-01', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1440, 0, 'no_recent_news', $1, true)",
+    )
+    .bind("n".repeat(24))
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO bir_events (at, scope, from_state, to_state, cause, reason) VALUES ('2020-01-01', 'overall', 'online', 'offline', 'rule', 'old')")
+        .execute(&db)
+        .await
+        .unwrap();
+    store::upkeep(&db).await.unwrap();
+    let count = |table: &'static str| {
+        let db = db.clone();
+        async move { sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}")).fetch_one(&db).await.unwrap() }
+    };
+    assert_eq!(count("bir_held").await, 1);
+    assert_eq!(count("bir_days").await, 1, "the day history is kept forever");
+    assert_eq!(count("bir_events").await, 1, "and the events");
 }

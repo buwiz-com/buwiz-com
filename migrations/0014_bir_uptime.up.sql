@@ -198,6 +198,9 @@ CREATE TABLE bir_days (
     hours           text NOT NULL CHECK (hours ~ '^[obxmn-]{24}$'),
     -- [{from, to, window, source}]
     outages         jsonb NOT NULL DEFAULT '[]',
+    -- Each window's own day: {"dispatcher": {worst, online_minutes,
+    -- busy_minutes, offline_minutes, quiet_minutes}, "upload": {...}}.
+    windows         jsonb NOT NULL DEFAULT '{}',
     final           boolean NOT NULL DEFAULT false
 );
 
@@ -234,10 +237,10 @@ BEGIN
     IF to_regclass('rollback_archive.bir_days') IS NOT NULL THEN
         INSERT INTO bir_days (day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
                               online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst,
-                              hours, outages, final)
+                              hours, outages, windows, final)
             SELECT DISTINCT ON (day) day, tries, got_in, failed, maybe, ours, user_network, held, accounts, networks,
                    online_minutes, busy_minutes, offline_minutes, quiet_minutes, note_minutes, worst, hours,
-                   outages, final
+                   outages, windows, final
               FROM rollback_archive.bir_days ORDER BY day, archived_at DESC;
         DROP TABLE rollback_archive.bir_days;
     END IF;

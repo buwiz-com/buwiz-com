@@ -14,8 +14,10 @@
 //! - [`sign`]: the rule engine, pure.
 //! - [`live`]: the sign in memory, rebuilt on start, written on change.
 //! - [`notes`]: what an Admin sets by hand.
+//! - [`days`]: the day history and the tables' retention.
 
 pub mod classify;
+pub mod days;
 pub mod keys;
 pub mod live;
 pub mod notes;
@@ -211,17 +213,30 @@ impl Uptime {
     }
 }
 
+/// How often the day history is rewritten.
+pub const ROLL_UP_EVERY: Duration = Duration::minutes(10);
+
 /// From `record` up, for as long as the server runs: loads the sign, then
-/// every 30 seconds runs the rules for what the clock alone changes.
-/// Nothing at `off`.
+/// every 30 seconds runs the rules for what the clock alone changes, and
+/// every 10 minutes (and after each Manila midnight) rewrites the day
+/// history. Nothing at `off`.
 pub async fn run_ticker(state: AppState) {
     let uptime = state.uptime.clone();
     if !uptime.level.records() {
         return;
     }
+    let mut rolled: Option<(OffsetDateTime, time::Date)> = None;
     loop {
-        if let Err(error) = live::tick(&uptime, &state.db, OffsetDateTime::now_utc()).await {
+        let now = OffsetDateTime::now_utc();
+        if let Err(error) = live::tick(&uptime, &state.db, now).await {
             tracing::error!(%error, "BIR uptime: the rules could not run");
+        }
+        let day = keys::manila_day(now);
+        if rolled.is_none_or(|(at, rolled_day)| now - at >= ROLL_UP_EVERY || rolled_day != day) {
+            match days::roll_up_recent(&uptime, &state.db, now).await {
+                Ok(()) => rolled = Some((now, day)),
+                Err(error) => tracing::error!(%error, "BIR uptime: the day history could not be written"),
+            }
         }
         tokio::time::sleep(live::TICK).await;
     }

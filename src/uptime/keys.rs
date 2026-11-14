@@ -385,16 +385,16 @@ impl<K: Eq + Hash> RateLimiter<K> {
 }
 
 /// The distinct accounts and networks of the Manila day's counted tries,
-/// for the day history. Raw ids and networks, in memory only, cleared when
-/// the day changes.
+/// for the day history. Raw ids and networks, in memory only. When the day
+/// changes, the day before is kept (for its last roll-up after midnight)
+/// and the one before that is dropped.
 #[derive(Default)]
 pub struct DaySets {
-    sets: Mutex<Sets>,
+    sets: Mutex<[Option<Sets>; 2]>,
 }
 
-#[derive(Default)]
 struct Sets {
-    day: Option<Date>,
+    day: Date,
     accounts: HashSet<Uuid>,
     networks: HashSet<Network>,
 }
@@ -403,14 +403,17 @@ impl DaySets {
     pub fn note(&self, account: Uuid, network: &Network, at: OffsetDateTime) {
         let day = manila_day(at);
         let mut sets = self.sets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sets.day != Some(day) {
-            if sets.day.is_some_and(|known| known > day) {
-                // A try that ended before midnight, noted after: its day's
-                // counts are no longer kept here.
-                return;
-            }
-            *sets = Sets { day: Some(day), ..Sets::default() };
+        let [today, yesterday] = &mut *sets;
+        if today.as_ref().is_none_or(|known| known.day < day) {
+            let before = today.take().filter(|known| known.day.next_day() == Some(day));
+            *yesterday = before;
+            *today = Some(Sets { day, accounts: HashSet::new(), networks: HashSet::new() });
         }
+        // A try that ended before midnight, noted after, still counts for its
+        // day while that day is kept.
+        let Some(sets) = [today, yesterday].into_iter().flatten().find(|sets| sets.day == day) else {
+            return;
+        };
         sets.accounts.insert(account);
         sets.networks.insert(network.clone());
     }
@@ -418,7 +421,7 @@ impl DaySets {
     /// (accounts, networks) on `day`, if this process holds that day.
     pub fn counts(&self, day: Date) -> Option<(usize, usize)> {
         let sets = self.sets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        (sets.day == Some(day)).then(|| (sets.accounts.len(), sets.networks.len()))
+        sets.iter().flatten().find(|sets| sets.day == day).map(|sets| (sets.accounts.len(), sets.networks.len()))
     }
 }
 
@@ -637,13 +640,28 @@ mod tests {
             sets.note(Uuid::from_u128(account), &Network::V4(network), morning);
         }
         assert_eq!(sets.counts(day), Some((2, 2)));
-        // 00:30 Manila the next day: a new day, and yesterday is gone.
+        // 00:30 Manila the next day: a new day; yesterday is kept for its
+        // last roll-up.
         let next = at("2026-11-11T16:30:00Z");
         sets.note(Uuid::from_u128(3), &Network::Local, next);
         assert_eq!(sets.counts(manila_day(next)), Some((1, 1)));
-        assert_eq!(sets.counts(day), None);
-        // A late note for yesterday changes nothing.
+        assert_eq!(sets.counts(day), Some((2, 2)));
+        // A late note for yesterday counts for yesterday only.
         sets.note(Uuid::from_u128(4), &Network::Local, morning);
         assert_eq!(sets.counts(manila_day(next)), Some((1, 1)));
+        assert_eq!(sets.counts(day), Some((3, 3)));
+        // The day after: the 11th is gone, the 12th kept.
+        let after = at("2026-11-12T16:30:00Z");
+        sets.note(Uuid::from_u128(5), &Network::Local, after);
+        assert_eq!(sets.counts(day), None);
+        assert_eq!(sets.counts(manila_day(next)), Some((1, 1)));
+        assert_eq!(sets.counts(manila_day(after)), Some((1, 1)));
+        // A note two days late changes nothing.
+        sets.note(Uuid::from_u128(6), &Network::Local, morning);
+        assert_eq!(sets.counts(day), None);
+        // Skipping a whole day keeps no stale yesterday.
+        let later = at("2026-11-14T16:30:00Z");
+        sets.note(Uuid::from_u128(7), &Network::Local, later);
+        assert_eq!(sets.counts(manila_day(after)), None);
     }
 }

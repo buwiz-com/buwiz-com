@@ -365,12 +365,14 @@ pub fn periods(seen: &Value) -> Vec<Period> {
         .collect()
 }
 
-/// The hourly upkeep: tries older than 90 days are deleted.
+/// The hourly upkeep: tries older than 90 days are deleted, and the other
+/// uptime tables kept as [`super::days::upkeep`] says.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<u64> {
     let deleted = sqlx::query("DELETE FROM bir_tries WHERE started_at < now() - make_interval(days => $1)")
         .bind(TRIES_KEPT_DAYS)
         .execute(db)
         .await?;
+    super::days::upkeep(db).await?;
     Ok(deleted.rows_affected())
 }
 

@@ -1393,7 +1393,12 @@ fn history(
     audit: &[AuditRow],
     account_audit: &[AccountAuditRow],
 ) -> Vec<(OffsetDateTime, &'static str, String)> {
-    let mut events = vec![(user.created_at, "person_add", "Created the account".to_owned())];
+    // A login staff or the seed tool made has a `created` line saying who
+    // made it, and why; any other account was made at its first sign-in.
+    let mut events = Vec::new();
+    if !account_audit.iter().any(|line| line.action == "created") {
+        events.push((user.created_at, "person_add", "Made the account at their first sign-in".to_owned()));
+    }
     for (at, _) in sessions {
         events.push((*at, "login", "Signed in on the website".to_owned()));
     }

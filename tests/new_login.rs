@@ -60,6 +60,9 @@ async fn an_admin_makes_a_login_with_the_test_label(db: PgPool) {
     assert_eq!(codes, 0);
     let history = text(site.get(&format!("/staff/users/{id}"), &staff).await).await;
     assert!(history.contains(&format!("Staff {STAFF} created the login: QA login")), "{history}");
+    // Who made it is the History's first line; it does not read as made
+    // at a sign-in.
+    assert!(!history.contains("Made the account at their first sign-in"), "{history}");
     assert!(history.contains("Test account"), "{history}");
 
     // Without a role or label.
@@ -133,6 +136,10 @@ async fn a_role_waits_for_the_first_sign_in(db: PgPool) {
     assert_eq!(account(&site.db, "typo@example.test").await.unwrap().1, None);
 
     // Once they signed in (an ended session counts), the role goes in.
+    // An account made at a sign-in says so.
+    let (signed_up, _) = site.person("self@example.test").await;
+    let history = text(site.get(&format!("/staff/users/{signed_up}"), &staff).await).await;
+    assert!(history.contains("Made the account at their first sign-in"), "{history}");
     let cookie = site.person_session(typo).await;
     site.post("/logout", &cookie, "").await;
     let page = text(site.get(&user, &staff).await).await;

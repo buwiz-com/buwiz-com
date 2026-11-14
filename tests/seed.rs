@@ -1125,6 +1125,25 @@ async fn the_seed_activating_its_own_admins_tin_is_flagged(db: PgPool) {
     assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
 }
 
+/// The Overview's feed reads a TIN the seed saved without papers as that,
+/// not as "changed".
+#[sqlx::test(migrations = "./migrations")]
+async fn the_overview_words_a_tin_the_seed_saved_without_papers(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let file = "[[login]]\nemail = \"jo@example.test\"\n[[login.tin]]\ntin = \"000-123-459\"\nkind = \"personal\"\nname = \"J O\"\nstate = \"not_verified\"\n";
+    seed(&site.db, file, &listing(STAFF, false, &[STAFF])).await.unwrap();
+    let page = text(site.get("/staff", &staff).await).await;
+    assert!(
+        page.contains(&format!(
+            "<b>{STAFF} (seed tool)</b> added <a class=\"w\" href=\"/staff/users/{}\">***-***-459-00000 to jo@example.test without papers</a>",
+            account(&site.db, "jo@example.test").await.0
+        )),
+        "{page}"
+    );
+    assert!(!page.contains("changed ***"), "{page}");
+}
+
 /// A test TIN goes in only when its entry says `test_tin = true`, active,
 /// on a login with the test label; the label then stays on.
 #[sqlx::test(migrations = "./migrations")]

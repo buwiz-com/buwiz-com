@@ -655,6 +655,8 @@ a.sx-tile:hover { border-color: var(--color-line2); }
 .sx-spark rect.now { fill: var(--acc); }
 .sx-spark text { fill: var(--color-faint); font-size: 8px; font-family: var(--font-sans); }
 .sx-home2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: var(--space-5); align-items: start; }
+/* Support's Overview has the waiting list alone. */
+.sx-home2.one { grid-template-columns: minmax(0, 1fr); }
 .sx-sec { display: flex; flex-direction: column; gap: var(--space-5); padding: var(--space-6); min-width: 0; }
 .sx-sec > h2, .sx-sec-h h2 { font: 600 var(--text-lg) / 1.25 var(--font-heading); }
 .sx-sec-h { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }

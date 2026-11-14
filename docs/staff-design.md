@@ -119,6 +119,14 @@ included, or for returns from midnight six days ago. Queries are in
 Each sub line keeps a count and its word together (no-break space) so a
 narrow tile wraps between parts, not inside one.
 
+Below the tiles, **Waiting longest** (the three oldest waiting claims, the
+queue's own data) shows for everyone with the Review power. **Recent staff
+activity** (who did what to which account, across all accounts) is for
+Admins only: for Support it is not rendered and its query does not run. It
+reads the newest lines of each audit table and merges them, so its work
+stays bounded (`recent_activity` in `src/account/staff.rs` names the index
+to add if those tables grow).
+
 ## Adding a screen
 
 1. Add a `#[page("/staff/…")]` in `src/account/pages/staff.rs` (or a module

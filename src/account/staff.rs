@@ -365,23 +365,39 @@ pub struct Activity {
 /// The newest staff actions on claims and accounts, newest first: lines
 /// written from the staff pages or the seed tool, not Buwiz's own, and
 /// not what people did to their own claims (a staff member acting on
-/// their own TIN as staff still counts).
+/// their own TIN as staff still counts). Admins only read it (the
+/// Overview).
+///
+/// Bounded: each audit table gives its newest `limit` lines by
+/// `created_at` alone, the two are merged and cut to `limit`, and only
+/// those lines are joined to their accounts. Without an index on
+/// `created_at` each table is still read once, keeping just the top
+/// `limit` while it sorts (no migration here); if the tables grow, the
+/// index that serves it is `claim_audit (created_at DESC) WHERE source IN
+/// ('web', 'seed')` and `account_audit (created_at DESC)`, after which
+/// each part reads about `limit` rows.
 pub async fn recent_activity(db: &PgPool, limit: i64) -> sqlx::Result<Vec<Activity>> {
     sqlx::query_as(
-        "(SELECT 'claim' AS kind, l.action, l.tin_masked, NULL::text AS old_value, NULL::text AS new_value,
-                 l.account_id, a.email AS account_email, l.actor_email, l.source, l.created_at
-          FROM claim_audit l LEFT JOIN accounts a ON a.id = l.account_id
-          WHERE l.source IN ('web', 'seed')
-            AND (l.actor_id <> l.account_id
-                 OR l.action IN ('approved', 'rejected', 'sent_back', 'activated', 'paused', 'resumed', 'revoked',
-                                 'auto_confirmed'))
-          ORDER BY l.created_at DESC LIMIT $1)
-         UNION ALL
-         (SELECT 'account', l.action, NULL, l.old_value, l.new_value,
-                 l.account_id, a.email, l.actor_email, l.source, l.created_at
-          FROM account_audit l LEFT JOIN accounts a ON a.id = l.account_id
-          ORDER BY l.created_at DESC LIMIT $1)
-         ORDER BY created_at DESC LIMIT $1",
+        "SELECT feed.kind, feed.action, feed.tin_masked, feed.old_value, feed.new_value, feed.account_id,
+                a.email AS account_email, feed.actor_email, feed.source, feed.created_at
+         FROM (
+             (SELECT 'claim' AS kind, l.action, l.tin_masked, NULL::text AS old_value, NULL::text AS new_value,
+                     l.account_id, l.actor_email, l.source, l.created_at
+              FROM claim_audit l
+              WHERE l.source IN ('web', 'seed')
+                AND (l.actor_id <> l.account_id
+                     OR l.action IN ('approved', 'rejected', 'sent_back', 'activated', 'paused', 'resumed', 'revoked',
+                                     'auto_confirmed'))
+              ORDER BY l.created_at DESC LIMIT $1)
+             UNION ALL
+             (SELECT 'account', l.action, NULL, l.old_value, l.new_value, l.account_id, l.actor_email, l.source,
+                     l.created_at
+              FROM account_audit l
+              ORDER BY l.created_at DESC LIMIT $1)
+             ORDER BY created_at DESC LIMIT $1
+         ) feed
+         LEFT JOIN accounts a ON a.id = feed.account_id
+         ORDER BY feed.created_at DESC",
     )
     .bind(limit)
     .fetch_all(db)

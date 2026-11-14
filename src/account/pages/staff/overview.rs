@@ -1,5 +1,5 @@
 //! The Overview, the staff console's home: the numbers that matter today,
-//! the claims waiting longest and what staff did lately.
+//! the claims waiting longest and, for Admins, what staff did lately.
 
 use super::ui::{ic, kind_icon, page_head, short_span, sx_notice};
 use super::*;
@@ -95,6 +95,8 @@ fn activity_words(line: &Activity) -> (&'static str, String, String) {
         ("claim", "revoked") => ("ban", "revoked", format!("{tin} from {email}")),
         ("claim", "deleted") => ("trash", "deleted a claim on", format!("{tin} by {email}")),
         ("claim", "removed") => ("x-circle", "removed", format!("{tin} from {email}")),
+        // The seed tool saving a TIN without papers.
+        ("claim", "created") => ("bookmark", "added", format!("{tin} to {email} without papers")),
         ("claim", _) => ("file", "changed", format!("{tin} of {email}")),
         (_, "banned") => ("ban", "banned", email),
         (_, "unbanned") => ("unlock", "lifted the ban on", email),
@@ -113,7 +115,7 @@ fn activity_words(line: &Activity) -> (&'static str, String, String) {
 
 #[page("/staff")]
 pub async fn overview_page(cx: &Cx) -> Result<impl View> {
-    let _viewer = staff_member(cx, Power::Review).await?;
+    let viewer = staff_member(cx, Power::Review).await?;
     // The queue's old address was `/staff?…`: anything that carries a query
     // (`?notice=`, `?status=`, `?open=`, `?q=`) is a queue link, kept alive.
     // Only after the staff check, so everyone else gets what they always did.
@@ -131,8 +133,12 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
     let returns = queries::returns_tile(db, today, week_start).await?;
     let returns_parts = returns_breakdown(&returns);
     let active_parts = active_breakdown(numbers.paused, numbers.test);
+    // The queue's own claims, for everyone who reviews.
     let longest = queries::waiting_longest(db, 3).await?;
-    let activity = queries::recent_activity(db, ACTIVITY_LINES).await?;
+    // What staff did to whom, across every account, is an Admin's: Support
+    // see counts and the queue, and the query does not run for them.
+    let admin = viewer.role == Role::Admin;
+    let activity = if admin { queries::recent_activity(db, ACTIVITY_LINES).await? } else { Vec::new() };
     let lines: Vec<(&'static str, String, String, String, Uuid, OffsetDateTime)> = activity
         .iter()
         .map(|line| {
@@ -202,7 +208,7 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                             <span class="s">"For a person to check"</span>
                         </a>
                     </div>
-                    <div class="sx-home2">
+                    <div class=(if admin { "sx-home2" } else { "sx-home2 one" })>
                         <section class="sx-card sx-sec" aria-labelledby="sx-longest">
                             <h2 id="sx-longest">"Waiting longest"</h2>
                             if longest.is_empty() {
@@ -228,25 +234,27 @@ pub async fn overview_page(cx: &Cx) -> Result<impl View> {
                             }
                             <a class="sx-btn" href="/staff/queue?status=waiting">(ic("arrow-right")) "Open the queue"</a>
                         </section>
-                        <section class="sx-card sx-sec" aria-labelledby="sx-activity">
-                            <h2 id="sx-activity">"Recent staff activity"</h2>
-                            if lines.is_empty() {
-                                <p class="sx-empty">"No staff actions yet."</p>
-                            } else {
-                                <ol class="sx-feed">
-                                    for (sym, who, verb, what, account_id, at) in lines {
-                                        <li>
-                                            <span class="sx-feed-ic">(ic(sym))</span>
-                                            <span class="x">
-                                                <b>(who)</b> " " (verb) " "
-                                                <a class="w" href=(format!("/staff/users/{account_id}"))>(what)</a>
-                                                <span class="t">(ago(Some(at)))</span>
-                                            </span>
-                                        </li>
-                                    }
-                                </ol>
-                            }
-                        </section>
+                        if admin {
+                            <section class="sx-card sx-sec" aria-labelledby="sx-activity">
+                                <h2 id="sx-activity">"Recent staff activity"</h2>
+                                if lines.is_empty() {
+                                    <p class="sx-empty">"No staff actions yet."</p>
+                                } else {
+                                    <ol class="sx-feed">
+                                        for (sym, who, verb, what, account_id, at) in lines {
+                                            <li>
+                                                <span class="sx-feed-ic">(ic(sym))</span>
+                                                <span class="x">
+                                                    <b>(who)</b> " " (verb) " "
+                                                    <a class="w" href=(format!("/staff/users/{account_id}"))>(what)</a>
+                                                    <span class="t">(ago(Some(at)))</span>
+                                                </span>
+                                            </li>
+                                        }
+                                    </ol>
+                                }
+                            </section>
+                        }
                     </div>
                 </div>
             </div>
@@ -268,6 +276,73 @@ mod tests {
         assert_eq!((now - start).whole_hours(), 10);
         assert_eq!(hour_label(0), "12 AM");
         assert_eq!(hour_label(15), "3 PM");
+    }
+
+    /// Every activity line's icon is in the sprite, and none reads "changed"
+    /// for an action the feed knows.
+    #[test]
+    fn every_activity_line_has_its_icon_and_words() {
+        let sprite = include_str!("../../staff-icons.svg");
+        let claim = [
+            "approved",
+            "rejected",
+            "sent_back",
+            "activated",
+            "auto_confirmed",
+            "paused",
+            "resumed",
+            "revoked",
+            "deleted",
+            "removed",
+            "created",
+            "file_replaced",
+        ];
+        let account = [
+            "banned",
+            "unbanned",
+            "role_changed",
+            "test_marked",
+            "test_unmarked",
+            "signed_out",
+            "app_signed_out",
+            "created",
+        ];
+        let lines =
+            claim.iter().map(|action| ("claim", *action)).chain(account.iter().map(|action| ("account", *action)));
+        for (kind, action) in lines {
+            let line = Activity {
+                kind: kind.to_owned(),
+                action: action.to_owned(),
+                tin_masked: Some("***-***-451-00000".to_owned()),
+                old_value: None,
+                new_value: Some("support".to_owned()),
+                account_id: Uuid::nil(),
+                account_email: Some("ana@example.test".to_owned()),
+                actor_email: "staff@example.test".to_owned(),
+                source: "seed".to_owned(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            let (sym, verb, what) = activity_words(&line);
+            assert!(sprite.contains(&format!("<symbol id=\"{sym}\"")), "{kind} {action}: {sym}");
+            if action != "file_replaced" {
+                assert_ne!(verb, "changed", "{kind} {action}");
+            }
+            assert!(what.contains("ana@example.test"), "{kind} {action}: {what}");
+        }
+        let created = Activity {
+            kind: "claim".to_owned(),
+            action: "created".to_owned(),
+            tin_masked: Some("***-***-451-00000".to_owned()),
+            old_value: None,
+            new_value: None,
+            account_id: Uuid::nil(),
+            account_email: Some("ana@example.test".to_owned()),
+            actor_email: "staff@example.test".to_owned(),
+            source: "seed".to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let (_, verb, what) = activity_words(&created);
+        assert_eq!(format!("{verb} {what}"), "added ***-***-451-00000 to ana@example.test without papers");
     }
 
     #[test]

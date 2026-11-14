@@ -293,6 +293,78 @@ async fn recent_activity_names_staff_actions_without_their_reasons(db: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn recent_activity_keeps_only_the_newest_lines_of_both_tables(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (bob, _) = site.person("bob@example.test").await;
+    let first = add_claim(&site.db, ana, "000123451", "pending").await;
+    let second = add_claim(&site.db, bob, "000123452", "pending").await;
+    site.post(&format!("/staff/claims/{first}/decision"), &staff, "decision=approve").await;
+    site.post(&format!("/staff/users/{ana}/test"), &staff, "test=on&reason=Trial").await;
+    site.post(&format!("/staff/claims/{second}/decision"), &staff, "decision=approve").await;
+    site.post(&format!("/staff/users/{bob}/test"), &staff, "test=on&reason=Trial").await;
+    let lines = queries::recent_activity(&site.db, 3).await.unwrap();
+    let got: Vec<(&str, &str, Option<&str>)> =
+        lines.iter().map(|line| (line.kind.as_str(), line.action.as_str(), line.account_email.as_deref())).collect();
+    assert_eq!(
+        got,
+        [
+            ("account", "test_marked", Some("bob@example.test")),
+            ("claim", "approved", Some("bob@example.test")),
+            ("account", "test_marked", Some("ana@example.test")),
+        ]
+    );
+    // A line outlives its account: it reads as a deleted account.
+    sqlx::query("UPDATE account_audit SET account_id = $1 WHERE account_id = $2")
+        .bind(Uuid::new_v4())
+        .bind(bob)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let lines = queries::recent_activity(&site.db, 1).await.unwrap();
+    assert_eq!((lines.len(), lines[0].account_email.as_deref()), (1, None));
+}
+
+/// Support see the Overview's counts and the queue's own claims; what staff
+/// did to which accounts is an Admin's, and its query does not run for them.
+#[sqlx::test(migrations = "./migrations")]
+async fn supports_overview_shows_counts_and_the_queue_but_no_staff_activity(db: PgPool) {
+    let site = Site::new(db);
+    let (_, admin) = site.person(STAFF).await;
+    let (_, support) = site.staff_with_role("helper@example.test", "support").await;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (bob, _) = site.person("bob@example.test").await;
+    let waiting = add_claim(&site.db, ana, "000123451", "pending").await;
+    let decided = add_claim(&site.db, bob, "000123452", "pending").await;
+    site.post(&format!("/staff/claims/{decided}/decision"), &admin, "decision=approve").await;
+    site.post(&format!("/staff/users/{bob}/test"), &admin, "test=on&reason=Trial").await;
+    site.post(&format!("/staff/users/{bob}/ban"), &admin, "reason=Spam").await;
+
+    // An Admin reads the feed: who did what to whom.
+    let page = text(site.get("/staff", &admin).await).await;
+    assert!(page.contains("Recent staff activity") && page.contains("class=\"sx-feed\""), "{page}");
+    assert!(page.contains(&format!("<b>{STAFF}</b> banned")) && page.contains("bob@example.test"), "{page}");
+
+    let page = text(site.get("/staff", &support).await).await;
+    // The tiles, counts only.
+    for label in ["Claims waiting", "Active TINs", "Accounts", "Returns sent today", "Activated automatically"] {
+        assert!(page.contains(&format!("{label}</span>")), "{label}: {page}");
+    }
+    assert!(page.contains("Claims waiting</span><span class=\"n\">1</span>"), "{page}");
+    // Waiting longest: the queue's own claim, with its link.
+    assert!(page.contains("Waiting longest") && page.contains("000-123-451-00000"), "{page}");
+    assert!(page.contains(&format!("open={waiting}")), "{page}");
+    assert!(page.contains("class=\"sx-home2 one\""), "{page}");
+    // No feed, no account acted on, no staff member named by it.
+    assert!(!page.contains("Recent staff activity") && !page.contains("sx-feed"), "{page}");
+    for email in ["ana@example.test", "bob@example.test", STAFF] {
+        assert!(!page.contains(email), "{email}: {page}");
+    }
+    assert!(!page.contains("</b> banned") && !page.contains("</b> approved"), "{page}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn search_everything_finds_people_and_claims_by_the_queue_rules(db: PgPool) {
     let site = Site::new(db);
     let (_, support) = site.staff_with_role("helper@example.test", "support").await;

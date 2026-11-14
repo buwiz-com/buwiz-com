@@ -180,9 +180,9 @@ Fields a `result` may carry besides these, each optional
 
 | Field | |
 |---|---|
-| `class` | On `failed` and `unknown`: whose side it failed on, `bir`, `user_network` or `ours`. An `ours` failure is not one of the return's tries; an unknown value reads as `bir`. Sent from `BIR_UPTIME=public`. |
-| `bir` | The sign right after this try was recorded ([bir-uptime.md](bir-uptime.md#22-the-sign-object)). |
-| `hold` | On a v1 send held for the BIR's state: `{"code":"bir_offline","wait_until":"…"}`. |
+| `class` | On `failed` and `unknown`: whose side it failed on, `bir`, `user_network` or `ours`. An `ours` failure is not one of the return's tries; an unknown value reads as `bir`. Sent from `BIR_UPTIME=public` (absent for a try that got in, and when the Sender's mode is `lab`, `dry_run` or unknown). |
+| `bir` | **Planned, not sent yet.** The sign right after this try ([bir-uptime.md](bir-uptime.md#22-the-sign-object)). |
+| `hold` | **Planned, not sent yet.** On a v1 send held for the BIR's state: `{"code":"bir_offline","wait_until":"…"}`. |
 
 The server checks the account and the TIN again when the socket opens,
 after the token check. If the account was banned, or the TIN stopped being
@@ -300,15 +300,17 @@ and idempotency:
   `dry_run`, `unknown`): `409 already_submitted`;
 - after a send that `failed` or `expired`: a new ticket.
 
-Two optional request fields come with the BIR uptime sign
-([bir-uptime.md](bir-uptime.md#6-turns-queue-reports-and-scouts)):
-`"bir_turn": "t_…"` spends a turn the server gave in a queue report, and
-`"bir_try_anyway": true` is a person's own Try anyway (never an agent's).
-Under `BIR_UPTIME=enforce` a ticket may be held with `503 bir_offline`,
-`bir_busy` or `relay_paused`, or refused with `429 try_anyway_limited`.
+**Planned, not built yet**
+([bir-uptime.md](bir-uptime.md#6-turns-queue-reports-and-scouts)): two
+optional request fields, `"bir_turn": "t_…"` to spend a turn the server
+gave in a queue report and `"bir_try_anyway": true` for a person's own Try
+anyway (never an agent's); `"admission"` in the answer; and, under
+`BIR_UPTIME=enforce`, tickets held with `503 bir_offline`, `bir_busy` or
+`relay_paused`, or refused with `429 try_anyway_limited`. Today the server
+ignores both fields, answers no `admission` and holds no ticket at any
+`BIR_UPTIME` level.
 
-Answer `201 {"ticket","jti","expires_at"}` (and, from `public`,
-`"admission"`). The ticket is a compact JWS,
+Answer `201 {"ticket","jti","expires_at"}`. The ticket is a compact JWS,
 `alg: EdDSA`, `typ: buwiz-ticket+jwt`, signed by the Gatekeeper and valid
 for five minutes:
 
@@ -417,9 +419,10 @@ The Gatekeeper reaches the Sender at `SENDER_URL` and presents
   `{"type":"sender","mode":"live"}` (`live`, `lab` or `dry_run`, its
   `BIR_RELAY_MODE`), before any `open`. The Gatekeeper reads the mode for
   its record of the try ([bir-uptime.md](bir-uptime.md#14-the-per-try-record))
-  and never forwards this frame to the app. The two processes ship from one
-  build and restart together; a try without the frame is recorded with
-  mode `unknown`.
+  and never forwards this frame to the app, whatever its other fields
+  hold. The two processes ship from one build and restart together; a try
+  without the frame is recorded with mode `unknown`, like a lab try: no
+  class, never counted, nothing told to the app.
 
 Without `SENDER_URL`, a development server runs a Sender in its own
 process. A public deployment (`https://` `ACCOUNT_ORIGIN`) refuses to start
@@ -464,10 +467,18 @@ in the BIR relay's private docs.
 Upload-server host keys come only from real sends; nothing in Buwiz scans
 or probes the BIR's servers for one (no `ssh-keyscan`). The SSH server
 offers its key in the handshake, before encryption starts, so the
-Gatekeeper reads it from the bytes it bridges and records it, with the
-day keys of the account and network that saw it, in `bir_host_keys`
-([bir-uptime.md](bir-uptime.md#143-the-table)). When BIR rotates its key,
-uploads stop with "host key is not pinned" (the Sender's log shows the
-fingerprint too) and the new key shows up there as a candidate. Pin one
-only once it has been seen from 3 accounts on 3 networks and an Admin has
-confirmed it.
+Gatekeeper reads it from the bytes it bridges and records it in
+`bir_host_keys` ([bir-uptime.md](bir-uptime.md#143-the-table)), with the
+day keys of the account and network that saw it, their key period, and
+whether the Sender went on to complete the key exchange in that try. When
+BIR rotates its key, uploads stop with "host key is not pinned" (the
+Sender's log shows the fingerprint too) and the new key shows up there.
+
+**A sighting is information only, never grounds to pin a key.** The bytes
+it is read from are relayed by the user's own app, so any app can forge
+one, and the day keys of different key periods cannot be compared, so
+sightings are counted only within one key period. To pin a new key an
+Admin needs a second source the owner trusts that does not pass through
+the relay: for example the key the official eBIRForms client ships, or a
+BIR notice. A key is never obtained by connecting to the BIR from a Buwiz
+machine.

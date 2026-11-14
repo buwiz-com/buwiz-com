@@ -509,9 +509,14 @@ runs migration 14 when it starts. It adds new tables only (`bir_tries`,
 `bir_events`, `bir_sign`, `bir_notes`, `bir_queue_reports`, `bir_turns`,
 `bir_held`, `bir_host_keys`, `bir_days`, `bir_proofs`) and two nullable
 columns, `tickets.bir_admission` and `devices.bir_reported_at`. No
-existing row changes. None of the tables holds a TIN, a name, an email or
-an IP address. The release before it (at 13) refuses to start on a
-database at 14, as with any newer migration.
+existing row changes, and no existing table is scanned under its lock
+(the check on `tickets.bir_admission` is added `NOT VALID`: every existing
+row is NULL). None of the tables holds a TIN, a name or an IP address;
+four columns hold an Admin's email for the audit
+(`bir_events.actor_email`, `bir_notes.set_by_email` and
+`cleared_by_email`, `bir_host_keys.confirmed_email`). `bir_tries` rows are
+deleted after 90 days by the hourly upkeep. The release before it (at 13)
+refuses to start on a database at 14, as with any newer migration.
 
 **Before you deploy.** The database is at 13 and has no uptime table
 yet (after a rollback, what it kept is in `rollback_archive` and comes
@@ -530,11 +535,18 @@ recorded with mode `unknown` and not counted.
 **The new settings** (Gatekeeper, `/buwiz/*`):
 - `BIR_UPTIME`: leave it unset (it means `record`) for the first deploy.
   The server then records each relay try and changes nothing any app sees.
-  `off` records nothing. `public` and `enforce` come with later releases
-  and are switched on only when those say so; `enforce` waits until no
-  mini app 0.3.2 install remains. A value it does not know is logged and
-  read as `record`.
+  `off` records nothing. `public` today only adds `class` to the relay
+  result, and `enforce` does nothing more than `public`; both are switched
+  on only when the later releases that build them say so, and `enforce`
+  waits until no mini app 0.3.2 install remains. Any case is read; a value
+  it does not know is logged and read as `record`.
 - `BIR_UPTIME_UPLOAD_PORTS`: leave it unset (`22`).
+
+A request that reaches the server without `CF-Connecting-IP` is logged as
+an error, at most once an hour ("BIR uptime: a request reached the server
+without CF-Connecting-IP"): every such try would count as one network. No
+one is mailed for it yet (the staff mail is a later release), so watch the
+log after the deploy.
 
 Check the record after the first real sends:
 ```sql

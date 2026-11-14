@@ -10,8 +10,19 @@ working ([Compatibility](#12-compatibility)).
 **What runs today.** The server's `BIR_UPTIME` setting decides how much of
 this is switched on ([Settings](#13-server-settings)). This release
 records: every real send through the relay leaves one classified row per
-try ([The per-try record](#14-the-per-try-record)). The routes of sections
-4 to 8 answer `404` until a later release switches them on at `public`.
+try ([The per-try record](#14-the-per-try-record)). At `public` it also
+adds `class` to the relay `result` and keeps the Sender's mode on a failed
+or unknown submission; `enforce` does nothing more yet.
+
+**Planned, not built yet:** everything else on this page. The sign and
+its `buwiz-bir` header (§2, §3), the routes of sections 4 to 8 (they do
+not exist yet, so they answer `404` at every level), holds on tickets and
+the v1 relay (§5), turns, queue reports, scouts and admission (§6), the
+`bir_turn` and `bir_try_anyway` ticket fields, the direct app's reports
+(§7), proofs (§8), the queue numbers (§9), the codes of §10 but `class`,
+and the `bir` and `hold` fields of the relay `result`. Their tables exist
+(migration 14) and stay empty. The sections below describe them as they
+will be, so app authors can build against them.
 
 ## 0. Ground rules
 
@@ -160,7 +171,7 @@ sign too. A sleeping queue makes no other request.
 | `GET /.well-known/buwiz-hpke.json` | header `buwiz-bir` |
 | `POST /api/tickets` (every answer, 2xx or not) | header `buwiz-bir`; on a hold also body `bir` (full object) |
 | `POST /api/v2/submissions`, `POST /api/submissions` | header `buwiz-bir` |
-| relay `result` frame | fields `bir` (full object, right after this try was recorded) and `class` |
+| relay `result` frame | field `class` (built, from `public`) and, planned, `bir` (full object, right after this try) |
 | `GET /api/tax-profiles` | header `buwiz-bir` |
 | `POST /api/bir/queue`, `POST /api/bir/reports` | body (full object) |
 | `GET /api/bir/status`, `GET /api/bir/status/mine` | body (full object) |
@@ -257,7 +268,8 @@ computed live.
 
 ## 5. Holds on tickets
 
-Holds are switched on with `BIR_UPTIME=enforce`, and only once no mini app
+**Planned, not built yet.** No ticket or v1 relay is held at any level
+today. Holds will be switched on with `BIR_UPTIME=enforce`, and only once no mini app
 0.3.2 install remains ([Compatibility](#12-compatibility)). Until then the
 server runs at `public` at most: the sign, queue reports, turns and scouts
 all work, new apps follow them by themselves, and no ticket is ever refused
@@ -328,6 +340,10 @@ POST /api/tickets   (signed)
   any try.
 
 ## 6. Turns, queue reports and scouts
+
+**Planned, not built yet**, as is `admission` (§6.3): today the server
+gives no turn, ignores `bir_turn` and `bir_try_anyway`, and every ticket's
+`bir_admission` stays NULL (recorded as `open`).
 
 The server does not know what is waiting in apps. Apps tell it, with no TIN
 or name, so it can hand out turns: scouts while Offline, and "a few at a
@@ -646,25 +662,43 @@ App-side words (shared by the desktop and mini app):
 
 ## 11. Privacy
 
-- No uptime record (`bir_tries`, `bir_days`, `bir_events`,
-  `bir_queue_reports`, `bir_turns`, `bir_held`, `bir_host_keys`) holds a
-  TIN, a name, an email or an IP address. `bir_tries` times are kept to
-  the minute.
+- No uptime record (`bir_tries`, `bir_days`, `bir_events`, `bir_notes`,
+  `bir_queue_reports`, `bir_turns`, `bir_held`, `bir_host_keys`,
+  `bir_proofs`) holds a TIN, a name or an IP address. Four columns hold a
+  staff member's email, for the audit of what an Admin did:
+  `bir_events.actor_email` (who set or cleared a note, or resumed the
+  relay), `bir_notes.set_by_email` and `bir_notes.cleared_by_email`, and
+  `bir_host_keys.confirmed_email` (who confirmed a key). No column holds a
+  user's email. `bir_tries` times are kept to the minute, and its rows 90
+  days (deleted by the hourly upkeep).
+- **The app label.** `bir_tries.client` keeps the `buwiz-client` header
+  only as a known app name (`desktop`, `mini`, `direct`, `buwiz-forms`,
+  `buwiz-desktop`, `buwiz-ebirforms`, `buwiz-direct`, else `other`) and the
+  version's `major.minor` (`desktop/0.2`), so nothing else a header holds
+  is kept.
 - **Network key.** The server sees the caller's address only in the
   Cloudflare tunnel's `CF-Connecting-IP` header (nothing on the instance
   listens publicly, [deploy.md](deploy.md)). It reduces the address to its
   network (IPv4 /24, IPv6 /48) and keeps `HMAC-SHA256(day_key, network)`
-  cut to 8 bytes. `day_key` is random, held only in memory, and replaced at
-  Manila midnight and on restart; the previous key is kept in memory for 3
-  hours after, so a new try can be compared with recent ones. After that,
-  no one can tell which network a key was. The address and the network are
-  never written anywhere.
+  cut to 8 bytes. `day_key` is random, held only in memory, with a random
+  id (its key period, `key_epoch`), and replaced at the first try recorded
+  after Manila midnight and on restart. Keys are taken when a try is
+  recorded and only turn forward, so a try that started before midnight
+  and ended after it gets the new day's. The previous key is kept in memory
+  for 3 hours after it was replaced, so a new try can be compared with
+  recent ones. After that, no one can tell which network a key was. The
+  address and the network are never written anywhere.
+- **A missing `CF-Connecting-IP`.** In production every request carries
+  it. A request without it is counted as one network ("missing"), which
+  would make every try one network; the server logs it as an error at most
+  once an hour and keeps it as an alert for the staff mail. That mail comes
+  with a later release: today nobody is mailed, only the log shows it.
 - **Account key.** Uptime tries keep `HMAC-SHA256(day_key, account_id)`
   (8 bytes), never the account id. Live turns and queue reports keep the
   account id for at most a day (scouts rotate between accounts); held
   requests keep it, with the claim they were for, for 90 days, for proofs.
-- Rate limits per IP and the day's distinct-account and distinct-network
-  counts are kept in memory only.
+- Rate limits per IP (an IPv6 address counted by its /64) and the day's
+  distinct-account and distinct-network counts are kept in memory only.
 - Public answers carry no counts, and their past times are rounded to 5
   minutes. A hand-set note's text is public; the form says so and asks for
   no personal data.
@@ -690,8 +724,9 @@ gate runs 0.3.2, 0.3.3 and 0.4.0 against a local server. New builds send
 **New apps on an old server** (no sign; `/api/bir/*` answer `404`): the
 smart queue without the sign: the waits of section 9, the spread, one at a
 time, stay queued, no sleeping. No queue reports for an hour after a
-`404`. **At `record`:** the same. **At `public` and `enforce`:** the full
-behaviour.
+`404`. **At `record`, and at `public` and `enforce` in this release:** the
+same (the routes are not built yet), plus `class` on the relay `result`
+from `public`. The full behaviour comes with the releases that build it.
 
 **Versioning:** fields and codes may be added to v1. A client ignores
 fields it does not know and treats an unknown `state` as `no_recent_news`,
@@ -700,7 +735,7 @@ unknown error code as a plain failed try. A change that would break this
 goes to `/api/bir/v2/…` and `v=2`.
 
 **Relay frames:** the relay `Control` type does not change. The `result`
-frame's new `bir`, `class` and `hold` fields, and an app's `refused.kind`
+frame's new `class` field (and the planned `bir` and `hold`), and an app's `refused.kind`
 (`"dns" | "refused" | "timeout" | "unreachable" | "denied" | "not_listed"`),
 are extra JSON keys that every `Control` reader in use ignores (none denies
 unknown fields; an extra key on `refused` and `result` parses, an unknown
@@ -714,7 +749,7 @@ Gatekeeper (`buwiz-cloud`):
 
 | Setting | Default | |
 |---|---|---|
-| `BIR_UPTIME` | `record` | `off`: nothing new runs (the Sender's `sender` frame is still dropped). `record`: every relay try is recorded and classified (§14); clients see no change. `public`: plus `class` on the relay `result` and `mode` on failed and unknown submissions; later releases add the routes of §4 to §8, the `buwiz-bir` header and `bir` on results here. `enforce`: plus holds on tickets and the v1 relay, the legacy scout and Try anyway. Below `public` the public routes answer `404`. A value it does not know is logged and read as `record`; it never stops the server from starting. |
+| `BIR_UPTIME` | `record` | `off`: nothing new runs (the Sender's `sender` frame is still dropped). `record`: every relay try is recorded and classified (§14); clients see no change. `public`: today, plus `class` on the relay `result` and `mode` on failed and unknown submissions; planned: the routes of §4 to §8, the `buwiz-bir` header and `bir` on results. `enforce`: today the same as `public`; planned: holds on tickets and the v1 relay, the legacy scout and Try anyway. Read in any case, spaces around it ignored. A value it does not know is logged and read as `record`; it never stops the server from starting. |
 | `BIR_UPTIME_UPLOAD_PORTS` | `22` | Comma-separated ports whose relay streams are the upload window; every other stream is the front desk. A value it cannot read is logged and the default is used. |
 
 Going down a level is a setting and a restart.
@@ -727,59 +762,88 @@ without touching the BIR or the private relay code: `src/uptime/observe.rs`
 watches the frames, `src/uptime/classify.rs` names the outcome,
 `src/uptime/sshkex.rs` reads the upload server's host key from the SSH
 handshake, which passes in clear before encryption starts, and
-`src/uptime/store.rs` writes one row. Recording never fails a send: an
-error is logged without the try's details and the try is lost.
+`src/uptime/store.rs` writes one row. Recording never fails or delays a
+send: the app gets its `result` first, and the row is written afterwards
+in a task of its own (shutdown waits up to 10 s for those). An error is
+logged without the try's details and the try is lost.
 
 ### 14.1 What the observer reads
 
 | Frame (in the Gatekeeper's bridge) | Read as |
 |---|---|
-| The Sender's first text frame `{"type":"sender","mode":"live"}` | The relay mode (`live`, `lab`, `dry_run`). Dropped there, never forwarded to the app. A try without it is `mode: unknown` and never counted. |
+| The Sender's first text frame `{"type":"sender","mode":"live"}` | The relay mode (`live`, `lab`, `dry_run`). Dropped there, never forwarded to the app, whatever its other fields hold. A try without it is `mode: unknown`, treated like `lab`: no class, never counted, nothing told to the app. |
 | Sender `open{stream,port}` | A stream: `upload` if its port is in `BIR_UPTIME_UPLOAD_PORTS`, else `dispatcher` (front desk), which is TLS on port 443. In `lab` every stream is the upload. Host names are not kept. |
-| App `opened` / `refused{reason[,kind]}` | The stream's answer. Forwarded unchanged. |
+| App `opened` / `refused{reason[,kind]}` | The stream's answer. Forwarded unchanged. A frame is known by its `type`; a field of an unexpected type reads as absent (a `refused` with an odd `kind` is read from its `reason`). |
 | App binary data | Bytes from the far end; on an upload stream, the SSH handshake (the first 64 KB at most). |
-| Neither answer before the Sender's next `open` or its `result` | The stream had no answer (the Sender's 20 s timeout). |
+| Neither answer before the Sender's next `open` or its `result` | The stream had no answer (the Sender's 20 s timeout). Every app answers within 10 s, so this is the app's side. |
 | The app's socket closing before `result` | The app went away. |
+| No `result` within 60 s after the app went away | The outcome wait expired: the app's side, not the Sender's. |
 | Sender `result` | The outcome and its error text. |
 
 ### 14.2 Classes and kinds
 
-Precedence: `sent` wins; then an `unknown` result from the Sender (even
-when the app also went away); then the Sender being lost; then the app
-going away; then the table.
+Precedence: `sent` wins; then an `unknown` result from the Sender (the
+user's side when the app also went away); then the Sender being lost (the
+user's side when the outcome wait expired after the app went away); then
+the app going away; then the table.
 
 | Seen | `stage` | `dispatcher` | `upload` | class / kind |
 |---|---|---|---|---|
 | `sent` | `uploaded` | `ok` if the front-desk stream that answered was TLS, else `none` (lab: `none`) | `ok` | none |
-| `unknown` from the Sender | `upload` | as reached | `maybe` | `bir` / `cut`: counts toward Busy, never toward Offline |
+| `unknown` from the Sender | `upload` | as reached | `maybe` | `bir` / `cut`: counts toward Busy, never toward Offline. When the app also went away: the outcome stays `unknown` and the upload `maybe`, but `user_network` / `app_gone`, not counted |
 | The Sender stopped without a result | as reached | `none` | `maybe` if the upload was opened, else `none` | `ours` / `sender_down` |
+| The app went away, and no result came within the 60 s wait | as reached | `none` | `maybe` if the upload was opened, else `none` | `user_network` / `app_gone` (outcome `unknown` once a stream was opened) |
 | The app went away before `result` | as reached | `none` | `none` | `user_network` / `app_gone` |
-| No `open` at all | `none` | `none` | `none` | `ours` / `sender_down` (Sender unreachable), `not_built_in`, `refusal` (a TIN refusal), `mismatch` (`return_mismatch`), `ticket` (ticket or envelope), `other` |
-| A `refused` "is not on the signed trust list" or "is not a BIR server" (or `kind: not_listed`) | as reached | `none` | `none` | `ours` / `trust_list` |
-| A `refused` with `kind: denied` or `unreachable`, or "permission denied" / "network is unreachable" (or a reason it cannot read) | as reached | `none` | `none` | `user_network` / `local` |
-| Every front-desk stream refused, unanswered or failed; no upload `open` | `dispatcher` | `fail` if a TLS stream was tried, else `none` | `none` | `bir` / `dns`, `refused`, `timeout`, `reset`, `tls`, `http`: the first TLS stream's, else the first stream's. "No route to host" is `refused`. |
-| The front desk said "no upload server for this TIN (mode 0)" | `dispatcher` | `none` | `none` | `bir` / `no_service`: evidence for no light |
-| The front desk's answer "was not understood" or "did not unwrap" | `dispatcher` | `none` | `none` | `ours` / `protocol`: touched the BIR |
+| No `open` at all | `none` | `none` | `none` | `ours` / `sender_down` (Sender unreachable; recorded with mode `unknown` but still classified, as Buwiz's own side), `not_built_in`, `refusal` (a TIN refusal), `mismatch` (`return_mismatch`), `ticket` (ticket or envelope), `other` |
+| A `refused` "is not on the signed trust list" or "is not a BIR server" (or `kind: not_listed`), when no later stream got further (opened, or was the upload) | as reached | `none` | `none` | `ours` / `trust_list` |
+| A `refused` with `kind: denied` or `unreachable`, or an OS error that is the user's own (permission denied, network unreachable or down, by number or words), or a reason it cannot read; when no later stream got further | as reached | `none` | `none` | `user_network` / `local` |
+| A stream the app never answered (front desk or upload) | as reached | `none` | `none` | `user_network` / `no_answer`, when it is the stream that decides |
+| Every front-desk stream refused or failed; no upload `open` | `dispatcher` | `fail` if a TLS stream was tried, else `none` | `none` | `bir` / `dns`, `refused`, `timeout`, `reset`, `tls`, `http`: the first TLS stream's, else the first stream's (local and trust-list refusals a later stream got past are skipped). "No route to host" and "Host is down" are `refused`; `timeout` only when the app's reason says it timed out. |
+| A TLS front-desk attempt said "no upload server for this TIN (mode 0)" | `dispatcher` | `none` | `none` | `bir` / `no_service`: evidence for no light |
+| A TLS front-desk attempt's answer "was not understood" or "did not unwrap" | `dispatcher` | `none` | `none` | `ours` / `protocol`: touched the BIR |
+| A plain-HTTP (port 80) attempt said either of those two | | | | Proves nothing (a middlebox can answer on port 80): read as `user_network` / `local` for that stream; a TLS stream decides when there is one |
 | An upload `open` happened | `upload` | `ok` if the front-desk stream that answered (the last with bytes before it) was TLS, else `none` | the rows below | |
-| Upload `refused` or unanswered | `upload` | | `fail` | `bir` / `refused`, `timeout`, `dns` |
+| Upload `refused` | `upload` | | `fail` | `bir` / `refused`, `timeout`, `dns` |
 | Upload opened; "host key is not pinned" | `upload` | | `none` | `ours` / `host_key`: touched the BIR; the key offered is recorded |
+| Upload opened; SSH found "no common … algorithm" | `upload` | | `none` | `ours` / `protocol`: Buwiz's own SSH settings; touched the BIR |
+| Upload opened; "invalid SSH version string" | `upload` | | `none` | `user_network` / `local`: what answered is not an SSH server (a proxy or portal on the user's way) |
 | The front desk named an upload server not on the Sender's list ("unknown upload server"; nothing is opened to it) | `dispatcher` | `ok` if the stream that answered was TLS, else `none` | `none` | `ours` / `unknown_host`: touched the BIR |
 | Upload opened; any other failure (SSH failed, login refused, before the upload, timed out) | `upload` | | `fail` | `bir` / `ssh`, `login`, `timeout` |
 | "could not encrypt", "no lab SFTP server set" | any | | | `ours` / `other` |
 
-`counted = mode = 'live' AND (outcome = 'sent' OR class = 'bir') AND kind <> 'no_service'`.
+An app's refusal is read by its `kind` when it sends one, then by the OS
+error's number in "(os error N)", which reads the same in every language
+(macOS, Linux and Windows numbers: 61/111/10061 refused, 60/110/10060
+timed out, 65/113/10065 and 64/112/10064 no route or host down, 54/104/10054
+reset, 51/101/10051 and 50/100/10050 the user's network, 13/1/10013 the
+user's own system, 11001/11002/11004 a name that does not resolve), and
+only then by the English words of each OS's message.
+
+`counted = mode = 'live' AND (outcome = 'sent' OR failure_class = 'bir') AND failure_kind IS DISTINCT FROM 'no_service'`
+(`IS DISTINCT FROM`, because `failure_kind` is NULL for a try that got
+in and `<>` would read that as not counted).
 A DNS failure is `bir`: the user reached Buwiz, so their own resolver
 works; only the 3-networks rule separates "the BIR's name broke" from "one
 ISP's DNS broke". Front-desk evidence comes only from TLS (port 443)
 streams: a plain-HTTP answer can come from a middlebox.
 
-Tries in `lab` and `dry_run` are recorded with their mode and stages, no
-class or kind, and never counted. A return for a test TIN is never
-recorded.
+Tries in `lab`, `dry_run` and mode `unknown` are recorded with their mode
+and stages, no class or kind (but for an unreachable Sender, above), and
+never counted. A return for a test TIN is never sent (the gate refuses it
+before the relay claims it), so never recorded.
+
+**What the record cannot tell apart.** Some blocks on the user's own side
+look like the BIR's and are recorded as counted BIR-side failures: an
+office network that blocks port 22 (the upload is refused or times out),
+a TLS-inspecting proxy (the front desk's TLS fails), a filtering resolver
+(the BIR's name does not resolve). One such network moves nothing on its
+own; only the rule that needs 3 accounts on 3 networks (§2.1, planned)
+separates them from the BIR being down.
 
 ### 14.3 The table
 
-`bir_tries` (migration 14), one row per try, kept 90 days:
+`bir_tries` (migration 14), one row per try, kept 90 days (the hourly
+upkeep deletes older rows):
 
 | Column | |
 |---|---|
@@ -794,12 +858,27 @@ recorded.
 | `opens` | How many streams the Sender asked for. |
 | `admission` | The ticket's admission (§1); `open` for v1. |
 | `counted` | §14.2. |
-| `key_epoch`, `account_key`, `network_key` | The day key's id and the 8-byte keys of section 11. |
-| `late`, `report_id` | The direct app's (§7). |
-| `client` | The `buwiz-client` header (`desktop/0.2.0`), if it reads as `<app>/<version>`. |
+| `key_epoch`, `account_key`, `network_key` | The day key's period (a random id, new with each key) and the 8-byte keys of section 11, taken when the try was recorded. |
+| `late`, `report_id` | The direct app's (§7, planned). |
+| `client` | The app's name and `major.minor` from `buwiz-client` (`desktop/0.2`; §11), if it reads as `<app>/<major>.<minor>`. |
 
 `bir_host_keys` keeps each upload-server host key a `live` try was offered:
-its `SHA256:` fingerprint, when it was first and last seen, and the
-`{epoch, account_key, network_key}` of the tries that saw it (the newest
-50). A key that is not pinned is a candidate; staff may confirm one only
-once 3 accounts on 3 networks saw it ([relay-protocol.md](relay-protocol.md#7-server-settings)).
+its `SHA256:` fingerprint, when it was first and last seen with something
+new, and the `{epoch, account_key, network_key, kex_done}` of the tries
+that saw it (the newest 50), where `kex_done` says whether the Sender went
+on to complete the key exchange (a try that reached the login or the
+upload did; "host key is not pinned", "wrong server signature" and earlier
+failures did not). A sighting is written only when it adds something (a
+new key, or a new account, network or `kex_done` in this key period), so a
+pinned key's row is not rewritten by every upload. Distinct accounts and
+networks are counted only within one key period. A sighting is read from
+bytes the user's app relays, so it can be forged: it is information only
+and never grounds to pin. Pinning a new key needs an Admin and a second
+source outside the relay
+([relay-protocol.md](relay-protocol.md#7-server-settings)).
+
+The fingerprint is SHA-256 over the key bytes exactly as the server sent
+them in its handshake. The Sender fingerprints the key it parsed; for a key
+in a non-canonical encoding (say, an RSA key with a leading zero byte the
+Sender's library drops) the two could differ, so a recorded fingerprint
+that matches no pin is not by itself proof the key changed.

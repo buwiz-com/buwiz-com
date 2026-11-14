@@ -1,10 +1,12 @@
 //! The keys an uptime record holds instead of who and where: the account
 //! and the network of a try, each as `HMAC-SHA256(day_key, …)` cut to 8
-//! bytes. The day key is 32 random bytes made at start and at each Manila
-//! midnight, held only in memory; the one before is kept for 3 hours after
-//! it is replaced, so a try just after midnight can be compared with those
-//! just before. After that nobody can tell which account or network a key
-//! was.
+//! bytes. The day key is 32 random bytes made at start and at the first
+//! use after each Manila midnight, held only in memory, with a random id
+//! (its key period). Keys are taken when a try is recorded and only ever
+//! turn forward: a try that started yesterday and ends today gets today's
+//! keys. The key before is kept for 3 hours after it is replaced, so a try
+//! just after midnight can be compared with those just before. After that
+//! nobody can tell which account or network a key was.
 //!
 //! The network is the caller's address cut to its IPv4 /24 or IPv6 /48,
 //! read from `CF-Connecting-IP` (production sits behind a Cloudflare
@@ -128,17 +130,26 @@ pub fn client_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 /// Reads the network of a request. In production a request without
-/// `CF-Connecting-IP` is logged as an error, at most once an hour, because
-/// every try would then count as one network; staff are told from
-/// [`NetworkReader::missing_header_at`].
+/// `CF-Connecting-IP` is raised at most once an hour, because every try
+/// would then count as one network: it is logged as an error and kept as an
+/// alert ([`NetworkReader::take_missing_header_alert`]) for the staff mail,
+/// which a later release sends. Nobody is mailed yet.
 pub struct NetworkReader {
     production: bool,
-    missing: Mutex<Option<OffsetDateTime>>,
+    missing: Mutex<Missing>,
+}
+
+#[derive(Default)]
+struct Missing {
+    /// When it was last raised.
+    raised: Option<OffsetDateTime>,
+    /// Raised and not yet taken for the staff mail.
+    alert: Option<OffsetDateTime>,
 }
 
 impl NetworkReader {
     pub fn new(production: bool) -> Self {
-        Self { production, missing: Mutex::new(None) }
+        Self { production, missing: Mutex::new(Missing::default()) }
     }
 
     pub fn network(&self, headers: &HeaderMap, now: OffsetDateTime) -> Network {
@@ -146,8 +157,9 @@ impl NetworkReader {
             Some(address) => Network::of(address),
             None if self.production => {
                 let mut missing = self.missing.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if missing.is_none_or(|at| now - at >= MISSING_HEADER_EVERY) {
-                    *missing = Some(now);
+                if missing.raised.is_none_or(|at| now - at >= MISSING_HEADER_EVERY || now < at) {
+                    missing.raised = Some(now);
+                    missing.alert = Some(now);
                     tracing::error!(
                         "BIR uptime: a request reached the server without CF-Connecting-IP; every such try counts as one network"
                     );
@@ -160,14 +172,22 @@ impl NetworkReader {
 
     /// When a missing `CF-Connecting-IP` was last raised, if ever.
     pub fn missing_header_at(&self) -> Option<OffsetDateTime> {
-        *self.missing.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.missing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).raised
+    }
+
+    /// The alert for the staff mail: when a missing `CF-Connecting-IP` was
+    /// raised, once per raise (at most once an hour). The mail is sent by a
+    /// later release; until then the alert is only kept here.
+    pub fn take_missing_header_alert(&self) -> Option<OffsetDateTime> {
+        self.missing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).alert.take()
     }
 }
 
 /// One try's keys under one day key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Keys {
-    /// Which day key: the Unix minute it was made (unique in a process).
+    /// Which day key (its key period): a random positive id, new with each
+    /// key and never that of the key before.
     pub epoch: i32,
     pub account: [u8; 8],
     pub network: [u8; 8],
@@ -189,14 +209,17 @@ struct DayKey {
 }
 
 impl DayKey {
-    fn new(now: OffsetDateTime, after: Option<i32>) -> Self {
-        let minute = i32::try_from(now.unix_timestamp().div_euclid(60)).unwrap_or(i32::MAX);
-        let epoch = match after {
-            Some(previous) if previous >= minute => previous.saturating_add(1),
-            _ => minute,
+    fn new(now: OffsetDateTime, before: Option<i32>) -> Self {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let epoch = loop {
+            let epoch = rng.random_range(1..=i32::MAX);
+            if Some(epoch) != before {
+                break epoch;
+            }
         };
         let mut key = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rng(), key.as_mut());
+        rand::RngCore::fill_bytes(&mut rng, key.as_mut());
         Self { epoch, day: manila_day(now), key }
     }
 
@@ -223,15 +246,15 @@ struct Ring {
 }
 
 impl Ring {
+    /// Only ever forward: a clock that steps back keeps the key it has.
     fn turn(&mut self, now: OffsetDateTime) {
         let today = manila_day(now);
-        if today != self.current.day {
-            let kept_until = manila_midnight(today) + PREVIOUS_KEPT;
+        if today > self.current.day {
             let next = DayKey::new(now, Some(self.current.epoch));
             let old = std::mem::replace(&mut self.current, next);
             // A key two days old is never kept: only yesterday's, and only
-            // until 3 AM.
-            self.previous = (old.day.next_day() == Some(today)).then_some((old, kept_until));
+            // for 3 hours from now, when it was replaced.
+            self.previous = (old.day.next_day() == Some(today)).then_some((old, now + PREVIOUS_KEPT));
         }
         if self.previous.as_ref().is_some_and(|(_, until)| now >= *until) {
             self.previous = None;
@@ -239,7 +262,7 @@ impl Ring {
     }
 }
 
-/// The day keys: the current one and, for 3 hours after Manila midnight,
+/// The day keys: the current one and, for 3 hours after it replaced it,
 /// the one before. A restart starts with a new key and no previous one.
 pub struct KeyRing {
     ring: Mutex<Ring>,
@@ -250,7 +273,8 @@ impl KeyRing {
         Self { ring: Mutex::new(Ring { current: DayKey::new(now, None), previous: None }) }
     }
 
-    /// The keys of a try by `account` from `network`, at `now`.
+    /// The keys of a try by `account` from `network`, recorded at `now`
+    /// (when it ended, never when it started).
     pub fn keys(&self, account: Uuid, network: &Network, now: OffsetDateTime) -> TryKeys {
         let mut ring = self.ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         ring.turn(now);
@@ -268,45 +292,86 @@ impl KeyRing {
     }
 }
 
+/// What the per-IP limiter counts an address as: an IPv4 address itself,
+/// an IPv6 address by its /64 (one household or one server gets a whole
+/// /64, so counting its addresses one by one limits nothing).
+pub fn ip_key(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => address,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(octets.into())
+            }
+        },
+    }
+}
+
+/// The most keys a limiter holds in one window.
+pub const MAX_KEYS: usize = 100_000;
+
 /// A fixed-window rate limiter held in memory: at most `limit` hits per key
-/// in each `window` that starts at the key's first hit. Keys (an IP
-/// address, an account id) are never stored anywhere else.
+/// in each `window`. Windows are shared: when one ends, every count starts
+/// again, so nothing is ever scanned. A key new in a window that already
+/// holds `cap` keys is refused until the window ends, so the map never
+/// grows past `cap`. Keys (an IP address, an account id) are never stored
+/// anywhere else.
 pub struct RateLimiter<K> {
     limit: u32,
     window: Duration,
+    cap: usize,
     hits: Mutex<Hits<K>>,
 }
 
 struct Hits<K> {
-    by_key: HashMap<K, (OffsetDateTime, u32)>,
-    /// When the map grows past this, windows that ended are dropped.
-    prune_at: usize,
+    /// When the current window began; `None` before the first hit.
+    since: Option<OffsetDateTime>,
+    by_key: HashMap<K, u32>,
 }
-
-const PRUNE_FLOOR: usize = 4096;
 
 impl<K: Eq + Hash> RateLimiter<K> {
     pub fn new(limit: u32, window: Duration) -> Self {
-        Self { limit, window, hits: Mutex::new(Hits { by_key: HashMap::new(), prune_at: PRUNE_FLOOR }) }
+        Self::with_cap(limit, window, MAX_KEYS)
+    }
+
+    pub fn with_cap(limit: u32, window: Duration, cap: usize) -> Self {
+        Self { limit, window, cap, hits: Mutex::new(Hits { since: None, by_key: HashMap::new() }) }
     }
 
     /// Counts a hit for `key`: `Ok`, or how long until it may go again.
     pub fn check(&self, key: K, now: OffsetDateTime) -> Result<(), Duration> {
-        let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if hits.by_key.len() >= hits.prune_at {
-            let window = self.window;
-            hits.by_key.retain(|_, (start, _)| now - *start < window);
-            hits.prune_at = (hits.by_key.len() * 2).max(PRUNE_FLOOR);
-        }
-        let entry = hits.by_key.entry(key).or_insert((now, 0));
-        if now - entry.0 >= self.window || now < entry.0 {
-            *entry = (now, 0);
-        }
-        if entry.1 >= self.limit {
-            return Err(self.window - (now - entry.0));
-        }
-        entry.1 += 1;
-        Ok(())
+        let (verdict, ended) = {
+            let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A window that ended (or a clock that went back) starts a new
+            // one; the old counts are dropped after the lock is let go.
+            let ended = match hits.since {
+                Some(since) if now >= since && now - since < self.window => None,
+                _ => {
+                    hits.since = Some(now);
+                    Some(std::mem::take(&mut hits.by_key))
+                }
+            };
+            let since = hits.since.unwrap_or(now);
+            let wait = self.window - (now - since);
+            let full = hits.by_key.len() >= self.cap;
+            let verdict = match hits.by_key.get_mut(&key) {
+                Some(count) if *count >= self.limit => Err(wait),
+                Some(count) => {
+                    *count += 1;
+                    Ok(())
+                }
+                None if full => Err(wait),
+                None => {
+                    hits.by_key.insert(key, 1);
+                    Ok(())
+                }
+            };
+            (verdict, ended)
+        };
+        drop(ended);
+        verdict
     }
 
     /// How many keys it holds now.
@@ -449,34 +514,72 @@ mod tests {
         let ring = KeyRing::new(before);
         let old = ring.keys(ana, &home, before);
         assert_eq!(old.previous, None);
-        // 00:10 on the 12th: a new key, and the old one alongside.
+        // 00:10 on the 12th: a new key with another id, and the old one
+        // alongside.
         let after = at("2026-11-11T16:10:00Z");
         let new = ring.keys(ana, &home, after);
         assert_ne!(new.current, old.current);
-        assert!(new.current.epoch > old.current.epoch);
+        assert_ne!(new.current.epoch, old.current.epoch);
+        assert!(new.current.epoch > 0);
         assert_eq!(new.previous, Some(old.current));
-        // Until 03:00 Manila, then gone.
-        assert_eq!(ring.keys(ana, &home, at("2026-11-11T18:59:59Z")).previous, Some(old.current));
-        assert_eq!(ring.keys(ana, &home, at("2026-11-11T19:00:00Z")).previous, None);
-        assert_eq!(ring.keys(ana, &home, at("2026-11-11T19:00:00Z")).current, new.current);
-        assert_eq!(ring.epochs(at("2026-11-11T19:00:00Z")), (new.current.epoch, None));
+        // For 3 hours from 00:10, when it was replaced, then gone.
+        assert_eq!(ring.keys(ana, &home, at("2026-11-11T19:09:59Z")).previous, Some(old.current));
+        assert_eq!(ring.keys(ana, &home, at("2026-11-11T19:10:00Z")).previous, None);
+        assert_eq!(ring.keys(ana, &home, at("2026-11-11T19:10:00Z")).current, new.current);
+        assert_eq!(ring.epochs(at("2026-11-11T19:10:00Z")), (new.current.epoch, None));
         // A process that sleeps through a whole day keeps no two-day-old key.
         let ring = KeyRing::new(before);
         assert_eq!(ring.keys(ana, &home, at("2026-11-13T00:30:00Z")).previous, None);
-        // The first use after 03:00 still turns the key, without the old.
+        // A first use late in the night still keeps the old one 3 hours.
         let ring = KeyRing::new(before);
-        assert_eq!(ring.keys(ana, &home, at("2026-11-11T20:00:00Z")).previous, None);
+        let late = ring.keys(ana, &home, at("2026-11-11T20:00:00Z"));
+        assert!(late.previous.is_some());
+        assert_eq!(ring.keys(ana, &home, at("2026-11-11T23:00:00Z")).previous, None);
     }
 
     #[test]
-    fn epochs_only_grow_even_when_the_clock_goes_back() {
-        let now = at("2026-11-11T16:10:00Z");
-        let ring = KeyRing::new(now);
-        let (first, _) = ring.epochs(now);
-        // The clock steps back across midnight: another day, so another key,
-        // whose epoch is still newer.
-        let (second, _) = ring.epochs(at("2026-11-11T15:50:00Z"));
-        assert_eq!(second, first + 1);
+    fn keys_never_turn_backwards() {
+        let ana = Uuid::from_u128(1);
+        let home = Network::V4([198, 51, 100]);
+        // Recorded at 00:00:15 Manila (a try that started at 00:00:05),
+        // then at 00:00:30 a try that started at 23:59:40: both get the
+        // keys of the time they are recorded, today's.
+        let ring = KeyRing::new(at("2026-11-11T15:59:00Z"));
+        let yesterday = ring.keys(ana, &home, at("2026-11-11T15:59:30Z")).current;
+        let first = ring.keys(ana, &home, at("2026-11-11T16:00:15Z")).current;
+        let second = ring.keys(ana, &home, at("2026-11-11T16:00:30Z")).current;
+        assert_ne!(first, yesterday);
+        assert_eq!(second, first);
+        // A clock that steps back across midnight keeps today's key.
+        let back = ring.keys(ana, &home, at("2026-11-11T15:59:50Z"));
+        assert_eq!(back.current, first);
+        assert_eq!(back.previous, Some(yesterday));
+    }
+
+    #[test]
+    fn every_key_period_has_its_own_random_id() {
+        let now = at("2026-11-11T07:12:00Z");
+        // Restarts in the same minute (a crash loop) give each key its own.
+        let ids: HashSet<i32> = (0..50).map(|_| KeyRing::new(now).epochs(now).0).collect();
+        assert_eq!(ids.len(), 50);
+        assert!(ids.iter().all(|id| *id > 0));
+    }
+
+    #[test]
+    fn a_missing_header_is_an_alert_taken_once_per_raise() {
+        let now = at("2026-11-11T07:12:00Z");
+        let production = NetworkReader::new(true);
+        assert_eq!(production.take_missing_header_alert(), None);
+        production.network(&HeaderMap::new(), now);
+        production.network(&HeaderMap::new(), now + Duration::minutes(5));
+        assert_eq!(production.take_missing_header_alert(), Some(now));
+        assert_eq!(production.take_missing_header_alert(), None);
+        production.network(&HeaderMap::new(), now + Duration::minutes(61));
+        assert_eq!(production.take_missing_header_alert(), Some(now + Duration::minutes(61)));
+        // Development never raises it.
+        let development = NetworkReader::new(false);
+        development.network(&HeaderMap::new(), now);
+        assert_eq!(development.take_missing_header_alert(), None);
     }
 
     #[test]
@@ -494,16 +597,35 @@ mod tests {
     }
 
     #[test]
-    fn the_rate_limiter_drops_ended_windows_as_it_grows() {
+    fn the_rate_limiter_holds_at_most_its_cap_and_forgets_whole_windows() {
         let now = at("2026-11-11T07:12:00Z");
-        let limiter = RateLimiter::new(1, Duration::minutes(1));
-        for key in 0..PRUNE_FLOOR as u32 {
+        let limiter = RateLimiter::with_cap(5, Duration::minutes(1), 100);
+        for key in 0..100u32 {
             limiter.check(key, now).unwrap();
         }
-        assert_eq!(limiter.len(), PRUNE_FLOOR);
-        limiter.check(u32::MAX, now + Duration::minutes(2)).unwrap();
+        // Full: a known key goes on, a new one waits for the next window.
+        assert_eq!(limiter.check(7, now + Duration::seconds(10)), Ok(()));
+        assert_eq!(limiter.check(100, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        assert_eq!(limiter.len(), 100);
+        // The next window starts empty.
+        limiter.check(100, now + Duration::minutes(1)).unwrap();
         assert_eq!(limiter.len(), 1);
         assert!(!limiter.is_empty());
+    }
+
+    #[test]
+    fn an_ipv6_address_counts_by_its_slash_64() {
+        let key = |raw: &str| ip_key(raw.parse().unwrap());
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("203.0.113.7"), "203.0.113.7".parse::<IpAddr>().unwrap());
+        assert_ne!(key("203.0.113.7"), key("203.0.113.8"));
+        assert_eq!(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+        let limiter = RateLimiter::new(1, Duration::minutes(1));
+        let now = at("2026-11-11T07:12:00Z");
+        assert_eq!(limiter.check(key("2001:db8:1:2::1"), now), Ok(()));
+        assert!(limiter.check(key("2001:db8:1:2::2"), now).is_err());
     }
 
     #[test]

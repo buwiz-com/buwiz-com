@@ -40,7 +40,8 @@ CREATE TABLE bir_tries (
     opens         smallint NOT NULL DEFAULT 0 CHECK (opens >= 0),
     admission     text NOT NULL CHECK (admission IN ('open', 'admit', 'scout', 'legacy_scout', 'try_anyway')),
     counted       boolean NOT NULL,
-    key_epoch     integer NOT NULL,
+    -- The day key's period: a random id, new with each key.
+    key_epoch     integer NOT NULL CHECK (key_epoch > 0),
     account_key   bytea NOT NULL CHECK (length(account_key) = 8),
     -- NULL for a late direct report.
     network_key   bytea CHECK (length(network_key) = 8),

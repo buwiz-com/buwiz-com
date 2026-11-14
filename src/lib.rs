@@ -74,6 +74,7 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::error!(error = ?error, "could not resume document readings");
     }
     let uptime = state.uptime.clone();
+    tokio::spawn(uptime::run_ticker(state.clone()));
     let app = app(state);
     let listener =
         tokio::net::TcpListener::bind(&address).await.with_context(|| format!("could not bind {address}"))?;

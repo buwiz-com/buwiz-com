@@ -81,6 +81,10 @@ pub enum Power {
     ChangeRole,
     /// Make a login on the staff pages.
     CreateLogin,
+    /// Set or clear a hand-set BIR note (an outage, planned maintenance, or
+    /// "declare Online"), and resume sending after the relay paused
+    /// ([`crate::uptime::notes`]).
+    SetBirStatus,
 }
 
 /// A signed-in staff member.
@@ -263,6 +267,7 @@ mod tests {
             MarkTest,
             ChangeRole,
             CreateLogin,
+            SetBirStatus,
         ];
         for power in all {
             assert!(Role::Admin.can(power), "{power:?}");

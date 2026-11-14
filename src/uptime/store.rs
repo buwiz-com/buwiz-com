@@ -24,8 +24,10 @@ use uuid::Uuid;
 
 use super::Uptime;
 use super::classify::Mode;
-use super::keys::{Keys, Network};
+use super::keys::{Keys, Network, TryKeys};
+use super::live;
 use super::observe::Observed;
+use super::sign::{Admission, Evidence, Source};
 use crate::base::crypto;
 
 /// How many sightings a host key keeps.
@@ -178,7 +180,7 @@ pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &O
         uptime.day_sets.note(relay.account_id, &relay.network, ended_at);
     }
     let insert = async {
-        insert_try(db, relay, observed, &keys.current, ended_at).await?;
+        let id = insert_try(db, relay, observed, &keys.current, ended_at).await?;
         if let Some(fingerprint) = &observed.host_key
             && observed.mode == Mode::Live
         {
@@ -188,12 +190,50 @@ pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &O
                 uptime.sightings.add(sighting);
             }
         }
-        Ok::<(), sqlx::Error>(())
+        Ok::<i64, sqlx::Error>(id)
     };
-    match tokio::time::timeout(RECORD_TIMEOUT, insert).await {
+    let id = match tokio::time::timeout(RECORD_TIMEOUT, insert).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(error)) => return tracing::error!(%error, "BIR uptime: could not record a try"),
+        Err(_) => return tracing::error!("BIR uptime: recording a try took too long; it is lost"),
+    };
+    // The rules, with this try. Only `live` tries are evidence.
+    if observed.mode != Mode::Live {
+        return;
+    }
+    let evidence = evidence(relay, observed, &keys, ended_at, Some(id));
+    match tokio::time::timeout(RECORD_TIMEOUT, live::feed(uptime, db, evidence, ended_at)).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!(%error, "BIR uptime: could not record a try"),
-        Err(_) => tracing::error!("BIR uptime: recording a try took too long; it is lost"),
+        Ok(Err(error)) => tracing::error!(%error, "BIR uptime: the rules could not run after a try"),
+        Err(_) => tracing::error!("BIR uptime: the rules took too long after a try; the next run takes it in"),
+    }
+}
+
+/// A `live` try as the rules read it: what the row holds, with both keys
+/// and the account id (in memory only).
+pub fn evidence(
+    relay: &RelayTry,
+    observed: &Observed,
+    keys: &TryKeys,
+    ended_at: OffsetDateTime,
+    id: Option<i64>,
+) -> Evidence {
+    let classified = &observed.classified;
+    Evidence {
+        id,
+        at: to_minute(ended_at).max(to_minute(relay.started_at)),
+        source: Source::Relay,
+        admission: Admission::parse(&relay.admission),
+        outcome: classified.outcome,
+        stage: classified.stage,
+        dispatcher: classified.dispatcher,
+        upload: classified.upload,
+        kind: observed.kind,
+        counted: observed.counted,
+        late: false,
+        keys: std::iter::once(keys.current).chain(keys.previous).collect(),
+        account_id: Some(relay.account_id),
+        port: observed.port,
     }
 }
 
@@ -203,15 +243,16 @@ async fn insert_try(
     observed: &Observed,
     keys: &Keys,
     ended_at: OffsetDateTime,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<i64> {
     let classified = &observed.classified;
     let admission = if ADMISSIONS.contains(&relay.admission.as_str()) { relay.admission.as_str() } else { "open" };
     let started_at = to_minute(relay.started_at);
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO bir_tries (started_at, ended_at, source, mode, outcome, stage, dispatcher, upload,
              failure_class, failure_kind, touched_bir, opens, admission, counted, key_epoch, account_key,
              network_key, client)
-         VALUES ($1, $2, 'relay', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+         VALUES ($1, $2, 'relay', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         RETURNING id",
     )
     .bind(started_at)
     .bind(to_minute(ended_at).max(started_at))
@@ -230,9 +271,8 @@ async fn insert_try(
     .bind(keys.account.as_slice())
     .bind(keys.network.as_slice())
     .bind(&relay.client)
-    .execute(db)
-    .await?;
-    Ok(())
+    .fetch_one(db)
+    .await
 }
 
 /// Adds a sighting of an upload server's host key: the keys of the account

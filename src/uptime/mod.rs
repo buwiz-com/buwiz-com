@@ -9,11 +9,16 @@
 //! - [`classify`]: names a try's stage, windows, class and kind.
 //! - [`sshkex`]: reads the upload server's host key from the clear SSH
 //!   handshake.
-//! - [`store`]: writes a try's row and its host key.
+//! - [`store`]: writes a try's row and its host key, and hands the try to
+//!   the rules.
 //! - [`sign`]: the rule engine, pure.
+//! - [`live`]: the sign in memory, rebuilt on start, written on change.
+//! - [`notes`]: what an Admin sets by hand.
 
 pub mod classify;
 pub mod keys;
+pub mod live;
+pub mod notes;
 pub mod observe;
 pub mod sign;
 pub mod sshkex;
@@ -26,7 +31,9 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use self::keys::{DaySets, KeyRing, NetworkReader, RateLimiter};
+use self::live::Live;
 use self::store::{Recorder, Sightings};
+use crate::base::state::AppState;
 
 /// `BIR_UPTIME`: how much of BIR uptime runs. Each level adds to the one
 /// below.
@@ -164,6 +171,8 @@ pub struct Uptime {
     /// The host-key sightings already written, so one that adds nothing is
     /// not written again.
     pub sightings: Sightings,
+    /// The sign, in memory ([`live`]).
+    pub live: Live,
 }
 
 impl Uptime {
@@ -180,6 +189,7 @@ impl Uptime {
             reads_per_account: RateLimiter::new(READS_PER_ACCOUNT, Duration::minutes(1)),
             recorder: Recorder::default(),
             sightings: Sightings::default(),
+            live: Live::new(now),
         }
     }
 
@@ -198,6 +208,22 @@ impl Uptime {
                 DEFAULT_UPLOAD_PORTS.to_vec()
             });
         Self::new(Level::from_env(), ports, production, OffsetDateTime::now_utc())
+    }
+}
+
+/// From `record` up, for as long as the server runs: loads the sign, then
+/// every 30 seconds runs the rules for what the clock alone changes.
+/// Nothing at `off`.
+pub async fn run_ticker(state: AppState) {
+    let uptime = state.uptime.clone();
+    if !uptime.level.records() {
+        return;
+    }
+    loop {
+        if let Err(error) = live::tick(&uptime, &state.db, OffsetDateTime::now_utc()).await {
+            tracing::error!(%error, "BIR uptime: the rules could not run");
+        }
+        tokio::time::sleep(live::TICK).await;
     }
 }
 

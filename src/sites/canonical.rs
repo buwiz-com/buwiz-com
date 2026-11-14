@@ -95,7 +95,9 @@ pub async fn split_site(State(state): State<AppState>, request: Request, next: N
     if let Some(file) = path.strip_prefix("/bot/") {
         return bot_site::file(file);
     }
-    let target = match moved_to(path) {
+    // The BIR status page is the filing site's, from `BIR_UPTIME=public`.
+    let bir_status = (path == "/bir-status" && state.uptime.level.is_public()).then_some(Site::Forms);
+    let target = match moved_to(path).or(bir_status) {
         Some(Site::Forms) => &config.forms_origin,
         Some(_) => &config.account_origin,
         None => return next.run(request).await,

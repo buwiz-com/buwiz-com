@@ -27,6 +27,7 @@ pub async fn tins_page(cx: &Cx) -> Result<impl View> {
     Ok(view! {
         <main class="home page">
             <div class="page-in">
+                bir_status::bir_banner()
                 <div class="page-head">
                     <div>
                         <h1>"My TINs"</h1>

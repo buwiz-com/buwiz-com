@@ -771,7 +771,9 @@ async fn faq() -> Result<impl View> {
 }
 
 #[component]
-pub(super) async fn footer() -> Result<impl View> {
+pub(super) async fn footer(cx: &Cx) -> Result<impl View> {
+    // The BIR status page exists from `BIR_UPTIME=public`.
+    let bir_status = state(cx).uptime.level.is_public();
     Ok(view! {
         <footer class="home-footer">
             <div class="home-footer-inner">
@@ -780,6 +782,9 @@ pub(super) async fn footer() -> Result<impl View> {
                     <p class="home-footer-note">"© 2026 Buwiz. Philippine tax filing, made modern."</p>
                 </div>
                 <nav class="home-footer-links" aria-label="Footer">
+                    if bir_status {
+                        <a href="/bir-status">"BIR status"</a>
+                    }
                     <a href="mailto:support@buwiz.com">"support@buwiz.com"</a>
                 </nav>
             </div>

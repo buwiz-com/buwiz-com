@@ -24,13 +24,17 @@ use crate::account::web::{link, safe_next, session_account};
 use crate::base::state::AppState;
 use crate::filing::devices;
 
+mod bir_status;
 mod download;
 mod home;
 mod staff;
 mod tins;
 
 pub fn router(state: AppState) -> Router {
-    Router::builder()
+    // The BIR status page exists from `BIR_UPTIME=public`; below it the
+    // address is the site's own 404, as before.
+    let bir_status = state.uptime.level.is_public();
+    let builder = Router::builder()
         .app_context(state)
         .layout(root_layout)
         .page(home::home_page)
@@ -48,8 +52,9 @@ pub fn router(state: AppState) -> Router {
         .page(staff::claims_page)
         .page(staff::claim_id::claim_page)
         .page(staff::users_page)
-        .page(staff::account_id::user_page)
-        .build()
+        .page(staff::account_id::user_page);
+    let builder = if bir_status { builder.page(bir_status::bir_status_page) } else { builder };
+    builder.build()
 }
 
 fn state(cx: &Cx) -> &AppState {
@@ -134,6 +139,13 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     if path == "/download" && state(cx).downloads.latest().await.is_none() {
         head.index = false;
     }
+    // The BIR status page (from `BIR_UPTIME=public`), and its look for the
+    // My TINs banner.
+    let public_bir = state(cx).uptime.level.is_public();
+    if public_bir && path == "/bir-status" {
+        head = Head { title: bir_status::TITLE, description: bir_status::DESCRIPTION, index: true };
+    }
+    let bir_styles = public_bir && (path == "/bir-status" || path == "/tins" && bir_status::banner_for(cx).is_some());
     let url = format!("{}{path}", crate::sites::seo::public_origin(&state(cx).config, host(cx)));
     let forms_origin = state(cx).config.forms_origin.clone();
     let (sign_in, sign_up) = (account_url(cx, "/login"), account_url(cx, "/signup"));
@@ -159,6 +171,9 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 <link rel="stylesheet" href="/assets/site.css">
                 brand_styles()
                 <link rel="stylesheet" href="/assets/account.css">
+                if bir_styles {
+                    <link rel="stylesheet" href="/assets/bir-status.css">
+                }
                 // Not deferred: it marks the page as scripted before the
                 // first paint, then sets itself up once the page is parsed.
                 <script src="/assets/account.js"></script>

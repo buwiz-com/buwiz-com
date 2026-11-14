@@ -90,7 +90,7 @@ async fn admin_in(tx: &mut Transaction<'_, Postgres>, config: &Config, actor: &S
 /// Before the engine's lock: someone who is not an Admin is refused at
 /// once and never waits on it.
 async fn admin_first(db: &PgPool, config: &Config, actor: &Staff) -> Result<(), NoteError> {
-    let mut tx = db.begin().await?;
+    let mut tx = live::begin(db).await?;
     let checked = admin_in(&mut tx, config, actor).await.map(drop);
     tx.rollback().await?;
     checked
@@ -172,7 +172,7 @@ pub async fn set_with_reason(
     let why = reason.map(note_text).transpose()?;
     let mut locked = live::lock(uptime, db, now).await?;
     let now = locked.now();
-    let mut tx = db.begin().await?;
+    let mut tx = live::begin(db).await?;
     // The sign's lock before any note row, as every path takes them.
     live::lock_sign(&mut tx).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
@@ -293,7 +293,7 @@ pub async fn clear(
     let reason = note_text(reason)?;
     let mut locked = live::lock(uptime, db, now).await?;
     let now = locked.now();
-    let mut tx = db.begin().await?;
+    let mut tx = live::begin(db).await?;
     live::lock_sign(&mut tx).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
     clear_note(&mut tx, &admin, &reason, now).await?;
@@ -347,7 +347,7 @@ pub async fn record_set(
 ) -> Result<Note, NoteError> {
     admin_first(db, config, actor).await?;
     let why = reason.map(note_text).transpose()?;
-    let mut tx = db.begin().await?;
+    let mut tx = live::begin(db).await?;
     live::lock_sign(&mut tx).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
     let (seq, state) = stored_seq(&mut tx).await?;
@@ -382,7 +382,7 @@ pub async fn record_clear(
 ) -> Result<(), NoteError> {
     admin_first(db, config, actor).await?;
     let reason = note_text(reason)?;
-    let mut tx = db.begin().await?;
+    let mut tx = live::begin(db).await?;
     live::lock_sign(&mut tx).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
     let (seq, state) = stored_seq(&mut tx).await?;
@@ -436,7 +436,7 @@ pub async fn resume_relay(
 ) -> Result<(), NoteError> {
     admin_first(db, config, actor).await?;
     let mut locked = live::lock(uptime, db, now).await?;
-    let mut tx = db.begin().await?;
+    let mut tx = live::begin(db).await?;
     let admin = admin_in(&mut tx, config, actor).await?;
     if !locked.previous().relay.paused {
         return Err(NoteError::NotPaused);

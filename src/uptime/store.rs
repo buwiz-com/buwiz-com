@@ -185,7 +185,9 @@ pub async fn record(uptime: &Uptime, db: &PgPool, relay: &RelayTry, observed: &O
         uptime.day_sets.note(relay.account_id, &relay.network, ended_at);
     }
     let insert = async {
-        let id = insert_try(db, relay, observed, &keys.current, ended_at).await?;
+        let mut tx = live::begin(db).await?;
+        let id = insert_try(&mut tx, relay, observed, &keys.current, ended_at).await?;
+        tx.commit().await?;
         if let Some(fingerprint) = &observed.host_key
             && observed.mode == Mode::Live
         {
@@ -259,7 +261,7 @@ pub fn evidence(
 }
 
 async fn insert_try(
-    db: &PgPool,
+    db: &mut sqlx::PgConnection,
     relay: &RelayTry,
     observed: &Observed,
     keys: &Keys,
@@ -314,6 +316,7 @@ pub async fn note_host_key(
         "network_key": crypto::hex(&keys.network),
         "kex_done": kex_done,
     }]);
+    let mut tx = live::begin(db).await?;
     sqlx::query(
         "INSERT INTO bir_host_keys (fingerprint, first_seen, last_seen, seen) VALUES ($1, $2, $2, $3)
          ON CONFLICT (fingerprint) DO UPDATE SET
@@ -328,9 +331,9 @@ pub async fn note_host_key(
     .bind(to_minute(at))
     .bind(sighting)
     .bind(HOST_KEY_SIGHTINGS)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// What a host key's sightings show within one key period: distinct
@@ -389,10 +392,12 @@ pub fn periods(seen: &Value) -> Vec<Period> {
 /// The hourly upkeep: tries older than 90 days are deleted, and the other
 /// uptime tables kept as [`super::days::upkeep`] says.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<u64> {
+    let mut tx = live::begin_for(db, super::days::LONG_STATEMENT).await?;
     let deleted = sqlx::query("DELETE FROM bir_tries WHERE started_at < now() - make_interval(days => $1)")
         .bind(TRIES_KEPT_DAYS)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     super::days::upkeep(db).await?;
     Ok(deleted.rows_affected())
 }

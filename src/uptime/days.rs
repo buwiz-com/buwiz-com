@@ -25,11 +25,12 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use time::{Date, Duration, OffsetDateTime};
 
 use super::Uptime;
 use super::keys::{DaySets, manila_day, manila_midnight};
+use super::live;
 use super::sign::{Light, NoteKind, Side};
 use super::store::to_minute;
 
@@ -38,6 +39,11 @@ pub const FINAL_AFTER: Duration = Duration::minutes(10);
 
 /// Days of `bir_held` kept (for proofs of outage).
 pub const HELD_KEPT_DAYS: i32 = 90;
+
+/// How long one statement of the day history or the retention may run on
+/// the server: longer than the rest of uptime's ([`live::STATEMENT_TIMEOUT`]),
+/// as they read a day's tries or delete old rows, but bounded all the same.
+pub const LONG_STATEMENT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One window's offline stretch, or a hand-set outage or maintenance, to
 /// the minute.
@@ -329,6 +335,10 @@ pub struct Record {
 
 /// Reads [`Record`] for `start` to `end`.
 pub async fn record(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Record> {
+    record_on(&mut *db.acquire().await?, start, end).await
+}
+
+async fn record_on(db: &mut PgConnection, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Record> {
     let overall = changes(db, "overall", start, end).await?;
     let dispatcher = changes(db, "dispatcher", start, end).await?;
     let upload = changes(db, "upload", start, end).await?;
@@ -338,7 +348,7 @@ pub async fn record(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> 
     )
     .bind(start)
     .bind(end)
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
     let notes: Vec<NoteSpan> =
         notes.into_iter().filter_map(|(kind, from, to)| Some((NoteKind::parse(&kind)?, from, to))).collect();
@@ -348,14 +358,18 @@ pub async fn record(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> 
 
 /// The states of Manila day `day` up to `now`, from the record.
 pub async fn states(db: &PgPool, day: Date, now: OffsetDateTime) -> sqlx::Result<DayStates> {
+    states_on(&mut *db.acquire().await?, day, now).await
+}
+
+async fn states_on(db: &mut PgConnection, day: Date, now: OffsetDateTime) -> sqlx::Result<DayStates> {
     let start = manila_midnight(day);
     let end = (start + Duration::DAY).min(now).max(start);
-    let record = record(db, start, end).await?;
+    let record = record_on(db, start, end).await?;
     Ok(day_states(day, &record.overall, [&record.dispatcher, &record.upload], &record.notes, &record.gaps, now))
 }
 
 async fn changes(
-    db: &PgPool,
+    db: &mut PgConnection,
     scope: &str,
     start: OffsetDateTime,
     end: OffsetDateTime,
@@ -365,7 +379,7 @@ async fn changes(
     )
     .bind(scope)
     .bind(start)
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
     rows.extend(
         sqlx::query_as::<_, (OffsetDateTime, String)>(
@@ -374,7 +388,7 @@ async fn changes(
         .bind(scope)
         .bind(start)
         .bind(end)
-        .fetch_all(db)
+        .fetch_all(&mut *db)
         .await?,
     );
     Ok(rows.into_iter().map(|(at, state)| (at, Light::parse(&state))).collect())
@@ -382,12 +396,12 @@ async fn changes(
 
 /// The spans Buwiz was not watching that touch `start` to `end`, from the
 /// `watch` events.
-async fn gaps(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Vec<Gap>> {
+async fn gaps(db: &mut PgConnection, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::Result<Vec<Gap>> {
     let mut rows: Vec<(OffsetDateTime, String)> = sqlx::query_as(
         "SELECT at, to_state FROM bir_events WHERE scope = 'watch' AND at < $1 ORDER BY at DESC, id DESC LIMIT 1",
     )
     .bind(start)
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
     rows.extend(
         sqlx::query_as::<_, (OffsetDateTime, String)>(
@@ -395,7 +409,7 @@ async fn gaps(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::
         )
         .bind(start)
         .bind(end)
-        .fetch_all(db)
+        .fetch_all(&mut *db)
         .await?,
     );
     let mut gaps = Vec::new();
@@ -413,25 +427,38 @@ async fn gaps(db: &PgPool, start: OffsetDateTime, end: OffsetDateTime) -> sqlx::
     Ok(gaps)
 }
 
-/// Computes and writes the line of `day` (Manila), up to `now`. A final
-/// line is left as it is. `None` for a day that has not begun.
+/// Computes and writes the line of `day` (Manila), up to `now`, in one
+/// transaction of its own ([`LONG_STATEMENT`]). A final line is left as it
+/// is. `None` for a day that has not begun.
 pub async fn roll_up(
     db: &PgPool,
     day_sets: &DaySets,
     day: Date,
     now: OffsetDateTime,
 ) -> sqlx::Result<Option<DayStates>> {
-    let start = manila_midnight(day);
-    let day_end = start + Duration::DAY;
-    if now <= start {
+    if now <= manila_midnight(day) {
         return Ok(None);
     }
+    let mut tx = live::begin_for(db, LONG_STATEMENT).await?;
+    let states = roll_up_on(&mut tx, day_sets, day, now).await?;
+    tx.commit().await?;
+    Ok(states)
+}
+
+async fn roll_up_on(
+    db: &mut PgConnection,
+    day_sets: &DaySets,
+    day: Date,
+    now: OffsetDateTime,
+) -> sqlx::Result<Option<DayStates>> {
+    let start = manila_midnight(day);
+    let day_end = start + Duration::DAY;
     let final_now: Option<bool> =
-        sqlx::query_scalar("SELECT final FROM bir_days WHERE day = $1").bind(day).fetch_optional(db).await?;
+        sqlx::query_scalar("SELECT final FROM bir_days WHERE day = $1").bind(day).fetch_optional(&mut *db).await?;
     if final_now == Some(true) {
         return Ok(None);
     }
-    let states = states(db, day, now).await?;
+    let states = states_on(db, day, now).await?;
 
     let (tries, got_in, failed, maybe, ours, user_network): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE counted), count(*) FILTER (WHERE counted AND outcome = 'sent'),
@@ -441,12 +468,12 @@ pub async fn roll_up(
     )
     .bind(start)
     .bind(day_end)
-    .fetch_one(db)
+    .fetch_one(&mut *db)
     .await?;
     let held: i64 = sqlx::query_scalar("SELECT count(*) FROM bir_held WHERE at >= $1 AND at < $2")
         .bind(start)
         .bind(day_end)
-        .fetch_one(db)
+        .fetch_one(&mut *db)
         .await?;
     // Distinct keys within one key period: a lower bound across a restart.
     let (key_accounts, key_networks): (Option<i64>, Option<i64>) = sqlx::query_as(
@@ -456,7 +483,7 @@ pub async fn roll_up(
     )
     .bind(start)
     .bind(day_end)
-    .fetch_one(db)
+    .fetch_one(&mut *db)
     .await?;
     let (set_accounts, set_networks) = day_sets.counts(day).unwrap_or((0, 0));
     let accounts = key_accounts.unwrap_or(0).max(i64::try_from(set_accounts).unwrap_or(i64::MAX));
@@ -473,7 +500,7 @@ pub async fn roll_up(
                            AND back.scope = 'watch' AND back.to_state = 'watched' AND back.at >= $1)",
     )
     .bind(day_end)
-    .fetch_one(db)
+    .fetch_one(&mut *db)
     .await?;
     let is_final = now >= day_end + FINAL_AFTER && judged;
     let count = |value: i64| i32::try_from(value).unwrap_or(i32::MAX);
@@ -515,7 +542,7 @@ pub async fn roll_up(
     .bind(windows)
     .bind(is_final)
     .bind(states.unwatched_minutes)
-    .execute(db)
+    .execute(&mut *db)
     .await?;
     Ok(Some(states))
 }
@@ -529,9 +556,12 @@ pub const MAX_DAYS: i64 = 3_660;
 /// the server was down. Usually yesterday's (until it is final) and today's.
 pub async fn roll_up_recent(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
     let today = manila_day(now);
+    let mut tx = live::begin(db).await?;
     let last_final: Option<Date> =
-        sqlx::query_scalar("SELECT max(day) FROM bir_days WHERE final").fetch_one(db).await?;
-    let began: Option<OffsetDateTime> = sqlx::query_scalar("SELECT min(at) FROM bir_events").fetch_one(db).await?;
+        sqlx::query_scalar("SELECT max(day) FROM bir_days WHERE final").fetch_one(&mut *tx).await?;
+    let began: Option<OffsetDateTime> =
+        sqlx::query_scalar("SELECT min(at) FROM bir_events").fetch_one(&mut *tx).await?;
+    tx.commit().await?;
     let mut day = match (last_final, began) {
         (Some(last), _) => last.next_day().unwrap_or(today),
         (None, Some(began)) => manila_day(began),
@@ -553,11 +583,12 @@ pub async fn roll_up_recent(uptime: &Uptime, db: &PgPool, now: OffsetDateTime) -
 /// day history, the events, the notes, the host keys and the proofs are
 /// kept.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
+    let mut tx = live::begin_for(db, LONG_STATEMENT).await?;
     sqlx::query("DELETE FROM bir_held WHERE at < now() - make_interval(days => $1)")
         .bind(HELD_KEPT_DAYS)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM bir_queue_reports WHERE expires_at < now()").execute(db).await?;
-    sqlx::query("DELETE FROM bir_turns WHERE granted_at < now() - interval '1 day'").execute(db).await?;
-    Ok(())
+    sqlx::query("DELETE FROM bir_queue_reports WHERE expires_at < now()").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM bir_turns WHERE granted_at < now() - interval '1 day'").execute(&mut *tx).await?;
+    tx.commit().await
 }

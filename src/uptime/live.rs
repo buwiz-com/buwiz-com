@@ -44,6 +44,12 @@
 //! times of news and of the evaluation alone are written at most once a
 //! minute. Everything public reads the sign as it stood at the last
 //! 5-minute mark ([`Live::public`]).
+//!
+//! Every transaction of uptime's ([`begin`]) has the server end a statement
+//! after [`STATEMENT_TIMEOUT`] and a lock wait (the sign's lock too) after
+//! [`LOCK_TIMEOUT`], so work a timeout here gave up on does not go on
+//! there, holding a connection the sends need, and nothing waits on a lock
+//! without a bound.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
@@ -78,6 +84,31 @@ pub const WRITE_EVERY: Duration = Duration::seconds(60);
 
 /// How long the database work of one run (or the load) may take.
 pub const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one statement of uptime's may run on the server.
+pub const STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long one statement of uptime's may wait for a lock, the sign's
+/// advisory lock included.
+pub const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A transaction whose statements the server ends after
+/// [`STATEMENT_TIMEOUT`], and whose lock waits after [`LOCK_TIMEOUT`].
+pub async fn begin(db: &PgPool) -> sqlx::Result<Transaction<'static, Postgres>> {
+    begin_for(db, STATEMENT_TIMEOUT).await
+}
+
+/// [`begin`] with statements ended after `statement` (the day history's
+/// and the retention's, which read or delete more, get longer).
+pub async fn begin_for(db: &PgPool, statement: std::time::Duration) -> sqlx::Result<Transaction<'static, Postgres>> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)")
+        .bind(format!("{}ms", statement.as_millis()))
+        .bind(format!("{}ms", LOCK_TIMEOUT.as_millis()))
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 
 /// The lock every write of the sign holds, across processes ("birsign" in
 /// ASCII). Every path takes it before it touches a note row, so no two
@@ -451,7 +482,7 @@ impl Locked<'_> {
             return Ok(());
         }
         let work = async {
-            let mut tx = db.begin().await?;
+            let mut tx = begin(db).await?;
             let written = self.write(&mut tx, &evaluation, None).await?;
             tx.commit().await?;
             Ok(written)
@@ -492,12 +523,15 @@ impl Locked<'_> {
 
 /// The newest audit line (an Admin's, with their reason) of `cause`.
 async fn audit_reason(db: &PgPool, cause: Cause) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar(
+    let mut tx = begin(db).await?;
+    let reason = sqlx::query_scalar(
         "SELECT reason FROM bir_events WHERE cause = $1 AND actor_id IS NOT NULL ORDER BY id DESC LIMIT 1",
     )
     .bind(cause.as_str())
-    .fetch_optional(db)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(reason)
 }
 
 /// One `bir_events` row, once: written again for the same `seq` and place,
@@ -693,12 +727,15 @@ fn restore(seq: i64, value: Value, updated_at: OffsetDateTime, now: OffsetDateTi
 /// The sign as stored, read as a start would read it, and the newest note
 /// not cleared; nothing is written. `None` before the first start.
 pub async fn stored(db: &PgPool, now: OffsetDateTime) -> sqlx::Result<Option<(SignState, Option<Note>)>> {
+    let mut tx = begin(db).await?;
     let row: Option<(i64, Value, OffsetDateTime)> =
-        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
+        sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(&mut *tx).await?;
     let Some((seq, value, updated_at)) = row else {
         return Ok(None);
     };
-    Ok(Some((restore(seq, value, updated_at, now).0, open_note(db).await?)))
+    let note = open_note(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Some((restore(seq, value, updated_at, now).0, note)))
 }
 
 /// The newest note the record has not cleared.
@@ -721,8 +758,9 @@ async fn open_note<'e>(db: impl sqlx::PgExecutor<'e>) -> sqlx::Result<Option<Not
 /// makes the note's change, writes it and mails staff. A stored sign that
 /// cannot be read is loaded again from the start.
 async fn refresh(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
+    let mut tx = begin(db).await?;
     let stored: Option<(i64, Value)> =
-        sqlx::query_as("SELECT seq, state FROM bir_sign WHERE id = 1").fetch_optional(db).await?;
+        sqlx::query_as("SELECT seq, state FROM bir_sign WHERE id = 1").fetch_optional(&mut *tx).await?;
     let Some((seq, value)) = stored.filter(|(seq, _)| *seq > engine.sign.seq) else {
         return Ok(());
     };
@@ -731,7 +769,8 @@ async fn refresh(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx:
         engine.loaded = false;
         return Ok(());
     }
-    engine.note = open_note(db).await?;
+    engine.note = open_note(&mut *tx).await?;
+    tx.commit().await?;
     tracing::info!(from = engine.sign.seq, to = seq, at = %now, "BIR uptime: took in a note another process wrote");
     engine.sign.seq = seq;
     Ok(())
@@ -744,15 +783,15 @@ async fn refresh(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx:
 /// restored from an older backup passes any `seq` handed out before. A
 /// stored evaluation within [`RESTART_SLACK`] of a gap writes none.
 async fn load(engine: &mut Engine, db: &PgPool, now: OffsetDateTime) -> sqlx::Result<()> {
+    let mut tx = begin(db).await?;
     let rows: Vec<TryRow> = sqlx::query_as(
         "SELECT id, ended_at, source, outcome, stage, dispatcher, upload, failure_kind, counted, late, admission,
                 key_epoch, account_key, network_key
            FROM bir_tries WHERE mode = 'live' AND ended_at >= $1 ORDER BY ended_at, id",
     )
     .bind(to_minute(now - sign::EVIDENCE_KEPT))
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
-    let mut tx = db.begin().await?;
     lock_sign(&mut tx).await?;
     let row: Option<(i64, Value, OffsetDateTime)> =
         sqlx::query_as("SELECT seq, state, updated_at FROM bir_sign WHERE id = 1").fetch_optional(&mut *tx).await?;

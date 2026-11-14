@@ -1120,7 +1120,12 @@ for them); a try that finds them busy is taken in by the run that holds
 them or the next tick, at most 30 seconds later, and stays in memory
 whatever that run does. A timeout bounds the database work (10 s for a run
 or the load, 5 s for a try's row); a try whose row could not be written
-still reaches the rules. A run that cannot be written (the database is
+still reaches the rules. The server bounds it too: every transaction of
+uptime's sets `statement_timeout` (5 s; 30 s for the day history and the
+retention) and `lock_timeout` (4 s, the sign's advisory lock included)
+with `SET LOCAL` semantics, so work given up on in the Gatekeeper does not
+go on in the database holding one of the connections the sends share (one
+pool of 10), and nothing in uptime waits on a lock without a bound. A run that cannot be written (the database is
 down) is still shown: the sign keeps aging in memory (Online cannot stay
 up for hours on no evidence), and the next run that can write makes and
 writes the same change. If the stored sign cannot be read, the run goes on

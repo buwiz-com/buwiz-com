@@ -132,6 +132,11 @@ pub fn is_staff_sql(account: &str, list: &str) -> String {
 /// accounts in `admin_emails` that are not banned, and addresses in
 /// `admin_emails` with no account yet. Sorted.
 pub async fn staff_emails(db: &PgPool, admin_emails: &[String]) -> sqlx::Result<Vec<String>> {
+    staff_emails_on(&mut *db.acquire().await?, admin_emails).await
+}
+
+/// [`staff_emails`] on one connection (a transaction of the caller's).
+pub async fn staff_emails_on(db: &mut sqlx::PgConnection, admin_emails: &[String]) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar(&format!(
         "SELECT email FROM accounts a
           WHERE {} AND (a.email = ANY($1) OR {})

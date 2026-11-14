@@ -1422,3 +1422,54 @@ async fn the_ticker_goes_on_through_a_panicking_tick(db: PgPool) {
     assert!(!ticker.is_finished());
     ticker.abort();
 }
+
+/// Every uptime transaction is bounded on the server too: a statement ends
+/// after 5 seconds (the day history's after 30) and a lock wait after 4.
+/// So a run that finds the sign's lock held gives up within seconds and
+/// leaves nothing waiting on the server, holding a connection.
+#[sqlx::test]
+async fn uptime_never_waits_on_a_lock_without_a_bound(db: PgPool) {
+    let mut tx = live::begin(&db).await.unwrap();
+    let set: (String, String) =
+        sqlx::query_as("SELECT current_setting('statement_timeout'), current_setting('lock_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(set, ("5s".into(), "4s".into()));
+    tx.commit().await.unwrap();
+    let mut tx = live::begin_for(&db, days::LONG_STATEMENT).await.unwrap();
+    let set: String =
+        sqlx::query_scalar("SELECT current_setting('statement_timeout')").fetch_one(&mut *tx).await.unwrap();
+    assert_eq!(set, "30s");
+    tx.rollback().await.unwrap();
+    // Outside a transaction nothing is changed.
+    let set: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')").fetch_one(&db).await.unwrap();
+    assert_eq!(set, "0");
+
+    // Another session holds the sign's lock.
+    let mut holder = db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(0x0062_6972_7369_676e_i64)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let uptime = uptime(t(0));
+    let started = std::time::Instant::now();
+    let error = live::tick(&uptime, &db, t(0)).await.unwrap_err();
+    let waited = started.elapsed();
+    assert!(
+        matches!(&error, sqlx::Error::Database(error) if error.code().as_deref() == Some("55P03")),
+        "the server ended the wait: {error}"
+    );
+    assert!(waited < std::time::Duration::from_secs(8), "{waited:?}");
+    let waiting: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(waiting, 0, "nothing is left waiting on the server");
+    holder.rollback().await.unwrap();
+    live::tick(&uptime, &db, t(0)).await.unwrap();
+}

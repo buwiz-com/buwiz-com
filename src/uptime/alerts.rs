@@ -30,7 +30,7 @@ use time::{Date, Duration, OffsetDateTime};
 use super::Uptime;
 use super::classify::Kind;
 use super::keys::{MANILA, manila_day};
-use super::live::Written;
+use super::live::{self, Written};
 use super::sign::{Cause, Light, NoteKind, Notice, Scope, Side, SignState};
 use crate::account::mail::Mailer;
 use crate::account::roles;
@@ -643,7 +643,13 @@ pub async fn flush(
     if rounds.is_empty() {
         return Ok(None);
     }
-    let to = match roles::staff_emails(db, &config.admin_emails).await {
+    let to = async {
+        let mut tx = live::begin(db).await?;
+        let to = roles::staff_emails_on(&mut tx, &config.admin_emails).await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(to)
+    };
+    let to = match to.await {
         Ok(to) => to,
         Err(error) => {
             for round in &rounds {
@@ -661,11 +667,7 @@ pub async fn flush(
                         continue;
                     };
                     if !event_ids.is_empty()
-                        && let Err(error) = sqlx::query("UPDATE bir_events SET mailed_at = $2 WHERE id = ANY($1)")
-                            .bind(&event_ids)
-                            .bind(now)
-                            .execute(db)
-                            .await
+                        && let Err(error) = mark_mailed(db, &event_ids, now).await
                     {
                         tracing::error!(%error, "BIR uptime: a mailed change could not be marked mailed");
                     }
@@ -682,6 +684,17 @@ pub async fn flush(
         uptime.alerts.round_end(round.id, &to, now);
     }
     Ok(told)
+}
+
+/// Marks `event_ids` mailed at `now`.
+async fn mark_mailed(db: &PgPool, event_ids: &[i64], now: OffsetDateTime) -> sqlx::Result<()> {
+    let mut tx = live::begin(db).await?;
+    sqlx::query("UPDATE bir_events SET mailed_at = $2 WHERE id = ANY($1)")
+        .bind(event_ids)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
 #[cfg(test)]

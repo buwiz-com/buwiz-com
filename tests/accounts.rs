@@ -38,9 +38,13 @@ async fn staff_pages_are_not_found_for_everyone_else(db: PgPool) {
             .unwrap();
     let pages = [
         "/staff".to_owned(),
-        "/staff?status=sent_back&q=cora".to_owned(),
+        "/staff/search?q=cora".to_owned(),
+        "/staff/queue".to_owned(),
+        "/staff/queue?status=sent_back&q=cora".to_owned(),
+        format!("/staff/queue?status=waiting&open={claim}"),
         "/staff/users".to_owned(),
         "/staff/users?filter=waiting&q=987".to_owned(),
+        format!("/staff/users?open={ana}&new=1"),
         format!("/staff/users/{ana}"),
         format!("/staff/claims/{claim}"),
         format!("/staff/documents/{document}"),
@@ -67,11 +71,19 @@ async fn staff_pages_are_not_found_for_everyone_else(db: PgPool) {
     assert_eq!(bytes(file).await, PNG);
 
     // Signed out, staff pages ask for a sign-in like every other page.
+    for page in ["/staff", "/staff/queue", "/staff?notice=claim_decided"] {
+        let response = site.get(page, "").await;
+        assert!(response.status().is_redirection() && location(&response).starts_with("/login"), "{page}");
+    }
     let response = site.get("/staff", "").await;
-    assert!(response.status().is_redirection() && location(&response).starts_with("/login"));
+    assert!(location(&response).contains("next=%2Fstaff"), "{}", location(&response));
 
-    let queue = text(site.get("/staff", &staff).await).await;
-    assert!(queue.contains("987-654-321-00000") && queue.contains("STAFF"), "{queue}");
+    let queue = text(site.get("/staff/queue", &staff).await).await;
+    assert!(
+        queue.contains("987-654-321-00000")
+            && queue.contains("<span class=\"sx-stag\" aria-hidden=\"true\">Staff</span>"),
+        "{queue}"
+    );
     let users = text(site.get("/staff/users?q=cora", &staff).await).await;
     assert!(users.contains("ana@example.test") && users.contains("Cora Trading Inc."), "{users}");
     // Users see the light header, never the staff one.
@@ -83,14 +95,14 @@ async fn old_links_move_to_their_new_places(db: PgPool) {
     let site = Site::new(db);
     let id = Uuid::new_v4();
     let moved = [
-        ("/admin".to_owned(), "/staff".to_owned()),
-        ("/admin/claims".to_owned(), "/staff".to_owned()),
-        ("/admin/claims?notice=claim_decided".to_owned(), "/staff?notice=claim_decided".to_owned()),
+        ("/admin".to_owned(), "/staff/queue".to_owned()),
+        ("/admin/claims".to_owned(), "/staff/queue".to_owned()),
+        ("/admin/claims?notice=claim_decided".to_owned(), "/staff/queue?notice=claim_decided".to_owned()),
         (format!("/admin/claims/{id}"), format!("/staff/claims/{id}")),
         (format!("/admin/documents/{id}"), format!("/staff/documents/{id}")),
         ("/account".to_owned(), "/tins".to_owned()),
         ("/account?notice=claim_submitted".to_owned(), "/tins?notice=claim_submitted".to_owned()),
-        ("/staff/claims".to_owned(), "/staff".to_owned()),
+        ("/staff/claims".to_owned(), "/staff/queue".to_owned()),
     ];
     for (old, new) in moved {
         let response = site.get(&old, "").await;

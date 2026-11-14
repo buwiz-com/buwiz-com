@@ -148,7 +148,7 @@ async fn a_tin_added_without_papers_is_not_verified(db: PgPool) {
 
     // Not in the review queue: there is nothing to review.
     let (_, staff) = site.person(STAFF).await;
-    assert!(!text(site.get("/staff", &staff).await).await.contains("000-123-451"));
+    assert!(!text(site.get("/staff/queue", &staff).await).await.contains("000-123-451"));
 
     // Once on My TINs, adding it again, with or without papers, says so.
     let again = site.upload("/tins/claims", &cookie, &skipped("000123451")).await;
@@ -369,7 +369,7 @@ async fn verifying_later_sends_the_same_claim_for_review(db: PgPool) {
     assert_eq!(site.readings(claim).await.len(), 1);
 
     // It waits in the queue from when the papers came: after carl's.
-    let queue = text(site.get("/staff", &staff).await).await;
+    let queue = text(site.get("/staff/queue", &staff).await).await;
     let (ours, carls) = (queue.find("000-123-471").unwrap(), queue.find("000-123-472").unwrap());
     assert!(carls < ours, "{queue}");
 

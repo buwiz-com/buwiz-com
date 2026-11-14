@@ -54,6 +54,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/home.css", get(home_stylesheet))
         .route("/assets/account.css", get(account_stylesheet))
         .route("/assets/account.js", get(account_script))
+        .route("/assets/staff.css", get(staff_stylesheet))
+        .route("/assets/staff.js", get(staff_script))
         .route("/assets/screens/{name}", get(screenshot))
         .route("/assets/demo.js", get(demo_script))
         .route("/assets/demo.css", get(demo_stylesheet))
@@ -117,7 +119,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         )
         .route("/tins/claims/{claim_id}/documents/{document_id}/remove", post(remove_document))
         // Staff. Everyone else gets a 404 (see `require_staff`).
-        .route("/staff/claims", get(|| async { Redirect::permanent("/staff") }))
+        .route("/staff/claims", get(|| async { Redirect::permanent("/staff/queue") }))
         .route("/staff/claims/{claim_id}/decision", post(decide_claim))
         .route("/staff/claims/{claim_id}/delete", post(staff_delete_claim))
         .route("/staff/claims/{claim_id}/revoke", post(revoke_claim))
@@ -162,6 +164,14 @@ async fn account_script() -> Response {
     text(include_str!("account.js"), "text/javascript; charset=utf-8")
 }
 
+async fn staff_stylesheet() -> Response {
+    css(include_str!("staff.css"))
+}
+
+async fn staff_script() -> Response {
+    text(include_str!("staff.js"), "text/javascript; charset=utf-8")
+}
+
 async fn demo_script() -> Response {
     text(include_str!("../sites/demo.js"), "text/javascript; charset=utf-8")
 }
@@ -188,7 +198,8 @@ fn text(body: &'static str, content_type: &'static str) -> Response {
 /// share card (also at /favicon.ico and in /site.webmanifest), and for the
 /// home page's AI
 /// agent demos the two printed 1601-C documents their Computer screen shows
-/// and the font those use. (path under /assets, content type, bytes)
+/// and the font those use; and the staff pages' fonts. (path under /assets,
+/// content type, bytes)
 pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
     ("brand/buwiz_logo_light.webp", "image/webp", include_bytes!("../assets/brand/buwiz_logo_light.webp")),
     ("brand/buwiz_logo_dark.webp", "image/webp", include_bytes!("../assets/brand/buwiz_logo_dark.webp")),
@@ -218,6 +229,25 @@ pub(crate) const ASSETS: &[(&str, &str, &[u8])] = &[
         "fonts/tinos-latin-400-normal.woff2",
         "font/woff2",
         include_bytes!("../assets/fonts/tinos-latin-400-normal.woff2"),
+    ),
+    // The staff pages' type (staff.css): Inter, variable, from rsms/inter
+    // v4.1, and IBM Plex Mono's Latin-1 cut for TINs, from IBM/plex
+    // (@ibm/plex-mono 2.5.0). Both are OFL; the licences sit beside them.
+    ("fonts/inter-variable.woff2", "font/woff2", include_bytes!("../assets/fonts/inter-variable.woff2")),
+    (
+        "fonts/ibm-plex-mono-regular-latin1.woff2",
+        "font/woff2",
+        include_bytes!("../assets/fonts/ibm-plex-mono-regular-latin1.woff2"),
+    ),
+    (
+        "fonts/ibm-plex-mono-medium-latin1.woff2",
+        "font/woff2",
+        include_bytes!("../assets/fonts/ibm-plex-mono-medium-latin1.woff2"),
+    ),
+    (
+        "fonts/ibm-plex-mono-semibold-latin1.woff2",
+        "font/woff2",
+        include_bytes!("../assets/fonts/ibm-plex-mono-semibold-latin1.woff2"),
     ),
 ];
 
@@ -260,15 +290,31 @@ async fn screenshot(Path(name): Path<String>) -> Response {
     response
 }
 
+/// What the staff pages may load: only this site's own files, each for
+/// what uses it: staff.js (`script-src`), staff.css (`style-src`), claim
+/// documents, the favicon and the brand marks staff.css masks with
+/// (`img-src`), the fonts (`font-src`), staff.js swapping the inspector in
+/// (`connect-src`) and the staff forms (`form-action`). No inline script
+/// or style, nothing from another host, no frames. The icons are inline SVG
+/// in the page (`ui::sprite`), so they load nothing. Not sent with the 404
+/// that everyone else gets there, which is the site's own page.
+const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
+     font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
 /// Hands a request to the Topcoat router and converts its response back.
 async fn render_page(pages: &topcoat::router::Router, request: axum::extract::Request) -> Response {
     let (parts, body) = request.into_parts();
+    let staff = parts.uri.path() == "/staff" || parts.uri.path().starts_with("/staff/");
     let request = http::Request::from_parts(parts, topcoat::router::Body::new(body));
     let mut response = pages.handle(request).await.map(axum::body::Body::new);
     let headers = response.headers_mut();
     headers.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    if staff && response.status().is_success() {
+        let headers = response.headers_mut();
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STAFF_CSP));
+    }
     response
 }
 
@@ -308,7 +354,22 @@ pub fn link(path: &str, notice: Option<Notice>, params: &[(&str, &str)]) -> Stri
         query.append_pair("notice", notice.code());
     }
     let query = query.finish();
-    if query.is_empty() { path.to_owned() } else { format!("{path}?{query}") }
+    match (query.is_empty(), path.contains('?')) {
+        (true, _) => path.to_owned(),
+        // `path` has a query already (a user page's `?tab=`): add to it.
+        (false, true) => format!("{path}&{query}"),
+        (false, false) => format!("{path}?{query}"),
+    }
+}
+
+/// A user page to go back to after an action, on the tab the action came
+/// from: one of the page's tabs, or none (the Account tab) for anything
+/// else.
+fn user_page(account_id: Uuid, tab: &str) -> String {
+    match crate::account::staff::user_tab(tab) {
+        "account" => format!("/staff/users/{account_id}"),
+        tab => format!("/staff/users/{account_id}?tab={tab}"),
+    }
 }
 
 fn see_other(location: String) -> Response {
@@ -418,12 +479,12 @@ async fn moved_to_tins(uri: Uri) -> Response {
     moved(&uri, "/tins")
 }
 
-/// `/admin/…` became `/staff/…`; the claims list is `/staff` itself. A
+/// `/admin/…` became `/staff/…`; the claims list is `/staff/queue`. A
 /// permanent redirect keeps the method, so old forms still post.
 async fn moved_to_staff(uri: Uri) -> Response {
     let rest = uri.path().strip_prefix("/admin").unwrap_or_default().trim_end_matches('/');
     let path = match rest {
-        "" | "/claims" => "/staff".to_owned(),
+        "" | "/claims" => "/staff/queue".to_owned(),
         rest => format!("/staff{rest}"),
     };
     moved(&uri, &path)
@@ -942,7 +1003,7 @@ async fn decide_claim(
         _ => return (StatusCode::BAD_REQUEST, "unknown decision").into_response(),
     };
     match claims::decide(&state.db, &state.config, &state.documents, claim_id, &reviewer, &decision, &note).await {
-        Ok(notice) => see_other(link("/staff", Some(notice), &[])),
+        Ok(notice) => see_other(link("/staff/queue", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }
@@ -952,6 +1013,9 @@ async fn decide_claim(
 struct StaffReason {
     #[serde(default)]
     reason: String,
+    /// On a user page, the tab the form is on ([`user_page`]).
+    #[serde(default)]
+    tab: String,
 }
 
 /// Staff delete a claim that never became active.
@@ -971,7 +1035,7 @@ async fn staff_delete_claim(
     };
     let by = By::Staff { reason: &form.reason, config: &state.config };
     match claims::delete(&state.db, &state.documents, claim_id, &staff, by).await {
-        Ok(notice) => see_other(link("/staff", Some(notice), &[])),
+        Ok(notice) => see_other(link("/staff/queue", Some(notice), &[])),
         Err(DecideError::Refused(notice)) => see_other(link(&back_to, Some(notice), &[])),
         Err(DecideError::Internal(error)) => internal(error),
     }
@@ -1123,7 +1187,7 @@ async fn sign_out_user(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1141,7 +1205,7 @@ async fn sign_out_user_app(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1160,7 +1224,7 @@ async fn ban_user(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::Ban).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1178,7 +1242,7 @@ async fn unban_user(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::Ban).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1192,6 +1256,8 @@ struct TestForm {
     test: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    tab: String,
 }
 
 /// An Admin puts the test-account label on (`test=on`) or takes it off.
@@ -1204,7 +1270,7 @@ async fn mark_test(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::MarkTest).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1227,6 +1293,8 @@ struct TestTinForm {
     registered_name: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    tab: String,
 }
 
 /// An Admin adds a made-up test TIN to a test account, active at once.
@@ -1239,7 +1307,7 @@ async fn add_test_tin(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::ActivateWithoutPapers).await {
         Ok(staff) => staff,
         Err(response) => return response,
@@ -1289,6 +1357,8 @@ struct RoleForm {
     role: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    tab: String,
 }
 
 /// An Admin changes an account's staff role: `admin`, `support` or `none`.
@@ -1301,7 +1371,7 @@ async fn change_role(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = format!("/staff/users/{account_id}");
+    let back_to = user_page(account_id, &form.tab);
     let staff = match require_staff(&state, &headers, &back_to, Power::ChangeRole).await {
         Ok(staff) => staff,
         Err(response) => return response,

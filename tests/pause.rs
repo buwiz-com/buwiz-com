@@ -98,14 +98,14 @@ async fn pausing_stops_sending_and_resuming_restores_it(db: PgPool) {
     assert_eq!(location(&add_link), "/tins?notice=tin_is_paused");
 
     // Staff see it as paused everywhere.
-    assert!(text(site.get("/staff?status=paused", &staff).await).await.contains("000-123-453-00000"));
-    assert!(!text(site.get("/staff?status=approved", &staff).await).await.contains("000-123-453-00000"));
+    assert!(text(site.get("/staff/queue?status=paused", &staff).await).await.contains("000-123-453-00000"));
+    assert!(!text(site.get("/staff/queue?status=approved", &staff).await).await.contains("000-123-453-00000"));
     let review = text(site.get(&page, &staff).await).await;
     assert!(review.contains(&format!("Paused by {STAFF} on")) && review.contains(REASON), "{review}");
     assert!(review.contains("Resume sending for 000-123-453-00000?"), "{review}");
     let user = text(site.get(&format!("/staff/users/{ana}"), &staff).await).await;
     assert!(
-        user.contains("user-tin-status paused")
+        user.contains("data-status=\"paused\"")
             && user.contains(&format!("Staff {STAFF} paused ***-***-453-00000: {REASON}")),
         "{user}"
     );
@@ -162,7 +162,7 @@ async fn pausing_stops_sending_and_resuming_restores_it(db: PgPool) {
     assert_eq!(location(&response), format!("/staff/claims/{again}?notice=admin_must_decide"));
     assert_eq!(site.claim_status(again).await, "pending");
     let response = site.post(&decide, &staff, "decision=approve").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     assert_eq!(site.claim_status(again).await, "approved");
 }
 

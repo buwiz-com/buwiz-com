@@ -77,7 +77,7 @@ email = "juan@example.test"
 # claim still waiting for review is deleted, with its files (the run needs
 # the server's S3_* settings for that). The old login never sees who has
 # the TIN now. A TIN paused on the old login does not move: resume or
-# revoke it on /staff first.
+# revoke it on /staff/queue first.
 #
 # [[login]]
 # email = "new-owner@example.test"

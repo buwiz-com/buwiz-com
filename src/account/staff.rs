@@ -13,9 +13,18 @@ use crate::filing::gate::LIVE_SQL;
 /// Rows a list shows at most; a search narrows the rest.
 pub const LIST_LIMIT: i64 = 200;
 
+/// A search as the staff pages read it: without NUL, which a Postgres
+/// `text` cannot hold (a `q` carrying one was a 500). Every search box
+/// (queue, users, search everything) reads its `q` through this, and so
+/// does every query here that takes one.
+pub fn search_text(raw: &str) -> String {
+    raw.replace('\0', "")
+}
+
 /// `%text%` for `ILIKE`, with `text`'s own wildcards escaped, or `None` for
 /// an empty search.
 fn contains(text: &str) -> Option<String> {
+    let text = search_text(text);
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -28,6 +37,15 @@ fn contains(text: &str) -> Option<String> {
 fn tin_digits(text: &str) -> Option<String> {
     let digits: String = text.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() { None } else { Some(format!("%{digits}%")) }
+}
+
+/// The tabs of a user page (`?tab=`), the first the one shown without one.
+pub const USER_TABS: [&str; 4] = ["account", "tins", "sign", "history"];
+
+/// `raw` as one of [`USER_TABS`], or `account` for anything else: the
+/// page's `?tab=` and the tab an action on the page goes back to.
+pub fn user_tab(raw: &str) -> &'static str {
+    USER_TABS.into_iter().find(|tab| *tab == raw).unwrap_or(USER_TABS[0])
 }
 
 /// The tabs of the claims queue.
@@ -104,8 +122,6 @@ impl QueueFilter {
         }
     }
 
-    /// Open claims oldest first, so nobody waits longest; decided ones
-    /// newest first.
     /// Whether the tab holds paused TINs, not paused ones, or either.
     fn paused(self) -> Option<bool> {
         match self {
@@ -118,6 +134,13 @@ impl QueueFilter {
     /// Whether the tab holds only automatic activations nobody confirmed.
     fn unconfirmed_auto(self) -> Option<bool> {
         (self == Self::Auto).then_some(true)
+    }
+
+    /// Open claims oldest first, so nobody waits longest, and so are
+    /// automatic activations waiting for a person (oldest activation first:
+    /// Buwiz pauses the ones left too long); decided ones newest first.
+    pub fn oldest_first(self) -> bool {
+        matches!(self, Self::Waiting | Self::SentBack | Self::Auto)
     }
 
     fn order(self) -> &'static str {
@@ -185,23 +208,233 @@ pub async fn queue(db: &PgPool, filter: QueueFilter, search: &str) -> sqlx::Resu
     .await
 }
 
-/// TINs activated automatically that no person has confirmed yet, for the
-/// tab's count.
-pub async fn unconfirmed_auto(db: &PgPool) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL")
-        .fetch_one(db)
-        .await
+/// The staff sidebar's live counts. Each is the length of a list every
+/// staff member can already open: the Waiting, Sent back and Activated
+/// automatically tabs, and the Everyone, Staff, Test accounts and Banned
+/// filters of the users list (without its row limit). The queue's tabs
+/// show the same three claim counts, from the same read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct Counts {
+    pub waiting: i64,
+    pub sent_back: i64,
+    /// TINs activated automatically that no person has confirmed yet.
+    pub auto: i64,
+    pub users: i64,
+    pub staff: i64,
+    pub test: i64,
+    pub banned: i64,
 }
 
-/// Claims waiting for review and claims sent back, for the tab counts.
-pub async fn open_counts(db: &PgPool) -> sqlx::Result<(i64, i64)> {
-    sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE status = 'pending'), count(*) FILTER (WHERE status = 'needs_fix')
-         FROM tin_claims WHERE status IN ('pending', 'needs_fix')",
-    )
+/// [`Counts`], in one round trip. `admin_emails` is `ADMIN_EMAILS`, whose
+/// people count as staff as in [`users`]. Small tables, counted whole: no
+/// index serves a status count, and none is needed at this size.
+pub async fn counts(db: &PgPool, admin_emails: &[String]) -> sqlx::Result<Counts> {
+    sqlx::query_as(&format!(
+        "SELECT
+             (SELECT count(*) FROM tin_claims WHERE status = 'pending') AS waiting,
+             (SELECT count(*) FROM tin_claims WHERE status = 'needs_fix') AS sent_back,
+             (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) AS auto,
+             (SELECT count(*) FROM accounts) AS users,
+             (SELECT count(*) FROM accounts a WHERE {staff}) AS staff,
+             (SELECT count(*) FROM accounts WHERE test_account) AS test,
+             (SELECT count(*) FROM accounts WHERE banned_at IS NOT NULL) AS banned",
+        staff = crate::account::roles::is_staff_sql("a", "$1")
+    ))
+    .bind(admin_emails)
     .fetch_one(db)
     .await
 }
+
+/// The Overview's numbers. Test TINs (`000-000-000`) are left out of the
+/// active TINs: they are made up and never send.
+#[derive(Clone, Copy, Debug, sqlx::FromRow)]
+pub struct Overview {
+    pub waiting: i64,
+    /// When the claim waiting longest started waiting.
+    pub oldest_waiting: Option<OffsetDateTime>,
+    /// Active and not paused.
+    pub active: i64,
+    /// Of those, activated in the last seven days.
+    pub active_week: i64,
+    /// Approved real TINs whose sending is paused: by a staff member, or by
+    /// Buwiz itself (an automatic activation nobody confirmed in time,
+    /// `paused_by` empty). They cannot send.
+    pub paused: i64,
+    /// Approved test TINs, paused or not: made up, never counted as active.
+    pub test: i64,
+    pub accounts: i64,
+    pub accounts_week: i64,
+    /// TINs activated automatically that no person has confirmed yet.
+    pub auto: i64,
+}
+
+pub async fn overview(db: &PgPool) -> sqlx::Result<Overview> {
+    sqlx::query_as(&format!(
+        "SELECT
+             (SELECT count(*) FROM tin_claims WHERE status = 'pending') AS waiting,
+             (SELECT min(coalesce(resent_at, submitted_at, created_at)) FROM tin_claims WHERE status = 'pending')
+                 AS oldest_waiting,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NULL
+                 AND tin_root <> '{test}') AS active,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NULL
+                 AND tin_root <> '{test}' AND decided_at > now() - interval '7 days') AS active_week,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NOT NULL
+                 AND tin_root <> '{test}') AS paused,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND tin_root = '{test}') AS test,
+             (SELECT count(*) FROM accounts) AS accounts,
+             (SELECT count(*) FROM accounts WHERE created_at > now() - interval '7 days') AS accounts_week,
+             (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) AS auto",
+        test = crate::account::tin::TEST_ROOT
+    ))
+    .fetch_one(db)
+    .await
+}
+
+/// Returns sent to the BIR since `since` (the start of today, Philippine
+/// time), per hour from then: (hours after `since`, count). Counts only.
+pub async fn sent_since(db: &PgPool, since: OffsetDateTime) -> sqlx::Result<Vec<(i32, i64)>> {
+    sqlx::query_as(
+        "SELECT floor(extract(epoch FROM sent_at - $1) / 3600)::int AS hour, count(*)
+         FROM submissions WHERE status = 'sent' AND sent_at >= $1
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(since)
+    .fetch_all(db)
+    .await
+}
+
+/// The returns tile's other numbers; counts only, never a TIN or a name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct ReturnsTile {
+    /// Sent (`status = 'sent'`) at or after the start of the week.
+    pub sent_week: i64,
+    /// `failed`, last touched today.
+    pub failed: i64,
+    /// `ready` (queued), `sending` or `unknown`, last touched today.
+    pub waiting: i64,
+}
+
+/// [`ReturnsTile`] in one pass. `today` and `week` are the starts of today
+/// and of the 7-day window that ends with today, Philippine time. A return
+/// that was sent counts by `sent_at`; failed and waiting ones have no
+/// outcome time, so they count by their last attempt (`sending_since`), or
+/// by `created_at` when none was made. `dry_run` and `expired` rows are
+/// neither sent nor failed nor waiting. No index serves this (the table
+/// holds a few rows per sending account per period), so it scans once.
+pub async fn returns_tile(db: &PgPool, today: OffsetDateTime, week: OffsetDateTime) -> sqlx::Result<ReturnsTile> {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status = 'sent' AND sent_at >= $2) AS sent_week,
+                count(*) FILTER (WHERE status = 'failed' AND coalesce(sending_since, created_at) >= $1) AS failed,
+                count(*) FILTER (WHERE status IN ('ready', 'sending', 'unknown')
+                                 AND coalesce(sending_since, created_at) >= $1) AS waiting
+         FROM submissions
+         WHERE sent_at >= $2 OR coalesce(sending_since, created_at) >= $1",
+    )
+    .bind(today)
+    .bind(week)
+    .fetch_one(db)
+    .await
+}
+
+/// The claims waiting longest, oldest first, as the Waiting tab orders them.
+pub async fn waiting_longest(db: &PgPool, limit: i64) -> sqlx::Result<Vec<ClaimRow>> {
+    sqlx::query_as(&format!(
+        "SELECT {CLAIM_COLUMNS} FROM tin_claims c JOIN accounts a ON a.id = c.account_id
+         WHERE c.status = 'pending'
+         ORDER BY coalesce(c.resent_at, c.submitted_at, c.created_at), c.id
+         LIMIT $1"
+    ))
+    .bind(limit)
+    .fetch_all(db)
+    .await
+}
+
+/// A line of the Overview's recent staff activity: what a staff member (or
+/// the seed tool) did, to whom, and when. It carries no reason; the account's
+/// history has those.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct Activity {
+    /// `claim` (a `claim_audit` line) or `account` (an `account_audit` one).
+    pub kind: String,
+    pub action: String,
+    /// The masked TIN of a claim line.
+    pub tin_masked: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub account_id: Uuid,
+    /// The account acted on; `None` once it is gone.
+    pub account_email: Option<String>,
+    pub actor_email: String,
+    /// `web` or `seed`.
+    pub source: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// The newest staff actions on claims and accounts, newest first: lines
+/// written from the staff pages or the seed tool, not Buwiz's own, and
+/// not what people did to their own claims (a staff member acting on
+/// their own TIN as staff still counts). Admins only read it (the
+/// Overview).
+///
+/// Bounded: each audit table gives its newest `limit` lines by
+/// `created_at` alone, the two are merged and cut to `limit`, and only
+/// those lines are joined to their accounts. Without an index on
+/// `created_at` each table is still read once, keeping just the top
+/// `limit` while it sorts (no migration here); if the tables grow, the
+/// index that serves it is `claim_audit (created_at DESC) WHERE source IN
+/// ('web', 'seed')` and `account_audit (created_at DESC)`, after which
+/// each part reads about `limit` rows.
+pub async fn recent_activity(db: &PgPool, limit: i64) -> sqlx::Result<Vec<Activity>> {
+    sqlx::query_as(
+        "SELECT feed.kind, feed.action, feed.tin_masked, feed.old_value, feed.new_value, feed.account_id,
+                a.email AS account_email, feed.actor_email, feed.source, feed.created_at
+         FROM (
+             (SELECT 'claim' AS kind, l.action, l.tin_masked, NULL::text AS old_value, NULL::text AS new_value,
+                     l.account_id, l.actor_email, l.source, l.created_at
+              FROM claim_audit l
+              WHERE l.source IN ('web', 'seed')
+                AND (l.actor_id <> l.account_id
+                     OR l.action IN ('approved', 'rejected', 'sent_back', 'activated', 'paused', 'resumed', 'revoked',
+                                     'auto_confirmed'))
+              ORDER BY l.created_at DESC LIMIT $1)
+             UNION ALL
+             (SELECT 'account', l.action, NULL, l.old_value, l.new_value, l.account_id, l.actor_email, l.source,
+                     l.created_at
+              FROM account_audit l
+              ORDER BY l.created_at DESC LIMIT $1)
+             ORDER BY created_at DESC LIMIT $1
+         ) feed
+         LEFT JOIN accounts a ON a.id = feed.account_id
+         ORDER BY feed.created_at DESC",
+    )
+    .bind(limit)
+    .fetch_all(db)
+    .await
+}
+
+/// Claims in any state that match a search, newest first, by the queue's
+/// rules: the claimant's email, the registered or trade name, or the TIN's
+/// digits. Nothing for an empty search.
+pub async fn search_claims(db: &PgPool, search: &str) -> sqlx::Result<Vec<ClaimRow>> {
+    let Some(pattern) = contains(search) else {
+        return Ok(Vec::new());
+    };
+    sqlx::query_as(&format!(
+        "SELECT {CLAIM_COLUMNS} FROM tin_claims c JOIN accounts a ON a.id = c.account_id
+         WHERE a.email ILIKE $1 OR c.registered_name ILIKE $1 OR c.trade_name ILIKE $1
+               OR ($2::text IS NOT NULL AND c.tin_root || c.branch_code LIKE $2)
+         ORDER BY c.created_at DESC, c.id
+         LIMIT $3"
+    ))
+    .bind(pattern)
+    .bind(tin_digits(search))
+    .bind(SEARCH_LIMIT)
+    .fetch_all(db)
+    .await
+}
+
+/// Rows each part of a search-everything shows at most.
+pub const SEARCH_LIMIT: i64 = 50;
 
 /// The claims waiting just before and just after this one in the queue.
 pub async fn neighbours(db: &PgPool, claim: &ClaimRow) -> sqlx::Result<(Option<Uuid>, Option<Uuid>)> {
@@ -533,6 +766,11 @@ mod tests {
         assert_eq!(contains("100%_a\\b").as_deref(), Some("%100\\%\\_a\\\\b%"));
         assert_eq!(tin_digits("123-456").as_deref(), Some("%123456%"));
         assert_eq!(tin_digits("ana"), None);
+        // NUL is dropped, never sent to Postgres.
+        assert_eq!(contains("a\0b").as_deref(), Some("%ab%"));
+        assert_eq!(contains("\0"), None);
+        assert_eq!(tin_digits("12\u{0}3").as_deref(), Some("%123%"));
+        assert_eq!(search_text("a\0b\0"), "ab");
     }
 
     #[test]
@@ -550,5 +788,24 @@ mod tests {
         assert_eq!(QueueFilter::parse(Some("sent_back")), QueueFilter::SentBack);
         assert_eq!(QueueFilter::parse(Some("<x>")), QueueFilter::Waiting);
         assert_eq!(UserFilter::parse(None), UserFilter::Everyone);
+    }
+
+    #[test]
+    fn only_known_user_tabs_are_kept() {
+        assert_eq!(user_tab("tins"), "tins");
+        assert_eq!(user_tab("history"), "history");
+        for raw in ["", "Tins", "tins ", "<b>", "account"] {
+            assert_eq!(user_tab(raw), "account", "{raw}");
+        }
+    }
+
+    #[test]
+    fn open_and_automatic_lists_run_oldest_first() {
+        for filter in QueueFilter::ALL {
+            let oldest = matches!(filter, QueueFilter::Waiting | QueueFilter::SentBack | QueueFilter::Auto);
+            assert_eq!(filter.oldest_first(), oldest, "{filter:?}");
+            // The label and the SQL agree.
+            assert_eq!(!filter.order().contains("DESC"), oldest, "{filter:?}");
+        }
     }
 }

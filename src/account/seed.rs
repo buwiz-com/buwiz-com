@@ -23,9 +23,9 @@
 //! - an active TIN without a reason, or on a banned account;
 //! - an active TIN another account owns, unless `move_from` names that
 //!   account; `move_from` naming an account with nothing to move, or one
-//!   whose row is paused (resume or revoke it on /staff first);
+//!   whose row is paused (resume or revoke it on /staff/queue first);
 //! - a TIN whose papers are waiting for review on the login (decide it on
-//!   /staff);
+//!   /staff/queue);
 //! - a TIN this login ended on the website or an earlier run moved away,
 //!   or an active one ever paused, without `reapply = true`;
 //! - `--as` that is not an Admin (on a server without `ADMIN_EMAILS` and a
@@ -876,7 +876,7 @@ impl Seed<'_> {
             && admin::holds_test_tins(&mut self.tx, id).await?
         {
             self.problems.push(format!(
-                "login {email}: it holds a test TIN, so the test label stays; revoke it on /staff first"
+                "login {email}: it holds a test TIN, so the test label stays; revoke it on /staff/queue first"
             ));
         } else if let Some(test) = login.test
             && test != stored_test
@@ -1110,7 +1110,7 @@ impl Seed<'_> {
                 }
                 "pending" | "needs_fix" => {
                     self.problems.push(format!(
-                        "TIN {shown} on {email}: its papers are waiting for review; decide it on /staff"
+                        "TIN {shown} on {email}: its papers are waiting for review; decide it on /staff/queue"
                     ));
                     return Ok(());
                 }

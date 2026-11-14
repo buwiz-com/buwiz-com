@@ -112,8 +112,8 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
         "{history}"
     );
     assert!(!history.contains("The person activated"), "{history}");
-    let queue = text(site.get("/staff?status=approved", &staff).await).await;
-    assert!(queue.contains("Activated by its owner, an admin"), "{queue}");
+    let queue = text(site.get("/staff/queue?status=approved", &staff).await).await;
+    assert!(list_part(&queue).contains("Activated by its owner, an admin"), "{queue}");
     let review = text(site.get(&format!("/staff/claims/{claim}"), &staff).await).await;
     assert!(review.contains("Activated by its owner, an admin"), "{review}");
     let own = text(site.get(&format!("/staff/users/{boss}"), &boss_cookie).await).await;
@@ -136,7 +136,7 @@ async fn an_admin_activates_their_own_tin_without_papers(db: PgPool) {
     assert_eq!(location(&response), format!("/staff/claims/{papers}?notice=own_needs_reason"));
     let response =
         site.post(&format!("/staff/claims/{papers}/decision"), &boss_cookie, "decision=approve&note=Mine").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
     let history = text(site.get(&format!("/staff/users/{boss}"), &staff).await).await;
     assert!(
         history.contains("Staff boss@example.test approved their own claim on ***-***-454-00000: Mine"),
@@ -230,5 +230,5 @@ async fn activation_is_refused_for_a_tin_owned_elsewhere_and_for_a_banned_accoun
     );
     // Rejecting stays possible.
     let response = site.post(&format!("/staff/claims/{pending}/decision"), &staff, "decision=reject&note=No").await;
-    assert_eq!(location(&response), "/staff?notice=claim_decided");
+    assert_eq!(location(&response), "/staff/queue?notice=claim_decided");
 }

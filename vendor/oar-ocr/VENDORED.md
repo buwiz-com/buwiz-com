@@ -11,7 +11,8 @@ is unchanged in zip 9.
   `5efb1b5c83d5e18cf0082b4222b420b3c193694bbd2d27e78fbad5ee29ab517d`
   (the checksum Cargo.lock had for the registry package).
 - Differences from the published crate: `zip` requirement `8.6` -> `9.0.5` in
-  `Cargo.toml` and `Cargo.toml.orig`; `.cargo_vcs_info.json` dropped; the
+  `Cargo.toml` and `Cargo.toml.orig`; `.cargo_vcs_info.json` and upstream's
+  `.github/` (CI and Dependabot config, inert here) dropped; the
   published `Cargo.lock` is not committed (the crate's own `.gitignore` ignores
   it, and cargo ignores it for a dependency).
 

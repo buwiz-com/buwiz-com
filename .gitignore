@@ -21,3 +21,7 @@ e2e/Cargo.lock
 /tests/fixtures/iaf/
 # The private repository's git directory (docs/relay.md).
 /.stow/
+
+# Vendored crates are committed (vendor/oar-ocr/VENDORED.md), even where a
+# global gitignore ignores vendor/.
+!/vendor/

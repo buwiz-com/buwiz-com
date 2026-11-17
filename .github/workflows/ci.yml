@@ -3,6 +3,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly, so main's caches (the OCR models above all) don't expire in a
+  # quiet week: GitHub evicts a cache after 7 days without use.
+  schedule:
+    - cron: "17 3 * * 1"
 
 jobs:
   check:
@@ -32,10 +36,50 @@ jobs:
       # Cargo.toml declares but this repository does not have.
       - run: git ls-files -z -- '*.rs' ':!:bot-site/' ':!:e2e/' ':!:vendor/' | xargs -0 rustfmt --check --edition 2024
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # The OCR build: compiles oar-ocr (vendor/oar-ocr, patched to zip 9) and
-      # ONNX Runtime. Its tests need the models (scripts/ocr-models.sh).
-      - run: cargo clippy --all-targets --locked --features ocr -- -D warnings
       - run: cargo test --locked
+
+  # The OCR build and its tests (tests/ocr.rs): oar-ocr (vendor/oar-ocr,
+  # patched to zip 9), ONNX Runtime and the PaddleOCR models.
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Two of the OCR tests are #[sqlx::test]s, which make a database each.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: buwiz_cloud
+          POSTGRES_PASSWORD: buwiz_cloud
+          POSTGRES_DB: buwiz_cloud
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://buwiz_cloud:buwiz_cloud@localhost:5432/buwiz_cloud
+      # Where ort-sys's build script downloads ONNX Runtime. The script links
+      # from this directory and reruns only when its env vars change, so it is
+      # cached in the same entry as target/ (below): a restored target/ without
+      # it would fail to link.
+      ORT_CACHE_DIR: ${{ github.workspace }}/../ort-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: ${{ env.ORT_CACHE_DIR }}
+      - run: cargo clippy --all-targets --locked --features ocr -- -D warnings
+      # ./ocr-models is OCR_MODEL_DIR's default. The script runs after every
+      # restore: it re-checks each file's SHA-256 and downloads only what is
+      # missing or wrong, so a partial (restore-keys) hit is safe.
+      - uses: actions/cache@v4
+        with:
+          path: ocr-models
+          key: ocr-models-${{ hashFiles('scripts/ocr-models.sh') }}
+          restore-keys: ocr-models-
+      - run: scripts/ocr-models.sh
+      - run: cargo test --locked --features ocr --test ocr
 
   # The Buwiz Bot site (bot-site/), a crate of its own built for wasm. Its
   # dist/ is committed (bot-site/build.sh) and checked by the server's tests.

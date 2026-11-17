@@ -30,7 +30,7 @@ echo "$models" | while read -r name commit sum; do
   if [ -f "$target" ] && [ "$(sha256 "$target")" = "$sum" ]; then
     continue
   fi
-  curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$target.part" \
+  curl -fsSL --retry 3 --connect-timeout 20 --max-time 120 -o "$target.part" \
     "https://www.modelscope.cn/api/v1/models/greatv/oar-ocr/repo?Revision=$commit&FilePath=$name"
   if [ "$(sha256 "$target.part")" != "$sum" ]; then
     rm -f "$target.part"

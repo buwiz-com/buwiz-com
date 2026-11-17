@@ -55,11 +55,12 @@ jobs:
         options: --health-cmd pg_isready --health-interval 5s --health-retries 10
     env:
       DATABASE_URL: postgres://buwiz_cloud:buwiz_cloud@localhost:5432/buwiz_cloud
-      # Where ort-sys's build script downloads ONNX Runtime. The script links
-      # from this directory and reruns only when its env vars change, so it is
-      # cached in the same entry as target/ (below): a restored target/ without
-      # it would fail to link.
-      ORT_CACHE_DIR: ${{ github.workspace }}/../ort-cache
+      # Where ort-sys's build script downloads ONNX Runtime. Its link-search
+      # path points here, and a restored target/ doesn't rerun the script, so
+      # this directory is cached in the same entry as target/ (below) and is
+      # part of that cache's key: the script doesn't rerun when this changes.
+      # rust-cache needs an absolute path without `..`.
+      ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,6 +69,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ort-${{ hashFiles('.github/workflows/ci.yml') }}
           cache-directories: ${{ env.ORT_CACHE_DIR }}
       - run: cargo clippy --all-targets --locked --features ocr -- -D warnings
       # ./ocr-models is OCR_MODEL_DIR's default. The script runs after every

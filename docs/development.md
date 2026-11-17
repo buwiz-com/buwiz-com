@@ -34,8 +34,9 @@ and `src/base/config.rs`.
   - The models are 13 MB, Apache-2.0, and are not in git. `scripts/ocr-models.sh` fetches them, pinned and checked, into `ocr-models/`. `OCR_MODEL_DIR` points somewhere else.
   - Without the feature, every reading ends "OCR not built in".
 
-The `Dockerfile` builds with `--features bir,ocr`. CI builds, lints and
-tests without them.
+The `Dockerfile` builds with `--features bir,ocr`. CI's `check` job builds,
+lints and tests without them; its `ocr` job lints with `--features ocr` and
+runs `tests/ocr.rs` with the models. No CI job builds `bir`.
 
 ## Tests
 

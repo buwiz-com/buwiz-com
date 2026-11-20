@@ -271,6 +271,11 @@ The desktop app and the mini apps use the OAuth device flow (RFC 8628):
 `/oauth/device/code` and `/oauth/token`. Refresh tokens rotate, and reusing
 an old one ends the whole sign-in.
 
+The person approves on `/device` by typing the code the app shows. No link
+fills it in: `verification_uri_complete` is the plain `/device` address, and
+a `user_code` in the page's link is ignored. So a sign-in someone else
+started cannot be approved with one click from a link they sent.
+
 The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 
 | Client | Scope |

@@ -96,13 +96,16 @@ pub async fn device_start(
     .bind(OffsetDateTime::now_utc() + DEVICE_TTL)
     .execute(&state.db)
     .await?;
-    let origin = &state.config.account_origin;
-    let query: String = form_urlencoded::Serializer::new(String::new()).append_pair("user_code", &user_code).finish();
+    // No link carries the code: the person types the one the app shows,
+    // so a link sent by someone else cannot be approved with one click.
+    // `verification_uri_complete` stays, without the code, for clients
+    // that expect it.
+    let verification_uri = format!("{}/device", state.config.account_origin);
     Ok(Json(json!({
         "device_code": device_code,
         "user_code": user_code,
-        "verification_uri": format!("{origin}/device"),
-        "verification_uri_complete": format!("{origin}/device?{query}"),
+        "verification_uri": verification_uri,
+        "verification_uri_complete": verification_uri,
         "expires_in": DEVICE_TTL.whole_seconds(),
         "interval": DEVICE_INTERVAL,
     })))
@@ -262,17 +265,6 @@ pub(crate) async fn banned_now(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, a
         .fetch_optional(&mut **tx)
         .await?;
     Ok(banned.unwrap_or(true))
-}
-
-/// The app asking to sign in, if `user_code` is still open.
-pub async fn pending_device(db: &PgPool, user_code: &str) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar(
-        "SELECT client_id FROM device_authorizations
-         WHERE user_code = $1 AND decision IS NULL AND consumed_at IS NULL AND expires_at > now()",
-    )
-    .bind(user_code)
-    .fetch_optional(db)
-    .await
 }
 
 /// What a token may do. The Buwiz apps get `app`; AI agents get `mcp`,

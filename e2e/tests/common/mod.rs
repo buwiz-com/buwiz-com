@@ -387,7 +387,7 @@ impl Harness {
         let store = SharedStore::default();
         let submission = Submission::with(config, Box::new(store.clone()));
         let code = submission.start_sign_in().await.expect("device flow starts");
-        assert!(code.verification_uri_complete.contains(&code.user_code));
+        assert!(!code.verification_uri_complete.contains(&code.user_code));
         assert!(
             buwiz_cloud::oauth::decide_device(&self.db, &code.user_code, self.account_id, true).await.unwrap(),
             "approved"

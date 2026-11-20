@@ -800,8 +800,7 @@ async fn device_decision(
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
-    let back_to = link("/device", None, &[("user_code", &form.user_code)]);
-    let account = match require_session(&state, &headers, &back_to).await {
+    let account = match require_session(&state, &headers, "/device").await {
         Ok(account) => account,
         Err(redirect) => return redirect,
     };

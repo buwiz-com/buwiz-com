@@ -584,18 +584,9 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
     let shown = notice(cx);
     // A finished decision shows only its notice, and needs no session.
     let finished = matches!(shown, Some(Notice::DeviceApproved | Notice::DeviceDenied));
-    let raw_code = query(cx, "user_code").unwrap_or_default();
-    let mut request = None;
-    let mut email = String::new();
-    if !finished {
-        email = signed_in(cx).await?.email;
-        if let Some(code) = oauth::normalize_user_code(&raw_code)
-            && let Some(client) = oauth::pending_device(&state(cx).db, &code).await?
-        {
-            request = oauth::client_name(&client).map(|name| (code, name));
-        }
-    }
-    let bad_code = !finished && request.is_none() && !raw_code.is_empty();
+    // A code in the link is never used: someone else can send that link.
+    // Only a code typed here, from the app, can be approved.
+    let email = if finished { String::new() } else { signed_in(cx).await?.email };
     Ok(view! {
         <main class="home auth">
             <section class="auth-card">
@@ -603,24 +594,9 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
                 <span class="auth-badge">icon(name: "devices")</span>
                 <h1>"Sign in to the app"</h1>
                 auth_notice(notice: shown)
-                if bad_code {
-                    auth_notice(notice: Some(Notice::DeviceInvalid))
-                }
-                if finished {
-                } else if let Some((code, name)) = request {
-                    <p class="auth-lead">"Check that this code matches the one shown in " <strong>(name)</strong> ":"</p>
-                    <p class="auth-device-code">(code.clone())</p>
-                    <p class="auth-hint">icon(name: "shield_person") "Approve only if you started this sign-in yourself. The app will act as " (email) "."</p>
+                if !finished {
+                    <p class="auth-lead">"Type the code the Buwiz app shows you."</p>
                     <form class="auth-form" method="post" action="/device/decision">
-                        <input type="hidden" name="user_code" value=(code)>
-                        <div class="auth-actions">
-                            <button class="btn btn-solid" type="submit" name="decision" value="approve">icon(name: "check") "Approve"</button>
-                            <button class="btn btn-ghost" type="submit" name="decision" value="deny">"Decline"</button>
-                        </div>
-                    </form>
-                } else {
-                    <p class="auth-lead">"Enter the code the Buwiz app shows you."</p>
-                    <form class="auth-form" method="get" action="/device">
                         <label class="auth-label" for="user_code">"Code shown in the app"</label>
                         <input
                             id="user_code"
@@ -632,7 +608,11 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
                             required=(true)
                             autofocus=(true)
                         >
-                        <button class="btn btn-solid auth-submit" type="submit">"Continue" icon(name: "arrow_forward")</button>
+                        <p class="auth-hint">icon(name: "shield_person") "Approve only if you started this sign-in yourself, in the app on your own device. Never type a code someone sent you. The app will act as " (email) "."</p>
+                        <div class="auth-actions">
+                            <button class="btn btn-solid" type="submit" name="decision" value="approve">icon(name: "check") "Approve"</button>
+                            <button class="btn btn-ghost" type="submit" name="decision" value="deny">"Decline"</button>
+                        </div>
                     </form>
                 }
             </section>

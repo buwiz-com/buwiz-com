@@ -506,9 +506,18 @@ pub(crate) fn same_origin(state: &AppState, headers: &HeaderMap) -> Result<(), R
 }
 
 /// Only paths on this site, so `next` cannot send people elsewhere.
+/// Printable ASCII only: browsers drop tabs and newlines from a
+/// `Location`, which would turn `/\t/evil.example` into `//evil.example`.
 pub fn safe_next(raw: Option<&str>) -> String {
     match raw {
-        Some(next) if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') => next.to_owned(),
+        Some(next)
+            if next.bytes().all(|byte| byte.is_ascii_graphic())
+                && next.starts_with('/')
+                && !next.starts_with("//")
+                && !next.contains('\\') =>
+        {
+            next.to_owned()
+        }
         _ => "/tins".to_owned(),
     }
 }
@@ -1566,6 +1575,14 @@ mod tests {
         assert_eq!(safe_next(Some("https://evil.example")), "/tins");
         assert_eq!(safe_next(Some("/\\evil.example")), "/tins");
         assert_eq!(safe_next(None), "/tins");
+        for sneaky in
+            ["/\t/evil.example", "/\n/evil.example", "/\r/evil.example", "/ /evil.example", "/\u{7f}/evil.example"]
+        {
+            assert_eq!(safe_next(Some(sneaky)), "/tins", "{sneaky:?}");
+        }
+        let decoded = form_urlencoded::parse(b"next=%2F%09%2Fevil.example").next().unwrap().1;
+        assert_eq!(safe_next(Some(&decoded)), "/tins");
+        assert_eq!(safe_next(Some("/tins/new?tin=000123491&branch=00000")), "/tins/new?tin=000123491&branch=00000");
     }
 
     #[test]

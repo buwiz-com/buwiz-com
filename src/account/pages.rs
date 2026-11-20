@@ -669,19 +669,27 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
     .filter_map(|name| params.get(*name).map(|value| ((*name).to_owned(), value.clone())))
     .collect();
     let email = signed_in(cx).await?.email;
+    let redirect_origin =
+        request.as_ref().map(|request| agents::redirect_origin(&request.redirect_uri)).unwrap_or_default();
     Ok(view! {
         <main class="home auth">
             if let Some(request) = request {
                 <section class="auth-card consent">
                     <div class="consent-pair" aria-hidden="true">
-                        <span class="consent-app">(request.client_name.chars().next().map(|first| first.to_uppercase().to_string()).unwrap_or_default())</span>
+                        <span class="consent-app">icon(name: "smart_toy")</span>
                         icon(name: "sync_alt")
                         <span class="consent-buwiz">
                             brand_mark(height: 32)
                         </span>
                     </div>
-                    <h1>(request.client_name.clone()) " wants to read your Buwiz account"</h1>
+                    <p class="consent-unverified">icon(name: "error") "Unverified app"</p>
+                    <h1>"An app calling itself " <q>(request.client_name.clone())</q> " wants to read your Buwiz account"</h1>
                     <p class="consent-who">"Signed in as " <strong>(email)</strong></p>
+                    <div class="consent-origin">
+                        <p>"Buwiz has not checked who made this app. Any app can choose its name, so judge it by where it sends you:"</p>
+                        <p class="consent-origin-url"><strong>(redirect_origin.clone())</strong></p>
+                        <p>"Allow only if you started this connection yourself and you know this address."</p>
+                    </div>
                     <div class="consent-lists">
                         <div class="consent-can">
                             <p class="consent-head">icon(name: "visibility") "It can see"</p>
@@ -710,7 +718,7 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
                             <button class="btn btn-solid" type="submit" name="decision" value="approve">"Allow"</button>
                         </div>
                     </form>
-                    <p class="consent-back">"After you answer, you go back to " <strong>(agents::redirect_host(&request.redirect_uri))</strong></p>
+                    <p class="consent-back">"After you answer, you go back to " <strong>(redirect_origin)</strong></p>
                 </section>
             } else {
                 <section class="auth-card">

@@ -245,12 +245,18 @@ pub async fn check_authorize(
     })
 }
 
-/// Where a redirect URI leads, for the consent page: its host, or its
-/// scheme for an app.
-pub fn redirect_host(redirect_uri: &str) -> String {
-    match Url::parse(redirect_uri) {
-        Ok(url) => url.host_str().map_or_else(|| format!("the {} app", url.scheme()), str::to_owned),
-        Err(_) => redirect_uri.to_owned(),
+/// Where a redirect URI leads, for the consent page: its full origin
+/// (scheme, host and any port), or the scheme and host of an app link.
+/// Registration checks neither the client's name nor its redirect, so this
+/// is the one thing the person can judge the app by.
+pub fn redirect_origin(redirect_uri: &str) -> String {
+    let Ok(url) = Url::parse(redirect_uri) else {
+        return redirect_uri.to_owned();
+    };
+    match (url.scheme(), url.host_str()) {
+        ("https" | "http", Some(_)) => url.origin().ascii_serialization(),
+        (scheme, Some(host)) if !host.is_empty() => format!("{scheme}://{host}"),
+        (scheme, _) => format!("{scheme}:"),
     }
 }
 
@@ -442,6 +448,21 @@ mod tests {
         ] {
             assert!(!redirect_uri_allowed(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn consent_shows_the_full_redirect_origin() {
+        assert_eq!(redirect_origin("https://mallory.example/cb?x=1"), "https://mallory.example");
+        assert_eq!(
+            redirect_origin("https://claude.ai.mallory.example:8443/cb"),
+            "https://claude.ai.mallory.example:8443"
+        );
+        assert_eq!(redirect_origin("http://127.0.0.1:33418/callback"), "http://127.0.0.1:33418");
+        assert_eq!(
+            redirect_origin("cursor://anysphere.cursor-retrieval/oauth/callback"),
+            "cursor://anysphere.cursor-retrieval"
+        );
+        assert_eq!(redirect_origin("com.example.agent:/oauth"), "com.example.agent:");
     }
 
     #[test]

@@ -101,12 +101,17 @@ pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
         }
     }
     let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
-    sqlx::query("INSERT INTO email_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)")
-        .bind(email)
-        .bind(code_hash(email, &code))
-        .bind(OffsetDateTime::now_utc() + CODE_TTL)
-        .execute(&mut *tx)
-        .await?;
+    // Dated when it is added, not when the transaction began: the code
+    // added last (after waiting for the lock) must be the newest, because
+    // only the newest can be redeemed.
+    sqlx::query(
+        "INSERT INTO email_codes (email, code_hash, expires_at, created_at) VALUES ($1, $2, $3, clock_timestamp())",
+    )
+    .bind(email)
+    .bind(code_hash(email, &code))
+    .bind(OffsetDateTime::now_utc() + CODE_TTL)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(code)
 }

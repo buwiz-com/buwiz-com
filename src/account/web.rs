@@ -700,13 +700,16 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Ok(email) => email,
         Err(notice) => return see_other(link("/login", Some(notice), &[("next", &next)])),
     };
-    if let Err(refused) = state.sign_in_guard.check(&headers, form.human.as_deref()).await {
-        let notice = match refused {
-            Refused::NotHuman => Notice::NotHuman,
-            Refused::NetworkTooMany => Notice::CodeNetworkTooMany,
-        };
-        return see_other(link("/login", Some(notice), &[("next", &next), ("email", &email)]));
-    }
+    let counted = match state.sign_in_guard.check(&headers, form.human.as_deref()).await {
+        Ok(counted) => counted,
+        Err(refused) => {
+            let notice = match refused {
+                Refused::NotHuman => Notice::NotHuman,
+                Refused::NetworkTooMany => Notice::CodeNetworkTooMany,
+            };
+            return see_other(link("/login", Some(notice), &[("next", &next), ("email", &email)]));
+        }
+    };
     // For the code page's countdown, in ms. Taken before the code is stored,
     // so it never outlasts the code.
     let expires =
@@ -714,14 +717,14 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
     let code = match accounts::issue_code(&state.db, &email).await {
         Ok(code) => Some(code),
         Err(CodeError::TooMany) => {
-            state.sign_in_guard.forgive(&headers);
+            state.sign_in_guard.forgive(&counted);
             return see_other(link("/login", Some(Notice::CodeTooMany), &[("next", &next), ("email", &email)]));
         }
         // The limit for addresses without an account: nothing is mailed,
         // and the answer is the one a mailed code gets, so the page tells
         // nothing about which addresses have an account.
         Err(CodeError::Busy) => {
-            state.sign_in_guard.forgive(&headers);
+            state.sign_in_guard.forgive(&counted);
             None
         }
         Err(error) => return internal(anyhow::anyhow!(error)),

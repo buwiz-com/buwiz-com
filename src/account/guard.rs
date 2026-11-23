@@ -48,6 +48,15 @@ pub enum Refused {
     NetworkTooMany,
 }
 
+/// A post [`SignInGuard::check`] let through, as it was counted: what
+/// [`SignInGuard::forgive`] takes back.
+#[derive(Debug)]
+pub struct Counted {
+    /// `None` when the post had no address to count.
+    network: Option<Network>,
+    at: OffsetDateTime,
+}
+
 /// Turnstile's answer; its other fields are not used.
 #[derive(Deserialize)]
 struct Verdict {
@@ -71,7 +80,7 @@ impl SignInGuard {
     /// Whether this form post may be mailed a code. `token` is what the
     /// widget put in the form's `cf-turnstile-response` field. The
     /// network's hour is counted only for posts Turnstile let through.
-    pub async fn check(&self, headers: &HeaderMap, token: Option<&str>) -> Result<(), Refused> {
+    pub async fn check(&self, headers: &HeaderMap, token: Option<&str>) -> Result<Counted, Refused> {
         let address = client_ip(headers);
         if let Some(turnstile) = &self.turnstile
             && !self.is_human(turnstile, token.unwrap_or_default(), address).await
@@ -84,22 +93,24 @@ impl SignInGuard {
     }
 
     /// Counts a post from `address` at `now` against its network's hour.
-    fn count(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), Refused> {
+    fn count(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<Counted, Refused> {
         // Without `CF-Connecting-IP` (development, or a tunnel that lost
         // it) there is no network to count, and counting them all as one
         // would let ten posts lock everyone out.
-        match address {
-            Some(address) => self.networks.check(Network::of(address), now).map_err(|_| Refused::NetworkTooMany),
-            None => Ok(()),
+        let network = address.map(Network::of);
+        if let Some(network) = &network {
+            self.networks.check(network.clone(), now).map_err(|_| Refused::NetworkTooMany)?;
         }
+        Ok(Counted { network, at: now })
     }
 
-    /// Gives a network back the post [`Self::check`] counted, when no code
+    /// Gives a network back a post [`Self::check`] counted, when no code
     /// was mailed for it after all (the address had its own limit). Others
-    /// on that network are not held back by posts that sent nothing.
-    pub fn forgive(&self, headers: &HeaderMap) {
-        if let Some(address) = client_ip(headers) {
-            self.networks.release(&Network::of(address));
+    /// on that network are not held back by posts that sent nothing. Once
+    /// the hour it was counted in has ended there is nothing to give back.
+    pub fn forgive(&self, counted: &Counted) {
+        if let Some(network) = &counted.network {
+            self.networks.release(network, counted.at);
         }
     }
 
@@ -150,41 +161,59 @@ mod tests {
         Some(address.parse().unwrap())
     }
 
+    /// Whether a post from `address` at `now` is counted, or why not.
+    fn counted(guard: &SignInGuard, address: &str, now: OffsetDateTime) -> Result<(), Refused> {
+        guard.count(at(address), now).map(|_| ())
+    }
+
     #[test]
     fn a_network_gets_ten_codes_an_hour_whatever_address_it_posts_from() {
         let guard = SignInGuard::new(None);
         let now = OffsetDateTime::now_utc();
         for last in 0..CODES_PER_NETWORK {
-            assert_eq!(guard.count(at(&format!("203.0.113.{last}")), now), Ok(()));
+            assert_eq!(counted(&guard, &format!("203.0.113.{last}"), now), Ok(()));
         }
-        assert_eq!(guard.count(at("203.0.113.200"), now), Err(Refused::NetworkTooMany));
+        assert_eq!(counted(&guard, "203.0.113.200", now), Err(Refused::NetworkTooMany));
         // Another network is not held back by it, and the hour ends.
-        assert_eq!(guard.count(at("198.51.100.7"), now), Ok(()));
-        assert_eq!(guard.count(at("203.0.113.200"), now + NETWORK_WINDOW), Ok(()));
+        assert_eq!(counted(&guard, "198.51.100.7", now), Ok(()));
+        assert_eq!(counted(&guard, "203.0.113.200", now + NETWORK_WINDOW), Ok(()));
     }
 
     #[test]
     fn a_forgiven_post_is_not_counted() {
         let guard = SignInGuard::new(None);
         let now = OffsetDateTime::now_utc();
-        for _ in 0..CODES_PER_NETWORK {
-            assert_eq!(guard.count(at("203.0.113.1"), now), Ok(()));
+        let first = guard.count(at("203.0.113.9"), now).unwrap();
+        for _ in 1..CODES_PER_NETWORK {
+            assert_eq!(counted(&guard, "203.0.113.1", now), Ok(()));
         }
-        assert_eq!(guard.count(at("203.0.113.1"), now), Err(Refused::NetworkTooMany));
-        guard.forgive(&from("203.0.113.9"));
-        assert_eq!(guard.count(at("203.0.113.1"), now), Ok(()));
-        assert_eq!(guard.count(at("203.0.113.1"), now), Err(Refused::NetworkTooMany));
-        // Forgiving a network that has nothing counted changes nothing.
-        guard.forgive(&from("198.51.100.7"));
-        guard.forgive(&HeaderMap::new());
-        assert_eq!(guard.count(at("203.0.113.1"), now), Err(Refused::NetworkTooMany));
+        assert_eq!(counted(&guard, "203.0.113.1", now), Err(Refused::NetworkTooMany));
+        guard.forgive(&first);
+        assert_eq!(counted(&guard, "203.0.113.1", now), Ok(()));
+        assert_eq!(counted(&guard, "203.0.113.1", now), Err(Refused::NetworkTooMany));
+        // A post without an address has nothing to give back.
+        guard.forgive(&guard.count(None, now).unwrap());
+        assert_eq!(counted(&guard, "203.0.113.1", now), Err(Refused::NetworkTooMany));
+    }
+
+    #[test]
+    fn a_post_forgiven_after_its_hour_ended_takes_nothing_from_the_next() {
+        let guard = SignInGuard::new(None);
+        let now = OffsetDateTime::now_utc();
+        let old = guard.count(at("203.0.113.1"), now).unwrap();
+        let next = now + NETWORK_WINDOW;
+        for _ in 0..CODES_PER_NETWORK {
+            assert_eq!(counted(&guard, "203.0.113.1", next), Ok(()));
+        }
+        guard.forgive(&old);
+        assert_eq!(counted(&guard, "203.0.113.1", next), Err(Refused::NetworkTooMany));
     }
 
     #[tokio::test]
     async fn a_post_without_an_address_is_not_counted() {
         let guard = SignInGuard::new(None);
         for _ in 0..CODES_PER_NETWORK * 2 {
-            assert_eq!(guard.check(&HeaderMap::new(), None).await, Ok(()));
+            assert!(guard.check(&HeaderMap::new(), None).await.is_ok());
         }
     }
 
@@ -199,7 +228,7 @@ mod tests {
         }));
         let long = "x".repeat(MAX_TOKEN_LEN + 1);
         for token in [None, Some(""), Some(long.as_str())] {
-            assert_eq!(guard.check(&from("203.0.113.1"), token).await, Err(Refused::NotHuman));
+            assert_eq!(guard.check(&from("203.0.113.1"), token).await.err(), Some(Refused::NotHuman));
         }
         // None of them used up the network's hour.
         assert_eq!(guard.networks.len(), 0);

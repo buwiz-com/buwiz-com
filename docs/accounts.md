@@ -10,6 +10,30 @@ organizations and no workspaces. One account can hold several TINs. Code:
 `src/account/accounts.rs`, `src/account/pages.rs` (the Topcoat pages) and
 `src/account/web.rs` (the form posts).
 
+### Who can be mailed a code
+
+Anyone can type any address into the sign-in form, so a script can use it
+to mail strangers. Four checks come before a code is mailed
+(`src/account/guard.rs`, `issue_code` in `src/account/accounts.rs`):
+
+| Check | Limit | The person sees |
+|---|---|---|
+| Cloudflare Turnstile on the three forms that ask for a code (sign in, sign up, "send a new one") | The form post must carry a token Turnstile accepts. On when `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` are both set | "We could not confirm that you are not a robot." |
+| Per network (an IPv4 /24 or IPv6 /48, from `CF-Connecting-IP`) | 10 codes an hour. Kept in memory, so a restart clears it | "Too many codes were asked for from your network." |
+| Per address | 5 codes an hour | "Too many codes were sent to this address." |
+| All addresses without an account, together | 20 codes an hour and 60 a day | The code page, as if a code was mailed; none is |
+
+An address that has an account is never held back by the last limit, so a
+flood of made-up addresses cannot stop people from signing in. While that
+limit is reached, a new address is answered exactly like one with an
+account, so the page tells nothing about who has one; the server logs a
+warning each time. A post that mails nothing (the last limit, or the
+address's own) is not counted against its network.
+
+The widget shows only when Turnstile wants a click. With Turnstile on,
+signing in needs JavaScript. If Turnstile cannot be reached, no code is
+mailed.
+
 ### Staff roles
 
 A staff role is kept on the account (`accounts.role`,

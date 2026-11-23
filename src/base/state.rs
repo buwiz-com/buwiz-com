@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
+use crate::account::guard::SignInGuard;
 use crate::account::mail::Mailer;
 use crate::account::verify::Verification;
 use crate::base::config::Config;
@@ -25,6 +26,8 @@ pub struct Inner {
     pub config: Config,
     pub db: PgPool,
     pub mailer: Mailer,
+    /// What a request for a sign-in code passes before one is mailed.
+    pub sign_in_guard: SignInGuard,
     pub documents: DocumentStore,
     /// Signs tickets.
     pub ticket_key: SigningKey,
@@ -74,6 +77,7 @@ impl AppState {
         sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
+        let sign_in_guard = SignInGuard::new(config.turnstile.clone());
         let downloads = Downloads::new(&config.downloads_url, downloads::APP, true);
         let bot_downloads = Downloads::new(&config.downloads_url, downloads::BOT_APP, false);
         let stars = Stars::new(&config.github_api_url);
@@ -82,6 +86,7 @@ impl AppState {
             config,
             db,
             mailer,
+            sign_in_guard,
             documents,
             ticket_key,
             sender,

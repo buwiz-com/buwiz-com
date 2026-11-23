@@ -13,6 +13,7 @@ document.documentElement.classList.add("js");
     for (const timer of document.querySelectorAll("[data-expires-at]")) codeTimer(timer);
     for (const form of document.querySelectorAll("form[data-addtin]")) addTin(form);
     for (const button of document.querySelectorAll("button[data-copy]")) copier(button);
+    for (const widget of document.querySelectorAll("form .cf-turnstile")) humanCheck(widget.closest("form"));
 
     // Files chosen in a drop zone: show the name and size, flag big files.
     document.addEventListener("change", (event) => {
@@ -600,6 +601,27 @@ document.documentElement.classList.add("js");
       sync();
     });
     sync();
+  }
+
+  // A form with Turnstile's widget (human_check in pages.rs) is posted once
+  // the widget has put its token in it. A post made sooner (a quick Enter,
+  // an autofill) waits for the token; after half a minute without one it
+  // goes anyway, and the server says what is wrong.
+  function humanCheck(form) {
+    const checked = () => Boolean(form.querySelector('[name="cf-turnstile-response"]')?.value);
+    let wait = 0;
+    form.addEventListener("submit", (event) => {
+      if (checked()) return;
+      event.preventDefault();
+      if (wait) return;
+      const until = Date.now() + 30000;
+      form.setAttribute("aria-busy", "true");
+      wait = setInterval(() => {
+        if (!checked() && Date.now() < until) return;
+        clearInterval(wait);
+        form.submit();
+      }, 200);
+    });
   }
 
   // A Copy button beside text to copy (the Linux install command), shown

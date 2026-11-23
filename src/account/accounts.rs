@@ -10,6 +10,16 @@ use crate::base::crypto;
 
 pub const CODE_TTL: Duration = Duration::minutes(10);
 const CODES_PER_HOUR: i64 = 5;
+/// Codes mailed to addresses without an account, all of them together, in
+/// an hour and in a day. Whoever gets past the form's other checks
+/// ([`crate::account::guard`]) can still mail strangers no more than this;
+/// an address that has an account is never held back by it.
+const NEW_ADDRESS_CODES_PER_HOUR: i64 = 20;
+const NEW_ADDRESS_CODES_PER_DAY: i64 = 60;
+/// The advisory lock that counting and adding a code for an address
+/// without an account are done under, so two posts at once cannot both
+/// take the last place.
+const NEW_ADDRESS_LOCK: i64 = 0x6275_7769_7a01;
 const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);
 
@@ -39,6 +49,10 @@ pub fn normalize_email(raw: &str) -> Result<String, Notice> {
 pub enum CodeError {
     #[error("Too many codes were sent to this address. Try again in an hour.")]
     TooMany,
+    /// The limit for addresses without an account is reached. The person
+    /// is not told: the answer must not differ from an account's.
+    #[error("Too many addresses without an account asked for a code.")]
+    Busy,
     #[error("That code is wrong or has expired. Request a new one.")]
     Invalid,
     #[error(transparent)]
@@ -57,22 +71,48 @@ fn code_hash(email: &str, code: &str) -> Vec<u8> {
 
 /// Creates a 6-digit code for `email` and returns it for mailing.
 pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
+    let mut tx = db.begin().await?;
     let recent: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > now() - interval '1 hour'",
     )
     .bind(email)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await?;
     if recent >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }
-    let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
-    sqlx::query("INSERT INTO email_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)")
+    let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)")
         .bind(email)
-        .bind(code_hash(email, &code))
-        .bind(OffsetDateTime::now_utc() + CODE_TTL)
-        .execute(db)
+        .fetch_one(&mut *tx)
         .await?;
+    if !known {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(NEW_ADDRESS_LOCK).execute(&mut *tx).await?;
+        let (hour, day): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE c.created_at > now() - interval '1 hour'), count(*)
+             FROM email_codes c
+             WHERE c.created_at > now() - interval '1 day'
+               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = c.email)",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if hour >= NEW_ADDRESS_CODES_PER_HOUR || day >= NEW_ADDRESS_CODES_PER_DAY {
+            tracing::warn!(hour, day, "sign-in codes for addresses without an account are at their limit");
+            return Err(CodeError::Busy);
+        }
+    }
+    let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
+    // Dated when it is added, not when the transaction began: the code
+    // added last (after waiting for the lock) must be the newest, because
+    // only the newest can be redeemed.
+    sqlx::query(
+        "INSERT INTO email_codes (email, code_hash, expires_at, created_at) VALUES ($1, $2, $3, clock_timestamp())",
+    )
+    .bind(email)
+    .bind(code_hash(email, &code))
+    .bind(OffsetDateTime::now_utc() + CODE_TTL)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(code)
 }
 

@@ -383,6 +383,22 @@ impl<K: Eq + Hash> RateLimiter<K> {
         verdict
     }
 
+    /// Takes back the hit counted for `key` at `counted`, for a try that
+    /// came to nothing. Once that hit's window has ended nothing is taken
+    /// back: the hits of the window after it are not its own. A key that
+    /// was counted in the overflow bucket gives that one back.
+    pub fn release(&self, key: &K, counted: OffsetDateTime) {
+        let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !hits.since.is_some_and(|since| counted >= since) {
+            return;
+        }
+        let Hits { by_key, overflow, .. } = &mut *hits;
+        match by_key.get_mut(key) {
+            Some(count) => *count = count.saturating_sub(1),
+            None => *overflow = overflow.saturating_sub(1),
+        }
+    }
+
     /// How many keys it holds now.
     pub fn len(&self) -> usize {
         self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).by_key.len()

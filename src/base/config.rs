@@ -27,6 +27,9 @@ pub struct Config {
     /// Accounts allowed to review TIN claims.
     pub admin_emails: Vec<String>,
     pub mail: MailConfig,
+    /// Cloudflare Turnstile on the sign-in forms
+    /// ([`crate::account::guard`]); `None` leaves them without it.
+    pub turnstile: Option<TurnstileConfig>,
     /// The offline-signed relay trust list apps fetch (`TRUST_LIST_JWS`).
     pub trust_list: Option<String>,
     /// Where the app's installers are, e.g. `https://downloads.buwiz.com`
@@ -50,6 +53,20 @@ pub enum MailConfig {
     },
 }
 
+/// A Turnstile widget's keys (`TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`).
+#[derive(Clone, Debug)]
+pub struct TurnstileConfig {
+    /// Public: the sign-in pages carry it.
+    pub site_key: String,
+    pub secret_key: String,
+    /// Where a form post's token is checked: [`TURNSTILE_VERIFY_URL`],
+    /// or a test's own.
+    pub verify_url: String,
+}
+
+/// Cloudflare's endpoint that checks a Turnstile token.
+pub const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let account_origin = origin(&var_or("ACCOUNT_ORIGIN", "http://localhost:3008"))?;
@@ -69,6 +86,27 @@ impl Config {
         if secure_cookies && matches!(mail, MailConfig::Log) {
             bail!("MAIL_TRANSPORT=log would print sign-in codes on a public deployment");
         }
+        let turnstile = match (optional("TURNSTILE_SITE_KEY"), optional("TURNSTILE_SECRET_KEY")) {
+            (Some(site_key), Some(secret_key)) => {
+                Some(TurnstileConfig { site_key, secret_key, verify_url: TURNSTILE_VERIFY_URL.into() })
+            }
+            (None, None) => {
+                if secure_cookies {
+                    tracing::warn!(
+                        "TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY are not set: the sign-in forms have no check against scripts"
+                    );
+                }
+                None
+            }
+            // Not a reason to stay down: a key that went missing would
+            // take the whole site with it. The other limits still apply.
+            _ => {
+                tracing::error!(
+                    "only one of TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY is set: the sign-in forms go without Turnstile until both are"
+                );
+                None
+            }
+        };
         Ok(Self {
             host: var_or("HOST", "127.0.0.1"),
             port: var_or("PORT", "3008").parse().context("PORT")?,
@@ -79,6 +117,7 @@ impl Config {
             document_key: document_key(&required("DOCUMENT_KEY")?)?,
             admin_emails: admin_emails(),
             mail,
+            turnstile,
             trust_list: std::env::var("TRUST_LIST_JWS")
                 .ok()
                 .map(|raw| raw.trim().to_owned())
@@ -104,6 +143,11 @@ impl Config {
 
 fn var_or(name: &str, default: &str) -> String {
     std::env::var(name).ok().filter(|value| !value.is_empty()).unwrap_or_else(|| default.to_owned())
+}
+
+/// A setting that may be left out; surrounding spaces are dropped.
+fn optional(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
 fn required(name: &str) -> anyhow::Result<String> {

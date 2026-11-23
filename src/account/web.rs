@@ -21,6 +21,7 @@ use crate::account::agents;
 use crate::account::claims::{
     self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Papers, Resend, SubmitError, Upload,
 };
+use crate::account::guard::Refused;
 use crate::account::mcp;
 use crate::account::notice::Notice;
 use crate::account::oauth;
@@ -684,6 +685,10 @@ fn internal(error: impl Into<anyhow::Error>) -> Response {
 struct EmailStart {
     email: String,
     next: Option<String>,
+    /// Turnstile's token, when the form has its widget
+    /// ([`crate::account::guard`]).
+    #[serde(rename = "cf-turnstile-response")]
+    human: Option<String>,
 }
 
 async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailStart>) -> Response {
@@ -695,14 +700,24 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Ok(email) => email,
         Err(notice) => return see_other(link("/login", Some(notice), &[("next", &next)])),
     };
+    let now = time::OffsetDateTime::now_utc();
+    if let Err(refused) = state.sign_in_guard.check(&headers, form.human.as_deref(), now).await {
+        let notice = match refused {
+            Refused::NotHuman => Notice::NotHuman,
+            Refused::NetworkTooMany => Notice::CodeNetworkTooMany,
+        };
+        return see_other(link("/login", Some(notice), &[("next", &next), ("email", &email)]));
+    }
     // For the code page's countdown, in ms. Taken before the code is stored,
     // so it never outlasts the code.
-    let expires =
-        ((time::OffsetDateTime::now_utc() + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
+    let expires = ((now + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
     let code = match accounts::issue_code(&state.db, &email).await {
         Ok(code) => code,
         Err(CodeError::TooMany) => {
             return see_other(link("/login", Some(Notice::CodeTooMany), &[("next", &next), ("email", &email)]));
+        }
+        Err(CodeError::Busy) => {
+            return see_other(link("/login", Some(Notice::CodeBusy), &[("next", &next), ("email", &email)]));
         }
         Err(error) => return internal(anyhow::anyhow!(error)),
     };
@@ -735,7 +750,7 @@ async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(fo
     };
     let account = match accounts::redeem_code(&state.db, &email, &form.code).await {
         Ok(account) => account,
-        Err(CodeError::Invalid | CodeError::TooMany) => {
+        Err(CodeError::Invalid | CodeError::TooMany | CodeError::Busy) => {
             let expires = form.expires.unwrap_or_default();
             return see_other(link(
                 "/login/verify",

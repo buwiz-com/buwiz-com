@@ -141,6 +141,7 @@ fn config() -> Config {
         document_key: [7; 32],
         admin_emails: Vec::new(),
         mail: MailConfig::Log,
+        turnstile: None,
         trust_list: None,
         downloads_url: "http://127.0.0.1:9".into(),
         forms_origin: "https://buwiz.com".into(),

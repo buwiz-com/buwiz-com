@@ -10,6 +10,12 @@ use crate::base::crypto;
 
 pub const CODE_TTL: Duration = Duration::minutes(10);
 const CODES_PER_HOUR: i64 = 5;
+/// Codes mailed to addresses without an account, all of them together, in
+/// an hour and in a day. Whoever gets past the form's other checks
+/// ([`crate::account::guard`]) can still mail strangers no more than this;
+/// an address that has an account is never held back by it.
+const NEW_ADDRESS_CODES_PER_HOUR: i64 = 20;
+const NEW_ADDRESS_CODES_PER_DAY: i64 = 60;
 const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);
 
@@ -39,6 +45,8 @@ pub fn normalize_email(raw: &str) -> Result<String, Notice> {
 pub enum CodeError {
     #[error("Too many codes were sent to this address. Try again in an hour.")]
     TooMany,
+    #[error("Too many new addresses asked for a code just now. Try again in an hour.")]
+    Busy,
     #[error("That code is wrong or has expired. Request a new one.")]
     Invalid,
     #[error(transparent)]
@@ -65,6 +73,22 @@ pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
     .await?;
     if recent >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
+    }
+    let known: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)").bind(email).fetch_one(db).await?;
+    if !known {
+        let (hour, day): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE c.created_at > now() - interval '1 hour'), count(*)
+             FROM email_codes c
+             WHERE c.created_at > now() - interval '1 day'
+               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = c.email)",
+        )
+        .fetch_one(db)
+        .await?;
+        if hour >= NEW_ADDRESS_CODES_PER_HOUR || day >= NEW_ADDRESS_CODES_PER_DAY {
+            tracing::warn!(hour, day, "sign-in codes for addresses without an account are at their limit");
+            return Err(CodeError::Busy);
+        }
     }
     let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
     sqlx::query("INSERT INTO email_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)")

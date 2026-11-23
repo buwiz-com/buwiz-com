@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::account::accounts::{self, Account};
 use crate::account::agents::{self, AuthorizeProblem};
 use crate::account::claims::{self, ClaimKind, ClaimRow, DocumentKind, DocumentRow};
+use crate::account::guard;
 use crate::account::notice::Notice;
 use crate::account::oauth;
 use crate::account::roles::{self, Power, Staff};
@@ -410,6 +411,21 @@ async fn auth_notice(notice: Option<Notice>) -> Result<impl View> {
     })
 }
 
+/// Turnstile's widget, inside a form that asks for a sign-in code
+/// ([`crate::account::guard`]): nothing when Turnstile is off. It shows
+/// only when it needs a click, and puts its token in the form.
+#[component]
+async fn human_check(cx: &Cx) -> Result<impl View> {
+    let site_key = state(cx).sign_in_guard.site_key().map(str::to_owned);
+    Ok(view! {
+        if let Some(site_key) = site_key {
+            <div class="cf-turnstile" data-sitekey=(site_key) data-appearance="interaction-only" data-action="sign-in"></div>
+            <script src=(guard::WIDGET_SCRIPT) async=(true) defer=(true)></script>
+            <noscript><p class="auth-notice error">"Turn on JavaScript to sign in: the form checks that you are not a robot."</p></noscript>
+        }
+    })
+}
+
 /// The BIR's ORUS site, where anyone with a TIN gets the free digital TIN ID.
 const ORUS: &str = "https://orus.bir.gov.ph/";
 
@@ -453,6 +469,7 @@ async fn email_form(
                             autofocus=(true)
                         >
                     </div>
+                    human_check()
                     <button class="btn btn-solid auth-submit" type="submit">(submit) icon(name: "arrow_forward")</button>
                 </form>
                 <p class="auth-hint">icon(name: "lock") "Passwordless login"</p>
@@ -561,6 +578,7 @@ async fn verify_page(cx: &Cx) -> Result<impl View> {
                 <form class=(if expired { "auth-resend due" } else { "auth-resend" }) method="post" action="/auth/email/start">
                     <input type="hidden" name="next" value=(next)>
                     <input type="hidden" name="email" value=(email)>
+                    human_check()
                     <span>"No code? Check spam, or"</span>
                     <button class="auth-link" type="submit">"send a new one"</button>
                 </form>

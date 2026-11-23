@@ -1007,6 +1007,10 @@
   letter-spacing: 0.12em;
 }
 .auth .auth-device-code + .auth-hint { margin-bottom: 20px; }
+/* Turnstile's widget (human_check in pages.rs) takes room only when it
+   asks for a click; in the resend line it gets a row of its own. */
+.auth .cf-turnstile { display: flex; justify-content: center; }
+.auth .auth-resend .cf-turnstile { flex-basis: 100%; }
 .auth .auth-resend { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; margin: 16px 0 0; color: var(--muted); font-size: 13px; }
 .auth .auth-link { padding: 0; border: 0; background: none; color: var(--brand); font: inherit; font-weight: 600; cursor: pointer; }
 .auth .auth-switch { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; text-align: center; }

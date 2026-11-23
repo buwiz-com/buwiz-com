@@ -7,7 +7,7 @@ use axum::http::{Request, header};
 use axum::response::Response;
 use buwiz_cloud::account::accounts;
 use buwiz_cloud::account::verify::Verification;
-use buwiz_cloud::base::config::{Config, MailConfig};
+use buwiz_cloud::base::config::{Config, MailConfig, TurnstileConfig};
 use buwiz_cloud::base::crypto;
 use buwiz_cloud::base::state::AppState;
 use buwiz_cloud::base::storage::DocumentStore;
@@ -33,6 +33,9 @@ pub const FORMS_HOST: &str = "ebirforms.buwiz.com";
 /// The account host that hostless test requests go to. Not [`ORIGIN`]'s own
 /// host: `localhost:3008` is the Bot site.
 pub const ACCOUNT_HOST: &str = "account.localhost:3008";
+/// The Turnstile keys of [`Site::with_turnstile`].
+pub const TURNSTILE_SITE_KEY: &str = "test-site-key";
+pub const TURNSTILE_SECRET_KEY: &str = "test-secret-key";
 
 pub struct Site {
     pub db: PgPool,
@@ -87,6 +90,22 @@ impl Site {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let sender = SenderLink::new(sender_url, Zeroizing::new(secret.into()));
         let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender).with_uptime(uptime);
+        Self { db, router: buwiz_cloud::app(state.clone()), state }
+    }
+
+    /// A site with Turnstile on its sign-in forms ([`TURNSTILE_SITE_KEY`],
+    /// [`TURNSTILE_SECRET_KEY`]), which checks tokens at `verify_url`: a
+    /// test's own fake.
+    pub fn with_turnstile(db: PgPool, verify_url: &str) -> Self {
+        let mut config = test_config(NO_DOWNLOADS, vec![STAFF.into()]);
+        config.turnstile = Some(TurnstileConfig {
+            site_key: TURNSTILE_SITE_KEY.into(),
+            secret_key: TURNSTILE_SECRET_KEY.into(),
+            verify_url: verify_url.into(),
+        });
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
+        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender);
         Self { db, router: buwiz_cloud::app(state.clone()), state }
     }
 
@@ -238,6 +257,7 @@ fn test_config(downloads_url: &str, admin_emails: Vec<String>) -> Config {
         document_key: [7; 32],
         admin_emails,
         mail: MailConfig::Log,
+        turnstile: None,
         trust_list: None,
         downloads_url: downloads_url.into(),
         forms_origin: FORMS.into(),

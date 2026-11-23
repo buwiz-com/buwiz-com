@@ -48,7 +48,6 @@ notices! {
     CodeSent = "code_sent" => info "Please check your email",
     CodeTooMany = "code_too_many" => error "Too many codes were sent to this address. Try again in an hour.",
     CodeNetworkTooMany = "code_network_too_many" => error "Too many codes were asked for from your network. Try again in an hour.",
-    CodeBusy = "code_busy" => error "Too many new addresses asked for a code just now. Try again in an hour.",
     NotHuman = "not_human" => error "We could not confirm that you are not a robot. Wait a moment, then try again.",
     CodeInvalid = "code_invalid" => error "That code is wrong or has expired. Request a new one.",
     SignedOut = "signed_out" => info "You are signed out.",

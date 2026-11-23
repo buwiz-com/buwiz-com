@@ -16,6 +16,10 @@ const CODES_PER_HOUR: i64 = 5;
 /// an address that has an account is never held back by it.
 const NEW_ADDRESS_CODES_PER_HOUR: i64 = 20;
 const NEW_ADDRESS_CODES_PER_DAY: i64 = 60;
+/// The advisory lock that counting and adding a code for an address
+/// without an account are done under, so two posts at once cannot both
+/// take the last place.
+const NEW_ADDRESS_LOCK: i64 = 0x6275_7769_7a01;
 const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);
 
@@ -45,7 +49,9 @@ pub fn normalize_email(raw: &str) -> Result<String, Notice> {
 pub enum CodeError {
     #[error("Too many codes were sent to this address. Try again in an hour.")]
     TooMany,
-    #[error("Too many new addresses asked for a code just now. Try again in an hour.")]
+    /// The limit for addresses without an account is reached. The person
+    /// is not told: the answer must not differ from an account's.
+    #[error("Too many addresses without an account asked for a code.")]
     Busy,
     #[error("That code is wrong or has expired. Request a new one.")]
     Invalid,
@@ -65,25 +71,29 @@ fn code_hash(email: &str, code: &str) -> Vec<u8> {
 
 /// Creates a 6-digit code for `email` and returns it for mailing.
 pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
+    let mut tx = db.begin().await?;
     let recent: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > now() - interval '1 hour'",
     )
     .bind(email)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await?;
     if recent >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }
-    let known: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)").bind(email).fetch_one(db).await?;
+    let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)")
+        .bind(email)
+        .fetch_one(&mut *tx)
+        .await?;
     if !known {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(NEW_ADDRESS_LOCK).execute(&mut *tx).await?;
         let (hour, day): (i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE c.created_at > now() - interval '1 hour'), count(*)
              FROM email_codes c
              WHERE c.created_at > now() - interval '1 day'
                AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = c.email)",
         )
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?;
         if hour >= NEW_ADDRESS_CODES_PER_HOUR || day >= NEW_ADDRESS_CODES_PER_DAY {
             tracing::warn!(hour, day, "sign-in codes for addresses without an account are at their limit");
@@ -95,8 +105,9 @@ pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
         .bind(email)
         .bind(code_hash(email, &code))
         .bind(OffsetDateTime::now_utc() + CODE_TTL)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(code)
 }
 

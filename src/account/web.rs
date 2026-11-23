@@ -700,8 +700,7 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Ok(email) => email,
         Err(notice) => return see_other(link("/login", Some(notice), &[("next", &next)])),
     };
-    let now = time::OffsetDateTime::now_utc();
-    if let Err(refused) = state.sign_in_guard.check(&headers, form.human.as_deref(), now).await {
+    if let Err(refused) = state.sign_in_guard.check(&headers, form.human.as_deref()).await {
         let notice = match refused {
             Refused::NotHuman => Notice::NotHuman,
             Refused::NetworkTooMany => Notice::CodeNetworkTooMany,
@@ -710,18 +709,26 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
     }
     // For the code page's countdown, in ms. Taken before the code is stored,
     // so it never outlasts the code.
-    let expires = ((now + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
+    let expires =
+        ((time::OffsetDateTime::now_utc() + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
     let code = match accounts::issue_code(&state.db, &email).await {
-        Ok(code) => code,
+        Ok(code) => Some(code),
         Err(CodeError::TooMany) => {
+            state.sign_in_guard.forgive(&headers);
             return see_other(link("/login", Some(Notice::CodeTooMany), &[("next", &next), ("email", &email)]));
         }
+        // The limit for addresses without an account: nothing is mailed,
+        // and the answer is the one a mailed code gets, so the page tells
+        // nothing about which addresses have an account.
         Err(CodeError::Busy) => {
-            return see_other(link("/login", Some(Notice::CodeBusy), &[("next", &next), ("email", &email)]));
+            state.sign_in_guard.forgive(&headers);
+            None
         }
         Err(error) => return internal(anyhow::anyhow!(error)),
     };
-    if let Err(error) = state.mailer.send_sign_in_code(&email, &code).await {
+    if let Some(code) = code
+        && let Err(error) = state.mailer.send_sign_in_code(&email, &code).await
+    {
         return internal(error);
     }
     see_other(link(

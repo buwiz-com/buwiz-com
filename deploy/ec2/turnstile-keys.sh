@@ -20,16 +20,22 @@ printf '%s' "$site" > "$K/TURNSTILE_SITE_KEY"
 printf '%s' "$secret" > "$K/TURNSTILE_SECRET_KEY"
 put() { # name type
   python3 -c "import json,sys;json.dump({'Name':'/buwiz/'+sys.argv[1],'Type':sys.argv[2],'Value':open(sys.argv[3]).read().strip(),'Overwrite':True},open(sys.argv[3]+'.json','w'))" "$1" "$2" "$K/$1"
-  echo "/buwiz/$1 version $(aws ssm put-parameter --cli-input-json "file://$K/$1.json" --query Version --output text)"
+  local version
+  version=$(aws ssm put-parameter --cli-input-json "file://$K/$1.json" --query Version --output text) \
+    || fail "/buwiz/$1 was not stored. The server was not restarted; run this again"
+  echo "/buwiz/$1 version $version"
 }
-put TURNSTILE_SITE_KEY String
+# With only one of the two stored, the server runs without Turnstile.
 put TURNSTILE_SECRET_KEY SecureString
+put TURNSTILE_SITE_KEY String
 on_server "systemctl restart buwiz.service; sleep 5; echo \"buwiz \$(systemctl is-active buwiz.service || true)\""
 # With Turnstile on, the page carries the widget. A plain request may be
 # answered by Cloudflare's own challenge first, so look in a browser too.
 if curl -fsS https://account.buwiz.com/signup 2>/dev/null | grep -q 'class="cf-turnstile"'; then
   echo "The sign-in forms have the widget."
 else
-  echo "Could not see the widget from here. Open https://account.buwiz.com/login in a browser and sign in once."
+  echo "Could not see the widget from here (a release without it, or Cloudflare's own challenge)."
 fi
+# Only a real sign-in shows that Cloudflare accepts the widget's tokens.
+echo "Now sign in once at https://account.buwiz.com/login in a browser."
 echo "Done. Tell Claude to continue."

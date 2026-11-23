@@ -98,7 +98,14 @@ impl Config {
                 }
                 None
             }
-            _ => bail!("set both TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY, or neither"),
+            // Not a reason to stay down: a key that went missing would
+            // take the whole site with it. The other limits still apply.
+            _ => {
+                tracing::error!(
+                    "only one of TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY is set: the sign-in forms go without Turnstile until both are"
+                );
+                None
+            }
         };
         Ok(Self {
             host: var_or("HOST", "127.0.0.1"),

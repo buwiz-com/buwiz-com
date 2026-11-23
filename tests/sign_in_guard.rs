@@ -111,6 +111,15 @@ async fn a_network_is_refused_after_ten_codes_in_the_hour(db: PgPool) {
     assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
 }
 
+/// Where a request for a code was sent on to, without the expiry (it is
+/// the time of the request).
+fn code_page(response: &Response) -> String {
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let to = location(response);
+    assert!(to.starts_with("/login/verify?"), "{to}");
+    to.split('&').filter(|part| !part.starts_with("expires=")).collect::<Vec<_>>().join("&")
+}
+
 /// `count` codes for addresses without an account, made `age` ago.
 async fn strangers_codes(site: &Site, count: i32, age: &str) {
     sqlx::query(
@@ -132,9 +141,12 @@ async fn new_addresses_share_an_hourly_limit_that_never_holds_back_an_account(db
     strangers_codes(&site, 19, "5 minutes").await;
     let sent = ask(&site, "email=new%40example.test", None).await;
     assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
-    // That was the twentieth: the next new address waits ...
-    let refused = ask(&site, "email=newer%40example.test", None).await;
-    assert!(refused_with(&refused, "code_busy"), "{}", location(&refused));
+    assert_eq!(codes(&site).await, 20);
+    // That was the twentieth: the next new address gets no code, and the
+    // same answer, so the page tells nothing about who has an account ...
+    let held = ask(&site, "email=newer%40example.test", None).await;
+    assert_eq!(code_page(&held), code_page(&sent).replace("new%40", "newer%40"));
+    assert_eq!(codes(&site).await, 20);
     // ... and someone with an account signs in as ever.
     let sent = ask(&site, "email=ana%40example.test", None).await;
     assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
@@ -150,6 +162,30 @@ async fn new_addresses_share_a_daily_limit_too(db: PgPool) {
     strangers_codes(&site, 30, "25 hours").await;
     let sent = ask(&site, "email=new%40example.test", None).await;
     assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
-    let refused = ask(&site, "email=newer%40example.test", None).await;
-    assert!(refused_with(&refused, "code_busy"), "{}", location(&refused));
+    assert_eq!(codes(&site).await, 90);
+    let held = ask(&site, "email=newer%40example.test", None).await;
+    assert!(location(&held).starts_with("/login/verify"), "{}", location(&held));
+    assert_eq!(codes(&site).await, 90);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_post_that_mails_nothing_does_not_use_up_its_networks_hour(db: PgPool) {
+    let site = Site::new(db);
+    let from = Some("203.0.113.5");
+    // Five codes for one address, then that address is at its own limit.
+    for n in 0..5 {
+        let sent = ask(&site, "email=ana%40example.test", from).await;
+        assert!(location(&sent).starts_with("/login/verify"), "{n}: {}", location(&sent));
+    }
+    for _ in 0..12 {
+        let refused = ask(&site, "email=ana%40example.test", from).await;
+        assert!(refused_with(&refused, "code_too_many"), "{}", location(&refused));
+    }
+    // The network still has the other five of its ten.
+    for n in 0..5 {
+        let sent = ask(&site, &format!("email=person{n}%40example.test"), from).await;
+        assert!(location(&sent).starts_with("/login/verify"), "{n}: {}", location(&sent));
+    }
+    let refused = ask(&site, "email=person5%40example.test", from).await;
+    assert!(refused_with(&refused, "code_network_too_many"), "{}", location(&refused));
 }

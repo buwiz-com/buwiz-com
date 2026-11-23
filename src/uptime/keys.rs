@@ -383,6 +383,18 @@ impl<K: Eq + Hash> RateLimiter<K> {
         verdict
     }
 
+    /// Takes back one hit counted for `key` in this window, for a try that
+    /// came to nothing. A key that was counted in the overflow bucket
+    /// gives that one back.
+    pub fn release(&self, key: &K) {
+        let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Hits { by_key, overflow, .. } = &mut *hits;
+        match by_key.get_mut(key) {
+            Some(count) => *count = count.saturating_sub(1),
+            None => *overflow = overflow.saturating_sub(1),
+        }
+    }
+
     /// How many keys it holds now.
     pub fn len(&self) -> usize {
         self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).by_key.len()

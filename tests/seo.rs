@@ -26,6 +26,7 @@ async fn robots_and_the_sitemap_follow_the_host(db: PgPool) {
     assert_eq!(content_type(&sitemap), "application/xml; charset=utf-8");
     let sitemap = text(sitemap).await;
     assert!(sitemap.contains("<loc>https://ebirforms.buwiz.com/</loc>") && sitemap.contains("<lastmod>"), "{sitemap}");
+    assert!(sitemap.contains("<loc>https://ebirforms.buwiz.com/privacy</loc>"), "{sitemap}");
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -618,6 +618,7 @@ async fn answers(site: &Site, host: &str) -> Vec<(&'static str, StatusCode, Stri
         "/download",
         "/download/mac?arch=arm64",
         "/install-linux.sh",
+        "/privacy",
         "/assets/demo.js",
         "/assets/screens/palette_dark.webp",
         "/assets/site.css",
@@ -644,6 +645,7 @@ async fn the_filing_site_answers_on_its_own_host(db: PgPool) {
         ok("/download"),
         ("/download/mac?arch=arm64", StatusCode::FOUND, "/download".to_owned()),
         ("/install-linux.sh", StatusCode::NOT_FOUND, String::new()),
+        ok("/privacy"),
         ok("/assets/demo.js"),
         ok("/assets/screens/palette_dark.webp"),
         ok("/assets/site.css"),
@@ -736,4 +738,91 @@ async fn download_counts_are_kept_per_app(db: PgPool) {
         downloads::totals(&db, downloads::APP).await.unwrap(),
         [Total { platform: Platform::Mac, arch: Arch::Universal, kind: Kind::Dmg, count: 1 }]
     );
+}
+
+/// The words of the app's policy (`privacy_policy.md`, a copy of
+/// hexuria/buwiz-forms's `PRIVACY_POLICY.md`), as a reader sees them: no
+/// heading marks, list marks, table rules, `**` or backticks.
+fn policy_words(markdown: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for line in markdown.lines().map(str::trim) {
+        if line.starts_with("| ---") {
+            continue;
+        }
+        let line = match line.strip_prefix('#') {
+            // A heading keeps its number ("## 1. Your Buwiz account").
+            Some(heading) => heading.trim_start_matches('#').trim_start(),
+            None => {
+                let line = line.strip_prefix("- ").unwrap_or(line);
+                match line.split_once(". ") {
+                    Some((number, step)) if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) => step,
+                    _ => line,
+                }
+            }
+        };
+        let line = line.replace("**", "").replace('`', "").replace('|', " ");
+        words.extend(line.split_whitespace().map(str::to_owned));
+    }
+    words
+}
+
+/// The words of the page's `<article>`, its tags taken out and its
+/// entities read. A block tag parts words; an inline one (`<code>`,
+/// `<strong>`, `<a>`) does not.
+fn page_words(page: &str) -> Vec<String> {
+    let article = page.split("<article class=\"policy\">").nth(1).unwrap().split("</article>").next().unwrap();
+    let mut text = String::new();
+    let mut rest = article;
+    while let Some(open) = rest.find('<') {
+        text.push_str(&rest[..open]);
+        let close = open + rest[open..].find('>').unwrap();
+        let name = rest[open + 1..close].trim_start_matches('/').split([' ', '>']).next().unwrap();
+        if !["code", "strong", "a"].contains(&name) {
+            text.push(' ');
+        }
+        rest = &rest[close + 1..];
+    }
+    text.push_str(rest);
+    let text = text
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&");
+    text.split_whitespace().map(str::to_owned).collect()
+}
+
+/// `/privacy` on the filing site says word for word what the app's policy
+/// says, is for search engines, and is linked from the footer; no other host
+/// has it (buwiz.com is the Bot site's).
+#[sqlx::test(migrations = "./migrations")]
+async fn the_privacy_page_is_the_apps_policy(db: PgPool) {
+    let site = Site::new(db);
+    let response = site.on_host(FORMS_HOST, "/privacy").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = text(response).await;
+    assert_eq!(page_words(&page), policy_words(include_str!("../src/account/pages/privacy_policy.md")));
+    // What the stores and a reader must not miss is as the policy puts it.
+    for said in [
+        "<strong>The database is a standard SQLite file and the app does not encrypt it.</strong>",
+        "You need a Buwiz account to use the app.",
+        "That request contains the first nine digits of the TIN and the form number.",
+        "It uses HTTPS, and falls back to plain HTTP if the BIR",
+        "contains the TIN and the taxpayer",
+    ] {
+        assert!(page.contains(said), "{said}");
+    }
+    assert!(page.contains("<title>Privacy Policy for eBIRForms · Buwiz</title>"));
+    assert!(page.contains(r#"<link rel="canonical" href="https://ebirforms.buwiz.com/privacy">"#));
+    assert!(!page.contains("noindex"), "a public page");
+    // Linked from the footer of the filing site's pages.
+    for path in ["/", "/download", "/privacy"] {
+        let page = text(site.on_host(FORMS_HOST, path).await).await;
+        let footer = page.split("<footer").nth(1).unwrap();
+        assert!(footer.contains(r#"<a href="/privacy">Privacy</a>"#), "{path}");
+    }
+    for host in ["buwiz.com", "account.buwiz.com", "api.buwiz.com"] {
+        assert_eq!(site.on_host(host, "/privacy").await.status(), StatusCode::NOT_FOUND, "{host}");
+    }
 }

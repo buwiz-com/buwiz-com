@@ -28,6 +28,7 @@ use crate::filing::devices;
 mod bir_status;
 mod download;
 mod home;
+mod privacy;
 mod staff;
 mod tins;
 
@@ -40,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .layout(root_layout)
         .page(home::home_page)
         .page(download::download_page)
+        .page(privacy::privacy_page)
         .page(login_page)
         .page(signup_page)
         .page(verify_page)
@@ -245,7 +247,7 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
 struct Head {
     title: &'static str,
     description: &'static str,
-    /// Only the public pages (home and download) are for search engines;
+    /// Only the public pages (home, download and privacy) are for search engines;
     /// every other page asks not to be indexed.
     index: bool,
 }
@@ -259,6 +261,7 @@ fn head_for(path: &str) -> Head {
     let title = match path {
         "/" => return Head { title: home::TITLE, description: home::DESCRIPTION, index: true },
         "/download" => return Head { title: download::TITLE, description: download::DESCRIPTION, index: true },
+        "/privacy" => return Head { title: privacy::TITLE, description: privacy::DESCRIPTION, index: true },
         "/login" => "Sign in · Buwiz",
         "/signup" => "Create account · Buwiz",
         "/login/verify" => "Check your email · Buwiz",

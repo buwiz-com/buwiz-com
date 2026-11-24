@@ -14,7 +14,7 @@ use crate::sites::downloads::Release;
 
 /// Marketing pages in the sitemap: (path, last changed). Add new public
 /// pages here.
-const PAGES: &[(&str, &str)] = &[("/", "2026-10-30")];
+const PAGES: &[(&str, &str)] = &[("/", "2026-10-30"), ("/privacy", "2026-11-24")];
 
 /// The Bot site's pages in its sitemap, likewise.
 const BOT_PAGES: &[(&str, &str)] = &[("/", "2026-11-01"), ("/mini-apps", "2026-11-01")];
@@ -145,9 +145,13 @@ mod tests {
     }
 
     #[test]
-    fn the_sitemap_lists_the_home_page() {
+    fn the_sitemap_lists_the_home_and_privacy_pages() {
         let sitemap = sitemap_xml("https://buwiz.com", PAGES, None);
         assert!(sitemap.contains("<loc>https://buwiz.com/</loc>\n    <lastmod>2026-10-30</lastmod>"), "{sitemap}");
+        assert!(
+            sitemap.contains("<loc>https://buwiz.com/privacy</loc>\n    <lastmod>2026-11-24</lastmod>"),
+            "{sitemap}"
+        );
         assert!(!sitemap.contains("/download"), "{sitemap}");
     }
 

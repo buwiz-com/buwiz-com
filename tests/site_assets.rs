@@ -221,7 +221,7 @@ async fn main_pages(site: &Site) -> Vec<(&'static str, &'static str, Option<Stri
     for path in ["/login", "/signup", "/login/verify?email=ana%40example.test"] {
         pages.push((ACCOUNT_HOST, path, None));
     }
-    for path in ["/", "/download"] {
+    for path in ["/", "/download", "/privacy"] {
         pages.push((FORMS_HOST, path, None));
     }
     for path in ["/", "/mini-apps"] {
@@ -246,7 +246,11 @@ async fn the_pages_load_nothing_from_another_host(db: PgPool) {
         assert_eq!(response.status(), StatusCode::OK, "{host}{path}");
         let page = text(response).await;
         let at = format!("{host}{path} (signed {})", if cookie.is_some() { "in" } else { "out" });
-        assert_no_google(&at, &page, true);
+        // The privacy policy names Google's mail permission, as text; the
+        // check below still finds nothing loaded from Google.
+        let named =
+            if path == "/privacy" { page.replace("<code>https://mail.google.com/</code>", "") } else { page.clone() };
+        assert_no_google(&at, &named, true);
         for url in loaded(&page) {
             assert!(is_local(&url), "{at} loads {url}");
             if url.ends_with(".css") {

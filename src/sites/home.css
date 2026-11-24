@@ -1047,6 +1047,26 @@
 .home .dl-check { margin-top: 32px; color: var(--faint); font-size: 13px; line-height: 1.65; }
 .home .dl-check code { color: var(--muted); }
 
+/* Privacy policy (src/account/pages/privacy.rs): the app's policy as one
+ * readable column. */
+.home .policy-page { border-top: 0; }
+.home .policy { max-width: 72ch; color: var(--text); font-size: 16px; line-height: 1.7; }
+.home .policy > * + * { margin-top: 16px; }
+.home .policy h1 { margin-bottom: 4px; font-size: 36px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.1; }
+@media (min-width: 768px) { .home .policy h1 { font-size: 48px; } }
+.home .policy h2 { margin-top: 48px; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.3; }
+.home .policy .policy-updated { margin-top: 8px; color: var(--muted); font-size: 14px; }
+.home .policy ul, .home .policy ol { margin-bottom: 0; padding-left: 1.4em; }
+.home .policy li + li { margin-top: 8px; }
+.home .policy code { font-size: 0.88em; overflow-wrap: anywhere; }
+.home .policy a { color: var(--brand); font-weight: 600; }
+.home .policy a:hover { text-decoration: underline; }
+.home .policy-table { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.home .policy table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.55; }
+.home .policy th, .home .policy td { padding: 12px 16px; text-align: left; vertical-align: top; }
+.home .policy th { color: var(--muted); font-size: 12px; font-weight: 600; }
+.home .policy tr + tr td, .home .policy tbody tr td { border-top: 1px solid var(--line); }
+
 /* The hero's download (src/pages/home.rs): one button, one quiet link. */
 .home .get { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px 20px; margin: 0; }
 @media (min-width: 1024px) { .home .get { justify-content: flex-start; } }

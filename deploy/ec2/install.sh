@@ -15,8 +15,22 @@ chmod 0755 /opt/buwiz/buwiz-sender.new
 mv /opt/buwiz/buwiz-sender.new /opt/buwiz/buwiz-sender
 echo "$release" > /opt/buwiz/RELEASE
 
+# The settings files: /etc/buwiz/env for the app, and the Sender's own,
+# which the app's user cannot read (see the top of buwiz-env).
+$aws s3 cp "s3://$bucket/releases/$release/buwiz-env" /usr/local/bin/buwiz-env.new --no-progress
+chmod 0755 /usr/local/bin/buwiz-env.new
+mv /usr/local/bin/buwiz-env.new /usr/local/bin/buwiz-env
+
+# The Sender runs as its own user, so the app's user can read neither its
+# settings nor its memory. Made here too, not only at first boot, so a
+# deploy moves an older instance over.
+id -u buwiz-sender >/dev/null 2>&1 ||
+  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin buwiz-sender
+install -d -o buwiz-sender -g buwiz-sender -m 0700 /etc/buwiz-sender
+
 # The Sender: loopback only (SENDER_HOST defaults to 127.0.0.1:3009); the
-# app reaches it at SENDER_URL. Same settings file as the app.
+# app reaches it at SENDER_URL. It holds open returns in memory, so its
+# memory is never swapped (the swap file is not encrypted) or dumped.
 cat > /etc/systemd/system/buwiz-sender.service <<'UNIT'
 [Unit]
 Description=Buwiz Sender
@@ -25,14 +39,26 @@ Wants=network-online.target
 
 [Service]
 ExecStartPre=+/usr/local/bin/buwiz-env
-EnvironmentFile=-/etc/buwiz/env
+EnvironmentFile=-/etc/buwiz-sender/sender.env
 ExecStart=/opt/buwiz/buwiz-sender
-User=buwiz
+User=buwiz-sender
+Group=buwiz-sender
 Restart=always
 RestartSec=2
+MemorySwapMax=0
+LimitCORE=0
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

@@ -72,7 +72,9 @@ fi
 public=$("$sign" public "$key")
 
 say "Reading the Sender's public keys from the server"
-on_server "systemd-run --quiet --pipe --wait -p EnvironmentFile=/etc/buwiz/env -E RUST_LOG=off /opt/buwiz/buwiz-sender public" \
+# As the Sender's user, with its settings file: the keys are only there.
+on_server "systemd-run --quiet --pipe --wait --uid=buwiz-sender -p EnvironmentFile=/etc/buwiz-sender/sender.env \
+  -p MemorySwapMax=0 -p LimitCORE=0 -E RUST_LOG=off /opt/buwiz/buwiz-sender public" \
   >"$dir/sender-keys.json"
 # The keys the server reads from the Sender must be the ones it publishes.
 curl -fsS "$api/.well-known/buwiz-hpke.json" >"$dir/published-hpke.json"

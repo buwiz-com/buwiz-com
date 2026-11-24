@@ -1,0 +1,67 @@
+#!/bin/bash
+# Writes the services' settings files from Parameter Store (/buwiz/*, not
+# nested). Both units run it, as root, before each start. install.sh puts it
+# at /usr/local/bin/buwiz-env.
+#
+#   /etc/buwiz/env                 buwiz.service, the Gatekeeper (root, 0600)
+#   /etc/buwiz-sender/sender.env   buwiz-sender.service, the Sender
+#                                  (buwiz-sender, 0600, in a 0700 directory)
+#
+# The rule, in one place (the lists below):
+# - A SENDER_ONLY setting goes to the Sender only.
+# - A BOTH setting goes to both.
+# - Any other setting goes to the Gatekeeper only. So a new setting reaches
+#   the Sender only once it is added here.
+#
+# After a rollback to a release whose install.sh still runs the Sender as
+# buwiz with /etc/buwiz/env, the Sender unit has no User=buwiz-sender: then
+# every setting goes to /etc/buwiz/env, as before the split, so that
+# release still starts.
+set -euo pipefail
+umask 077
+
+# What buwiz-sender reads and buwiz-cloud does not, with a SENDER_URL set:
+# src/bin/buwiz-sender.rs, SenderConfig::from_env (src/sender/mod.rs) and
+# relay_settings, receipt_key (src/base/config.rs).
+SENDER_ONLY="SENDER_HOST SENDER_PORT TICKET_PUBLIC_KEYS SENDER_HPKE_KEY
+  RECEIPT_SIGNING_KEY RECEIPT_ISSUER BIR_RELAY_MODE BIR_IAF_PASSPHRASE
+  BIR_DISPATCHER_PASSPHRASE BIR_SSH_HOST_KEYS BIR_SFTP_HOSTS BIR_LAB_SFTP"
+# What both read. ACCOUNT_ORIGIN is the receipts' issuer when RECEIPT_ISSUER
+# is not set.
+BOTH="SENDER_SECRET ACCOUNT_ORIGIN RUST_LOG"
+
+gatekeeper=/etc/buwiz/env
+sender=/etc/buwiz-sender/sender.env
+split=$(grep -qx 'User=buwiz-sender' /etc/systemd/system/buwiz-sender.service 2>/dev/null && echo yes || true)
+
+in_list() { case " ${2//$'\n'/ } " in *" $1 "*) return 0 ;; esac; return 1; }
+
+gatekeeper_new=$(mktemp "$gatekeeper.XXXXXX")
+sender_new=/dev/null
+if [ -n "$split" ]; then
+  sender_new=$(mktemp "$sender.XXXXXX")
+fi
+trap 'rm -f "$gatekeeper_new"; [ "$sender_new" = /dev/null ] || rm -f "$sender_new"' EXIT
+
+aws ssm get-parameters-by-path --region ap-southeast-1 --path /buwiz --with-decryption \
+  --query 'Parameters[].[Name,Value]' --output text \
+  | sed -E 's#^/buwiz/([A-Z0-9_]+)\t#\1=#' \
+  | while IFS= read -r line; do
+      name=${line%%=*}
+      if [ -z "$split" ]; then
+        printf '%s\n' "$line" >&3
+      elif in_list "$name" "$SENDER_ONLY"; then
+        printf '%s\n' "$line" >&4
+      elif in_list "$name" "$BOTH"; then
+        printf '%s\n' "$line" >&3
+        printf '%s\n' "$line" >&4
+      else
+        printf '%s\n' "$line" >&3
+      fi
+    done 3>"$gatekeeper_new" 4>"$sender_new"
+
+mv "$gatekeeper_new" "$gatekeeper"
+if [ -n "$split" ]; then
+  chown buwiz-sender:buwiz-sender "$sender_new"
+  mv "$sender_new" "$sender"
+fi

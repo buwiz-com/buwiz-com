@@ -461,6 +461,9 @@ Sender (`buwiz-sender`):
 The ticket public key is the Ed25519 public half of `TICKET_SIGNING_KEY`,
 base64url without padding.
 
+On EC2 each process gets only the settings it reads, from its own file, and
+the Sender runs as its own user ([deploy.md](deploy.md#its-own-user-and-settings-file)).
+
 The `BIR_*` settings other than `BIR_RELAY_MODE` take effect only in a
 build with the `bir` feature. The values for live (the upload hosts) are
 in the BIR relay's private docs.

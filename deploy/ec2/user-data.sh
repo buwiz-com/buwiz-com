@@ -1,6 +1,7 @@
 #!/bin/bash
 # First boot of the Buwiz server: security updates, cloudflared, the AWS
-# CLI and the systemd units. The app binary arrives later through SSM.
+# CLI, the users and the systemd units. The binaries, the Sender's unit and
+# buwiz-env arrive later through SSM (install.sh).
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -26,20 +27,15 @@ apt-get install -y cloudflared
 snap install aws-cli --classic
 
 useradd --system --no-create-home --shell /usr/sbin/nologin buwiz || true
+# The Sender's own user: the app's user cannot read its settings or memory.
+useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin buwiz-sender || true
 install -d -m 0755 /opt/buwiz
 install -d -m 0700 /etc/buwiz /etc/cloudflared
+install -d -o buwiz-sender -g buwiz-sender -m 0700 /etc/buwiz-sender
 
-# Writes the app's environment from Parameter Store (/buwiz/*, not nested).
-cat > /usr/local/bin/buwiz-env <<'EOF'
-#!/bin/bash
-set -euo pipefail
-umask 077
-aws ssm get-parameters-by-path --region ap-southeast-1 --path /buwiz --with-decryption \
-  --query 'Parameters[].[Name,Value]' --output text \
-  | sed -E 's#^/buwiz/([A-Z0-9_]+)\t#\1=#' > /etc/buwiz/env.new
-mv /etc/buwiz/env.new /etc/buwiz/env
-EOF
-chmod 0755 /usr/local/bin/buwiz-env
+# /usr/local/bin/buwiz-env, which writes the settings files from Parameter
+# Store at each start, and the Sender's unit come with each release
+# (install.sh).
 
 cat > /etc/systemd/system/buwiz.service <<'EOF'
 [Unit]

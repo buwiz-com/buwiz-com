@@ -44,22 +44,29 @@ const NAMED_ELSEWHERE: &str = "
                     WHERE c.account_id = $1 AND t.account_id <> $1)";
 
 /// Why the account of `account_id` (with `email`) cannot be deleted now,
-/// or `None`. Staff first: ask an Admin. Then records of staff work
-/// elsewhere that name it: write to support. Then a send under way: wait.
-/// A ban is no reason: a banned account may delete itself.
+/// or `None`. Staff first: ask an Admin. Then a ban, and records of staff
+/// work elsewhere that name it: write to support. Then a send under way:
+/// wait. A banned account is not deleted here because the ban lives on its
+/// row: deleting it would free the address to sign up afresh, unbanned.
 pub async fn refusal(
     db: &mut PgConnection,
     admin_emails: &[String],
     account_id: Uuid,
     email: &str,
 ) -> sqlx::Result<Option<Notice>> {
-    let role: Option<String> =
-        sqlx::query_scalar("SELECT role FROM accounts WHERE id = $1").bind(account_id).fetch_one(&mut *db).await?;
+    let (role, banned): (Option<String>, bool) =
+        sqlx::query_as("SELECT role, banned_at IS NOT NULL FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_one(&mut *db)
+            .await?;
     if role.is_some() {
         return Ok(Some(Notice::DeleteStaff));
     }
     if roles::in_list(admin_emails, email) {
         return Ok(Some(Notice::DeleteAdminList));
+    }
+    if banned {
+        return Ok(Some(Notice::DeleteBanned));
     }
     let named: bool = sqlx::query_scalar(NAMED_ELSEWHERE).bind(account_id).fetch_one(&mut *db).await?;
     if named {

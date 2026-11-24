@@ -111,7 +111,8 @@ any sign-in not yet picked up. The person cannot sign in ("This account
 can't be used on Buwiz…"). App sign-ins stay but every API call answers
 `403 account_banned`; the token refresh and signing out still work, so the
 app can say why. Lifting the ban restores everything. An Admin can't be
-banned. The **test label** is for staff only: they see and filter it, and
+banned. A banned account can't delete itself either: `/delete` sends it to
+support (see "Deleting an account"). The **test label** is for staff only: they see and filter it, and
 sends work as usual.
 
 A **test TIN** is a made-up one: its root is `000-000-000`, at any branch,
@@ -282,10 +283,11 @@ and when it is typed:
 - A return being sent right now (`submissions.status = 'sending'`): try
   again in a few minutes. The deletion locks the account and its returns,
   so none starts sending meanwhile.
-
-A banned account may delete itself. Its sign-in with `next=/delete` gets a
-session that only `/delete` takes; every other page still treats it as
-signed out. Its history lines (the ban among them) stay.
+- A banned account: write to support@buwiz.com. The ban is on the
+  account's row, so deleting it here would let the address sign up again,
+  unbanned; support decides what to keep. Its sign-in with `next=/delete`
+  gets a session that only `/delete` takes (every other page still treats
+  it as signed out), so the page can say this.
 
 **Sign-in records** are deleted by the hourly upkeep
 (`accounts::upkeep`): codes 30 days after they were made, and device and

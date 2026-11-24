@@ -1,8 +1,9 @@
 //! Deleting one's own account (`/delete`, docs/accounts.md, "Deleting an
 //! account"); the eBIRForms app's Settings > Account > Delete account opens
 //! it. It says what goes and what stays, then mails a code; the posts are
-//! [`crate::account::deletion`]'s. A banned account may delete itself, so
-//! the session is read banned or not ([`deletion_account`]).
+//! [`crate::account::deletion`]'s. A banned account gets here too, so the
+//! session is read banned or not ([`deletion_account`]), and is told to
+//! write to support.
 
 use super::*;
 use crate::account::deletion;

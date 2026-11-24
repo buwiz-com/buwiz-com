@@ -175,6 +175,12 @@ pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Re
 /// only one that works.
 pub(crate) async fn issue_deletion_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
     let mut tx = db.begin().await?;
+    // One at a time per address, so requests at once cannot all pass the
+    // count before any of them adds its code.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('delete code ' || $1, 0))")
+        .bind(email)
+        .execute(&mut *tx)
+        .await?;
     if codes_this_hour(&mut tx, email).await? >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }

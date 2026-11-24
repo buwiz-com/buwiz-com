@@ -156,6 +156,7 @@ notices! {
     DeleteCodeInvalid = "delete_code_invalid" => error "That code is wrong or has expired. Send a new one.",
     DeleteStaff = "delete_staff" => error "Your account has a staff role. Ask an Admin to remove the role first, then delete the account.",
     DeleteAdminList = "delete_admin_list" => error "Your address is an Admin through the server setting ADMIN_EMAILS. Have it taken out of that setting first, then delete the account.",
+    DeleteBanned = "delete_banned" => error "This account is banned, so it can't be deleted here. Write to support@buwiz.com from its address and we will delete it.",
     DeleteReferenced = "delete_referenced" => error "Staff records about other accounts name this account, so it can't be deleted here. Write to support@buwiz.com to delete it.",
     DeleteSending = "delete_sending" => error "A return is being sent right now; try again in a few minutes.",
     AccountDeleted = "account_deleted" => info "Your Buwiz account is deleted, and every app is signed out of it.",

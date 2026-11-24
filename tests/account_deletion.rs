@@ -546,10 +546,10 @@ async fn a_send_under_way_holds_the_deletion(db: PgPool) {
     assert!(!exists(&site.db, ana).await);
 }
 
-/// A banned account can't sign in, but it can sign in to delete itself;
-/// its history stays.
+/// A banned account can't sign in, but it can reach `/delete`, which sends
+/// it to support: deleting it would free the address of its ban.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_banned_account_may_delete_itself(db: PgPool) {
+async fn a_banned_account_is_sent_to_support(db: PgPool) {
     let site = Site::with_mailbox(db);
     let (ana, _) = site.person(ANA).await;
     exec(
@@ -571,12 +571,14 @@ async fn a_banned_account_may_delete_itself(db: PgPool) {
     assert!(cookie.starts_with("buwiz_session=bws_"), "{cookie}");
     // That session opens no other page.
     assert_eq!(location(&site.get("/tins", &cookie).await), "/login?next=%2Ftins&notice=sign_in_first");
-    assert_eq!(site.get("/delete", &cookie).await.status(), StatusCode::OK);
-    let code = ask(&site, &cookie).await.1.unwrap();
-    assert_eq!(confirm(&site, &cookie, &code).await, "/login?notice=account_deleted");
-    assert!(!exists(&site.db, ana).await);
+    let page = site.get("/delete", &cookie).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(text(page).await.contains("support@buwiz.com"));
+    assert_eq!(ask(&site, &cookie).await, ("/delete?notice=delete_banned".to_owned(), None));
+    assert_eq!(confirm(&site, &cookie, "123456").await, "/delete?notice=delete_banned");
+    assert!(exists(&site.db, ana).await);
     let actions: Vec<String> = account_audit_lines(&site.db, ana).await.into_iter().map(|line| line.0).collect();
-    assert_eq!(actions, ["banned", "deleted"]);
+    assert_eq!(actions, ["banned"]);
 }
 
 /// The app is signed out the way it already understands: its access token

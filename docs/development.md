@@ -27,6 +27,11 @@ and `src/base/config.rs`.
 - `ebirforms.localhost:3008` or `forms.localhost:3008` is the filing site;
 - `localhost:3008`, like any other host, is the Bot site.
 
+The desktop app reaches the account site at its own setting: run it with
+`BUWIZ_ACCOUNT_URL=http://account.localhost:3008` to sign in or delete an
+account (`/delete`) against a local server. Without it, a debug build uses
+its API address, which is not the account site.
+
 ## Cargo features
 
 - **`bir`:** the BIR relay code. It needs the private files, which are not in this repository. See [relay.md](relay.md#restoring-the-private-files).

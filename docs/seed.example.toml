@@ -42,6 +42,14 @@ test = true                 # a label staff see; sends work as usual
   # reapply = true          # only to bring back a TIN ended on the website,
                             # or to activate one that was ever paused
 
+# The login the app stores' reviewers sign in to (REVIEW_LOGIN_EMAIL on the
+# server names the same address; docs/accounts.md, "The store review
+# login"). It needs the test label and no TIN: its fixed code works only
+# while it has the label, and the app only simulates its sends.
+[[login]]
+email = "reviewer@example.test"
+test = true
+
 [[login]]
 email = "shop@example.test"
   [[login.tin]]

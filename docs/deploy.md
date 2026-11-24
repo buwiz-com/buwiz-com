@@ -28,6 +28,7 @@ lost, every stored claim document becomes unreadable.**
 | `SENDER_URL`, `SENDER_SECRET` | The Sender's private address (`http://127.0.0.1:3009`) and a shared secret, `openssl rand -base64 32` |
 | `RESEND_API_KEY`, `MAIL_FROM` | Resend, with buwiz.com verified as the sending domain |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | A Cloudflare Turnstile widget (Managed) for the hostname `account.buwiz.com`; `deploy/ec2/turnstile-keys.sh` stores both and restarts the server. Without them the sign-in forms have no check against scripts, and the server says so in its log at start ([accounts.md](accounts.md#who-can-be-mailed-a-code)) |
+| `REVIEW_LOGIN_EMAIL`, `REVIEW_LOGIN_CODE` | Optional. The login the app stores' reviewers use: the address signs in with this six-digit code, never mailed, while it is a test account ([accounts.md](accounts.md#the-store-review-login)). Make the account and give it the test label first |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | An R2 API token, "Object Read & Write", limited to the `buwiz` and `assets` buckets |
 
 Claim documents live in the R2 bucket `buwiz` as `claims/{claim}/{document}`.

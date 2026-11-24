@@ -30,6 +30,9 @@ pub struct Config {
     /// Cloudflare Turnstile on the sign-in forms
     /// ([`crate::account::guard`]); `None` leaves them without it.
     pub turnstile: Option<TurnstileConfig>,
+    /// The login the app stores' reviewers use (`REVIEW_LOGIN_EMAIL`,
+    /// `REVIEW_LOGIN_CODE`); `None` leaves every code random and mailed.
+    pub review_login: Option<ReviewLogin>,
     /// The offline-signed relay trust list apps fetch (`TRUST_LIST_JWS`).
     pub trust_list: Option<String>,
     /// Where the app's installers are, e.g. `https://downloads.buwiz.com`
@@ -51,6 +54,50 @@ pub enum MailConfig {
         api_key: String,
         from: String,
     },
+}
+
+/// One login whose sign-in code is fixed and never mailed, for the app
+/// stores' reviewers: they have no way to read a mailbox of ours. The code
+/// stands in only while that address is an existing account with the test
+/// label, no staff role and no ban ([`crate::account::accounts::issue_code`]);
+/// every limit on codes still applies to it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReviewLogin {
+    /// As [`crate::account::accounts::normalize_email`] writes it.
+    pub email: String,
+    /// Six digits, as the code page takes them.
+    pub code: String,
+}
+
+impl std::fmt::Debug for ReviewLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewLogin").field("email", &self.email).field("code", &"[hidden]").finish()
+    }
+}
+
+/// The review login the two settings describe, or why there is none. A
+/// setting that is wrong turns the login off and is logged at start: it is
+/// not a reason for the site to stay down.
+pub fn review_login(
+    email: Option<String>,
+    code: Option<String>,
+    admin_emails: &[String],
+) -> Result<Option<ReviewLogin>, &'static str> {
+    let (email, code) = match (email, code) {
+        (None, None) => return Ok(None),
+        (Some(email), Some(code)) => (email, code),
+        _ => return Err("only one of REVIEW_LOGIN_EMAIL and REVIEW_LOGIN_CODE is set"),
+    };
+    let Ok(email) = crate::account::accounts::normalize_email(&email) else {
+        return Err("REVIEW_LOGIN_EMAIL is not an email address");
+    };
+    if crate::account::roles::in_list(admin_emails, &email) {
+        return Err("REVIEW_LOGIN_EMAIL is in ADMIN_EMAILS: an admin never signs in with a fixed code");
+    }
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("REVIEW_LOGIN_CODE must be exactly six digits");
+    }
+    Ok(Some(ReviewLogin { email, code }))
 }
 
 /// A Turnstile widget's keys (`TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`).
@@ -107,6 +154,25 @@ impl Config {
                 None
             }
         };
+        let admin_emails = admin_emails();
+        let review_login = match review_login(
+            optional("REVIEW_LOGIN_EMAIL"),
+            optional("REVIEW_LOGIN_CODE"),
+            &admin_emails,
+        ) {
+            Ok(Some(login)) => {
+                tracing::warn!(
+                    email = %login.email,
+                    "the store review login is on: this address signs in with the fixed code of REVIEW_LOGIN_CODE while it is a test account"
+                );
+                Some(login)
+            }
+            Ok(None) => None,
+            Err(why) => {
+                tracing::error!("{why}: the store review login stays off");
+                None
+            }
+        };
         Ok(Self {
             host: var_or("HOST", "127.0.0.1"),
             port: var_or("PORT", "3008").parse().context("PORT")?,
@@ -115,9 +181,10 @@ impl Config {
             extra_origins: list("EXTRA_ORIGINS").iter().map(|raw| origin(raw)).collect::<anyhow::Result<_>>()?,
             secure_cookies,
             document_key: document_key(&required("DOCUMENT_KEY")?)?,
-            admin_emails: admin_emails(),
+            admin_emails,
             mail,
             turnstile,
+            review_login,
             trust_list: std::env::var("TRUST_LIST_JWS")
                 .ok()
                 .map(|raw| raw.trim().to_owned())
@@ -362,6 +429,29 @@ mod tests {
         assert_eq!((lab.username.as_str(), lab.password.as_str()), ("lab", "pa:ss"));
         assert_eq!((lab.host.as_str(), lab.port), ("127.0.0.1", 2222));
         assert!(lab_server("127.0.0.1:22").is_err());
+    }
+
+    #[test]
+    fn the_review_login_needs_both_settings_a_plain_address_and_six_digits() {
+        let set = |email: &str, code: &str| {
+            review_login(Some(email.into()), Some(code.into()), &["root@example.test".into()])
+        };
+        assert_eq!(review_login(None, None, &[]), Ok(None));
+        assert_eq!(
+            set(" Reviewer@Example.test ", "481516"),
+            Ok(Some(ReviewLogin { email: "reviewer@example.test".into(), code: "481516".into() }))
+        );
+        assert!(review_login(Some("reviewer@example.test".into()), None, &[]).is_err());
+        assert!(review_login(None, Some("481516".into()), &[]).is_err());
+        assert!(set("not an address", "481516").is_err());
+        for code in ["48151", "4815162", "48151a", "481 516"] {
+            assert!(set("reviewer@example.test", code).is_err(), "{code}");
+        }
+        // An admin never signs in with a code the stores' reviewers know.
+        assert!(set("Root@example.test", "481516").is_err());
+        // The code is not printed with the settings.
+        let shown = format!("{:?}", set("reviewer@example.test", "481516"));
+        assert!(!shown.contains("481516"), "{shown}");
     }
 
     #[test]

@@ -508,9 +508,22 @@ impl FromRequestParts<AppState> for SigningOut {
     }
 }
 
-/// `GET /me`.
-pub async fn me(bearer: Bearer) -> Json<Value> {
-    Json(json!({ "user_id": bearer.account.id, "email": bearer.account.email }))
+/// `GET /me`. `practice` is true only for the store review login while it
+/// is a plain test account ([`crate::base::config::ReviewLogin`]): an app
+/// signed in to it simulates every send, so a reviewer trying the app files
+/// nothing by pressing a button. The test label alone does not set it: a
+/// test account's sends work as usual.
+pub async fn me(State(state): State<AppState>, bearer: Bearer) -> Result<Json<Value>, ApiError> {
+    let practice = match &state.config.review_login {
+        Some(review) if review.email == bearer.account.email => {
+            sqlx::query_scalar("SELECT test_account AND role IS NULL AND banned_at IS NULL FROM accounts WHERE id = $1")
+                .bind(bearer.account.id)
+                .fetch_one(&state.db)
+                .await?
+        }
+        _ => false,
+    };
+    Ok(Json(json!({ "user_id": bearer.account.id, "email": bearer.account.email, "practice": practice })))
 }
 
 /// `POST /api/auth/logout`: ends this app's sign-in.

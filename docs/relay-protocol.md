@@ -95,7 +95,7 @@ app that can send treats it as a plain failed try (not sent), never as
 | `tin_test_only` | Active, but a test TIN (root `000-000-000`, which staff add to test accounts only): it never sends, in any relay mode, and a paused one answers this code too | This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR. |
 | `tin_not_active` | Anything else | this TIN is not active on your account |
 | `account_banned` | The account is banned (every bearer call but `POST /api/auth/logout`; the token refresh still works) | This Buwiz account is banned: it can't send returns. Write to support@buwiz.com. |
-| `account_practice` | A practice account: one with a fixed sign-in code, the kind app-store reviewers use (`practice` on `GET /me`). Tickets, both submission calls and the relay refuse it, whatever the TIN; its TIN list is as anyone's | This is a practice account: you can prepare returns, but Buwiz never sends them to the BIR. |
+| `account_practice` | A practice account: one with a fixed sign-in code stored, the kind app-store reviewers use. `practice` on `GET /me` is narrower (it also needs no role and no ban), so the server may refuse an account whose `/me` says `false`. Tickets, both submission calls and the relay refuse it, whatever the TIN (a `POST /api/submissions` retried with the idempotency key of a return already stored gets that return first); its TIN list is as anyone's | This is a practice account: you can prepare returns, but Buwiz never sends them to the BIR. |
 
 None of these is worth retrying: the return goes back to a draft with the
 words shown. Nor is `return_mismatch` (a `400` from `POST /api/submissions`,

@@ -525,7 +525,8 @@ async fn make_practice(db: &PgPool, account: Uuid, admin: Uuid) {
 /// A practice account (a fixed sign-in code, the kind store reviewers use)
 /// never sends, whatever its TINs: a ticket, a v1 return, a sealed return
 /// on a ticket from before, and the relay all refuse it with its own code,
-/// before any TIN is looked at. Its TIN list is as anyone's.
+/// before any TIN is looked at; a v1 retry of a return stored before still
+/// gets that return. Its TIN list is as anyone's.
 #[sqlx::test(migrations = "./migrations")]
 async fn a_practice_account_never_sends(db: PgPool) {
     let site = Site::new(db);
@@ -543,7 +544,19 @@ async fn a_practice_account_never_sends(db: PgPool) {
     let sealed = body["ticket"].as_str().unwrap().to_owned();
     let v1 = submission(db, reviewer, active, "ready", false).await;
     let v2 = submission(db, reviewer, active, "ready", true).await;
+    let mut keyed = v1_body("000555001");
+    keyed["idempotency_key"] = json!("r1");
+    let stored_v1 = post_v1(&site, &device.token, &keyed).await;
+    assert_eq!(stored_v1.status(), StatusCode::CREATED);
+    let stored_v1: Value = serde_json::from_str(&text(stored_v1).await).unwrap();
     make_practice(db, reviewer, admin).await;
+
+    // A retry of a return stored before gets that return, not the
+    // refusal: the app must not take it back to a draft.
+    let replay = post_v1(&site, &device.token, &keyed).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value = serde_json::from_str(&text(replay).await).unwrap();
+    assert_eq!(replay["id"], stored_v1["id"]);
 
     let practice = (403, "account_practice".to_owned(), PRACTICE.to_owned());
     assert_eq!(refusal(device.post(&site, "/api/tickets", &ticket_body("000555001", "k2")).await).await, practice);
@@ -554,11 +567,12 @@ async fn a_practice_account_never_sends(db: PgPool) {
         refusal(device.post(&site, "/api/v2/submissions", &json!({ "ticket": sealed, "envelope": envelope })).await)
             .await;
     assert_eq!(refused, practice);
-    let spent: bool = sqlx::query_scalar("SELECT used_at IS NOT NULL FROM tickets WHERE account_id = $1")
-        .bind(reviewer)
-        .fetch_one(db)
-        .await
-        .unwrap();
+    let spent: bool =
+        sqlx::query_scalar("SELECT used_at IS NOT NULL FROM tickets WHERE account_id = $1 AND idempotency_key = 'k1'")
+            .bind(reviewer)
+            .fetch_one(db)
+            .await
+            .unwrap();
     assert!(!spent, "a refused sealed return does not spend its ticket");
 
     // The relay: the waiting returns are failed with the words, the

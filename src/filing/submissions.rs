@@ -122,8 +122,9 @@ pub async fn create(
     {
         return Err(ApiError::bad_request("bad_idempotency_key", "idempotency_key must be 1 to 100 characters"));
     }
-    gate::account_sends(&state.db, bearer.account.id).await?;
-    let claim_id = gate::own(&state.db, bearer.account.id, &name.tin).await?.sendable()?;
+    // A replay first: a return stored before the account became a practice
+    // one, or before its TIN changed, keeps its answer, so the app never
+    // takes one the BIR may have back to a draft.
     if let Some(key) = &request.idempotency_key {
         let existing: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM submissions WHERE account_id = $1 AND idempotency_key = $2")
@@ -136,6 +137,8 @@ pub async fn create(
             return Ok(Json(view).into_response());
         }
     }
+    gate::account_sends(&state.db, bearer.account.id).await?;
+    let claim_id = gate::own(&state.db, bearer.account.id, &name.tin).await?.sendable()?;
     let id = Uuid::new_v4();
     let (nonce, ciphertext) = crypto::seal(&state.config.document_key, &xml_context(id), xml)?;
     let inserted = sqlx::query(
@@ -438,9 +441,9 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
         return Ok(RelayStart::Send(Box::new(locked)));
     }
     // A return still waiting whose account was banned or became a practice
-    // one, or whose TIN stopped being active since: it is failed with the reason, so the app takes it
-    // back to a draft. Only a return still waiting: one `sending` on
-    // another connection keeps its own outcome.
+    // one, or whose TIN stopped being active since: it is failed with the
+    // reason, so the app takes it back to a draft. Only a return still
+    // waiting: one `sending` on another connection keeps its own outcome.
     let waiting: Option<(Uuid, bool, bool)> = sqlx::query_as(&format!(
         "SELECT s.claim_id, a.banned_at IS NOT NULL, {} FROM submissions s JOIN accounts a ON a.id = s.account_id
          WHERE s.id = $1 AND s.account_id = $2",

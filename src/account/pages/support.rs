@@ -113,7 +113,7 @@ pub async fn delete_account_page(cx: &Cx) -> Result<impl View> {
                     <h2>"How"</h2>
                     <ol>
                         <li>
-                            "In the app, open Settings > Account > Delete account. Or open "
+                            "In the app (from version 0.2.1), open Settings > Account > Delete account. Or open "
                             <a href=(DELETE_PAGE)>"account.buwiz.com/delete"</a>
                             " in any browser."
                         </li>

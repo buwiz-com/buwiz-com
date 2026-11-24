@@ -111,7 +111,6 @@ pub async fn split_site(State(state): State<AppState>, request: Request, next: N
 fn moved_to(path: &str) -> Option<Site> {
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     if under("/download")
-        || path == "/privacy"
         || path == "/install-linux.sh"
         || path.starts_with("/assets/demo")
         || path.starts_with("/assets/screens/")
@@ -211,7 +210,6 @@ mod tests {
         for path in [
             "/download",
             "/download/mac",
-            "/privacy",
             "/install-linux.sh",
             "/assets/demo.js",
             "/assets/demo.css",

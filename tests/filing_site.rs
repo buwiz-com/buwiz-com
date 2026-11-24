@@ -794,8 +794,8 @@ fn page_words(page: &str) -> Vec<String> {
 }
 
 /// `/privacy` on the filing site says word for word what the app's policy
-/// says, is for search engines, and is linked from the footer; the Bot host
-/// sends it here, and the account host has none.
+/// says, is for search engines, and is linked from the footer; no other host
+/// has it (buwiz.com is the Bot site's).
 #[sqlx::test(migrations = "./migrations")]
 async fn the_privacy_page_is_the_apps_policy(db: PgPool) {
     let site = Site::new(db);
@@ -822,11 +822,7 @@ async fn the_privacy_page_is_the_apps_policy(db: PgPool) {
         let footer = page.split("<footer").nth(1).unwrap();
         assert!(footer.contains(r#"<a href="/privacy">Privacy</a>"#), "{path}");
     }
-    // The Bot host sends it to the filing site; the account and API hosts have none.
-    let moved = site.on_host("buwiz.com", "/privacy").await;
-    assert_eq!(moved.status(), StatusCode::MOVED_PERMANENTLY);
-    assert_eq!(location(&moved), "https://ebirforms.buwiz.com/privacy");
-    for host in ["account.buwiz.com", "api.buwiz.com"] {
+    for host in ["buwiz.com", "account.buwiz.com", "api.buwiz.com"] {
         assert_eq!(site.on_host(host, "/privacy").await.status(), StatusCode::NOT_FOUND, "{host}");
     }
 }

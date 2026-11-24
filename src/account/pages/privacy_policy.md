@@ -25,9 +25,11 @@ The app asks you to sign in to a Buwiz account before it can be used. Sign-in ha
 - **When the app contacts our server (`api.buwiz.com`):** when you sign in or out, and each time the app starts, to
   renew the sign-in. After you have signed in, the app keeps working without a connection to our server.
 - **What it is used for:** signing you in. It is not used for advertising and is not sold or shared.
+- **Practice accounts:** our server can mark an account as a practice account (the one app-store reviewers use). The
+  app then only simulates sending a return; nothing from that account reaches the BIR.
 
 To delete your Buwiz account and the email address held with it, use Settings > Account > Delete account in the app
-(from version 0.2.1), or write to support@goldcoders.dev from that address.
+(from version 0.2.1), or write to support@buwiz.com from that address.
 
 ## 2. What is stored on your computer
 
@@ -85,7 +87,7 @@ the sign-in under its own terms and privacy policy.
 ## 5. Update checks
 
 The Mac App Store and Microsoft Store versions never check for updates themselves; the store delivers them. Versions
-downloaded from GitHub ask GitHub (`github.com/hexuria/buwiz-forms`) whether a newer version exists, shortly after
+downloaded from GitHub ask GitHub, where the app's releases are published, whether a newer version exists, shortly after
 starting and every few hours. That request carries no information about you beyond what any web request does, such as
 your IP address. The Microsoft Store version behaves this way from version 0.2.1.
 
@@ -106,4 +108,4 @@ repository.
 
 ## 9. Contact
 
-Write to support@goldcoders.dev, or open an issue at https://github.com/hexuria/buwiz-forms/issues.
+Write to support@buwiz.com. The app's website is https://ebirforms.buwiz.com.

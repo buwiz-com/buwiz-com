@@ -9,7 +9,7 @@ use http::header;
 
 use super::home::footer;
 use super::*;
-use crate::sites::canonical::is_app_host;
+use crate::sites::canonical::Site;
 
 pub(super) const TITLE: &str = "Privacy Policy for eBIRForms · Buwiz";
 pub(super) const DESCRIPTION: &str =
@@ -18,7 +18,9 @@ pub(super) const DESCRIPTION: &str =
 #[page("/privacy")]
 pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
     let host = headers(cx).get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
-    if is_app_host(host) {
+    // The filing site's only: buwiz.com is the Bot site's, and the account
+    // and API hosts have no public pages.
+    if Site::for_host(host) != Site::Forms {
         return Err(topcoat::router::error::not_found().into());
     }
     Ok(view! {
@@ -53,10 +55,11 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
                             " when you sign in or out, and each time the app starts, to renew the sign-in. After you have signed in, the app keeps working without a connection to our server."
                         </li>
                         <li><strong>"What it is used for:"</strong>" signing you in. It is not used for advertising and is not sold or shared."</li>
+                        <li><strong>"Practice accounts:"</strong>" our server can mark an account as a practice account (the one app-store reviewers use). The app then only simulates sending a return; nothing from that account reaches the BIR."</li>
                     </ul>
                     <p>
                         "To delete your Buwiz account and the email address held with it, use Settings > Account > Delete account in the app (from version 0.2.1), or write to "
-                        <a href="mailto:support@goldcoders.dev">"support@goldcoders.dev"</a>
+                        <a href="mailto:support@buwiz.com">"support@buwiz.com"</a>
                         " from that address."
                     </p>
 
@@ -126,9 +129,7 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
 
                     <h2>"5. Update checks"</h2>
                     <p>
-                        "The Mac App Store and Microsoft Store versions never check for updates themselves; the store delivers them. Versions downloaded from GitHub ask GitHub ("
-                        <code>"github.com/hexuria/buwiz-forms"</code>
-                        ") whether a newer version exists, shortly after starting and every few hours. That request carries no information about you beyond what any web request does, such as your IP address. The Microsoft Store version behaves this way from version 0.2.1."
+                        "The Mac App Store and Microsoft Store versions never check for updates themselves; the store delivers them. Versions downloaded from GitHub ask GitHub, where the app's releases are published, whether a newer version exists, shortly after starting and every few hours. That request carries no information about you beyond what any web request does, such as your IP address. The Microsoft Store version behaves this way from version 0.2.1."
                     </p>
 
                     <h2>"6. What the app does not do"</h2>
@@ -149,9 +150,9 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
                     <h2>"9. Contact"</h2>
                     <p>
                         "Write to "
-                        <a href="mailto:support@goldcoders.dev">"support@goldcoders.dev"</a>
-                        ", or open an issue at "
-                        <a href="https://github.com/hexuria/buwiz-forms/issues">"https://github.com/hexuria/buwiz-forms/issues"</a>
+                        <a href="mailto:support@buwiz.com">"support@buwiz.com"</a>
+                        ". The app's website is "
+                        <a href="https://ebirforms.buwiz.com">"https://ebirforms.buwiz.com"</a>
                         "."
                     </p>
                 </article>

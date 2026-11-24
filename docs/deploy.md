@@ -826,18 +826,20 @@ every few seconds.
 Both services log to the journal on the instance, and nowhere else: no
 log shipping is set up. `install.sh` keeps them 30 days:
 
-- `/etc/systemd/journald.conf.d/50-buwiz.conf` sets `MaxRetentionSec=30day`
-  and one journal file a day (`MaxFileSec=1day`), so entries leave close
-  to their 30 days;
+- `/etc/systemd/journald.conf.d/50-buwiz.conf` keeps the journal on disk
+  (`Storage=persistent`, so it survives a reboot), sets
+  `MaxRetentionSec=30day` and one journal file a day (`MaxFileSec=1day`),
+  so entries leave close to their 30 days;
 - `/etc/rsyslog.d/10-buwiz.conf` keeps the services' lines
   (`buwiz-cloud`, `buwiz-sender`) out of `/var/log/syslog`, whose weekly
   rotation would keep a second copy for five weeks.
 
 The lines carry ids (account, submission, device, ticket, claim), never a
-TIN, a name or an email address. The privacy policy at
-`ebirforms.buwiz.com/privacy` says so, and names the 30 days: a log line
-with any of those in it is a bug, and so is a change to the 30 days that
-the policy does not follow.
+TIN, a name or an email address; request lines name the path, never the
+query. A log line with any of those in it is a bug. The privacy policy at
+`ebirforms.buwiz.com/privacy` and the `/delete-account` page state the 30
+days once the relay is switched on: a change to the 30 days must change
+them too.
 
 ### Once, after the first deploy with this
 
@@ -850,8 +852,10 @@ sudo journalctl -u buwiz-sender.service --no-pager -o cat | grep -c 'remote_path
 sudo grep -c 'remote_path' /var/log/syslog /var/log/syslog.1 ; sudo zgrep -c 'remote_path' /var/log/syslog.*.gz
 ```
 
-If either prints more than 0, start the journal afresh (it drops every
-entry from before now) and remove the old syslog files:
+If either prints more than 0, start the journal afresh and remove the old
+syslog files. This drops every log on the instance from before now, of
+every service (sshd, sudo and the kernel too), so copy out anything you
+still need first:
 
 ```sh
 sudo journalctl --rotate && sudo journalctl --vacuum-time=1s

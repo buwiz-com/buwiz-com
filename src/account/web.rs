@@ -226,7 +226,11 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
             async move { render_page(&pages, &state, request).await }
         })
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(TraceLayer::new_for_http())
+        // The path only: a query can hold an email address or a TIN
+        // (`/login?email=`, `/tins/new?tin=`), and logs carry neither.
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
+            tracing::debug_span!("request", method = %request.method(), path = %request.uri().path())
+        }))
         .with_state(state)
 }
 
@@ -733,9 +737,9 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
     };
     match issued {
         // A test account with a fixed code: its holder has the code
-        // already. The log names the address, never the code.
+        // already. Logs carry no address (docs/deploy.md#logs).
         Some(IssuedCode::Fixed) => {
-            tracing::info!(email = %email, "a code was asked for a test account with a fixed code: nothing is mailed");
+            tracing::info!("a code was asked for a test account with a fixed code: nothing is mailed");
         }
         Some(IssuedCode::Mail(code)) => {
             if let Err(error) = state.mailer.send_sign_in_code(&email, &code).await {

@@ -63,9 +63,11 @@ fi
 # Logs are kept 30 days (docs/deploy.md#logs): journald drops entries
 # older than that, and rsyslog keeps no second copy of the two services'
 # lines in /var/log/syslog, whose weekly rotation would keep them longer.
-mkdir -p /etc/systemd/journald.conf.d
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
 cat > /etc/systemd/journald.conf.d/50-buwiz.conf <<'CONF'
 [Journal]
+# On disk, so a reboot keeps the last 30 days rather than none.
+Storage=persistent
 MaxRetentionSec=30day
 # One file a day, so entries leave close to their 30 days.
 MaxFileSec=1day

@@ -305,7 +305,9 @@ impl Sender {
                     claims["jti"] = json!(jti);
                 }
                 let receipt = jws::sign(&self.config.receipt_key, RECEIPT_TYP, &claims);
-                tracing::info!(submission = %send.submission_id, status, remote_path = %sent.remote_path, "sent");
+                // Ids only: the remote path is the file name, which holds the TIN and
+                // the taxpayer's email. The receipt carries it.
+                tracing::info!(submission = %send.submission_id, status, "sent");
                 Control::Result { status: status.to_owned(), error: None, receipt: Some(Value::String(receipt)) }
             }
             Err(SendError::NotSent(reason)) => {

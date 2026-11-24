@@ -21,6 +21,7 @@ use crate::account::agents;
 use crate::account::claims::{
     self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Papers, Resend, SubmitError, Upload,
 };
+use crate::account::deletion::{self, DeleteError};
 use crate::account::guard::Refused;
 use crate::account::mcp;
 use crate::account::notice::Notice;
@@ -172,6 +173,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/auth/email/start", post(email_start))
         .route("/auth/email/verify", post(email_verify))
         .route("/logout", post(logout))
+        .route("/delete/code", post(deletion_code))
+        .route("/delete/confirm", post(delete_account))
         .route("/device/decision", post(device_decision))
         .route("/account", get(moved_to_tins))
         .route("/tins/claims", post(submit_claim).layer(DefaultBodyLimit::max(CLAIM_BODY_LIMIT)))
@@ -502,6 +505,15 @@ pub async fn session_account(state: &AppState, headers: &HeaderMap) -> anyhow::R
     Ok(accounts::session_account(&state.db, token).await?)
 }
 
+/// The account of the website session, banned or not: only `/delete`
+/// asks this way ([`accounts::deletion_session_account`]).
+pub async fn deletion_account(state: &AppState, headers: &HeaderMap) -> anyhow::Result<Option<Account>> {
+    let Some(token) = accounts::cookie(headers, state.config.session_cookie()) else {
+        return Ok(None);
+    };
+    Ok(accounts::deletion_session_account(&state.db, token).await?)
+}
+
 /// Form posts must come from our own pages. Browsers send `Origin` on every
 /// POST; `Sec-Fetch-Site` covers the rare case they leave it out.
 pub(crate) fn same_origin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -785,9 +797,12 @@ async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(fo
         Err(CodeError::Internal(error)) => return internal(error),
     };
     // The code was right, but a banned account gets no session. Its code
-    // was emailed like any other, so typing an email tells nothing.
+    // was emailed like any other, so typing an email tells nothing. Only
+    // to delete itself does it get one, which no page but `/delete` takes
+    // ([`deletion_account`]).
     match accounts::is_banned(&state.db, account.id).await {
         Ok(false) => {}
+        Ok(true) if next == DELETE_PAGE => {}
         Ok(true) => return see_other(link("/login", Some(Notice::AccountBanned), &[])),
         Err(error) => return internal(error),
     }
@@ -823,6 +838,66 @@ async fn require_session(state: &AppState, headers: &HeaderMap, back_to: &str) -
         Ok(None) => Err(see_other(link("/login", Some(Notice::SignInFirst), &[("next", back_to)]))),
         Err(error) => Err(internal(error)),
     }
+}
+
+/// Where people delete their account.
+pub const DELETE_PAGE: &str = "/delete";
+
+/// The account of the session, banned or not, for deleting it; or a
+/// redirect to sign in and come back to `/delete`.
+async fn require_deletion_session(state: &AppState, headers: &HeaderMap) -> Result<Account, Response> {
+    match deletion_account(state, headers).await {
+        Ok(Some(account)) => Ok(account),
+        Ok(None) => Err(see_other(link("/login", Some(Notice::SignInFirst), &[("next", DELETE_PAGE)]))),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+/// The person asks for a code to delete their account. It is mailed now,
+/// unless the account can't be deleted.
+async fn deletion_code(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_deletion_session(&state, &headers).await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    let admins = &state.config.admin_emails;
+    let notice = match deletion::send_code(&state.db, &state.mailer, admins, account.id, &account.email).await {
+        Ok(()) => Notice::DeleteCodeSent,
+        Err(DeleteError::Refused(notice)) => notice,
+        Err(DeleteError::Code(CodeError::TooMany)) => Notice::CodeTooMany,
+        Err(error) => return internal(anyhow::anyhow!(error)),
+    };
+    see_other(link(DELETE_PAGE, Some(notice), &[]))
+}
+
+#[derive(Deserialize)]
+struct DeleteForm {
+    code: String,
+}
+
+/// The person types the code: the account is deleted, and the browser
+/// signed out.
+async fn delete_account(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<DeleteForm>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_deletion_session(&state, &headers).await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    let admins = &state.config.admin_emails;
+    match deletion::delete(&state.db, &state.documents, admins, account.id, &form.code).await {
+        Ok(()) => {}
+        Err(DeleteError::Refused(notice)) => return see_other(link(DELETE_PAGE, Some(notice), &[])),
+        Err(DeleteError::Code(_)) => return see_other(link(DELETE_PAGE, Some(Notice::DeleteCodeInvalid), &[])),
+        Err(DeleteError::Internal(error)) => return internal(error),
+    }
+    let mut response = see_other(link("/login", Some(Notice::AccountDeleted), &[]));
+    response.headers_mut().insert(header::SET_COOKIE, session_cookie(&state, "", 0));
+    response
 }
 
 #[derive(Deserialize)]

@@ -111,7 +111,8 @@ any sign-in not yet picked up. The person cannot sign in ("This account
 can't be used on Buwiz…"). App sign-ins stay but every API call answers
 `403 account_banned`; the token refresh and signing out still work, so the
 app can say why. Lifting the ban restores everything. An Admin can't be
-banned. The **test label** is for staff only: they see and filter it, and
+banned. A banned account can't delete itself either: `/delete` sends it to
+support (see "Deleting an account"). The **test label** is for staff only: they see and filter it, and
 sends work as usual.
 
 A **test TIN** is a made-up one: its root is `000-000-000`, at any branch,
@@ -216,6 +217,82 @@ why; actions on claims go to `claim_audit`, review decisions (approved,
 rejected, sent back) included, so who decided outlives the claim. Both are
 on the user's page under History, which staff read on their own page
 too.
+
+### Deleting an account
+
+People delete their own account on `account.buwiz.com/delete`. The
+eBIRForms app's Settings > Account > Delete account opens that page. It
+needs a sign-in, and says what goes and what stays before anything
+happens. Code: `src/account/deletion.rs`, the page in
+`src/account/pages/delete.rs`.
+
+**The code.** "Email me a code" mails a fresh six-digit code to the
+account's address. Typing it on the page deletes the account. It is kept
+in `email_codes` like a sign-in code, with `purpose = 'delete'`; a code
+works only for its own purpose, so a sign-in code never deletes an account
+and a deletion code never signs anyone in. Only the newest deletion code
+works, so one asked for earlier does not. The limits of sign-in codes
+hold: five codes an hour for the address (sign-in and deletion codes
+together), ten minutes, five wrong tries. A test account with a fixed
+sign-in code still gets a random code by mail, never its fixed code:
+whoever deletes it must read its mailbox. The form has no Turnstile check
+or limit per network: it mails only the signed-in account's own address.
+The page asks once more, in the
+site's own dialog, before the account is deleted.
+
+**What is deleted,** in one transaction: the account, and with it (`ON
+DELETE CASCADE`) its browser sessions, devices and app and agent sign-ins
+with their tokens, device and agent sign-in requests, every TIN with its
+files and their readings, its returns with their receipts, its tickets,
+its BIR queue reports and turns, and its held requests and proofs of
+outage. Also its codes in `email_codes` (no foreign key) and the recent
+signatures of its devices (`request_nonces`). After the commit, the stored
+objects of files that were still kept (claims still open) are deleted, as
+when a claim is deleted: a failure is logged, and the bytes are ciphertext
+whose key stays with us. The browser is signed out. An app signed in to
+the account hears `401 invalid_token` on its calls and `invalid_grant` on
+its refresh, as for any ended sign-in.
+
+**What stays:**
+- Audit lines. `claim_audit` names a TIN only masked and `account_audit`
+  names the account by its id. A `deleted` line is added (actor: the
+  account itself, no address). Lines where the person was the actor on
+  their own account lose the address (`actor_email` becomes empty); staff
+  lines keep the staff member's. A seed run's summary keeps the address of
+  a login it made.
+- BIR uptime tries (`bir_tries`), 90 days. They hold only keyed daily
+  hashes, not the account.
+- Server logs, which carry ids only.
+- The database provider's backups, for their window.
+
+Returns the BIR already received are not withdrawn. Nothing stored in the
+app on the person's computer is touched.
+
+**Refused,** with the reason on the page, both when the code is asked for
+and when it is typed:
+- A stored staff role: an Admin removes it first. An address in
+  `ADMIN_EMAILS` is refused too, until it leaves that setting.
+- An account named in staff work elsewhere: the staff columns of other
+  accounts' TINs (`decided_by`, `sent_back_by`, `removed_by`, `paused_by`,
+  `auto_confirmed_by`) and accounts (`banned_by`, `fixed_code_set_by`),
+  audit lines about other accounts, BIR notes, events and host keys, and
+  seed runs. The person writes to support@buwiz.com. Those rows are never
+  changed to let the deletion through: several checks give NULL a meaning
+  (`paused_by` NULL is a pause by Buwiz), and the audit must keep who did
+  it.
+- A return being sent right now (`submissions.status = 'sending'`): try
+  again in a few minutes. The deletion locks the account and its returns,
+  so none starts sending meanwhile.
+- A banned account: write to support@buwiz.com. The ban is on the
+  account's row, so deleting it here would let the address sign up again,
+  unbanned; support decides what to keep. Its sign-in with `next=/delete`
+  gets a session that only `/delete` takes (every other page still treats
+  it as signed out), so the page can say this.
+
+**Sign-in records** are deleted by the hourly upkeep
+(`accounts::upkeep`): codes 30 days after they were made, and device and
+agent sign-in requests 30 days after they expired. The limits per address
+look back an hour and a day, so nothing needs them by then.
 
 ## TIN activation
 

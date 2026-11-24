@@ -26,6 +26,7 @@ use crate::base::state::AppState;
 use crate::filing::devices;
 
 mod bir_status;
+mod delete;
 mod download;
 mod home;
 mod privacy;
@@ -46,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         .page(signup_page)
         .page(verify_page)
         .page(device_page)
+        .page(delete::delete_page)
         .page(authorize_page)
         .page(tins::tins_page)
         .page(tins::new_tin_page)
@@ -266,6 +268,7 @@ fn head_for(path: &str) -> Head {
         "/signup" => "Create account · Buwiz",
         "/login/verify" => "Check your email · Buwiz",
         "/device" => "Sign in to the app · Buwiz",
+        "/delete" => delete::TITLE,
         "/oauth/authorize" => "Connect an AI app · Buwiz",
         "/tins" => "My TINs · Buwiz",
         "/tins/new" => "Add a TIN · Buwiz",

@@ -100,6 +100,9 @@ pub async fn run() -> anyhow::Result<()> {
                 if let Err(error) = account::verify::upkeep(&state.db).await {
                     tracing::error!(error = ?error, "automatic activation upkeep failed");
                 }
+                if let Err(error) = account::accounts::upkeep(&state.db).await {
+                    tracing::error!(error = ?error, "sign-in records upkeep failed");
+                }
                 uptime::hourly(&state, time::OffsetDateTime::now_utc()).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }

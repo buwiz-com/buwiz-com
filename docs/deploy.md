@@ -821,6 +821,45 @@ Move to a t4g.small (2 GB) when the server's own memory passes about
 350 MB, when the host starts to swap, or when claims queue faster than one
 every few seconds.
 
+## Logs
+
+Both services log to the journal on the instance, and nowhere else: no
+log shipping is set up. `install.sh` keeps them 30 days:
+
+- `/etc/systemd/journald.conf.d/50-buwiz.conf` sets `MaxRetentionSec=30day`
+  and one journal file a day (`MaxFileSec=1day`), so entries leave close
+  to their 30 days;
+- `/etc/rsyslog.d/10-buwiz.conf` keeps the services' lines
+  (`buwiz-cloud`, `buwiz-sender`) out of `/var/log/syslog`, whose weekly
+  rotation would keep a second copy for five weeks.
+
+The lines carry ids (account, submission, device, ticket, claim), never a
+TIN, a name or an email address. The privacy policy at
+`ebirforms.buwiz.com/privacy` says so, and names the 30 days: a log line
+with any of those in it is a bug, and so is a change to the 30 days that
+the policy does not follow.
+
+### Once, after the first deploy with this
+
+Releases before it logged each send's remote path (the file name, with
+the TIN and the taxpayer's email) from the Sender. Check whether any such
+line is left, and remove them if so:
+
+```sh
+sudo journalctl -u buwiz-sender.service --no-pager -o cat | grep -c 'remote_path'
+sudo grep -c 'remote_path' /var/log/syslog /var/log/syslog.1 ; sudo zgrep -c 'remote_path' /var/log/syslog.*.gz
+```
+
+If either prints more than 0, start the journal afresh (it drops every
+entry from before now) and remove the old syslog files:
+
+```sh
+sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+sudo rm -f /var/log/syslog.*.gz /var/log/syslog.1 && sudo truncate -s 0 /var/log/syslog
+```
+
+On 2026-11-25 both counts were 0 (nothing had gone through the relay yet).
+
 ## The Sender
 
 The Sender runs on the same instance as `buwiz-sender.service`. It listens

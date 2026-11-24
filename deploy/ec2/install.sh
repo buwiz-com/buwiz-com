@@ -60,6 +60,25 @@ if ! swapon --show=NAME --noheadings | grep -q /swapfile; then
   grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
+# Logs are kept 30 days (docs/deploy.md#logs): journald drops entries
+# older than that, and rsyslog keeps no second copy of the two services'
+# lines in /var/log/syslog, whose weekly rotation would keep them longer.
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/50-buwiz.conf <<'CONF'
+[Journal]
+MaxRetentionSec=30day
+# One file a day, so entries leave close to their 30 days.
+MaxFileSec=1day
+CONF
+systemctl restart systemd-journald.service
+if [ -d /etc/rsyslog.d ]; then
+  cat > /etc/rsyslog.d/10-buwiz.conf <<'CONF'
+# The Buwiz services log to the journal only (30 days there).
+if $programname startswith 'buwiz' then stop
+CONF
+  systemctl restart rsyslog.service || true
+fi
+
 # Tunnel settings: every hostname routed to this tunnel reaches the app.
 umask 077
 tunnel_id=$($aws ssm get-parameter --name /buwiz/tunnel/id --query Parameter.Value --output text)

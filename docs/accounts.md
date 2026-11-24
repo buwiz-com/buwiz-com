@@ -137,38 +137,63 @@ label cannot come off an account while it holds one that has not ended
 database: such a row is only ever an Admin's or the seed tool's, active
 or ended (`approved`, `removed`, `revoked`).
 
-### The store review login
+<a id="the-store-review-login"></a>
+
+### Fixed sign-in codes for test accounts (store review)
 
 Apple's and Microsoft's reviewers have to sign in to the apps, and they
-cannot read a mailbox of ours. `REVIEW_LOGIN_EMAIL` and `REVIEW_LOGIN_CODE`
-name one address and one six-digit code for them (`ReviewLogin` in
-`src/base/config.rs`, `issue_code` in `src/account/accounts.rs`):
+cannot read a mailbox of ours. So an Admin can give a test account a
+**fixed sign-in code**: six digits, set on the account's staff page. While
+it is set, no code is mailed to that address; whoever asks for one types
+the fixed code instead. Any test account can have one, not only the
+reviewers' (`set_fixed_code` in `src/account/admin.rs`, `issue_code` in
+`src/account/accounts.rs`).
 
-- When that address asks for a code, the fixed code is stored in place of
-  a random one, and nothing is mailed. The reviewer types it on the code
-  page as anyone types theirs.
-- It stands in only while the address is an existing account with the
-  **test label**, no staff role and no ban. The settings alone open
-  nothing: an Admin makes the login ("New user" on `/staff/users`, or the
-  seed tool with `test = true`) and gives it the label, and taking the
-  label away closes it at the next code asked for. Otherwise the address
-  gets a random, mailed code like any other.
-- Every limit holds for it: Turnstile and the limit per network, five codes
-  an hour for the address, ten minutes for a code, five wrong guesses.
-- `GET /me` answers `practice: true` for it, and for no other account. An
-  app that reads it simulates every send, so a reviewer files nothing by
-  pressing a button. The test label alone does not do this: a test
-  account's sends work as usual.
+**Who and where.** Only an Admin sets, changes or clears it, on the
+account's page (`/staff/users/{id}`, Account tab, "Fixed sign-in code";
+the users list's inspector links there). Support sees that one is set and
+cannot change it. Each set, change and clear needs a reason and writes a
+line in the account's history (`fixed_code_set`, `fixed_code_changed`,
+`fixed_code_cleared`), which holds neither the code nor its hash.
 
-Both settings must be given, the address must be a plain one that is not
-in `ADMIN_EMAILS`, and the code must be exactly six digits; otherwise the
-login stays off and the server says why in its log at start. When it is
-on, the server logs the address (never the code) at start, and a line each
-time the fixed code is asked for.
+**The conditions.** It is set only on an account with the test label, no
+staff role, no ban, not in `ADMIN_EMAILS`, and not the Admin's own. It
+stands in only while all of that still holds (`fixed_code_sql` in
+`src/account/roles.rs`): a ban or a staff role given later makes the next
+code random and mailed again, though the fixed code stays stored until an
+Admin clears it.
 
-The code is as secret as a password that two companies hold: pick a random
-one, give the login no real TIN, and change the code (or clear the
-settings) when a review is over.
+**What it does to sign-in.** The sign-in form works as always: when the
+address asks for a code, the fixed code's hash is stored as the new code
+and nothing is mailed. The reviewer types it on the code page as anyone
+types theirs. Every limit holds: Turnstile and the limit per network, five
+codes an hour for the address, ten minutes for a code, five wrong guesses.
+The fixed code signs nobody in unless a code was asked for through the
+form first. Setting, changing or clearing it closes any code asked for
+before.
+
+**What it does to `GET /me`.** It answers `practice: true` exactly while
+the account signs in with a fixed code, and `false` for every other
+account. An app that reads it simulates every send, so a reviewer files
+nothing by pressing a button. The test label alone does not do this: a
+test account's sends work as usual.
+
+**Stored as a hash.** Only `code_hash(email, code)` is kept
+(`accounts.fixed_code_hash`, the form `email_codes` uses), with who set it
+and when. The code is never shown again, on any page, and never logged: a
+code asked for logs the address only. Write it down where you keep the
+stores' review notes before you press Set. The label cannot come off the
+account while a code is set (`fixed_code_held`, and migration 15's check
+in the database): clear the code first. The seed file never sets one.
+
+**How to use it:**
+1. Give the account the test label ("New user" with "Test account" on
+   `/staff/users`, "Mark as test" on its page, or the seed tool with
+   `test = true`). Give it no real TIN.
+2. On its staff page, under "Fixed sign-in code", press Set, type a random
+   six-digit code (not 123456) and a reason.
+3. Give the address and the code to the stores. When the review is over,
+   clear the code (or change it for the next review).
 
 A ban that commits while a request for the account is under way wins:
 activation, approval, an app's sign-in approval and an agent's consent

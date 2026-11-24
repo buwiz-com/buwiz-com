@@ -28,7 +28,6 @@ lost, every stored claim document becomes unreadable.**
 | `SENDER_URL`, `SENDER_SECRET` | The Sender's private address (`http://127.0.0.1:3009`) and a shared secret, `openssl rand -base64 32` |
 | `RESEND_API_KEY`, `MAIL_FROM` | Resend, with buwiz.com verified as the sending domain |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | A Cloudflare Turnstile widget (Managed) for the hostname `account.buwiz.com`; `deploy/ec2/turnstile-keys.sh` stores both and restarts the server. Without them the sign-in forms have no check against scripts, and the server says so in its log at start ([accounts.md](accounts.md#who-can-be-mailed-a-code)) |
-| `REVIEW_LOGIN_EMAIL`, `REVIEW_LOGIN_CODE` | Optional. The login the app stores' reviewers use: the address signs in with this six-digit code, never mailed, while it is a test account ([accounts.md](accounts.md#the-store-review-login)). Make the account and give it the test label first |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | An R2 API token, "Object Read & Write", limited to the `buwiz` and `assets` buckets |
 
 Claim documents live in the R2 bucket `buwiz` as `claims/{claim}/{document}`.
@@ -246,8 +245,9 @@ The order:
    `sudo systemctl stop buwiz.service`.
 3. From the release's checkout, run the newer down file, then the older,
    each in one transaction (from a release with migration 13, run
-   [its down file](#migration-13-test-tins) first, and from one with 14,
-   [14's](#migration-14-bir-uptime) before that; each commits on its own,
+   [its down file](#migration-13-test-tins) first, from one with 14,
+   [14's](#migration-14-bir-uptime) before that, and from one with 15,
+   [15's](#migration-15-fixed-sign-in-codes) before 14's; each commits on its own,
    [below](#rolling-back-from-13)):
    ```sh
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0012_staff_roles.down.sql
@@ -650,7 +650,8 @@ SELECT date_trunc('hour', started_at) AS hour, mode, outcome, failure_class, fai
   FROM bir_tries GROUP BY 1, 2, 3, 4, 5 ORDER BY 1 DESC;
 ```
 
-**Rolling back to 13.** The down file never refuses. It moves what Buwiz
+**Rolling back to 13.** From a release with migration 15, run
+[15's down file](#migration-15-fixed-sign-in-codes) first. The down file never refuses. It moves what Buwiz
 keeps forever, the day history (`bir_days`), events, notes, proofs and the
 sign (`bir_sign`, whose `seq` only grows), to tables in the
 `rollback_archive` schema, which the release before this one does not
@@ -758,6 +759,46 @@ sudo systemd-run --quiet --uid=buwiz --pipe --wait -p EnvironmentFile=/etc/buwiz
 ```
 Below `BIR_UPTIME=public` the note is kept and staff see it in the mail,
 but no app or page shows anything.
+
+## Migration 15 (fixed sign-in codes)
+
+The release with fixed sign-in codes for test accounts
+([accounts.md](accounts.md#fixed-sign-in-codes-for-test-accounts-store-review))
+runs migration 15 when it starts. It adds three nullable columns to
+`accounts` (`fixed_code_hash`, `fixed_code_set_by`, `fixed_code_set_at`)
+with a check that a code always says who set it and when and lives on a
+test account only, and it lets `account_audit` hold the three new actions.
+No row changes; the checks scan `accounts` and `account_audit`, both small.
+There is no setting: an Admin sets each code on the account's staff page.
+The release before it (at 14) refuses to start on a database at 15.
+
+**Before you deploy.** The database is at 14 (a read-only check):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 14
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 14.** The down file never refuses. It drops every fixed
+code (those test accounts get a random, mailed code again; tell the stores
+first if a review is under way, and set the codes again after the way up)
+and moves the history lines of fixed codes to
+`rollback_archive.account_audit`, where they stay; they never held a code.
+In this order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0015_fixed_codes.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 14
+   ```
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 15 again (with no codes), and the
+   rollback starts over at 1.
+
+Going further back runs 15's down file first, then 14's and the others as
+[above](#migration-14-bir-uptime); each commits on its own.
 
 ## OCR of claim documents
 

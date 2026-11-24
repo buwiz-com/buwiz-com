@@ -78,6 +78,9 @@ pub enum Power {
     Pause,
     Ban,
     MarkTest,
+    /// Set, change or clear a test account's fixed sign-in code
+    /// ([`crate::account::admin::set_fixed_code`]).
+    FixedCode,
     ChangeRole,
     /// Make a login on the staff pages.
     CreateLogin,
@@ -124,6 +127,19 @@ pub fn in_list(admin_emails: &[String], email: &str) -> bool {
 /// with a stored role or in the list bound as `list`.
 pub fn is_staff_sql(account: &str, list: &str) -> String {
     format!("({account}.banned_at IS NULL AND ({account}.role IS NOT NULL OR {account}.email = ANY({list})))")
+}
+
+/// The SQL for "this account (alias `account`) signs in with its fixed
+/// code" ([`crate::account::accounts::issue_code`]): it has one, and it is
+/// still a plain test account: the test label, no stored role, no ban, and
+/// not in the list bound as `list` (`ADMIN_EMAILS`). A code set before a
+/// ban or a role stays stored, but signs nobody in until the account is a
+/// plain test account again.
+pub fn fixed_code_sql(account: &str, list: &str) -> String {
+    format!(
+        "({account}.fixed_code_hash IS NOT NULL AND {account}.test_account AND {account}.role IS NULL
+          AND {account}.banned_at IS NULL AND NOT {account}.email = ANY({list}))"
+    )
 }
 
 /// Every staff address, for staff mail: accounts with a stored role that
@@ -291,6 +307,7 @@ mod tests {
             Pause,
             Ban,
             MarkTest,
+            FixedCode,
             ChangeRole,
             CreateLogin,
             SetBirStatus,

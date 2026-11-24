@@ -6,7 +6,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::account::notice::Notice;
-use crate::base::config::ReviewLogin;
+use crate::account::roles;
 use crate::base::crypto;
 
 pub const CODE_TTL: Duration = Duration::minutes(10);
@@ -66,28 +66,38 @@ impl From<sqlx::Error> for CodeError {
     }
 }
 
-fn code_hash(email: &str, code: &str) -> Vec<u8> {
+/// How a sign-in code is stored: in `email_codes.code_hash`, and an
+/// account's fixed code in `accounts.fixed_code_hash`, so the one can be
+/// copied into the other.
+pub(crate) fn code_hash(email: &str, code: &str) -> Vec<u8> {
     crypto::hash(&format!("{email}:{code}"))
 }
 
-/// A code [`issue_code`] made.
-#[derive(Debug)]
-pub struct IssuedCode {
-    pub code: String,
-    /// The store review login's fixed code: its holder already knows it,
-    /// so it is not mailed.
-    pub fixed: bool,
+/// A code [`issue_code`] stored.
+pub enum IssuedCode {
+    /// A random code, for the caller to mail.
+    Mail(String),
+    /// The account's fixed code ([`roles::fixed_code_sql`]): its hash was stored,
+    /// its holder knows the code, and nothing is mailed.
+    Fixed,
 }
 
-/// Creates a 6-digit code for `email` and returns it for mailing.
-///
-/// `review` is the store review login, when the server has one. Its fixed
-/// code is used in place of a random one only while its address is an
-/// existing account with the test label, no staff role and no ban, so the
-/// setting alone opens nothing: an Admin has to make that account and mark
-/// it first, and taking the label away closes it again. The code is stored
-/// like any other, so the limits on codes and on wrong guesses hold for it.
-pub async fn issue_code(db: &PgPool, email: &str, review: Option<&ReviewLogin>) -> Result<IssuedCode, CodeError> {
+impl std::fmt::Debug for IssuedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mail(_) => f.write_str("Mail([hidden])"),
+            Self::Fixed => f.write_str("Fixed"),
+        }
+    }
+}
+
+/// Stores a sign-in code for `email`: a random 6-digit one, returned for
+/// mailing, or, for an account with a fixed code that is still a plain
+/// test account ([`roles::fixed_code_sql`]; `admin_emails` is `ADMIN_EMAILS`), a
+/// copy of that code's hash, with nothing to mail. Either way the code is
+/// stored the same way after the same limits, so the ten minutes and the
+/// five wrong guesses hold for both.
+pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Result<IssuedCode, CodeError> {
     let mut tx = db.begin().await?;
     let recent: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > now() - interval '1 hour'",
@@ -117,21 +127,25 @@ pub async fn issue_code(db: &PgPool, email: &str, review: Option<&ReviewLogin>) 
             return Err(CodeError::Busy);
         }
     }
-    let fixed = match review.filter(|review| known && review.email == email) {
-        Some(review) => {
-            let test_only: bool = sqlx::query_scalar(
-                "SELECT test_account AND role IS NULL AND banned_at IS NULL FROM accounts WHERE email = $1",
-            )
-            .bind(email)
-            .fetch_one(&mut *tx)
-            .await?;
-            test_only.then(|| review.code.clone())
-        }
-        None => None,
+    let fixed: Option<Vec<u8>> = if known {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(&format!(
+            "SELECT a.fixed_code_hash FROM accounts a WHERE a.email = $1 AND {}",
+            roles::fixed_code_sql("a", "$2")
+        ))
+        .bind(email)
+        .bind(admin_emails)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+    } else {
+        None
     };
-    let (code, fixed) = match fixed {
-        Some(code) => (code, true),
-        None => (format!("{:06}", rand::rng().random_range(0..1_000_000)), false),
+    let (hash, issued) = match fixed {
+        Some(hash) => (hash, IssuedCode::Fixed),
+        None => {
+            let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
+            (code_hash(email, &code), IssuedCode::Mail(code))
+        }
     };
     // Dated when it is added, not when the transaction began: the code
     // added last (after waiting for the lock) must be the newest, because
@@ -140,12 +154,12 @@ pub async fn issue_code(db: &PgPool, email: &str, review: Option<&ReviewLogin>) 
         "INSERT INTO email_codes (email, code_hash, expires_at, created_at) VALUES ($1, $2, $3, clock_timestamp())",
     )
     .bind(email)
-    .bind(code_hash(email, &code))
+    .bind(hash)
     .bind(OffsetDateTime::now_utc() + CODE_TTL)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(IssuedCode { code, fixed })
+    Ok(issued)
 }
 
 /// Checks the newest open code for `email`. A match signs the person in,

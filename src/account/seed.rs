@@ -39,7 +39,9 @@
 //! TIN (000-000-000, at any branch) goes in only when its entry says
 //! `test_tin = true`, active, on a login with the test label; such an
 //! entry for a real TIN refuses the file, as does taking the label off a
-//! login that holds a test TIN.
+//! login that holds a test TIN or has a fixed sign-in code. The file never
+//! sets a fixed code (it has no key for one): an Admin sets it on the
+//! account's staff page.
 //!
 //! Reasons stay with staff: they go into the audit lines only, never into
 //! `decision_note` or `removal_note`, and the old owner of a TIN that moves
@@ -877,6 +879,17 @@ impl Seed<'_> {
         {
             self.problems.push(format!(
                 "login {email}: it holds a test TIN, so the test label stays; revoke it on /staff/queue first"
+            ));
+        } else if let Some(test) = login.test
+            && test != stored_test
+            && !test
+            && admin::has_fixed_code(&mut self.tx, id).await?
+        {
+            // The seed file never sets or clears one: an Admin does, on the
+            // account's staff page.
+            self.problems.push(format!(
+                "login {email}: it has a fixed sign-in code, so the test label stays; an Admin clears the code on \
+                 its staff page first"
             ));
         } else if let Some(test) = login.test
             && test != stored_test

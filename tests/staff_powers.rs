@@ -187,6 +187,8 @@ const MATRIX: &[&str] = &[
     "/staff/users/{account_id}/unban",
     "/staff/users/{account_id}/test",
     "/staff/users/{account_id}/test-tin",
+    "/staff/users/{account_id}/fixed-code",
+    "/staff/users/{account_id}/fixed-code/clear",
     "/staff/users/new",
 ];
 
@@ -438,6 +440,31 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
                 .await
                 .unwrap();
         assert_eq!(test_tins == 1, who.may(true), "{who:?}");
+
+        // A fixed sign-in code on a plain test account (the target has a
+        // role by now): Admins only.
+        let (tester, _) = site.person(&format!("tester{n}@example.test")).await;
+        sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1")
+            .bind(tester)
+            .execute(&site.db)
+            .await
+            .unwrap();
+        let tester_page = format!("/staff/users/{tester}");
+        let fixed = || async {
+            sqlx::query_scalar::<_, bool>("SELECT fixed_code_hash IS NOT NULL FROM accounts WHERE id = $1")
+                .bind(tester)
+                .fetch_one(&site.db)
+                .await
+                .unwrap()
+        };
+        let done = format!("{tester_page}?notice=fixed_code_set");
+        let path = format!("{tester_page}/fixed-code");
+        expect_post(site, (who, &cookie), &path, "code=730215&reason=Store+review", true, &tester_page, &done).await;
+        assert_eq!(fixed().await, who.may(true), "{who:?}");
+        let done = format!("{tester_page}?notice=fixed_code_cleared");
+        let path = format!("{tester_page}/fixed-code/clear");
+        expect_post(site, (who, &cookie), &path, "reason=Review+over", true, &tester_page, &done).await;
+        assert!(!fixed().await, "{who:?}");
 
         // A new login: Admins only.
         let email = format!("new-{}@example.test", format!("{who:?}").to_lowercase());
@@ -780,6 +807,8 @@ async fn every_admin_action_rechecks_its_actor_in_its_transaction(db: PgPool) {
     admin_only(admin::ban(db, config, &staff, ana, "Abuse").await);
     admin_only(admin::unban(db, config, &staff, dan, "Sorted").await);
     admin_only(admin::mark_test(db, config, &staff, ana, true, "Trial").await);
+    admin_only(admin::set_fixed_code(db, config, &staff, ana, "730215", "Store review").await);
+    admin_only(admin::clear_fixed_code(db, config, &staff, ana, "Review over").await);
     admin_only(claims::activate_without_papers(db, config, store, unverified, actor, "Known").await);
     admin_only(claims::pause(db, config, active, actor, "Check").await);
     admin_only(claims::resume(db, config, paused, actor, "Ok").await);
@@ -1091,6 +1120,8 @@ fn staff_posts(t: &Target, user: &str) -> Vec<(String, String)> {
         (format!("{user}/unban"), "reason=Sorted".into()),
         (format!("{user}/test"), "test=on&reason=Trial".into()),
         (format!("{user}/test-tin"), "tin=000-000-000&kind=personal&registered_name=Test&reason=Trial".into()),
+        (format!("{user}/fixed-code"), "code=730215&reason=Store+review".into()),
+        (format!("{user}/fixed-code/clear"), "reason=Review+over".into()),
         ("/staff/users/new".into(), "email=new%40example.test&role=support&reason=Joins".into()),
     ]
 }
@@ -1100,7 +1131,7 @@ fn staff_posts(t: &Target, user: &str) -> Vec<(String, String)> {
 async fn everything(db: &PgPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT concat_ws('|', 'claims', (SELECT string_agg(id || status || coalesce(paused_at::text, ''), ',' ORDER BY id) FROM tin_claims))
-         UNION ALL SELECT concat_ws('|', 'accounts', (SELECT string_agg(id || coalesce(role, '') || test_account || coalesce(banned_at::text, ''), ',' ORDER BY id) FROM accounts))
+         UNION ALL SELECT concat_ws('|', 'accounts', (SELECT string_agg(id || coalesce(role, '') || test_account || coalesce(banned_at::text, '') || coalesce(fixed_code_set_at::text, ''), ',' ORDER BY id) FROM accounts))
          UNION ALL SELECT concat_ws('|', 'sessions', (SELECT count(*) FROM web_sessions WHERE revoked_at IS NULL))
          UNION ALL SELECT concat_ws('|', 'grants', (SELECT count(*) FROM oauth_grants WHERE revoked_at IS NULL))
          UNION ALL SELECT concat_ws('|', 'audit', (SELECT count(*) FROM claim_audit), (SELECT count(*) FROM account_audit))",

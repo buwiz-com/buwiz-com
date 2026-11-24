@@ -30,6 +30,9 @@ pub struct Mailer {
     http: reqwest::Client,
     /// Tests only ([`Mailer::recording`]): notices are kept here, not sent.
     outbox: Option<Mutex<Vec<Notice>>>,
+    /// Tests only ([`Mailer::recording`]): sign-in codes as (to, code),
+    /// kept here, not sent.
+    codes: Option<Mutex<Vec<(String, String)>>>,
     /// Tests only: a recording mailer that fails every notice.
     failing: AtomicBool,
 }
@@ -53,14 +56,27 @@ impl Mailer {
                 .build()
                 .unwrap_or_default(),
             outbox: None,
+            codes: None,
             failing: AtomicBool::new(false),
         }
     }
 
-    /// A mailer for tests: notices are kept in memory ([`Mailer::notices`])
-    /// and nothing goes out; sign-in codes are logged.
+    /// A mailer for tests: notices and sign-in codes are kept in memory
+    /// ([`Mailer::notices`], [`Mailer::sign_in_codes`]) and nothing goes out.
     pub fn recording(site_origin: &str) -> Self {
-        Self { outbox: Some(Mutex::new(Vec::new())), ..Self::new(MailConfig::Log, site_origin) }
+        Self {
+            outbox: Some(Mutex::new(Vec::new())),
+            codes: Some(Mutex::new(Vec::new())),
+            ..Self::new(MailConfig::Log, site_origin)
+        }
+    }
+
+    /// The sign-in codes a [`Mailer::recording`] kept, as (to, code), oldest
+    /// first.
+    pub fn sign_in_codes(&self) -> Vec<(String, String)> {
+        self.codes
+            .as_ref()
+            .map_or_else(Vec::new, |codes| codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
     }
 
     /// Tests only: a [`Mailer::recording`] fails every notice while `fail`.
@@ -106,6 +122,10 @@ impl Mailer {
     }
 
     pub async fn send_sign_in_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
+        if let Some(codes) = &self.codes {
+            codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((to.into(), code.into()));
+            return Ok(());
+        }
         let message = CodeMessage::new(code, &self.logo_url);
         match &self.config {
             MailConfig::Log => {

@@ -7,7 +7,7 @@ use axum::http::{Request, header};
 use axum::response::Response;
 use buwiz_cloud::account::accounts;
 use buwiz_cloud::account::verify::Verification;
-use buwiz_cloud::base::config::{Config, MailConfig, ReviewLogin, TurnstileConfig};
+use buwiz_cloud::base::config::{Config, MailConfig, TurnstileConfig};
 use buwiz_cloud::base::crypto;
 use buwiz_cloud::base::state::AppState;
 use buwiz_cloud::base::storage::DocumentStore;
@@ -109,14 +109,14 @@ impl Site {
         Self { db, router: buwiz_cloud::app(state.clone()), state }
     }
 
-    /// A site with the store review login `email`, whose fixed code is `code`
-    /// (`REVIEW_LOGIN_EMAIL`, `REVIEW_LOGIN_CODE`).
-    pub fn with_review_login(db: PgPool, email: &str, code: &str) -> Self {
-        let mut config = test_config(NO_DOWNLOADS, vec![STAFF.into()]);
-        config.review_login = Some(ReviewLogin { email: email.into(), code: code.into() });
+    /// A site whose mail is kept, not sent: the sign-in codes it mails are
+    /// `site.state.mailer.sign_in_codes()`.
+    pub fn with_mailbox(db: PgPool) -> Self {
+        let config = test_config(NO_DOWNLOADS, vec![STAFF.into()]);
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
-        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender);
+        let mailer = buwiz_cloud::account::mail::Mailer::recording(ORIGIN);
+        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender).with_mailer(mailer);
         Self { db, router: buwiz_cloud::app(state.clone()), state }
     }
 
@@ -269,7 +269,6 @@ fn test_config(downloads_url: &str, admin_emails: Vec<String>) -> Config {
         admin_emails,
         mail: MailConfig::Log,
         turnstile: None,
-        review_login: None,
         trust_list: None,
         downloads_url: downloads_url.into(),
         forms_origin: FORMS.into(),

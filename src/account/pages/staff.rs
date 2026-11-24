@@ -1391,7 +1391,7 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
     let claims = queries::claims_of(db, &ids).await?;
     let list_params = |open: &str| href("/staff/users", &[("filter", filter.code()), ("q", &search), ("open", open)]);
     let summary = match selected {
-        Some(id) => user_summary_data(cx, id, &claims).await?,
+        Some(id) => user_summary_data(cx, &viewer, id, &claims).await?,
         None => None,
     };
     let selected = summary.as_ref().map(|summary| summary.user.id);
@@ -1523,6 +1523,9 @@ async fn user_row(row: UserListRow) -> Result<impl View> {
                     if row.user.test_account {
                         sx_pill(label: "Test", sym: "flask", tone: "test")
                     }
+                    if row.user.fixed_code_set_at.is_some() {
+                        sx_pill(label: "Fixed code", sym: "key", tone: "warn")
+                    }
                     if row.user.banned_at.is_some() {
                         sx_pill(label: "Banned", sym: "ban", tone: "bad")
                     }
@@ -1560,9 +1563,18 @@ struct UserSummary {
     id_status: IdStatus,
     live_sessions: usize,
     apps: Vec<AppRow>,
+    fixed: FixedCode,
+    /// The viewer may set the fixed code (an Admin, not on their own
+    /// account): the inspector links to the control on the account's page.
+    may_fixed: bool,
 }
 
-async fn user_summary_data(cx: &Cx, account_id: Uuid, claims: &[queries::UserClaim]) -> Result<Option<UserSummary>> {
+async fn user_summary_data(
+    cx: &Cx,
+    viewer: &Staff,
+    account_id: Uuid,
+    claims: &[queries::UserClaim],
+) -> Result<Option<UserSummary>> {
     let db = &state(cx).db;
     let Some(user) = queries::user(db, account_id).await? else {
         return Ok(None);
@@ -1575,14 +1587,20 @@ async fn user_summary_data(cx: &Cx, account_id: Uuid, claims: &[queries::UserCla
     let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
     let live_sessions = queries::sessions(db, account_id).await?.iter().filter(|(_, live)| *live).count();
     let apps = queries::apps(db, account_id).await?.into_iter().filter(|app| app.signed_in).collect();
-    Ok(Some(UserSummary { badge: role_badge(role), user, claims, id_status, live_sessions, apps }))
+    let fixed = FixedCode::of(&state(cx).config, &user);
+    let may_fixed = viewer.can(Power::FixedCode) && viewer.account.id != account_id;
+    Ok(Some(UserSummary { badge: role_badge(role), user, claims, id_status, live_sessions, apps, fixed, may_fixed }))
 }
 
 /// The inspector's account: who it is, its TINs and sign-ins, and the way
 /// to its full page, where its actions are.
 #[component]
 async fn user_summary(summary: UserSummary) -> Result<impl View> {
-    let UserSummary { user, claims, badge, id_status, live_sessions, apps } = summary;
+    let UserSummary { user, claims, badge, id_status, live_sessions, apps, fixed, may_fixed } = summary;
+    // The list's quick way to the control: the inspector has no actions of
+    // its own, only links to the account's page.
+    let fixed_link =
+        (may_fixed && (fixed.set || fixed.why_not.is_none())).then(|| format!("/staff/users/{}#fixed-code", user.id));
     let (id_label, id_icon, _) = id_status.look();
     let mut names: Vec<String> = Vec::new();
     for claim in &claims {
@@ -1617,6 +1635,9 @@ async fn user_summary(summary: UserSummary) -> Result<impl View> {
                             if user.test_account {
                                 sx_pill(label: "Test account", sym: "flask", tone: "test")
                             }
+                            if fixed.set {
+                                sx_pill(label: "Fixed code", sym: "key", tone: "warn")
+                            }
                             if user.banned_at.is_some() {
                                 sx_pill(label: "Banned", sym: "ban", tone: "bad")
                             }
@@ -1625,6 +1646,14 @@ async fn user_summary(summary: UserSummary) -> Result<impl View> {
                 </div>
                 <div class="sx-facts">
                     <div class="sx-fact"><span class="k">"Role"</span><span class="v">(badge.map_or("No staff role", |(label, _)| label))</span></div>
+                    if let Some(link) = fixed_link {
+                        <div class="sx-fact">
+                            <span class="k">"Fixed code"</span>
+                            <span class="v">
+                                <a class="sx-btn sm" href=(link)>(ic("key")) (if fixed.set { "Change or clear" } else { "Set fixed code" })</a>
+                            </span>
+                        </div>
+                    }
                     <div class="sx-fact"><span class="k">"Active"</span><span class="v">(ago(user.last_active))</span></div>
                     <div class="sx-fact"><span class="k">"Joined"</span><span class="v">(date(user.created_at))</span></div>
                 </div>
@@ -1767,6 +1796,9 @@ pub mod account_id {
         .collect();
         let holds_test_tins =
             claims.iter().any(|claim| claim.tin().is_test() && crate::filing::gate::is_live(&claim.status));
+        let fixed = FixedCode::of(config, &user);
+        // Set, changed and cleared by an Admin, never on their own account.
+        let may_fixed = viewer.can(Power::FixedCode) && !own_page;
         let mut names: Vec<String> = Vec::new();
         for claim in claims.iter().filter(|claim| claim.status != "withdrawn") {
             if !names.contains(&claim.registered_name) {
@@ -1830,6 +1862,9 @@ pub mod account_id {
                                     }
                                     if user.test_account {
                                         sx_pill(label: "Test account", sym: "flask", tone: "test")
+                                    }
+                                    if fixed.set {
+                                        sx_pill(label: "Fixed code", sym: "key", tone: "warn")
                                     }
                                     if user.banned_at.is_some() {
                                         sx_pill(label: "Banned", sym: "ban", tone: "bad")
@@ -1922,8 +1957,11 @@ pub mod account_id {
                                             if acts && holds_test_tins {
                                                 <span class="sx-text">" It holds test TINs: revoke them before you remove the test label."</span>
                                             }
+                                            if acts && fixed.set {
+                                                <span class="sx-text">" It has a fixed sign-in code: clear it before you remove the test label."</span>
+                                            }
                                         </span>
-                                        if acts && !holds_test_tins && user.test_account {
+                                        if acts && !holds_test_tins && !fixed.set && user.test_account {
                                             act(id: "act-test".to_owned(), label: "Remove", small: true, question: format!("Remove the test label from {email}?"), detail: "Staff no longer see it as a test account.".to_owned(),
                                                 <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test"))>
                                                     <input type="hidden" name="test" value="off">
@@ -1932,7 +1970,7 @@ pub mod account_id {
                                                     act_buttons(label: "Remove the test label")
                                                 </form>
                                             )
-                                        } else if acts && !holds_test_tins {
+                                        } else if acts && !user.test_account {
                                             act(id: "act-test".to_owned(), label: "Mark as test", small: true, question: format!("Mark {email} as a test account?"), detail: "A label for staff only. Sends work as usual.".to_owned(),
                                                 <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test"))>
                                                     <input type="hidden" name="test" value="on">
@@ -1945,6 +1983,9 @@ pub mod account_id {
                                             <span></span>
                                         }
                                     </div>
+                                    if fixed.set || may_fixed {
+                                        fixed_code_fact(account_id: account_id, email: email.clone(), fixed: fixed.clone(), may: may_fixed)
+                                    }
                                     <div class="sx-fact">
                                         <span class="k">"Status"</span>
                                         <span class="v">
@@ -2090,6 +2131,105 @@ pub mod account_id {
         }
         .boxed())
     }
+}
+
+/// An account's fixed sign-in code as staff see it: whether one is set, by
+/// whom and when (never the code), and why the account cannot sign in with
+/// one, if it cannot.
+#[derive(Clone)]
+struct FixedCode {
+    set: bool,
+    by: String,
+    at: Option<OffsetDateTime>,
+    /// The rule of `accounts::fixed_code_sql`, in words; `None` when the
+    /// account can have one.
+    why_not: Option<&'static str>,
+}
+
+impl FixedCode {
+    fn of(config: &crate::base::config::Config, user: &queries::UserRow) -> Self {
+        let why_not = if roles::in_server_setting(config, &user.email) {
+            Some("An admin through ADMIN_EMAILS never signs in with a fixed code.")
+        } else if user.role.is_some() {
+            Some("Staff never sign in with a fixed code.")
+        } else if user.banned_at.is_some() {
+            Some("A banned account gets none.")
+        } else if !user.test_account {
+            Some("Only a test account gets one: mark it as a test account first.")
+        } else {
+            None
+        };
+        Self {
+            set: user.fixed_code_set_at.is_some(),
+            by: user.fixed_code_set_by_email.clone().unwrap_or_default(),
+            at: user.fixed_code_set_at,
+            why_not,
+        }
+    }
+}
+
+/// The user page's "Fixed sign-in code" row (`#fixed-code`, which the users
+/// inspector links to): set, change or clear it, for an Admin (`may`). The
+/// code is never shown, only who set it and when.
+#[component]
+async fn fixed_code_fact(account_id: Uuid, email: String, fixed: FixedCode, may: bool) -> Result<impl View> {
+    let FixedCode { set, by, at, why_not } = fixed;
+    let sets = may && why_not.is_none();
+    let clears = may && set;
+    let set_text =
+        at.map(|at| format!(" Set by {by} on {}. The code is not shown again.", date(at))).unwrap_or_default();
+    Ok(view! {
+        <div class="sx-fact" id="fixed-code">
+            <span class="k">"Fixed sign-in code"</span>
+            <span class="v">
+                if set {
+                    sx_pill(label: "Fixed code", sym: "key", tone: "warn")
+                    <span class="sx-text">(set_text)</span>
+                    if let Some(why) = why_not {
+                        <span class="sx-text">" It signs nobody in now, and codes are mailed: " (why)</span>
+                    }
+                } else if let Some(why) = why_not {
+                    "None. " (why)
+                } else {
+                    "None: sign-in codes are mailed."
+                }
+            </span>
+            if sets || clears {
+                <div class="sx-uacts">
+                    if sets {
+                        act(id: "act-fixed-code".to_owned(), label: if set { "Change" } else { "Set" }, sym: "key", small: true,
+                            question: format!("A fixed sign-in code for {email}"),
+                            detail: "While it is set, no code is mailed to this address: whoever asks for a code types this one. Give it only to the app stores' reviewers. Only its hash is kept, and it is not shown again.".to_owned(),
+                            <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/fixed-code"))>
+                                <label class="sx-field">
+                                    <span>"Six-digit code"</span>
+                                    <input class="sx-mono" type="text" name="code" required=(true) inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="off" spellcheck="false">
+                                    <span class="sx-hint">"Pick a random one, not 123456. Asking for a code still has its limits: ten minutes, five wrong guesses."</span>
+                                </label>
+                                tab_field(tab: "account")
+                                reason_field()
+                                act_buttons(label: if set { "Change the code" } else { "Set the code" })
+                            </form>
+                        )
+                    }
+                    if clears {
+                        reason_act(
+                            id: "act-fixed-clear".to_owned(),
+                            label: "Clear",
+                            small: true,
+                            action: format!("/staff/users/{account_id}/fixed-code/clear"),
+                            question: format!("Clear the fixed code of {email}?"),
+                            detail: "Its sign-in codes are random and mailed again. A code asked for before no longer signs in.",
+                            confirm: "Clear the code",
+                            tab: "account"
+                        )
+                    }
+                </div>
+            } else {
+                <span></span>
+            }
+        </div>
+    })
 }
 
 /// An Admin adds a made-up TIN to a test account: active at once, it never
@@ -2362,6 +2502,7 @@ fn account_audit_icon(action: &str) -> &'static str {
         "unbanned" => "lock_open",
         "role_changed" => "shield_person",
         "test_marked" | "test_unmarked" => "science",
+        "fixed_code_set" | "fixed_code_changed" | "fixed_code_cleared" => "key",
         "signed_out" | "app_signed_out" => "logout",
         "created" => "person_add",
         _ => "draft",
@@ -2380,6 +2521,10 @@ fn account_audit_text(line: &AccountAuditRow) -> String {
         ),
         "test_marked" => "marked it as a test account".to_owned(),
         "test_unmarked" => "removed the test label".to_owned(),
+        // Never the code: the line holds none.
+        "fixed_code_set" => "set a fixed sign-in code".to_owned(),
+        "fixed_code_changed" => "changed the fixed sign-in code".to_owned(),
+        "fixed_code_cleared" => "cleared the fixed sign-in code".to_owned(),
         "signed_out" => "signed the account out everywhere".to_owned(),
         "app_signed_out" => match line.new_value.as_deref().and_then(crate::account::oauth::client_name) {
             Some(name) => format!("signed the {name} app out"),

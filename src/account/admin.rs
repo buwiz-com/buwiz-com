@@ -1,6 +1,6 @@
 //! What staff do to accounts: make a login, change a role, ban and lift a
-//! ban, label a test account, and sign an account out everywhere or out of
-//! one app. Each runs in one transaction (lock, check,
+//! ban, label a test account and set its fixed sign-in code, and sign an
+//! account out everywhere or out of one app. Each runs in one transaction (lock, check,
 //! change, a line in `account_audit` with who, when and why). The routes
 //! check the power first ([`crate::account::roles`]); the checks here are
 //! the ones that depend on the account acted on.
@@ -424,7 +424,8 @@ pub(crate) async fn holds_test_tins(tx: &mut Transaction<'_, Postgres>, account_
 }
 
 /// An Admin labels an account as a test account, or takes the label off
-/// (refused while it holds a test TIN: revoke those first). Only staff see
+/// (refused while it holds a test TIN or a fixed sign-in code: revoke or
+/// clear those first). Only staff see
 /// it; sends work as usual. Not one's own account. Locks as a ban does: the
 /// roles lock, the actor, then the account.
 pub async fn mark_test(
@@ -459,6 +460,11 @@ pub async fn mark_test(
     if !test && holds_test_tins(&mut tx, target.id).await? {
         return Err(DecideError::Refused(Notice::TestTinsHeld));
     }
+    // So is a fixed sign-in code (the database's check says so too): it is
+    // cleared on purpose, with its own reason, not as a side effect.
+    if !test && has_fixed_code(&mut tx, target.id).await? {
+        return Err(DecideError::Refused(Notice::FixedCodeHeld));
+    }
     sqlx::query("UPDATE accounts SET test_account = $2 WHERE id = $1")
         .bind(target.id)
         .bind(test)
@@ -475,4 +481,147 @@ pub async fn mark_test(
     audit(&mut tx, &actor.account, line).await?;
     tx.commit().await?;
     Ok(notice)
+}
+
+/// Whether the account has a fixed sign-in code stored, whether or not it
+/// stands in for a mailed one now.
+pub(crate) async fn has_fixed_code(tx: &mut Transaction<'_, Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT fixed_code_hash IS NOT NULL FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+/// Whether `code` can be a fixed sign-in code: exactly six ASCII digits,
+/// as the code page takes them.
+fn six_digits(code: &str) -> bool {
+    code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Ends the codes asked for and not yet used for `email`: after a fixed
+/// code is set, changed or cleared, none asked for before still signs in.
+async fn close_open_codes(tx: &mut Transaction<'_, Postgres>, email: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE email_codes SET expires_at = now() WHERE email = $1 AND consumed_at IS NULL AND expires_at > now()",
+    )
+    .bind(email)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// An Admin sets or changes a test account's fixed sign-in code, for the
+/// app stores' reviewers, who cannot read a mailbox of ours. While it
+/// stands, a code asked for on the sign-in form is this one and nothing is
+/// mailed ([`accounts::issue_code`]). Only its hash is stored, in the form
+/// `email_codes` uses; the history line holds neither.
+///
+/// Refused unless the account is a plain test account: the test label, no
+/// stored staff role, not in `ADMIN_EMAILS`, not banned, and not one's own.
+/// Locks as a ban does (the roles lock, the actor, then the account), so a
+/// role or a ban given at the same time is seen.
+pub async fn set_fixed_code(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    account_id: Uuid,
+    code: &str,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = required_reason(reason)?;
+    if !six_digits(code) {
+        return Err(DecideError::Refused(Notice::FixedCodeDigits));
+    }
+    if account_id == actor.account.id {
+        return Err(DecideError::Refused(Notice::OwnAccount));
+    }
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::FixedCode).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    let target = lock_account(&mut tx, account_id).await?;
+    if roles::in_server_setting(config, &target.email) {
+        return Err(DecideError::Refused(Notice::FixedCodeFromServer));
+    }
+    if target.role.is_some() {
+        return Err(DecideError::Refused(Notice::FixedCodeStaff));
+    }
+    if target.banned {
+        return Err(DecideError::Refused(Notice::FixedCodeBanned));
+    }
+    let (labelled, had): (bool, bool) =
+        sqlx::query_as("SELECT test_account, fixed_code_hash IS NOT NULL FROM accounts WHERE id = $1")
+            .bind(target.id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !labelled {
+        return Err(DecideError::Refused(Notice::FixedCodeNotTest));
+    }
+    sqlx::query(
+        "UPDATE accounts SET fixed_code_hash = $2, fixed_code_set_by = $3, fixed_code_set_at = now() WHERE id = $1",
+    )
+    .bind(target.id)
+    .bind(accounts::code_hash(&target.email, code))
+    .bind(actor.account.id)
+    .execute(&mut *tx)
+    .await?;
+    close_open_codes(&mut tx, &target.email).await?;
+    let line = Line {
+        account_id: target.id,
+        action: if had { "fixed_code_changed" } else { "fixed_code_set" },
+        old_value: None,
+        new_value: None,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
+    tx.commit().await?;
+    tracing::info!(account_id = %target.id, actor = %actor.account.id, changed = had, "fixed sign-in code set");
+    Ok(if had { Notice::FixedCodeChanged } else { Notice::FixedCodeSet })
+}
+
+/// An Admin clears an account's fixed sign-in code: its codes are random
+/// and mailed again, and one asked for before no longer signs in. Allowed
+/// whatever the account is now (banned, staff), so a code left from before
+/// can always go; not on one's own account.
+pub async fn clear_fixed_code(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    account_id: Uuid,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = required_reason(reason)?;
+    if account_id == actor.account.id {
+        return Err(DecideError::Refused(Notice::OwnAccount));
+    }
+    let mut tx = db.begin().await?;
+    roles::lock(&mut tx).await?;
+    if !roles::may(&mut tx, config, actor.account.id, Power::FixedCode).await? {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    let target = lock_account(&mut tx, account_id).await?;
+    if !has_fixed_code(&mut tx, target.id).await? {
+        return Ok(Notice::FixedCodeNone);
+    }
+    sqlx::query(
+        "UPDATE accounts SET fixed_code_hash = NULL, fixed_code_set_by = NULL, fixed_code_set_at = NULL WHERE id = $1",
+    )
+    .bind(target.id)
+    .execute(&mut *tx)
+    .await?;
+    close_open_codes(&mut tx, &target.email).await?;
+    let line = Line {
+        account_id: target.id,
+        action: "fixed_code_cleared",
+        old_value: None,
+        new_value: None,
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
+    tx.commit().await?;
+    tracing::info!(account_id = %target.id, actor = %actor.account.id, "fixed sign-in code cleared");
+    Ok(Notice::FixedCodeCleared)
 }

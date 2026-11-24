@@ -141,6 +141,16 @@ notices! {
     OwnNeedsReason = "own_needs_reason" => error "This is your own TIN: write why you make it active. It is kept in your history.",
     LoginCreated = "login_created" => info "Login made. No email was sent: they sign in with a code sent to this address when they ask for one.",
     AdminMustDecide = "admin_must_decide" => error "An admin must decide this one: sending for this TIN was paused before. It stays waiting.",
+    FixedCodeSet = "fixed_code_set" => info "Fixed sign-in code set. No code is mailed to this address while it stands. It is not shown again.",
+    FixedCodeChanged = "fixed_code_changed" => info "Fixed sign-in code changed. The old one no longer signs in; the new one is not shown again.",
+    FixedCodeCleared = "fixed_code_cleared" => info "Fixed sign-in code cleared. This address gets a random code by email again.",
+    FixedCodeNone = "fixed_code_none" => info "Nothing changed: this account has no fixed sign-in code.",
+    FixedCodeDigits = "fixed_code_digits" => error "The fixed code must be exactly six digits.",
+    FixedCodeNotTest = "fixed_code_not_test" => error "Only a test account gets a fixed sign-in code. Mark it as a test account first.",
+    FixedCodeStaff = "fixed_code_staff" => error "Staff never sign in with a fixed code. Take the staff role away first, if that is what you want.",
+    FixedCodeFromServer = "fixed_code_from_server" => error "This address is an admin through the server setting ADMIN_EMAILS, so it never signs in with a fixed code.",
+    FixedCodeBanned = "fixed_code_banned" => error "This account is banned. Lift the ban before setting a fixed code.",
+    FixedCodeHeld = "fixed_code_held" => error "This account has a fixed sign-in code. Clear it first, then remove the label.",
     AdminMustConfirm = "admin_must_confirm" => error "Sending for this TIN is paused: an admin confirms it, and lifting Buwiz's pause takes a reason.",
 }
 

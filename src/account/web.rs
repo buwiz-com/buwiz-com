@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::account::accounts::{self, Account, CodeError};
+use crate::account::accounts::{self, Account, CodeError, IssuedCode};
 use crate::account::admin;
 use crate::account::agents;
 use crate::account::claims::{
@@ -203,6 +203,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/{account_id}/unban", post(unban_user))
         .route("/staff/users/{account_id}/test", post(mark_test))
         .route("/staff/users/{account_id}/test-tin", post(add_test_tin))
+        .route("/staff/users/{account_id}/fixed-code", post(set_fixed_code))
+        .route("/staff/users/{account_id}/fixed-code/clear", post(clear_fixed_code))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
         .route("/devices/{device_id}/revoke", post(revoke_device));
@@ -714,7 +716,7 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
     // so it never outlasts the code.
     let expires =
         ((time::OffsetDateTime::now_utc() + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
-    let issued = match accounts::issue_code(&state.db, &email, state.config.review_login.as_ref()).await {
+    let issued = match accounts::issue_code(&state.db, &email, &state.config.admin_emails).await {
         Ok(issued) => Some(issued),
         Err(CodeError::TooMany) => {
             state.sign_in_guard.forgive(&counted);
@@ -730,12 +732,13 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Err(error) => return internal(anyhow::anyhow!(error)),
     };
     match issued {
-        // The store review login: its holder has the code already.
-        Some(issued) if issued.fixed => {
-            tracing::info!(email = %email, "the store review login asked for a code: its fixed code stands, nothing is mailed");
+        // A test account with a fixed code: its holder has the code
+        // already. The log names the address, never the code.
+        Some(IssuedCode::Fixed) => {
+            tracing::info!(email = %email, "a code was asked for a test account with a fixed code: nothing is mailed");
         }
-        Some(issued) => {
-            if let Err(error) = state.mailer.send_sign_in_code(&email, &issued.code).await {
+        Some(IssuedCode::Mail(code)) => {
+            if let Err(error) = state.mailer.send_sign_in_code(&email, &code).await {
                 return internal(error);
             }
         }
@@ -1490,6 +1493,62 @@ async fn mark_test(
         _ => return (StatusCode::BAD_REQUEST, "test must be on or off").into_response(),
     };
     staff_outcome(&back_to, admin::mark_test(&state.db, &state.config, &staff, account_id, test, &form.reason).await)
+}
+
+#[derive(Deserialize)]
+struct FixedCodeForm {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    tab: String,
+}
+
+/// Not derived: the form holds the code, which nothing prints.
+impl std::fmt::Debug for FixedCodeForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FixedCodeForm").field("code", &"[hidden]").field("tab", &self.tab).finish_non_exhaustive()
+    }
+}
+
+/// An Admin sets or changes a test account's fixed sign-in code, with a
+/// reason.
+async fn set_fixed_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<FixedCodeForm>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = user_page(account_id, &form.tab);
+    let staff = match require_staff(&state, &headers, &back_to, Power::FixedCode).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let outcome =
+        admin::set_fixed_code(&state.db, &state.config, &staff, account_id, form.code.trim(), &form.reason).await;
+    staff_outcome(&back_to, outcome)
+}
+
+/// An Admin clears an account's fixed sign-in code, with a reason.
+async fn clear_fixed_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = user_page(account_id, &form.tab);
+    let staff = match require_staff(&state, &headers, &back_to, Power::FixedCode).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    staff_outcome(&back_to, admin::clear_fixed_code(&state.db, &state.config, &staff, account_id, &form.reason).await)
 }
 
 #[derive(Deserialize)]

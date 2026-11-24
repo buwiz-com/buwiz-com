@@ -1,7 +1,7 @@
 #!/bin/bash
 # Writes the services' settings files from Parameter Store (/buwiz/*, not
-# nested). Both units run it, as root, before each start. install.sh puts it
-# at /usr/local/bin/buwiz-env.
+# nested). buwiz-env.service runs it, as root, before each start of either
+# service. install.sh puts it at /usr/local/bin/buwiz-env.
 #
 #   /etc/buwiz/env                 buwiz.service, the Gatekeeper (root, 0600)
 #   /etc/buwiz-sender/sender.env   buwiz-sender.service, the Sender

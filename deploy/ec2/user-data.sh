@@ -44,8 +44,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# install.sh's drop-in (buwiz.service.d/env.conf) replaces this line with
+# buwiz-env.service, and keeps the app from the metadata address.
 ExecStartPre=+/usr/local/bin/buwiz-env
-# Optional at load time: ExecStartPre writes it before ExecStart reads it.
+# Optional at load time: buwiz-env writes it before ExecStart reads it.
 EnvironmentFile=-/etc/buwiz/env
 ExecStart=/opt/buwiz/buwiz-cloud
 User=buwiz

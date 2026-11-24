@@ -61,8 +61,8 @@ deploy/ec2/deploy.sh <sha>                                     # install, smoke-
 2. `deploy.sh` runs `install.sh <sha> <bucket> <region>` on the instance
    through SSM `send-command`. It swaps the binaries, puts
    `/usr/local/bin/buwiz-env` in place, makes the `buwiz-sender` user if it
-   is missing, rewrites the Sender's unit and the tunnel settings, and
-   restarts the services. Then it prints the last log
+   is missing, rewrites `buwiz-env.service`, the Sender's unit, the app
+   unit's drop-ins and the tunnel settings, and restarts the services. Then it prints the last log
    lines and checks the public hosts.
 
 Build one release at a time: the Docker build needs most of a 16 GB Mac.
@@ -79,7 +79,8 @@ The rest of `deploy/ec2/` sets up a new instance:
   Sender's unit and `buwiz-env` come with each release (`install.sh`).
 - `test-install.sh`: runs `user-data.sh` and `install.sh` in an Ubuntu
   24.04 container, with fake settings and no AWS, and checks the settings
-  files, users, modes and units ([below](#the-sender)).
+  files, users, modes, units and that neither service reaches a fake
+  metadata address ([below](#the-sender)).
 - `role-policy.json` and `trust.json`: the instance role. Replace `REGION`,
   `ACCOUNT_ID` and `DEPLOY_BUCKET` before use.
 - `sender-keys.sh`: creates the Sender's keys in Parameter Store. It prints
@@ -945,10 +946,23 @@ the code:
   (which is not encrypted), and `LimitCORE=0`, so a crash writes no core
   dump. It is hardened like the Gatekeeper's, plus `ProtectProc=invisible`
   and `ProcSubset=pid`.
+- Neither service can reach the instance's metadata address
+  (`IPAddressDeny=169.254.169.254 fd00:ec2::254`). The instance role reads
+  every `/buwiz/*` setting, so a process that could reach it could fetch
+  the Sender's secrets from SSM. Neither needs it: the Gatekeeper reaches
+  R2 with its own keys (`S3_*`), and neither calls AWS.
 
-`/usr/local/bin/buwiz-env` (`deploy/ec2/buwiz-env`) writes both files from
-`/buwiz/*` before each start of either service. Which setting goes where is
-decided there, by two lists:
+So the Gatekeeper can read neither the Sender's settings, on disk or in
+SSM, nor its memory.
+
+`buwiz-env.service`, a oneshot unit, runs `/usr/local/bin/buwiz-env`
+(`deploy/ec2/buwiz-env`) as root. Both services `Require` it and start
+after it, so it writes both files from `/buwiz/*` before each start or
+restart of either, also when one restarts itself after a crash. It is the
+only one of the three that reaches the metadata address. It has no start
+limit, so a service that keeps crashing cannot stop the other from
+starting. Which setting goes where is decided in `buwiz-env`, by two
+lists:
 
 - `SENDER_ONLY`: only in `sender.env`. Everything the Sender reads that
   the Gatekeeper does not: `SENDER_HOST`, `SENDER_PORT`,
@@ -981,13 +995,20 @@ Parameter Store. On its first run, `install.sh`:
 
 1. puts the new `/usr/local/bin/buwiz-env` in place;
 2. makes the system user `buwiz-sender` and `/etc/buwiz-sender` (0700);
-3. rewrites `buwiz-sender.service` to run as `buwiz-sender` with
-   `/etc/buwiz-sender/sender.env`, `MemorySwapMax=0` and `LimitCORE=0`;
-4. restarts the Sender, then the Gatekeeper. Each start writes both files,
+3. writes `buwiz-env.service`;
+4. rewrites `buwiz-sender.service` to run as `buwiz-sender` with
+   `/etc/buwiz-sender/sender.env`, `MemorySwapMax=0`, `LimitCORE=0` and no
+   metadata address, after `buwiz-env.service`;
+5. adds the drop-in `/etc/systemd/system/buwiz.service.d/env.conf`: the
+   Gatekeeper no longer runs `buwiz-env` itself (`ExecStartPre=` is
+   emptied), starts after `buwiz-env.service`, and cannot reach the
+   metadata address;
+6. restarts the Sender, then the Gatekeeper. Each start writes both files,
    so `/etc/buwiz/env` loses the Sender's secrets then.
 
 Later deploys find the user there, and set the directory's owner and mode
-again. `buwiz.service` is not changed.
+again. The unit `buwiz.service` itself (from `user-data.sh`) is not
+changed; the drop-in overrides it.
 
 **Check it**, in an SSM session:
 ```sh
@@ -999,6 +1020,9 @@ sudo stat -c '%U %a %n' /etc/buwiz-sender /etc/buwiz-sender/sender.env /etc/buwi
 sudo -u buwiz cat /etc/buwiz-sender/sender.env    # must fail: Permission denied
 sudo grep -c SENDER_HPKE_KEY /etc/buwiz/env       # must print 0
 sudo grep -c SENDER_HPKE_KEY /etc/buwiz-sender/sender.env   # 1
+systemctl show buwiz buwiz-sender -p IPAddressDeny  # 169.254.169.254/32 fd00:ec2::254/128, twice
+systemctl show buwiz -p ExecStartPre               # empty
+journalctl -u buwiz-env.service -n 4 --no-pager    # a run just before each service started
 ```
 Then smoke-test as usual, and check that `/.well-known/buwiz-hpke.json`
 still serves the same keys as before (`deploy/ec2/trust-list.sh` compares
@@ -1015,11 +1039,17 @@ before the split, so the older release starts as it did. Left behind:
 - `/etc/buwiz-sender/sender.env`, still `buwiz-sender` 0600 in its 0700
   directory, with the Sender's settings from the last start before the
   rollback; nothing reads or updates it;
-- the new `/usr/local/bin/buwiz-env`.
+- the new `/usr/local/bin/buwiz-env`;
+- `buwiz-env.service` and the drop-in `buwiz.service.d/env.conf`, which the
+  older `install.sh` does not know. So the Gatekeeper still starts after
+  `buwiz-env.service` and still cannot reach the metadata address. The
+  older Sender's unit runs `buwiz-env` itself again, as it did.
 
-This is safe: the older release runs exactly as before this change, and
-the file left behind is no easier to read than `/etc/buwiz/env`. Deploying
-this release again picks them up as they are. Remove nothing by hand.
+This is safe: both services start with the settings they had before this
+change (`test-install.sh` checks it), the Gatekeeper never needed the
+metadata address, and the file left behind is no easier to read than
+`/etc/buwiz/env`. Deploying this release again picks them up as they are.
+Remove nothing by hand.
 
 Putting the previous binaries back by hand
 ([above](#putting-the-previous-binaries-back)) keeps the new units and both

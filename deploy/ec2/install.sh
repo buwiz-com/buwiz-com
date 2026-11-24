@@ -28,17 +28,34 @@ id -u buwiz-sender >/dev/null 2>&1 ||
   useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin buwiz-sender
 install -d -o buwiz-sender -g buwiz-sender -m 0700 /etc/buwiz-sender
 
+# buwiz-env runs in a unit of its own, as root, before each start of either
+# service (both Require it). Only it reaches the instance's metadata address
+# (169.254.169.254, fd00:ec2::254), whose role reads every /buwiz/*
+# setting: neither service may, so the app's user cannot fetch the Sender's
+# secrets from SSM. No start limit: it runs with each restart of either.
+cat > /etc/systemd/system/buwiz-env.service <<'UNIT'
+[Unit]
+Description=Buwiz settings files, from Parameter Store
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/buwiz-env
+UNIT
+
 # The Sender: loopback only (SENDER_HOST defaults to 127.0.0.1:3009); the
 # app reaches it at SENDER_URL. It holds open returns in memory, so its
 # memory is never swapped (the swap file is not encrypted) or dumped.
 cat > /etc/systemd/system/buwiz-sender.service <<'UNIT'
 [Unit]
 Description=Buwiz Sender
-After=network-online.target
+After=network-online.target buwiz-env.service
 Wants=network-online.target
+Requires=buwiz-env.service
 
 [Service]
-ExecStartPre=+/usr/local/bin/buwiz-env
 EnvironmentFile=-/etc/buwiz-sender/sender.env
 ExecStart=/opt/buwiz/buwiz-sender
 User=buwiz-sender
@@ -47,6 +64,7 @@ Restart=always
 RestartSec=2
 MemorySwapMax=0
 LimitCORE=0
+IPAddressDeny=169.254.169.254 fd00:ec2::254
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -68,6 +86,17 @@ cat > /etc/systemd/system/buwiz.service.d/sender.conf <<'UNIT'
 [Unit]
 After=buwiz-sender.service
 Wants=buwiz-sender.service
+UNIT
+# The app's unit (user-data.sh) ran buwiz-env itself; now buwiz-env.service
+# does, and the app cannot reach the metadata address.
+cat > /etc/systemd/system/buwiz.service.d/env.conf <<'UNIT'
+[Unit]
+After=buwiz-env.service
+Requires=buwiz-env.service
+
+[Service]
+ExecStartPre=
+IPAddressDeny=169.254.169.254 fd00:ec2::254
 UNIT
 systemctl daemon-reload
 

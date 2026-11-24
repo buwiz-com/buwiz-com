@@ -5,7 +5,10 @@
 #   1. an instance set up by BASE's scripts (default origin/main);
 #   2. this checkout's install.sh on it (the move to the Sender's own user);
 #   3. BASE's install.sh again (a rollback);
-#   4. this checkout's install.sh again.
+#   4. this checkout's install.sh again;
+#   5. a new instance set up by this checkout.
+# A fake metadata server listens on 169.254.169.254 (and fd00:ec2::254 if
+# the container has IPv6); the fake binaries try to reach it as they start.
 # Needs Docker. Usage: deploy/ec2/test-install.sh [BASE]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -46,15 +49,53 @@ case "$1 $2" in
     file=${3##*/}
     case $file in
       buwiz-env) cp /work/new/buwiz-env "$4" ;;
-      buwiz-cloud) printf '#!/bin/bash\nexec python3 -m http.server 8080 --bind 127.0.0.1 --directory /opt/buwiz\n' >"$4" ;;
-      buwiz-sender) printf '#!/bin/bash\n[ "${1:-}" = public ] && { echo "{\\"uid\\": \\"$(id -un)\\", \\"hpke\\": \\"${SENDER_HPKE_KEY:-}\\"}"; exit; }\nexec sleep infinity\n' >"$4" ;;
+      buwiz-cloud | buwiz-sender) cp "/work/stub/fake-$file" "$4" ;;
       *) echo fake >"$4" ;;
     esac ;;
-  "ssm get-parameters-by-path") cat /work/stub/params ;;
+  "ssm get-parameters-by-path")
+    # Only buwiz-env asks this: count its runs, and whether it reached the
+    # metadata address.
+    echo run >>/run/buwiz-env.runs
+    /work/stub/probe >/run/buwiz-env.probe
+    chmod 0644 /run/buwiz-env.runs /run/buwiz-env.probe
+    cat /work/stub/params ;;
   "ssm get-parameter")
     case "$*" in *tunnel/id*) echo fake-tunnel ;; *) echo '{}' ;; esac ;;
   *) echo "aws stub: $*" >&2; exit 1 ;;
 esac
+EOF
+# What a process sees as it starts: buwiz-env's runs so far, and whether
+# the metadata address answers it.
+cat >"$work/stub/probe" <<'EOF'
+#!/bin/bash
+reach() { curl -s -m2 -o /dev/null "$1" && echo reached || echo blocked; }
+echo "start: env-runs=$(wc -l </run/buwiz-env.runs 2>/dev/null || echo 0) imds=$(reach http://169.254.169.254/) imds6=$(reach 'http://[fd00:ec2::254]/')"
+EOF
+cat >"$work/stub/fake-buwiz-cloud" <<'EOF'
+#!/bin/bash
+/work/stub/probe
+exec python3 -m http.server 8080 --bind 127.0.0.1 --directory /opt/buwiz
+EOF
+cat >"$work/stub/fake-buwiz-sender" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = public ]; then echo "{\"uid\": \"$(id -un)\", \"hpke\": \"${SENDER_HPKE_KEY:-}\"}"; exit; fi
+/work/stub/probe
+exec sleep infinity
+EOF
+# Restarts UNIT (restart) or kills it so it restarts itself (kill), and
+# checks the new process saw one more run of buwiz-env than before.
+cat >"$work/stub/env-before-start" <<'EOF'
+#!/bin/bash
+unit=$1
+starts() { journalctl -u "$unit" -o cat | grep -c '^start:'; }
+runs=$(wc -l </run/buwiz-env.runs)
+before=$(starts)
+case $2 in
+  restart) systemctl restart "$unit" ;;
+  kill) kill -9 "$(systemctl show -p MainPID --value "$unit")" ;;
+esac
+for _ in $(seq 40); do [ "$(starts)" -gt "$before" ] && break; sleep 0.25; done
+journalctl -u "$unit" -o cat | grep '^start:' | tail -1 | tee /dev/stderr | grep -q " env-runs=$((runs + 1)) "
 EOF
 # First-boot commands that would reach the network.
 for cmd in hostnamectl apt-get timedatectl snap; do printf '#!/bin/sh\nexit 0\n' >"$work/stub/$cmd"; done
@@ -70,7 +111,7 @@ chmod 0755 "$work/stub/"*
 cat >"$work/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      systemd systemd-sysv dbus curl python3 && rm -rf /var/lib/apt/lists/*
+      systemd systemd-sysv dbus curl python3 iproute2 && rm -rf /var/lib/apt/lists/*
 # cloudflared and the snap's aws: stand-ins. On the instance snapd puts
 # /snap/bin on the services' PATH; here a link does.
 RUN printf '#!/bin/sh\nexec sleep infinity\n' >/usr/bin/cloudflared && chmod 0755 /usr/bin/cloudflared \
@@ -86,6 +127,20 @@ for _ in $(seq 30); do
 done
 on() { docker exec "$name" bash -c "$1"; }
 
+# The fake metadata server, on the addresses EC2 uses.
+on "ip addr add 169.254.169.254/32 dev lo && systemd-run --quiet --unit=fake-imds \
+  python3 -m http.server 80 --bind 169.254.169.254 --directory /var/empty"
+ipv6=
+if on "sysctl -qw net.ipv6.conf.lo.disable_ipv6=0 && ip -6 addr add fd00:ec2::254/128 dev lo nodad \
+  && systemd-run --quiet --unit=fake-imds6 python3 -m http.server 80 --bind fd00:ec2::254 --directory /var/empty" 2>/dev/null; then
+  ipv6=yes
+fi
+for _ in $(seq 20); do on "curl -s -m1 -o /dev/null http://169.254.169.254/" && break; sleep 0.25; done
+if [ -n "$ipv6" ]; then
+  for _ in $(seq 20); do on "curl -s -m1 -o /dev/null 'http://[fd00:ec2::254]/'" && break; sleep 0.25; done
+  on "curl -s -m1 -o /dev/null 'http://[fd00:ec2::254]/'" || ipv6=
+fi
+
 failures=0
 check() { # description, command that must succeed
   if on "$2" >/dev/null 2>"$work/check.err"; then echo "  ok: $1"; else echo "  FAILED: $1: $(tail -3 "$work/check.err")"; failures=$((failures + 1)); fi
@@ -96,6 +151,33 @@ install_run() { # dir
 }
 pid() { echo "\$(systemctl show -p MainPID --value $1)"; }
 environ() { printf '%s' "tr '\\0' '\\n' </proc/$(pid "$1")/environ"; }
+last_start() { printf '%s' "journalctl -u $1.service -o cat | grep '^start:' | tail -1"; }
+
+imds_checks() {
+  check "(the checks below can tell: root reaches the metadata address)" "curl -s -m2 -o /dev/null http://169.254.169.254/"
+  check "the app cannot reach the metadata address" "$(last_start buwiz) | grep -q ' imds=blocked '"
+  check "systemctl show buwiz: IPAddressDeny has both addresses" \
+    "systemctl show buwiz -p IPAddressDeny | grep -q 169.254.169.254 && systemctl show buwiz -p IPAddressDeny | grep -q fd00:ec2::254"
+  if [ -n "$ipv6" ]; then
+    check "the app cannot reach the IPv6 metadata address" "$(last_start buwiz) | grep -q ' imds6=blocked\$'"
+  fi
+}
+split_imds_checks() {
+  imds_checks
+  check "buwiz-env.service reaches the metadata address" "grep -q ' imds=reached ' /run/buwiz-env.probe"
+  check "the Sender cannot reach the metadata address" "$(last_start buwiz-sender) | grep -q ' imds=blocked '"
+  check "systemctl show buwiz-sender: IPAddressDeny has both addresses" \
+    "systemctl show buwiz-sender -p IPAddressDeny | grep -q 169.254.169.254 && systemctl show buwiz-sender -p IPAddressDeny | grep -q fd00:ec2::254"
+  if [ -n "$ipv6" ]; then
+    check "buwiz-env.service reaches the IPv6 metadata address" "grep -q ' imds6=reached\$' /run/buwiz-env.probe"
+    check "the Sender cannot reach the IPv6 metadata address" "$(last_start buwiz-sender) | grep -q ' imds6=blocked\$'"
+  fi
+  check "buwiz-env runs before a restart of the app" "/work/stub/env-before-start buwiz.service restart"
+  check "buwiz-env runs before a restart of the Sender" "/work/stub/env-before-start buwiz-sender.service restart"
+  check "buwiz-env runs before the Sender restarts itself (crash)" "/work/stub/env-before-start buwiz-sender.service kill"
+  check "buwiz-env runs before the app restarts itself (crash)" "/work/stub/env-before-start buwiz.service kill"
+  check "both still run" "systemctl is-active buwiz.service buwiz-sender.service"
+}
 
 split_checks() {
   check "the Sender runs as buwiz-sender" "[ \"\$(ps -o user= -p $(pid buwiz-sender))\" = buwiz-sender ]"
@@ -125,6 +207,7 @@ split_checks() {
   check "the Sender's process has its key" "$(environ buwiz-sender) | grep -qx 'SENDER_HPKE_KEY=fake-hpke-private-key='"
   check "trust-list.sh's command reads the Sender's keys" \
     "systemd-run --quiet --pipe --wait --uid=buwiz-sender -p EnvironmentFile=/etc/buwiz-sender/sender.env -p MemorySwapMax=0 -p LimitCORE=0 -E RUST_LOG=off /opt/buwiz/buwiz-sender public | grep -q '\"uid\": \"buwiz-sender\", \"hpke\": \"fake-hpke-private-key=\"'"
+  split_imds_checks
   check "no settings file left half-written" "[ \"\$(ls -A /etc/buwiz)\" = env ] && [ \"\$(ls -A /etc/buwiz-sender)\" = sender.env ]"
 }
 single_checks() {
@@ -137,6 +220,7 @@ echo "1. An instance set up by $base"
 on "PATH=/work/stub:\$PATH bash /work/base/user-data.sh >/work/user-data.log 2>&1"
 install_run base
 single_checks
+check "(before: the app reaches the metadata address)" "$(last_start buwiz) | grep -q ' imds=reached '"
 
 echo "2. This checkout's install.sh"
 install_run new
@@ -147,6 +231,11 @@ install_run base
 single_checks
 check "left behind: the user, the directory and sender.env" \
   "id buwiz-sender && [ \"\$(stat -c '%U %a' /etc/buwiz-sender/sender.env)\" = 'buwiz-sender 600' ]"
+check "left behind: buwiz-env.service, which the app still needs" "systemctl show -p Requires buwiz | grep -q buwiz-env.service"
+check "both run" "systemctl is-active buwiz.service buwiz-sender.service"
+imds_checks
+check "buwiz-env runs before a restart of the Sender, the old way" "/work/stub/env-before-start buwiz-sender.service restart"
+check "buwiz-env runs before a restart of the app" "/work/stub/env-before-start buwiz.service restart"
 
 echo "4. This checkout's install.sh again"
 install_run new
@@ -154,10 +243,12 @@ split_checks
 
 echo "5. A new instance set up by this checkout"
 on "systemctl stop buwiz.service buwiz-sender.service cloudflared-buwiz.service; userdel buwiz-sender; \
-  rm -rf /etc/buwiz-sender /etc/systemd/system/buwiz-sender.service /usr/local/bin/buwiz-env"
+  rm -rf /etc/buwiz-sender /etc/systemd/system/buwiz-sender.service /usr/local/bin/buwiz-env \
+  /etc/systemd/system/buwiz-env.service /etc/systemd/system/buwiz.service.d; systemctl daemon-reload"
 on "PATH=/work/stub:\$PATH bash /work/new/user-data.sh >/work/user-data.log 2>&1"
 install_run new
 split_checks
 
+[ -n "$ipv6" ] || echo "Not checked: the IPv6 metadata address (the container has no IPv6)."
 [ "$failures" = 0 ] || { echo "$failures check(s) failed"; exit 1; }
 echo "All checks passed."

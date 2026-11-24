@@ -6,6 +6,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::account::notice::Notice;
+use crate::base::config::ReviewLogin;
 use crate::base::crypto;
 
 pub const CODE_TTL: Duration = Duration::minutes(10);
@@ -69,8 +70,24 @@ fn code_hash(email: &str, code: &str) -> Vec<u8> {
     crypto::hash(&format!("{email}:{code}"))
 }
 
+/// A code [`issue_code`] made.
+#[derive(Debug)]
+pub struct IssuedCode {
+    pub code: String,
+    /// The store review login's fixed code: its holder already knows it,
+    /// so it is not mailed.
+    pub fixed: bool,
+}
+
 /// Creates a 6-digit code for `email` and returns it for mailing.
-pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
+///
+/// `review` is the store review login, when the server has one. Its fixed
+/// code is used in place of a random one only while its address is an
+/// existing account with the test label, no staff role and no ban, so the
+/// setting alone opens nothing: an Admin has to make that account and mark
+/// it first, and taking the label away closes it again. The code is stored
+/// like any other, so the limits on codes and on wrong guesses hold for it.
+pub async fn issue_code(db: &PgPool, email: &str, review: Option<&ReviewLogin>) -> Result<IssuedCode, CodeError> {
     let mut tx = db.begin().await?;
     let recent: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > now() - interval '1 hour'",
@@ -100,7 +117,22 @@ pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
             return Err(CodeError::Busy);
         }
     }
-    let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
+    let fixed = match review.filter(|review| known && review.email == email) {
+        Some(review) => {
+            let test_only: bool = sqlx::query_scalar(
+                "SELECT test_account AND role IS NULL AND banned_at IS NULL FROM accounts WHERE email = $1",
+            )
+            .bind(email)
+            .fetch_one(&mut *tx)
+            .await?;
+            test_only.then(|| review.code.clone())
+        }
+        None => None,
+    };
+    let (code, fixed) = match fixed {
+        Some(code) => (code, true),
+        None => (format!("{:06}", rand::rng().random_range(0..1_000_000)), false),
+    };
     // Dated when it is added, not when the transaction began: the code
     // added last (after waiting for the lock) must be the newest, because
     // only the newest can be redeemed.
@@ -113,7 +145,7 @@ pub async fn issue_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(code)
+    Ok(IssuedCode { code, fixed })
 }
 
 /// Checks the newest open code for `email`. A match signs the person in,

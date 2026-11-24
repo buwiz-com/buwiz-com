@@ -23,7 +23,7 @@ async fn bearer_get(site: &Site, token: &str, path: &str) -> StatusCode {
 
 /// Signs in with an emailed code: (where it goes, a session cookie set).
 async fn sign_in_with_code(site: &Site, email: &str) -> (String, bool) {
-    let code = buwiz_cloud::accounts::issue_code(&site.db, email).await.unwrap();
+    let code = buwiz_cloud::accounts::issue_code(&site.db, email, None).await.unwrap().code;
     let response = site.post("/auth/email/verify", "", &format!("email={email}&code={code}")).await;
     let cookie = response.headers().get(header::SET_COOKIE).is_some();
     (location(&response), cookie)

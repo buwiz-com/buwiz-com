@@ -137,6 +137,39 @@ label cannot come off an account while it holds one that has not ended
 database: such a row is only ever an Admin's or the seed tool's, active
 or ended (`approved`, `removed`, `revoked`).
 
+### The store review login
+
+Apple's and Microsoft's reviewers have to sign in to the apps, and they
+cannot read a mailbox of ours. `REVIEW_LOGIN_EMAIL` and `REVIEW_LOGIN_CODE`
+name one address and one six-digit code for them (`ReviewLogin` in
+`src/base/config.rs`, `issue_code` in `src/account/accounts.rs`):
+
+- When that address asks for a code, the fixed code is stored in place of
+  a random one, and nothing is mailed. The reviewer types it on the code
+  page as anyone types theirs.
+- It stands in only while the address is an existing account with the
+  **test label**, no staff role and no ban. The settings alone open
+  nothing: an Admin makes the login ("New user" on `/staff/users`, or the
+  seed tool with `test = true`) and gives it the label, and taking the
+  label away closes it at the next code asked for. Otherwise the address
+  gets a random, mailed code like any other.
+- Every limit holds for it: Turnstile and the limit per network, five codes
+  an hour for the address, ten minutes for a code, five wrong guesses.
+- `GET /me` answers `practice: true` for it, and for no other account. An
+  app that reads it simulates every send, so a reviewer files nothing by
+  pressing a button. The test label alone does not do this: a test
+  account's sends work as usual.
+
+Both settings must be given, the address must be a plain one that is not
+in `ADMIN_EMAILS`, and the code must be exactly six digits; otherwise the
+login stays off and the server says why in its log at start. When it is
+on, the server logs the address (never the code) at start, and a line each
+time the fixed code is asked for.
+
+The code is as secret as a password that two companies hold: pick a random
+one, give the login no real TIN, and change the code (or clear the
+settings) when a review is over.
+
 A ban that commits while a request for the account is under way wins:
 activation, approval, an app's sign-in approval and an agent's consent
 lock the account and look again as they write, and no new sign-in (device

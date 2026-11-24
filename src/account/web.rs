@@ -714,8 +714,8 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
     // so it never outlasts the code.
     let expires =
         ((time::OffsetDateTime::now_utc() + accounts::CODE_TTL).unix_timestamp_nanos() / 1_000_000).to_string();
-    let code = match accounts::issue_code(&state.db, &email).await {
-        Ok(code) => Some(code),
+    let issued = match accounts::issue_code(&state.db, &email, state.config.review_login.as_ref()).await {
+        Ok(issued) => Some(issued),
         Err(CodeError::TooMany) => {
             state.sign_in_guard.forgive(&counted);
             return see_other(link("/login", Some(Notice::CodeTooMany), &[("next", &next), ("email", &email)]));
@@ -729,10 +729,17 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         }
         Err(error) => return internal(anyhow::anyhow!(error)),
     };
-    if let Some(code) = code
-        && let Err(error) = state.mailer.send_sign_in_code(&email, &code).await
-    {
-        return internal(error);
+    match issued {
+        // The store review login: its holder has the code already.
+        Some(issued) if issued.fixed => {
+            tracing::info!(email = %email, "the store review login asked for a code: its fixed code stands, nothing is mailed");
+        }
+        Some(issued) => {
+            if let Err(error) = state.mailer.send_sign_in_code(&email, &issued.code).await {
+                return internal(error);
+            }
+        }
+        None => {}
     }
     see_other(link(
         "/login/verify",

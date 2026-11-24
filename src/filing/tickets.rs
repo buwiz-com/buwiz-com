@@ -127,6 +127,7 @@ pub async fn issue(State(state): State<AppState>, signed: Signed<TicketRequest>)
         return Err(ApiError::bad_request("bad_idempotency_key", "idempotency_key must be 1 to 100 characters"));
     }
 
+    gate::account_sends(&state.db, bearer.account.id).await?;
     let claim_id = gate::own(&state.db, bearer.account.id, &tin).await?.sendable()?;
 
     let previous: Option<Previous> = sqlx::query_as(

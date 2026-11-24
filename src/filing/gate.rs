@@ -16,6 +16,13 @@
 //! `dry_run` when unset), so it never trusts it to let one through; the
 //! Sender refuses one too.
 //!
+//! A practice account (one with a fixed sign-in code, the kind app-store
+//! reviewers use) never sends either, whatever its TINs: [`account_sends`]
+//! refuses it with `account_practice` before any TIN is looked at. The app
+//! only pretends to send on one; this is the server's half, so nothing
+//! from one reaches the BIR even from an app that tried. Its TIN list is
+//! left as it is: the app shows the account's TINs as it would anyone's.
+//!
 //! A refusal's words are fixed sentences. The note staff write when they
 //! send a claim back is never in one: refusals end up where an assistant can
 //! read them. It travels only in the app's TIN list (`include=all`).
@@ -56,8 +63,38 @@ pub const NEEDS_FIX_PREFIX: &str = "Sent back for a fix: ";
 pub const NEEDS_FIX_NO_REASON: &str = "Sent back for a fix. See what to change on My TINs at account.buwiz.com.";
 pub const PAUSED_MESSAGE: &str = "Sending is paused for this TIN. Write to support@buwiz.com.";
 pub const NOT_ACTIVE_MESSAGE: &str = "this TIN is not active on your account";
+pub const PRACTICE_MESSAGE: &str =
+    "This is a practice account: you can prepare returns, but Buwiz never sends them to the BIR.";
 pub const TEST_ONLY_MESSAGE: &str =
     "This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR.";
+
+/// The condition on an account `a` that is a practice account. A stored
+/// fixed code counts, working or not ([`crate::account::roles::fixed_code_sql`]
+/// also asks for the test label, no role and no ban): wider than the
+/// `practice` the app reads on `GET /me`, never narrower. Only an Admin sets
+/// one, and only on a test account (`accounts_fixed_code_check`).
+pub const PRACTICE_SQL: &str = "a.fixed_code_hash IS NOT NULL";
+
+/// The refusal for a practice account, as the apps read it.
+pub const PRACTICE_CODE: &str = "account_practice";
+
+/// `Ok` if this account may send at all; the `403` for a practice account.
+/// Every way of sending asks this before the TIN ([`own`], [`of_claim`]).
+pub async fn account_sends(db: impl PgExecutor<'_>, account_id: Uuid) -> Result<(), ApiError> {
+    let practice: Option<bool> = sqlx::query_scalar(&format!("SELECT {PRACTICE_SQL} FROM accounts a WHERE a.id = $1"))
+        .bind(account_id)
+        .fetch_optional(db)
+        .await?;
+    if practice == Some(true) {
+        return Err(practice_refusal());
+    }
+    Ok(())
+}
+
+/// The `403` [`account_sends`] answers for a practice account.
+pub fn practice_refusal() -> ApiError {
+    ApiError::Refused { status: StatusCode::FORBIDDEN, code: PRACTICE_CODE, message: PRACTICE_MESSAGE.to_owned() }
+}
 
 /// Where a TIN stands for sending.
 #[derive(Clone, Debug, PartialEq, Eq)]

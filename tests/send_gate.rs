@@ -26,6 +26,7 @@ const NEEDS_FIX_NO_REASON: &str = "Sent back for a fix. See what to change on My
 const PAUSED: &str = "Sending is paused for this TIN. Write to support@buwiz.com.";
 const NOT_ACTIVE: &str = "this TIN is not active on your account";
 const BANNED: &str = "This Buwiz account is banned: it can't send returns. Write to support@buwiz.com.";
+const PRACTICE: &str = "This is a practice account: you can prepare returns, but Buwiz never sends them to the BIR.";
 /// What a staff member typed when sending a claim back. It is for the
 /// person on My TINs and in the app's own screens, never in a refusal an
 /// assistant could read.
@@ -505,6 +506,91 @@ async fn the_relay_checks_the_account_again_when_it_starts(db: PgPool) {
         .await
         .unwrap();
     assert!(matches!(submissions::claim_for_relay(db, ana, v1).await.unwrap(), RelayStart::Send(_)));
+}
+
+/// Makes `account` a practice account: the test label and a fixed code
+/// (only its hash, as an Admin's form stores it), set by `admin`.
+async fn make_practice(db: &PgPool, account: Uuid, admin: Uuid) {
+    sqlx::query(
+        "UPDATE accounts SET test_account = true, fixed_code_hash = sha256('practice'::bytea),
+             fixed_code_set_by = $2, fixed_code_set_at = now() WHERE id = $1",
+    )
+    .bind(account)
+    .bind(admin)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// A practice account (a fixed sign-in code, the kind store reviewers use)
+/// never sends, whatever its TINs: a ticket, a v1 return, a sealed return
+/// on a ticket from before, and the relay all refuse it with its own code,
+/// before any TIN is looked at. Its TIN list is as anyone's.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_practice_account_never_sends(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (reviewer, _) = site.person("reviewer@example.test").await;
+    let (admin, _) = site.person(STAFF).await;
+    let active = claim(db, reviewer, "000555001", "approved").await;
+    let device = TestDevice::new(db, reviewer).await;
+    let envelope = json!({ "kid": "k", "enc": "e", "ct": "c" });
+
+    // A ticket and two returns from before it became a practice account.
+    let response = device.post(&site, "/api/tickets", &ticket_body("000555001", "k1")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: Value = serde_json::from_str(&text(response).await).unwrap();
+    let sealed = body["ticket"].as_str().unwrap().to_owned();
+    let v1 = submission(db, reviewer, active, "ready", false).await;
+    let v2 = submission(db, reviewer, active, "ready", true).await;
+    make_practice(db, reviewer, admin).await;
+
+    let practice = (403, "account_practice".to_owned(), PRACTICE.to_owned());
+    assert_eq!(refusal(device.post(&site, "/api/tickets", &ticket_body("000555001", "k2")).await).await, practice);
+    // A TIN it does not have: still the account's answer, not the TIN's.
+    assert_eq!(refusal(device.post(&site, "/api/tickets", &ticket_body("000555099", "k3")).await).await, practice);
+    assert_eq!(refusal(post_v1(&site, &device.token, &v1_body("000555001")).await).await, practice);
+    let refused =
+        refusal(device.post(&site, "/api/v2/submissions", &json!({ "ticket": sealed, "envelope": envelope })).await)
+            .await;
+    assert_eq!(refused, practice);
+    let spent: bool = sqlx::query_scalar("SELECT used_at IS NOT NULL FROM tickets WHERE account_id = $1")
+        .bind(reviewer)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(!spent, "a refused sealed return does not spend its ticket");
+
+    // The relay: the waiting returns are failed with the words, the
+    // envelope goes, nothing is handed to the Sender.
+    let failed = format!("{PRACTICE} (account_practice)");
+    for (id, kept) in [(v1, true), (v2, false)] {
+        let (status, error) = answered(submissions::claim_for_relay(db, reviewer, id).await.unwrap());
+        assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(failed.as_str())));
+        assert_eq!(stored(db, id).await, ("failed".to_owned(), Some(failed.clone()), kept));
+    }
+    assert_eq!(count(db, "SELECT count(*) FROM submissions WHERE status = 'sending'").await, 0);
+
+    // The TIN list still shows the TIN as the app would show anyone's.
+    let request = Request::get("/api/tax-profiles?include=all")
+        .header(header::AUTHORIZATION, format!("Bearer {}", device.token))
+        .body(Body::empty())
+        .unwrap();
+    let list: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+    assert_eq!(list["profiles"][0]["status"], "approved", "{list}");
+
+    // The code cleared: it sends again.
+    sqlx::query(
+        "UPDATE accounts SET fixed_code_hash = NULL, fixed_code_set_by = NULL, fixed_code_set_at = NULL WHERE id = $1",
+    )
+    .bind(reviewer)
+    .execute(db)
+    .await
+    .unwrap();
+    let response = device.post(&site, "/api/tickets", &ticket_body("000555001", "k4")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let v1 = submission(db, reviewer, active, "ready", false).await;
+    assert!(matches!(submissions::claim_for_relay(db, reviewer, v1).await.unwrap(), RelayStart::Send(_)));
 }
 
 /// The two forms of each rule agree on every status, paused and not: the

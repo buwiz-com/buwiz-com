@@ -178,6 +178,14 @@ account. An app that reads it simulates every send, so a reviewer files
 nothing by pressing a button. The test label alone does not do this: a
 test account's sends work as usual.
 
+**The server refuses its sends too.** An account with a fixed code stored
+(set by an Admin, working or not) never sends, whatever its TINs:
+tickets, both submission calls and the relay answer `account_practice`
+([relay-protocol.md](relay-protocol.md#refusals)), and a return already
+waiting is failed with those words. So nothing from a practice account
+reaches the BIR even from an app that does not read `practice`. Its TIN
+list is as anyone's. Clearing the code lets the account send again.
+
 **Stored as a hash.** Only `code_hash(email, code)` is kept
 (`accounts.fixed_code_hash`, the form `email_codes` uses), with who set it
 and when. The code is never shown again, on any page, and never logged: a

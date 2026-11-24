@@ -12,8 +12,10 @@ Fly on 2026-10-30. Fly is retired and `fly.toml` is gone.
   are proxied CNAMEs to the tunnel. Nothing on the instance listens publicly.
 - **Database:** Postgres on Neon (Singapore, `aws-ap-southeast-1`).
   Migrations run at start.
-- **Settings:** in SSM Parameter Store under `/buwiz/*`. They are written to
-  `/etc/buwiz/env` at each start.
+- **Settings:** in SSM Parameter Store under `/buwiz/*`. At each start they
+  are written to two files: `/etc/buwiz/env` for the Gatekeeper and
+  `/etc/buwiz-sender/sender.env` for the Sender, which runs as its own user
+  ([below](#the-sender)).
 
 ## Secrets
 
@@ -54,11 +56,13 @@ deploy/ec2/deploy.sh <sha>                                     # install, smoke-
 1. `build-release.sh` runs `docker build --platform linux/arm64` and copies
    the binaries `buwiz-cloud` and `buwiz-sender` and the OCR models out of
    the image, into `target/ec2-releases/<sha>/`. It uploads them, with
-   `install.sh`, to the deploy bucket under `releases/<sha>/`. It refuses a
-   sha that is not `HEAD`.
+   `install.sh` and `buwiz-env`, to the deploy bucket under
+   `releases/<sha>/`. It refuses a sha that is not `HEAD`.
 2. `deploy.sh` runs `install.sh <sha> <bucket> <region>` on the instance
-   through SSM `send-command`. It swaps the binaries, rewrites the unit and
-   tunnel settings, and restarts the services. Then it prints the last log
+   through SSM `send-command`. It swaps the binaries, puts
+   `/usr/local/bin/buwiz-env` in place, makes the `buwiz-sender` user if it
+   is missing, rewrites `buwiz-env.service`, the Sender's unit, the app
+   unit's drop-ins and the tunnel settings, and restarts the services. Then it prints the last log
    lines and checks the public hosts.
 
 Build one release at a time: the Docker build needs most of a 16 GB Mac.
@@ -70,9 +74,13 @@ Smoke-test after each deploy (`deploy.sh` does the first four):
 - `/healthz` on each host.
 
 The rest of `deploy/ec2/` sets up a new instance:
-- `user-data.sh`: first boot (updates, cloudflared, the AWS CLI, the systemd
-  units, `/usr/local/bin/buwiz-env`, which writes `/etc/buwiz/env` from
-  `/buwiz/*` at each start).
+- `user-data.sh`: first boot (updates, cloudflared, the AWS CLI, the users
+  `buwiz` and `buwiz-sender`, the app's and the tunnel's units). The
+  Sender's unit and `buwiz-env` come with each release (`install.sh`).
+- `test-install.sh`: runs `user-data.sh` and `install.sh` in an Ubuntu
+  24.04 container, with fake settings and no AWS, and checks the settings
+  files, users, modes, units and that neither service reaches a fake
+  metadata address ([below](#the-sender)).
 - `role-policy.json` and `trust.json`: the instance role. Replace `REGION`,
   `ACCOUNT_ID` and `DEPLOY_BUCKET` before use.
 - `sender-keys.sh`: creates the Sender's keys in Parameter Store. It prints
@@ -303,9 +311,9 @@ usage: buwiz-cloud seed <FILE> --as <admin email> --dry-run [--no-admin-emails]
 
 It reads `DATABASE_URL`, `ADMIN_EMAILS` and the `S3_*` settings, so it runs
 **on the instance, with the service's own settings file**, like the other
-server-side commands (`deploy/ec2/trust-list.sh`): `systemd-run -p
-EnvironmentFile=/etc/buwiz/env`. Never run it from a shell with settings
-of its own.
+server-side Gatekeeper commands (`buwiz-cloud bir`): `systemd-run
+--uid=buwiz -p EnvironmentFile=/etc/buwiz/env`. Never run it from a shell
+with settings of its own.
 
 - **Who is an Admin** comes from the server's `ADMIN_EMAILS`. The command
   refuses to run when `ADMIN_EMAILS` is not set, unless `--no-admin-emails`
@@ -919,6 +927,137 @@ on 127.0.0.1:3009 only, and the Gatekeeper reaches it there
 
 The Gatekeeper refuses to start on a public origin without `SENDER_URL`
 and `TICKET_SIGNING_KEY`. See [relay-protocol.md](relay-protocol.md) §6.
+So it never runs a Sender of its own, and never needs the Sender's
+secrets.
+
+### Its own user and settings file
+
+The Sender holds the key that opens sealed returns, and the open return
+while it sends. So the system keeps it apart from the Gatekeeper, not only
+the code:
+
+- It runs as the system user `buwiz-sender` (no login shell, no home), not
+  as `buwiz`. A process running as `buwiz` cannot read its settings file,
+  its environment or its memory.
+- Its settings are in `/etc/buwiz-sender/sender.env` (`buwiz-sender`,
+  0600, in a 0700 directory). The Gatekeeper's `/etc/buwiz/env` (root,
+  0600) has no Sender-only setting (its keys, the BIR passphrases). The
+  two share `SENDER_SECRET` (the Gatekeeper's bearer token for calls to the
+  Sender), `ACCOUNT_ORIGIN` and `RUST_LOG`.
+- Its unit has `MemorySwapMax=0`, so its memory never goes to the swap file
+  (which is not encrypted), and `LimitCORE=0`, so a crash writes no core
+  dump. It is hardened like the Gatekeeper's, plus `ProtectProc=invisible`
+  and `ProcSubset=pid`.
+- Neither service can reach the instance's metadata address
+  (`IPAddressDeny=169.254.169.254 fd00:ec2::254`). The instance role reads
+  every `/buwiz/*` setting, so a process that could reach it could fetch
+  the Sender's secrets from SSM. Neither needs it: the Gatekeeper reaches
+  R2 with its own keys (`S3_*`), and neither calls AWS.
+
+So the Gatekeeper can read neither the Sender's settings, on disk or in
+SSM, nor its memory.
+
+`buwiz-env.service`, a oneshot unit, runs `/usr/local/bin/buwiz-env`
+(`deploy/ec2/buwiz-env`) as root. Both services `Require` it and start
+after it, so it writes both files from `/buwiz/*` before each start or
+restart of either, also when one restarts itself after a crash. It is the
+only one of the three that reaches the metadata address. It has no start
+limit, so a service that keeps crashing cannot stop the other from
+starting. A value with a line break in it, or a name other than A-Z, 0-9
+and `_`, fails the run before either file changes, so neither service
+starts: keep every value on one line (base64 for a key). Which setting
+goes where is decided in `buwiz-env`, by two lists:
+
+- `SENDER_ONLY`: only in `sender.env`. Everything the Sender reads that
+  the Gatekeeper does not: `SENDER_HOST`, `SENDER_PORT`,
+  `TICKET_PUBLIC_KEYS`, `SENDER_HPKE_KEY`, `RECEIPT_SIGNING_KEY`,
+  `RECEIPT_ISSUER` and every `BIR_*` relay setting above, with
+  `BIR_LAB_SFTP`.
+- `BOTH`: in both files. `SENDER_SECRET`, `ACCOUNT_ORIGIN` (the receipts'
+  issuer when `RECEIPT_ISSUER` is not set) and `RUST_LOG`.
+- Any other setting goes to the Gatekeeper only.
+
+So a new setting the Sender reads reaches it only once it is added to a
+list. A Sender setting that is missing makes the Sender refuse to start
+(outside `dry_run`), which `install.sh` shows. `BIR_UPTIME*` are the
+Gatekeeper's, not relay settings.
+
+The Gatekeeper's commands (`buwiz-cloud seed`, `buwiz-cloud bir`) keep
+`--uid=buwiz -p EnvironmentFile=/etc/buwiz/env`. A command that runs
+`buwiz-sender` uses `--uid=buwiz-sender -p
+EnvironmentFile=/etc/buwiz-sender/sender.env`, as `trust-list.sh` does.
+
+`deploy/ec2/test-install.sh` runs all of this in an Ubuntu 24.04 container
+with fake settings: an instance set up by an older commit (its argument,
+`origin/main` by default), the move, a rollback, the move again, and a new
+instance. It needs Docker and nothing else.
+
+### Deploying the release that splits the settings
+
+Deploy it as usual (`build-release.sh`, `deploy.sh`). Nothing changes in
+Parameter Store. On its first run, `install.sh`:
+
+1. puts the new `/usr/local/bin/buwiz-env` in place;
+2. makes the system user `buwiz-sender` and `/etc/buwiz-sender` (0700);
+3. writes `buwiz-env.service`;
+4. rewrites `buwiz-sender.service` to run as `buwiz-sender` with
+   `/etc/buwiz-sender/sender.env`, `MemorySwapMax=0`, `LimitCORE=0` and no
+   metadata address, after `buwiz-env.service`;
+5. adds the drop-in `/etc/systemd/system/buwiz.service.d/env.conf`: the
+   Gatekeeper no longer runs `buwiz-env` itself (`ExecStartPre=` is
+   emptied), starts after `buwiz-env.service`, and cannot reach the
+   metadata address;
+6. restarts the Sender, then the Gatekeeper. Each start writes both files,
+   so `/etc/buwiz/env` loses the Sender's secrets then.
+
+Later deploys find the user there, and set the directory's owner and mode
+again. The unit `buwiz.service` itself (from `user-data.sh`) is not
+changed; the drop-in overrides it.
+
+**Check it**, in an SSM session:
+```sh
+systemctl is-active buwiz-sender.service buwiz.service      # active, active
+systemctl show buwiz-sender -p User,MemorySwapMax,LimitCORE  # User=buwiz-sender, MemorySwapMax=0, LimitCORE=0
+ps -o user= -p "$(systemctl show -p MainPID --value buwiz-sender)"   # buwiz-sender
+sudo stat -c '%U %a %n' /etc/buwiz-sender /etc/buwiz-sender/sender.env /etc/buwiz/env
+# buwiz-sender 700, buwiz-sender 600, root 600
+sudo -u buwiz cat /etc/buwiz-sender/sender.env    # must fail: Permission denied
+sudo grep -c SENDER_HPKE_KEY /etc/buwiz/env       # must print 0
+sudo grep -c SENDER_HPKE_KEY /etc/buwiz-sender/sender.env   # 1
+systemctl show buwiz buwiz-sender -p IPAddressDeny  # 169.254.169.254/32 fd00:ec2::254/128, twice
+systemctl show buwiz -p ExecStartPre               # empty
+journalctl -u buwiz-env.service -n 4 --no-pager    # a run just before each service started
+```
+Then smoke-test as usual, and check that `/.well-known/buwiz-hpke.json`
+still serves the same keys as before (`deploy/ec2/trust-list.sh` compares
+them, too).
+
+**Rolling back.** Deploy the previous release (`deploy/ec2/deploy.sh
+<previous sha>`). Its `install.sh` rewrites `buwiz-sender.service` as it
+was: user `buwiz`, settings from `/etc/buwiz/env`. It does not put back
+the old `buwiz-env`. The new one sees that the Sender's unit has no
+`User=buwiz-sender` and writes every setting to `/etc/buwiz/env` again, as
+before the split, so the older release starts as it did. Left behind:
+
+- the user `buwiz-sender`;
+- `/etc/buwiz-sender/sender.env`, still `buwiz-sender` 0600 in its 0700
+  directory, with the Sender's settings from the last start before the
+  rollback; nothing reads or updates it;
+- the new `/usr/local/bin/buwiz-env`;
+- `buwiz-env.service` and the drop-in `buwiz.service.d/env.conf`, which the
+  older `install.sh` does not know. So the Gatekeeper still starts after
+  `buwiz-env.service` and still cannot reach the metadata address. The
+  older Sender's unit runs `buwiz-env` itself again, as it did.
+
+This is safe: both services start with the settings they had before this
+change (`test-install.sh` checks it), the Gatekeeper never needed the
+metadata address, and the file left behind is no easier to read than
+`/etc/buwiz/env`. Deploying this release again picks them up as they are.
+Remove nothing by hand.
+
+Putting the previous binaries back by hand
+([above](#putting-the-previous-binaries-back)) keeps the new units and both
+files: the older Sender reads the same settings, now as `buwiz-sender`.
 
 ## Going live with BIR (once)
 
@@ -964,7 +1103,9 @@ it, and prints the public key to pin. Run it again to renew. The manual steps:
 ```sh
 cargo run --release --bin buwiz-trust-sign -- keygen trust.key
 # prints the public key: put it in eBIRForms crates/bir-submit/src/filing/trust.rs TRUST_KEYS
-# on the instance (through SSM): buwiz-sender public > sender-keys.json
+# on the instance (through SSM), as the Sender, with its settings:
+#   sudo systemd-run --quiet --pipe --wait --uid=buwiz-sender -p EnvironmentFile=/etc/buwiz-sender/sender.env \
+#     -p MemorySwapMax=0 -p LimitCORE=0 -E RUST_LOG=off /opt/buwiz/buwiz-sender public > sender-keys.json
 cargo run --release --bin buwiz-trust-sign -- sign trust.key 365 sender-keys.json \
   <host:port> …   # BIR's dispatcher and upload hosts, from the BIR relay's private docs
 # prints the JWS: store it as TRUST_LIST_JWS in /buwiz/* and restart buwiz.service

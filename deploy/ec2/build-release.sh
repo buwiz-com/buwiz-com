@@ -24,5 +24,6 @@ up() { aws s3 cp "$@" --only-show-errors; }
 up "$R/buwiz-cloud" "$B/buwiz-cloud"
 up "$R/buwiz-sender" "$B/buwiz-sender"
 up "$R/ocr-models" "$B/ocr-models" --recursive
+up "$here/buwiz-env" "$B/buwiz-env"
 up "$here/install.sh" "$B/install.sh"
 echo "UPLOADED $sha"

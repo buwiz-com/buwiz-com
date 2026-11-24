@@ -109,6 +109,13 @@ impl AppState {
         self
     }
 
+    /// The same state with `mailer` (a [`Mailer::recording`]), for tests.
+    /// Only before the state is shared (cloned).
+    pub fn with_mailer(mut self, mailer: Mailer) -> Self {
+        Arc::get_mut(&mut self.0).expect("set before the state is shared").mailer = mailer;
+        self
+    }
+
     /// The same state with BIR uptime set to `uptime`, for tests. Only
     /// before the state is shared (cloned).
     pub fn with_uptime(mut self, uptime: Uptime) -> Self {

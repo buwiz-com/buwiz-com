@@ -10,7 +10,6 @@ and `src/base/config.rs`.
 | `DATABASE_URL`, `DOCUMENT_KEY` | Required. `DOCUMENT_KEY` encrypts claim files: losing it makes every stored file unreadable |
 | `ACCOUNT_ORIGIN` | The account host. If it starts with `https://`, secure cookies turn on, and a public deployment must send email (`RESEND_API_KEY`, `MAIL_FROM`). The server refuses to start if it would print sign-in codes on a public deployment |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile on the sign-in forms, on when both are set ([accounts.md](accounts.md#who-can-be-mailed-a-code)). Cloudflare's test keys work on localhost: site key `1x00000000000000000000AA` with secret `1x0000000000000000000000000000000AA` always passes |
-| `REVIEW_LOGIN_EMAIL`, `REVIEW_LOGIN_CODE` | The store review login: one address that signs in with a fixed six-digit code while it is a test account ([accounts.md](accounts.md#the-store-review-login)). Off unless both are set |
 | `FORMS_ORIGIN` | The filing site's host (default `https://ebirforms.buwiz.com`). The bare domain is the Bot site ([bot-site.md](bot-site.md)) |
 | `EXTRA_ORIGINS`, `ADMIN_EMAILS` | Additional allowed origins. Staff email addresses |
 | `DOWNLOADS_URL` | Where the release manifests and installers are ([ebirforms-site.md](ebirforms-site.md)) |

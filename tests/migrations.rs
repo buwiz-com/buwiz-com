@@ -1,9 +1,10 @@
-//! Migrations 11 to 14 on a database at migration 10 with a row in every
+//! Migrations 11 to 15 on a database at migration 10 with a row in every
 //! claim status, files, readings, audit lines, tickets and returns: the
 //! rows survive and read as before, and going back down to 10 leaves a
 //! database the release before this one starts on, every return kept.
-//! Migration 13 (test TINs) goes back to 12 on its own, and 14 (BIR
-//! uptime) to 13, keeping its history in the archive for the way up.
+//! Migration 13 (test TINs) goes back to 12 on its own, 14 (BIR uptime) to
+//! 13, keeping its history in the archive for the way up, and 15 (fixed
+//! sign-in codes) to 14.
 //! Each test gets its own empty database (`migrations = false`).
 
 use std::borrow::Cow;
@@ -319,7 +320,7 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     let before = rows(&db).await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
     let after = rows(&db).await;
     assert_eq!(only_columns_at_10(&after, &before), before, "no row or old column changed");
 
@@ -771,6 +772,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
     for (down, set) in [
+        (include_str!("../migrations/0015_fixed_codes.down.sql"), ""),
         (include_str!("../migrations/0014_bir_uptime.down.sql"), ""),
         (include_str!("../migrations/0013_test_tins.down.sql"), ""),
         (include_str!("../migrations/0012_staff_roles.down.sql"), "SET LOCAL buwiz.rollback_drop_roles = 'yes'"),
@@ -903,7 +905,7 @@ async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgP
     assert_eq!(versions(&db).await, (1..=10).collect::<Vec<_>>());
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
 }
 
 /// Migration 13: a test TIN (root 000-000-000) is only ever one an Admin or
@@ -965,7 +967,7 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
 
     let refused = MIGRATOR.undo(&db, 12).await.unwrap_err().to_string();
     assert!(refused.contains("1 row(s) hold a test TIN (000-000-000)"), "{refused}");
-    // 14 went back on its own first: it never refuses.
+    // 15 and 14 went back on their own first: they never refuse.
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
     // Ended, it still blocks: the old release reads ended rows too.
     exec(&db, &format!("UPDATE tin_claims SET status = 'revoked', removed_at = now() WHERE id = '{test_tin}'")).await;
@@ -980,7 +982,7 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
             .unwrap();
     assert_eq!(checks, 0);
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
 }
 
 /// The migrations of the release before BIR uptime: 1 to 13.
@@ -1029,7 +1031,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     release_13().run(&db).await.unwrap();
     let schema_13 = schema(&db).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
 
     // What a try may hold: a live failure has a class and a kind, a lab
     // try neither and is never counted, times are to the minute, keys are
@@ -1181,10 +1183,16 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
         assert_eq!(rows, 0, "{table}");
     }
 
-    // By hand, as psql runs it, the down file does the same.
-    let mut tx = db.begin().await.unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0014_bir_uptime.down.sql")).execute(&mut *tx).await.unwrap();
-    tx.commit().await.unwrap();
+    // By hand, as psql runs it, the down file does the same (after 15's,
+    // newest first).
+    for down in [
+        include_str!("../migrations/0015_fixed_codes.down.sql"),
+        include_str!("../migrations/0014_bir_uptime.down.sql"),
+    ] {
+        let mut tx = db.begin().await.unwrap();
+        sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_13);
     MIGRATOR.run(&db).await.unwrap();
@@ -1268,7 +1276,7 @@ async fn a_stray_open_transaction_fails_migration_14(db: PgPool, table: &str) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>(), "{table}");
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
     let validated: bool =
         sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tickets_bir_admission_check'")
             .fetch_one(&db)
@@ -1285,4 +1293,88 @@ async fn a_stray_open_transaction_on_tickets_fails_migration_14(db: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn a_stray_open_transaction_on_devices_fails_migration_14(db: PgPool) {
     a_stray_open_transaction_fails_migration_14(db, "devices").await;
+}
+
+/// The migrations of the release before fixed sign-in codes: 1 to 14.
+fn release_14() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 14).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// Migration 15: a fixed sign-in code's hash lives on a test account only,
+/// always with who set it and when, and the history knows its three
+/// actions. Going back to 14 never refuses, leaves 14's schema exactly and
+/// moves those history lines to the archive; the way up works again, by
+/// sqlx and by hand.
+#[sqlx::test(migrations = false)]
+async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
+    release_14().run(&db).await.unwrap();
+    let schema_14 = schema(&db).await;
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let boss = id(&db, "INSERT INTO accounts (email, role) VALUES ('boss@example.test', 'admin') RETURNING id").await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
+
+    let hash = "decode(repeat('ab', 32), 'hex')";
+    let set = |columns: &str| format!("UPDATE accounts SET {columns} WHERE id = '{ana}'");
+    let whole = format!("fixed_code_hash = {hash}, fixed_code_set_by = '{boss}', fixed_code_set_at = now()");
+    // Not without the test label.
+    fails_with(&db, &set(&whole), "accounts_fixed_code_check").await;
+    exec(&db, &set("test_account = true")).await;
+    // Never without who and when, and only a SHA-256 hash.
+    for columns in [
+        format!("fixed_code_hash = {hash}"),
+        format!("fixed_code_hash = {hash}, fixed_code_set_by = '{boss}'"),
+        format!("fixed_code_hash = decode('ab', 'hex'), fixed_code_set_by = '{boss}', fixed_code_set_at = now()"),
+        format!("fixed_code_set_by = '{boss}', fixed_code_set_at = now()"),
+    ] {
+        fails_with(&db, &set(&columns), "accounts_fixed_code_check").await;
+    }
+    exec(&db, &set(&whole)).await;
+    // The label cannot come off while it is set.
+    fails_with(&db, &set("test_account = false"), "accounts_fixed_code_check").await;
+    let line = |action: &str| {
+        format!(
+            "INSERT INTO account_audit (account_id, action, actor_id, actor_email, source, reason)
+             VALUES ('{ana}', '{action}', '{boss}', 'boss@example.test', 'web', 'Store review')"
+        )
+    };
+    for action in ["fixed_code_set", "fixed_code_changed", "fixed_code_cleared", "banned"] {
+        exec(&db, &line(action)).await;
+    }
+    fails_with(&db, &line("fixed_code_shown"), "account_audit_action_check").await;
+
+    // Back to 14 the way sqlx reverts: 14's schema exactly, the code gone,
+    // its history in the archive, every other line kept.
+    MIGRATOR.undo(&db, 14).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_14, "the schema is migration 14's");
+    assert_eq!(
+        archived(&db, "account_audit", "action").await,
+        ["fixed_code_changed", "fixed_code_cleared", "fixed_code_set"]
+    );
+    let kept: Vec<String> = sqlx::query_scalar("SELECT action FROM account_audit").fetch_all(&db).await.unwrap();
+    assert_eq!(kept, ["banned"]);
+    release_14().run(&db).await.unwrap();
+
+    // Up again: no code came back. Set one, then go back by hand.
+    MIGRATOR.run(&db).await.unwrap();
+    let none: bool = sqlx::query_scalar("SELECT fixed_code_hash IS NULL FROM accounts WHERE id = $1")
+        .bind(ana)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(none);
+    exec(&db, &set(&whole)).await;
+    exec(&db, &line("fixed_code_set")).await;
+    let mut tx = db.begin().await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0015_fixed_codes.down.sql")).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(versions(&db).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_14);
+    // A second rollback adds to the archive.
+    assert_eq!(archived(&db, "account_audit", "action").await.len(), 4);
+    release_14().run(&db).await.unwrap();
 }

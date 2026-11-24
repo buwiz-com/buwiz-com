@@ -519,6 +519,9 @@ pub struct UserRow {
     pub banned_at: Option<OffsetDateTime>,
     pub ban_reason: Option<String>,
     pub banned_by_email: Option<String>,
+    /// When a fixed sign-in code was set, if one is (never the code).
+    pub fixed_code_set_at: Option<OffsetDateTime>,
+    pub fixed_code_set_by_email: Option<String>,
 }
 
 const USER_COLUMNS: &str = "a.id, a.email, a.created_at,
@@ -528,7 +531,9 @@ const USER_COLUMNS: &str = "a.id, a.email, a.created_at,
           WHERE g.account_id = a.id)
      ) AS last_active,
      a.role, a.test_account, a.banned_at, a.ban_reason,
-     (SELECT b.email FROM accounts b WHERE b.id = a.banned_by) AS banned_by_email";
+     (SELECT b.email FROM accounts b WHERE b.id = a.banned_by) AS banned_by_email,
+     a.fixed_code_set_at,
+     (SELECT f.email FROM accounts f WHERE f.id = a.fixed_code_set_by) AS fixed_code_set_by_email";
 
 /// Accounts for the users list. `admin_emails` is `ADMIN_EMAILS`, whose
 /// people are staff whatever their account says.

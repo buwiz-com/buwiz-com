@@ -1196,3 +1196,32 @@ async fn a_test_tin_goes_in_only_on_purpose_on_a_test_login(db: PgPool) {
     assert!(problem.contains("login jane@example.test: it holds a test TIN, so the test label stays"), "{problem}");
     assert!(account(db, "jane@example.test").await.2);
 }
+
+/// The seed file never sets a fixed sign-in code (it has no key for one),
+/// and cannot take the test label off a login that has one: an Admin
+/// clears it on the account's staff page first.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_seed_never_sets_a_fixed_code_nor_takes_the_label_off_one(db: PgPool) {
+    let site = Site::with_admins(db, &[]);
+    let db = &site.db;
+    let (_, boss) = site.staff_with_role("boss@example.test", "admin").await;
+    let opts = options("boss@example.test", false);
+    let login = |extra: &str| format!("[[login]]\nemail = \"reviewer@example.test\"\n{extra}");
+    let problem = refused(seed(db, &login("test = true\nfixed_code = \"481516\"\n"), &opts).await);
+    assert!(problem.contains("unknown field"), "{problem}");
+    assert_eq!(count(db, "accounts").await, 1);
+
+    seed(db, &login("test = true\n"), &opts).await.unwrap();
+    let (reviewer, _, labelled) = account(db, "reviewer@example.test").await;
+    assert!(labelled);
+    let set = site.post(&format!("/staff/users/{reviewer}/fixed-code"), &boss, "code=481516&reason=Store+review").await;
+    assert_eq!(location(&set), format!("/staff/users/{reviewer}?notice=fixed_code_set"));
+    let before = counts(db).await;
+    let problem = refused(seed(db, &login("test = false\n"), &opts).await);
+    assert!(
+        problem.contains("login reviewer@example.test: it has a fixed sign-in code, so the test label stays"),
+        "{problem}"
+    );
+    assert!(account(db, "reviewer@example.test").await.2);
+    assert_eq!(counts(db).await, before);
+}

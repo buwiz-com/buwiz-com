@@ -23,6 +23,28 @@ const NEW_ADDRESS_CODES_PER_DAY: i64 = 60;
 const NEW_ADDRESS_LOCK: i64 = 0x6275_7769_7a01;
 const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);
+/// How long sign-in records are kept: codes from when they were made,
+/// device and agent sign-ins from when they expired ([`upkeep`]).
+const SIGN_IN_RECORDS_DAYS: i32 = 30;
+
+/// What a code in `email_codes` is for. A code works only for its own
+/// purpose: a sign-in code never deletes an account, and a deletion code
+/// never signs anyone in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    SignIn,
+    /// Deleting the account ([`crate::account::deletion`]).
+    Delete,
+}
+
+impl Purpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SignIn => "sign_in",
+            Self::Delete => "delete",
+        }
+    }
+}
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Account {
@@ -99,13 +121,7 @@ impl std::fmt::Debug for IssuedCode {
 /// five wrong guesses hold for both.
 pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Result<IssuedCode, CodeError> {
     let mut tx = db.begin().await?;
-    let recent: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > now() - interval '1 hour'",
-    )
-    .bind(email)
-    .fetch_one(&mut *tx)
-    .await?;
-    if recent >= CODES_PER_HOUR {
+    if codes_this_hour(&mut tx, email).await? >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }
     let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)")
@@ -143,53 +159,110 @@ pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Re
     let (hash, issued) = match fixed {
         Some(hash) => (hash, IssuedCode::Fixed),
         None => {
-            let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
+            let code = random_code();
             (code_hash(email, &code), IssuedCode::Mail(code))
         }
     };
-    // Dated when it is added, not when the transaction began: the code
-    // added last (after waiting for the lock) must be the newest, because
-    // only the newest can be redeemed.
-    sqlx::query(
-        "INSERT INTO email_codes (email, code_hash, expires_at, created_at) VALUES ($1, $2, $3, clock_timestamp())",
-    )
-    .bind(email)
-    .bind(hash)
-    .bind(OffsetDateTime::now_utc() + CODE_TTL)
-    .execute(&mut *tx)
-    .await?;
+    add_code(&mut tx, email, hash, Purpose::SignIn).await?;
     tx.commit().await?;
     Ok(issued)
 }
 
-/// Checks the newest open code for `email`. A match signs the person in,
-/// creating the account the first time.
-pub async fn redeem_code(db: &PgPool, email: &str, code: &str) -> Result<Account, CodeError> {
-    let code: String = code.chars().filter(char::is_ascii_digit).collect();
+/// Stores a code for deleting the account of `email` and returns it, for
+/// mailing. Always a random one, mailed to the address: a test account's
+/// fixed code never deletes it. It counts towards the address's five codes
+/// an hour, as a sign-in code does, and the newest one asked for is the
+/// only one that works.
+pub(crate) async fn issue_deletion_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
     let mut tx = db.begin().await?;
+    if codes_this_hour(&mut tx, email).await? >= CODES_PER_HOUR {
+        return Err(CodeError::TooMany);
+    }
+    let code = random_code();
+    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete).await?;
+    tx.commit().await?;
+    Ok(code)
+}
+
+fn random_code() -> String {
+    format!("{:06}", rand::rng().random_range(0..1_000_000))
+}
+
+/// Codes of any purpose made for `email` in the last hour.
+async fn codes_this_hour(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, email: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > now() - interval '1 hour'")
+        .bind(email)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+async fn add_code(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+    hash: Vec<u8>,
+    purpose: Purpose,
+) -> sqlx::Result<()> {
+    // Dated when it is added, not when the transaction began: the code
+    // added last (after waiting for the lock) must be the newest, because
+    // only the newest can be redeemed.
+    sqlx::query(
+        "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose)
+         VALUES ($1, $2, $3, clock_timestamp(), $4)",
+    )
+    .bind(email)
+    .bind(hash)
+    .bind(OffsetDateTime::now_utc() + CODE_TTL)
+    .bind(purpose.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Uses up the newest open code of `purpose` for `email` if `code` is it.
+/// Only the newest counts, so a code asked for earlier stops working once
+/// a new one is asked for. A wrong code counts towards that code's five
+/// tries; the caller commits either way, so the try stays counted.
+pub(crate) async fn take_code(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+    purpose: Purpose,
+    code: &str,
+) -> sqlx::Result<bool> {
+    let code: String = code.chars().filter(char::is_ascii_digit).collect();
     let row: Option<(Uuid, Vec<u8>, i32)> = sqlx::query_as(
         "SELECT id, code_hash, attempts FROM email_codes
-         WHERE email = $1 AND consumed_at IS NULL AND expires_at > now()
+         WHERE email = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > now()
          ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
     )
     .bind(email)
-    .fetch_optional(&mut *tx)
+    .bind(purpose.as_str())
+    .fetch_optional(&mut **tx)
     .await?;
     let Some((code_id, stored, attempts)) = row else {
-        return Err(CodeError::Invalid);
+        return Ok(false);
     };
     if attempts >= CODE_ATTEMPTS {
-        return Err(CodeError::Invalid);
+        return Ok(false);
     }
     if code.len() != 6 || stored != code_hash(email, &code) {
         sqlx::query("UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1")
             .bind(code_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
+        return Ok(false);
+    }
+    sqlx::query("UPDATE email_codes SET consumed_at = now() WHERE id = $1").bind(code_id).execute(&mut **tx).await?;
+    Ok(true)
+}
+
+/// Checks the newest open sign-in code for `email`. A match signs the
+/// person in, creating the account the first time.
+pub async fn redeem_code(db: &PgPool, email: &str, code: &str) -> Result<Account, CodeError> {
+    let mut tx = db.begin().await?;
+    if !take_code(&mut tx, email, Purpose::SignIn, code).await? {
         tx.commit().await?;
         return Err(CodeError::Invalid);
     }
-    sqlx::query("UPDATE email_codes SET consumed_at = now() WHERE id = $1").bind(code_id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO accounts (email) VALUES ($1) ON CONFLICT (email) DO NOTHING")
         .bind(email)
         .execute(&mut *tx)
@@ -218,6 +291,19 @@ pub async fn session_account(db: &PgPool, token: &str) -> sqlx::Result<Option<Ac
     sqlx::query_as(
         "SELECT a.id, a.email FROM web_sessions s JOIN accounts a ON a.id = s.account_id
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND a.banned_at IS NULL",
+    )
+    .bind(crypto::hash(token))
+    .fetch_optional(db)
+    .await
+}
+
+/// The account of a website session, banned or not: only for deleting the
+/// account (`/delete`), which a banned account may do. Every other page
+/// asks [`session_account`].
+pub async fn deletion_session_account(db: &PgPool, token: &str) -> sqlx::Result<Option<Account>> {
+    sqlx::query_as(
+        "SELECT a.id, a.email FROM web_sessions s JOIN accounts a ON a.id = s.account_id
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now()",
     )
     .bind(crypto::hash(token))
     .fetch_optional(db)
@@ -267,6 +353,24 @@ pub(crate) async fn end_sign_ins(
         .bind(account_id)
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+/// The hourly upkeep: deletes sign-in records once nothing needs them.
+/// Codes go 30 days after they were made (the limits per address look back
+/// an hour and a day), and device and agent sign-ins 30 days after they
+/// expired (nothing reads one after that).
+pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM email_codes WHERE created_at < now() - make_interval(days => $1)")
+        .bind(SIGN_IN_RECORDS_DAYS)
+        .execute(db)
+        .await?;
+    for table in ["device_authorizations", "oauth_codes"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE expires_at < now() - make_interval(days => $1)"))
+            .bind(SIGN_IN_RECORDS_DAYS)
+            .execute(db)
+            .await?;
+    }
     Ok(())
 }
 

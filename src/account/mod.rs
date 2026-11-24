@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod admin;
 pub mod agents;
 pub mod claims;
+pub mod deletion;
 pub mod guard;
 pub mod mail;
 pub mod mcp;

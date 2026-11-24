@@ -1,5 +1,5 @@
-//! Sends sign-in codes, and short plain-text notices to staff (BIR uptime's
-//! alerts, [`crate::uptime::alerts`]).
+//! Sends sign-in codes, codes for deleting an account, and short
+//! plain-text notices to staff (BIR uptime's alerts, [`crate::uptime::alerts`]).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,9 @@ pub struct Mailer {
     /// Tests only ([`Mailer::recording`]): sign-in codes as (to, code),
     /// kept here, not sent.
     codes: Option<Mutex<Vec<(String, String)>>>,
+    /// Tests only ([`Mailer::recording`]): codes for deleting an account as
+    /// (to, code), kept here, not sent.
+    deletion_codes: Option<Mutex<Vec<(String, String)>>>,
     /// Tests only: a recording mailer that fails every notice.
     failing: AtomicBool,
 }
@@ -57,6 +60,7 @@ impl Mailer {
                 .unwrap_or_default(),
             outbox: None,
             codes: None,
+            deletion_codes: None,
             failing: AtomicBool::new(false),
         }
     }
@@ -67,6 +71,7 @@ impl Mailer {
         Self {
             outbox: Some(Mutex::new(Vec::new())),
             codes: Some(Mutex::new(Vec::new())),
+            deletion_codes: Some(Mutex::new(Vec::new())),
             ..Self::new(MailConfig::Log, site_origin)
         }
     }
@@ -75,6 +80,14 @@ impl Mailer {
     /// first.
     pub fn sign_in_codes(&self) -> Vec<(String, String)> {
         self.codes
+            .as_ref()
+            .map_or_else(Vec::new, |codes| codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// The codes for deleting an account a [`Mailer::recording`] kept, as
+    /// (to, code), oldest first.
+    pub fn deletion_codes(&self) -> Vec<(String, String)> {
+        self.deletion_codes
             .as_ref()
             .map_or_else(Vec::new, |codes| codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
     }
@@ -153,6 +166,51 @@ impl Mailer {
             }
         }
     }
+
+    /// The code for deleting the account at `to`, as plain text: a short
+    /// message of its own, so it is never taken for a sign-in code.
+    pub async fn send_deletion_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
+        if let Some(codes) = &self.deletion_codes {
+            codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((to.into(), code.into()));
+            return Ok(());
+        }
+        let (subject, text) = deletion_message(code);
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(to, code, "account deletion code (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .timeout(CODE_TIMEOUT)
+                    .bearer_auth(api_key)
+                    .json(&json!({ "from": from, "to": [to], "subject": subject, "text": text }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The subject and text of the email with a code for deleting an account.
+/// As in the sign-in email, the code is the only number.
+fn deletion_message(code: &str) -> (String, String) {
+    (
+        format!("{code} is your code to delete your Buwiz account"),
+        format!(
+            "Your code to delete your Buwiz account is {code}\n\n\
+             Type it on the Delete your account page to delete the account for good. \
+             It expires in ten minutes and works once.\n\n\
+             Didn't ask to delete your account? Don't type this code anywhere, and sign in to check your account. \
+             Nobody can delete it without this code.\n\n\
+             Buwiz - https://buwiz.com"
+        ),
+    )
 }
 
 /// A sign-in code email. Mail apps (Gmail's "Copy code", Apple's code
@@ -202,6 +260,16 @@ mod tests {
         assert!(message.subject.starts_with("042917 "));
         assert!(message.text.contains("verification code is 042917"));
         for part in [message.subject.as_str(), message.text.as_str(), visible(&message.html).as_str()] {
+            assert!(numbers(part).iter().all(|number| *number == "042917"), "{part}");
+        }
+    }
+
+    #[test]
+    fn the_deletion_code_is_the_only_number_and_leads_the_subject() {
+        let (subject, text) = deletion_message("042917");
+        assert!(subject.starts_with("042917 "));
+        assert!(text.contains("delete your Buwiz account is 042917"));
+        for part in [subject.as_str(), text.as_str()] {
             assert!(numbers(part).iter().all(|number| *number == "042917"), "{part}");
         }
     }

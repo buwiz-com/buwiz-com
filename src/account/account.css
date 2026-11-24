@@ -807,6 +807,8 @@
 .auth .consent .auth-hint { margin: 0; }
 .auth .consent .auth-actions .btn { height: 48px; font-size: 15px; }
 .consent-back { color: var(--muted); font-size: 12.5px; text-align: center; }
+/* Deleting an account: the two lists one above the other. */
+.delete-account .delete-lists { grid-template-columns: 1fr; }
 
 /* The code page: its badge on the heading's line, and the countdown
    (account.js), red once the code has run out, when the resend link

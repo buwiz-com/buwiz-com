@@ -797,8 +797,47 @@ In this order:
    starts instead, it runs migration 15 again (with no codes), and the
    rollback starts over at 1.
 
-Going further back runs 15's down file first, then 14's and the others as
+Going further back from 16 runs 16's down file first
+([below](#migration-16-account-deletion)). From 15, it runs 15's down file
+first, then 14's and the others as
 [above](#migration-14-bir-uptime); each commits on its own.
+
+## Migration 16 (account deletion)
+
+The release where people delete their own account
+([accounts.md](accounts.md#deleting-an-account)) runs migration 16 when it
+starts. It adds `email_codes.purpose` (`sign_in`, the default for every
+existing row, or `delete`) and lets `account_audit` hold `deleted`. No row
+is rewritten; the checks scan `email_codes` and `account_audit`, both
+small. There is no setting. The release before it (at 15) refuses to start
+on a database at 16.
+
+**Before you deploy.** The database is at 15 (a read-only check):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 15
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 15.** The down file never refuses. It deletes the codes
+mailed for deleting an account (15 would take them for sign-in codes;
+whoever was deleting asks again after the way up) and moves the `deleted`
+lines to `rollback_archive.account_audit`, where they stay. Accounts
+deleted at 16 stay deleted. In this order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0016_account_deletion.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 15
+   ```
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 16 again, and the rollback starts
+   over at 1.
+
+Going further back runs 16's down file first, then 15's and the others as
+[above](#migration-15-fixed-sign-in-codes); each commits on its own.
 
 ## OCR of claim documents
 

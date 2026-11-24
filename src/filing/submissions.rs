@@ -122,7 +122,9 @@ pub async fn create(
     {
         return Err(ApiError::bad_request("bad_idempotency_key", "idempotency_key must be 1 to 100 characters"));
     }
-    let claim_id = gate::own(&state.db, bearer.account.id, &name.tin).await?.sendable()?;
+    // A replay first: a return stored before the account became a practice
+    // one, or before its TIN changed, keeps its answer, so the app never
+    // takes one the BIR may have back to a draft.
     if let Some(key) = &request.idempotency_key {
         let existing: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM submissions WHERE account_id = $1 AND idempotency_key = $2")
@@ -135,6 +137,8 @@ pub async fn create(
             return Ok(Json(view).into_response());
         }
     }
+    gate::account_sends(&state.db, bearer.account.id).await?;
+    let claim_id = gate::own(&state.db, bearer.account.id, &name.tin).await?.sendable()?;
     let id = Uuid::new_v4();
     let (nonce, ciphertext) = crypto::seal(&state.config.document_key, &xml_context(id), xml)?;
     let inserted = sqlx::query(
@@ -299,8 +303,10 @@ pub async fn create_v2(State(state): State<AppState>, signed: Signed<NewSubmissi
     let Some(spent) = spent else {
         return Err(ApiError::conflict("ticket_used", "this ticket was already used; ask for a new one"));
     };
-    // The TIN may have stopped being active since the ticket. Refusing
-    // drops the transaction, so the ticket is not spent.
+    // The account may have become a practice one, or the TIN stopped being
+    // active, since the ticket. Refusing drops the transaction, so the
+    // ticket is not spent.
+    gate::account_sends(&mut *tx, bearer.account.id).await?;
     gate::of_claim(&mut *tx, bearer.account.id, spent.claim_id).await?.sendable()?;
     let id = Uuid::new_v4();
     let filename = claims.filename();
@@ -410,12 +416,13 @@ pub enum RelayStart {
 pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow::Result<RelayStart> {
     // Only one send at a time, and never after `sent` or `unknown`. A v2
     // submission gets one attempt: its ticket works once. The claim must be
-    // this account's and sendable, and the account not banned.
+    // this account's and sendable, and the account neither banned nor a
+    // practice one.
     let locked: Option<Locked> = sqlx::query_as(&format!(
         "UPDATE submissions s SET status = 'sending', sending_since = now(), attempts = attempts + 1
          FROM tin_claims c, accounts a
          WHERE s.id = $1 AND s.account_id = $2 AND c.id = s.claim_id AND c.account_id = s.account_id AND {}
-           AND a.id = s.account_id AND a.banned_at IS NULL
+           AND a.id = s.account_id AND a.banned_at IS NULL AND NOT ({})
            AND ((s.xml_ciphertext IS NOT NULL AND s.status IN ('ready', 'failed'))
              OR (s.envelope IS NOT NULL AND s.status = 'ready'))
            AND (s.device_id IS NULL OR EXISTS (SELECT 1 FROM devices d WHERE d.id = s.device_id AND d.revoked_at IS NULL))
@@ -423,7 +430,8 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
                    (SELECT t.jws FROM tickets t WHERE t.jti = s.ticket_jti) AS ticket,
                    c.tin_root, c.branch_code,
                    (SELECT t.bir_admission FROM tickets t WHERE t.jti = s.ticket_jti) AS admission",
-        gate::SENDABLE_SQL
+        gate::SENDABLE_SQL,
+        gate::PRACTICE_SQL
     ))
     .bind(id)
     .bind(account_id)
@@ -432,21 +440,24 @@ pub async fn claim_for_relay(db: &PgPool, account_id: Uuid, id: Uuid) -> anyhow:
     if let Some(locked) = locked {
         return Ok(RelayStart::Send(Box::new(locked)));
     }
-    // A return still waiting whose account was banned or whose TIN stopped
-    // being active since: it is failed with the reason, so the app takes it
-    // back to a draft. Only a return still waiting: one `sending` on
-    // another connection keeps its own outcome.
-    let waiting: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT s.claim_id, a.banned_at IS NOT NULL FROM submissions s JOIN accounts a ON a.id = s.account_id
+    // A return still waiting whose account was banned or became a practice
+    // one, or whose TIN stopped being active since: it is failed with the
+    // reason, so the app takes it back to a draft. Only a return still
+    // waiting: one `sending` on another connection keeps its own outcome.
+    let waiting: Option<(Uuid, bool, bool)> = sqlx::query_as(&format!(
+        "SELECT s.claim_id, a.banned_at IS NOT NULL, {} FROM submissions s JOIN accounts a ON a.id = s.account_id
          WHERE s.id = $1 AND s.account_id = $2",
-    )
+        gate::PRACTICE_SQL
+    ))
     .bind(id)
     .bind(account_id)
     .fetch_optional(db)
     .await?;
-    if let Some((claim_id, banned)) = waiting {
+    if let Some((claim_id, banned, practice)) = waiting {
         let refusal = if banned {
             Some(("account_banned", format!("{BANNED_MESSAGE} (account_banned)")))
+        } else if practice {
+            Some((gate::PRACTICE_CODE, format!("{} ({})", gate::PRACTICE_MESSAGE, gate::PRACTICE_CODE)))
         } else {
             let standing = gate::of_claim(db, account_id, claim_id).await?;
             (!standing.can_send()).then(|| (standing.code(), standing.failure()))

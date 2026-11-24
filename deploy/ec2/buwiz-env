@@ -11,7 +11,12 @@
 # - A SENDER_ONLY setting goes to the Sender only.
 # - A BOTH setting goes to both.
 # - Any other setting goes to the Gatekeeper only. So a new setting reaches
-#   the Sender only once it is added here.
+#   the Sender only once it is added here, and a new Sender secret left out
+#   of SENDER_ONLY lands in the Gatekeeper's file: add it here first.
+# - A value over more than one line fails the run, and both files stay as
+#   they were: an env file holds one setting a line, so its next lines
+#   would be read as settings of their own (a base64 line such as `QUJD==`
+#   looks like one). Parameter Store's JSON is read for this, not its text.
 #
 # After a rollback to a release whose install.sh still runs the Sender as
 # buwiz with /etc/buwiz/env, the Sender unit has no User=buwiz-sender: then
@@ -43,9 +48,17 @@ if [ -n "$split" ]; then
 fi
 trap 'rm -f "$gatekeeper_new"; [ "$sender_new" = /dev/null ] || rm -f "$sender_new"' EXIT
 
-aws ssm get-parameters-by-path --region ap-southeast-1 --path /buwiz --with-decryption \
-  --query 'Parameters[].[Name,Value]' --output text \
-  | sed -E 's#^/buwiz/([A-Z0-9_]+)\t#\1=#' \
+aws ssm get-parameters-by-path --region ap-southeast-1 --path /buwiz --with-decryption --output json \
+  | python3 -I -c '
+import json, re, sys
+for parameter in json.load(sys.stdin)["Parameters"]:
+    name, value = parameter["Name"].removeprefix("/buwiz/"), parameter["Value"]
+    # Nothing of the setting is printed: it may be a secret.
+    if not re.fullmatch("[A-Z][A-Z0-9_]*", name) or "\n" in value or "\r" in value:
+        sys.exit("buwiz-env: a setting in /buwiz has a value over more than one line, "
+                 "or a name that is not A-Z, 0-9 and _; nothing was written")
+    print(name + "=" + value)
+' \
   | while IFS= read -r line; do
       name=${line%%=*}
       if [ -z "$split" ]; then

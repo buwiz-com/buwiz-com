@@ -58,11 +58,36 @@ case "$1 $2" in
     echo run >>/run/buwiz-env.runs
     /work/stub/probe >/run/buwiz-env.probe
     chmod 0644 /run/buwiz-env.runs /run/buwiz-env.probe
-    cat /work/stub/params ;;
+    # As text (the old user-data.sh) or JSON (buwiz-env), from the tab file
+    # and any extra.json (values the tab file cannot hold).
+    python3 -I - "$@" <<'PY'
+import json, os, sys
+params = [line.rstrip("\n").split("\t", 1) for line in open("/work/stub/params")]
+if os.path.exists("/work/stub/extra.json"):
+    params += [(p["Name"], p["Value"]) for p in json.load(open("/work/stub/extra.json"))]
+if "json" in sys.argv:
+    print(json.dumps({"Parameters": [{"Name": n, "Value": v} for n, v in params]}))
+else:
+    print("\n".join(n + "\t" + v for n, v in params))
+PY
+    ;;
   "ssm get-parameter")
     case "$*" in *tunnel/id*) echo fake-tunnel ;; *) echo '{}' ;; esac ;;
   *) echo "aws stub: $*" >&2; exit 1 ;;
 esac
+EOF
+# A setting whose value is over two lines: buwiz-env must fail and leave
+# both files as they were.
+cat >"$work/stub/two-lines" <<'EOF'
+#!/bin/bash
+echo '[{"Name": "/buwiz/BIR_LAB_SFTP", "Value": "first-line\nQUJD=="}]' >/work/stub/extra.json
+before=$(md5sum /etc/buwiz/env /etc/buwiz-sender/sender.env)
+/usr/local/bin/buwiz-env 2>/work/two-lines.err; status=$?
+rm /work/stub/extra.json
+[ "$status" != 0 ] || { echo "buwiz-env succeeded" >&2; exit 1; }
+grep -q 'over more than one line' /work/two-lines.err || { cat /work/two-lines.err >&2; exit 1; }
+[ "$(md5sum /etc/buwiz/env /etc/buwiz-sender/sender.env)" = "$before" ] || { echo "a file changed" >&2; exit 1; }
+[ "$(ls -A /etc/buwiz)" = env ] && [ "$(ls -A /etc/buwiz-sender)" = sender.env ] || { echo "a file was left behind" >&2; exit 1; }
 EOF
 # What a process sees as it starts: buwiz-env's runs so far, and whether
 # the metadata address answers it.
@@ -135,7 +160,11 @@ if on "sysctl -qw net.ipv6.conf.lo.disable_ipv6=0 && ip -6 addr add fd00:ec2::25
   && systemd-run --quiet --unit=fake-imds6 python3 -m http.server 80 --bind fd00:ec2::254 --directory /var/empty" 2>/dev/null; then
   ipv6=yes
 fi
-for _ in $(seq 20); do on "curl -s -m1 -o /dev/null http://169.254.169.254/" && break; sleep 0.25; done
+# Ready once a process systemd starts reaches it, as the services are:
+# that can take several seconds longer than a shell's first answer.
+for _ in $(seq 60); do
+  on "systemd-run --quiet --pipe --wait curl -s -m1 -o /dev/null http://169.254.169.254/" && break; sleep 0.5
+done
 if [ -n "$ipv6" ]; then
   for _ in $(seq 20); do on "curl -s -m1 -o /dev/null 'http://[fd00:ec2::254]/'" && break; sleep 0.25; done
   on "curl -s -m1 -o /dev/null 'http://[fd00:ec2::254]/'" || ipv6=
@@ -209,6 +238,7 @@ split_checks() {
     "systemd-run --quiet --pipe --wait --uid=buwiz-sender -p EnvironmentFile=/etc/buwiz-sender/sender.env -p MemorySwapMax=0 -p LimitCORE=0 -E RUST_LOG=off /opt/buwiz/buwiz-sender public | grep -q '\"uid\": \"buwiz-sender\", \"hpke\": \"fake-hpke-private-key=\"'"
   split_imds_checks
   check "no settings file left half-written" "[ \"\$(ls -A /etc/buwiz)\" = env ] && [ \"\$(ls -A /etc/buwiz-sender)\" = sender.env ]"
+  check "a value over two lines: buwiz-env fails, both files stay as they were" "bash /work/stub/two-lines"
 }
 single_checks() {
   check "the Sender runs as buwiz" "[ \"\$(ps -o user= -p $(pid buwiz-sender))\" = buwiz ]"

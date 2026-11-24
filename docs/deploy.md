@@ -941,7 +941,9 @@ the code:
   its environment or its memory.
 - Its settings are in `/etc/buwiz-sender/sender.env` (`buwiz-sender`,
   0600, in a 0700 directory). The Gatekeeper's `/etc/buwiz/env` (root,
-  0600) has none of the Sender's secrets.
+  0600) has no Sender-only setting (its keys, the BIR passphrases). The
+  two share `SENDER_SECRET` (the Gatekeeper's bearer token for calls to the
+  Sender), `ACCOUNT_ORIGIN` and `RUST_LOG`.
 - Its unit has `MemorySwapMax=0`, so its memory never goes to the swap file
   (which is not encrypted), and `LimitCORE=0`, so a crash writes no core
   dump. It is hardened like the Gatekeeper's, plus `ProtectProc=invisible`
@@ -961,8 +963,10 @@ after it, so it writes both files from `/buwiz/*` before each start or
 restart of either, also when one restarts itself after a crash. It is the
 only one of the three that reaches the metadata address. It has no start
 limit, so a service that keeps crashing cannot stop the other from
-starting. Which setting goes where is decided in `buwiz-env`, by two
-lists:
+starting. A value with a line break in it, or a name other than A-Z, 0-9
+and `_`, fails the run before either file changes, so neither service
+starts: keep every value on one line (base64 for a key). Which setting
+goes where is decided in `buwiz-env`, by two lists:
 
 - `SENDER_ONLY`: only in `sender.env`. Everything the Sender reads that
   the Gatekeeper does not: `SENDER_HOST`, `SENDER_PORT`,

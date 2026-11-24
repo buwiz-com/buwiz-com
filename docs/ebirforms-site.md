@@ -8,6 +8,7 @@ on the host in `FORMS_ORIGIN`.
 |---|---|---|
 | `/` | The home page: the app tour, the AI coworker demos and the FAQ | `src/account/pages/home.rs`, `src/sites/home.css`, `src/sites/demo.js`, `src/sites/demo.css` |
 | `/download` | One card per platform, with one Download button and the version, size and SHA-256 | `src/account/pages/download.rs` |
+| `/privacy` | The eBIRForms app's privacy policy, the address the app stores list; linked from the footer | `src/account/pages/privacy.rs`, `src/account/pages/privacy_policy.md` |
 | `/download/{platform}` | A counted redirect to the installer in R2 | `src/sites/downloads.rs` |
 | `/install-linux.sh` | The Linux install script, once a version is released | `src/sites/downloads.rs` |
 | `/assets/screens/*`, `/assets/demo/*` | The tour screenshots and the demo assets | `src/assets/` |
@@ -37,5 +38,13 @@ good one.
 ## SEO
 
 `robots.txt` and the sitemap come from `src/sites/seo.rs`. The sitemap lists `/`
-and, once a version is released, `/download` with the release date. The
+and `/privacy` and, once a version is released, `/download` with the release date. The
 account and API hosts send `X-Robots-Tag: noindex`.
+
+## The privacy policy
+
+`/privacy` is the app's `PRIVACY_POLICY.md` (hexuria/buwiz-forms), copied to
+`src/account/pages/privacy_policy.md`. The page is written out by hand in
+`privacy.rs`, and `tests/filing_site.rs` checks that its words are the copy's,
+word for word. When the policy changes, copy the new file over, change the
+page until the test passes, and change the sitemap date in `src/sites/seo.rs`.

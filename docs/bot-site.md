@@ -7,7 +7,7 @@ The bare domain serves the Buwiz Bot site. It has two pages:
 
 Every other path on this host either:
 
-- answers with a 301 to the filing site, for `/download`, `/install-linux.sh` and the demo assets;
+- answers with a 301 to the filing site, for `/download`, `/privacy`, `/install-linux.sh` and the demo assets;
 - answers with a 301 to the account host, for `/login`, `/signup` and `/tins`;
 - or falls through to the shared routes: `robots.txt`, `sitemap.xml`, `/healthz`, `/.well-known/*`.
 

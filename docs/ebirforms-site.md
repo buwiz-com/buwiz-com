@@ -9,6 +9,8 @@ on the host in `FORMS_ORIGIN`.
 | `/` | The home page: the app tour, the AI coworker demos and the FAQ | `src/account/pages/home.rs`, `src/sites/home.css`, `src/sites/demo.js`, `src/sites/demo.css` |
 | `/download` | One card per platform, with one Download button and the version, size and SHA-256 | `src/account/pages/download.rs` |
 | `/privacy` | The eBIRForms app's privacy policy, the address the app stores list; linked from the footer | `src/account/pages/privacy.rs`, `src/account/pages/privacy_policy.md` |
+| `/support` | How to reach support; the support address the app stores list; linked from the footer | `src/account/pages/support.rs` |
+| `/delete-account` | How to delete a Buwiz account, what is removed and what is kept; the account-deletion address the app stores list. The deletion itself is on `account.buwiz.com/delete`, signed in | `src/account/pages/support.rs` |
 | `/download/{platform}` | A counted redirect to the installer in R2 | `src/sites/downloads.rs` |
 | `/install-linux.sh` | The Linux install script, once a version is released | `src/sites/downloads.rs` |
 | `/assets/screens/*`, `/assets/demo/*` | The tour screenshots and the demo assets | `src/assets/` |
@@ -37,8 +39,8 @@ good one.
 
 ## SEO
 
-`robots.txt` and the sitemap come from `src/sites/seo.rs`. The sitemap lists `/`
-and `/privacy` and, once a version is released, `/download` with the release date. The
+`robots.txt` and the sitemap come from `src/sites/seo.rs`. The sitemap lists `/`,
+`/privacy`, `/support` and `/delete-account` and, once a version is released, `/download` with the release date. The
 account and API hosts send `X-Robots-Tag: noindex`.
 
 ## The privacy policy

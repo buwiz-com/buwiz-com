@@ -793,6 +793,55 @@ fn page_words(page: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
 }
 
+/// `/support` and `/delete-account` are the addresses the app stores list
+/// for support and for deleting an account: public, for search engines,
+/// on the filing site only, and saying how to reach support and how to
+/// delete the account (on the account site's signed-in page).
+#[sqlx::test(migrations = "./migrations")]
+async fn the_support_and_delete_account_pages_are_public(db: PgPool) {
+    let site = Site::new(db);
+    for (path, title, said) in [
+        (
+            "/support",
+            "Support for eBIRForms · Buwiz",
+            &[r#"<a href="mailto:support@buwiz.com">"#, r#"<a href="/delete-account">"#][..],
+        ),
+        (
+            "/delete-account",
+            "Delete your Buwiz account · Buwiz",
+            &[
+                r#"<a href="https://account.buwiz.com/delete">account.buwiz.com/delete</a>"#,
+                "Settings &gt; Account &gt; Delete account",
+                "We email a six-digit code to your address.",
+                "What is kept, and why",
+                r#"<a href="mailto:support@buwiz.com">"#,
+            ][..],
+        ),
+    ] {
+        let response = site.on_host(FORMS_HOST, path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let page = text(response).await;
+        assert!(page.contains(&format!("<title>{title}</title>")), "{path}");
+        assert!(
+            page.contains(&format!(r#"<link rel="canonical" href="https://ebirforms.buwiz.com{path}">"#)),
+            "{path}"
+        );
+        assert!(!page.contains("noindex"), "{path} is a public page");
+        for said in said {
+            assert!(page.contains(said), "{path}: {said}");
+        }
+        for host in ["buwiz.com", "account.buwiz.com", "api.buwiz.com"] {
+            assert_eq!(site.on_host(host, path).await.status(), StatusCode::NOT_FOUND, "{host}{path}");
+        }
+    }
+    // Support is linked from the footer of the filing site's pages.
+    for path in ["/", "/download", "/privacy", "/support", "/delete-account"] {
+        let page = text(site.on_host(FORMS_HOST, path).await).await;
+        let footer = page.split("<footer").nth(1).unwrap();
+        assert!(footer.contains(r#"<a href="/support">Support</a>"#), "{path}");
+    }
+}
+
 /// `/privacy` on the filing site says word for word what the app's policy
 /// says, is for search engines, and is linked from the footer; no other host
 /// has it (buwiz.com is the Bot site's).

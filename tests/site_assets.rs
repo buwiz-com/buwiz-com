@@ -221,7 +221,7 @@ async fn main_pages(site: &Site) -> Vec<(&'static str, &'static str, Option<Stri
     for path in ["/login", "/signup", "/login/verify?email=ana%40example.test"] {
         pages.push((ACCOUNT_HOST, path, None));
     }
-    for path in ["/", "/download", "/privacy"] {
+    for path in ["/", "/download", "/privacy", "/support", "/delete-account"] {
         pages.push((FORMS_HOST, path, None));
     }
     for path in ["/", "/mini-apps"] {

@@ -785,6 +785,7 @@ pub(super) async fn footer(cx: &Cx) -> Result<impl View> {
                         <a href="/bir-status">"BIR status"</a>
                     }
                     <a href="/privacy">"Privacy"</a>
+                    <a href="/support">"Support"</a>
                     <a href="mailto:support@buwiz.com">"support@buwiz.com"</a>
                 </nav>
             </div>

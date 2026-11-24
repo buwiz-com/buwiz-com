@@ -31,6 +31,7 @@ mod download;
 mod home;
 mod privacy;
 mod staff;
+mod support;
 mod tins;
 
 pub fn router(state: AppState) -> Router {
@@ -43,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .page(home::home_page)
         .page(download::download_page)
         .page(privacy::privacy_page)
+        .page(support::support_page)
+        .page(support::delete_account_page)
         .page(login_page)
         .page(signup_page)
         .page(verify_page)
@@ -249,7 +252,8 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
 struct Head {
     title: &'static str,
     description: &'static str,
-    /// Only the public pages (home, download and privacy) are for search engines;
+    /// Only the public pages (home, download, privacy, support and account
+    /// deletion) are for search engines;
     /// every other page asks not to be indexed.
     index: bool,
 }
@@ -264,6 +268,12 @@ fn head_for(path: &str) -> Head {
         "/" => return Head { title: home::TITLE, description: home::DESCRIPTION, index: true },
         "/download" => return Head { title: download::TITLE, description: download::DESCRIPTION, index: true },
         "/privacy" => return Head { title: privacy::TITLE, description: privacy::DESCRIPTION, index: true },
+        "/support" => {
+            return Head { title: support::SUPPORT_TITLE, description: support::SUPPORT_DESCRIPTION, index: true };
+        }
+        "/delete-account" => {
+            return Head { title: support::DELETE_TITLE, description: support::DELETE_DESCRIPTION, index: true };
+        }
         "/login" => "Sign in · Buwiz",
         "/signup" => "Create account · Buwiz",
         "/login/verify" => "Check your email · Buwiz",

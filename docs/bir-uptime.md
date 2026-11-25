@@ -400,6 +400,11 @@ for the BIR's state.
 | `offline` | held `bir_offline`, except the legacy scout (§6.4) | admitted | admitted, within its limits |
 | any, with `relay: paused` | held `relay_paused` | held `relay_paused` | held `relay_paused` |
 
+A test TIN's ticket and v1 relay are never held, whatever the sign: its
+send is a dry run that never touches the BIR (§14.2), so no hold, no
+`bir_held` row and no admission refusal applies to it. (Nothing is held
+today; this is the rule holds are to follow.)
+
 A hold creates no ticket, so it never counts toward the ticket quotas
 (30/hour per account and device, 50/day per TIN). The server keeps a record
 of each held request for the account (so a proof of outage can show the
@@ -967,8 +972,13 @@ streams: a plain-HTTP answer can come from a middlebox.
 
 Tries in `lab`, `dry_run` and mode `unknown` are recorded with their mode
 and stages, no class or kind (but for an unreachable Sender, above), and
-never counted. A return for a test TIN is never sent (the gate refuses it
-before the relay claims it), so never recorded.
+never counted. A send for a test TIN (root `000-000-000`) is not recorded
+at all: the Sender makes it a dry run whatever its mode, so it never
+touches the BIR. It writes no `bir_tries` row, is never counted, and never
+moves the sign or the upload hosts' key sightings; its `result` carries no
+`class` and no sign. The bridge tells it by the locked claim's TIN root.
+(Before the dry run the gate refused such a return, so it was never
+recorded either.)
 
 **What the record cannot tell apart.** Some blocks on the user's own side
 look like the BIR's and are recorded as counted BIR-side failures: an

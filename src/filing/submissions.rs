@@ -71,7 +71,7 @@ pub fn parse_filename(name: &str) -> Result<IafName, &'static str> {
     if !matches!(digits.len(), 12 | 14) || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid);
     }
-    // A test TIN too: the gate refuses it with its own code.
+    // A test TIN too: its send is a dry run.
     let tin = Tin::parse_any(&digits[..9], &digits[9..]).map_err(|_| invalid)?;
     let word = |text: &str, max: usize| {
         (1..=max).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -531,10 +531,11 @@ async fn run_relay(
         }
         _ => anyhow::bail!("submission {id} has nothing to send"),
     };
-    // A test TIN's return never gets here (`gate::SENDABLE_SQL` keeps it
-    // from being claimed), so it is never recorded. Every return that does
-    // is a real send, whatever its TIN reads as.
-    let recording = context.map(|context| RelayTry {
+    // A test TIN's send is a dry run (the Sender forces it) and never
+    // touches the BIR: it gets no uptime record, so it is never counted and
+    // never moves the sign or the host-key sightings.
+    let test_tin = locked.tin_root == crate::account::tin::TEST_ROOT;
+    let recording = context.filter(|_| !test_tin).map(|context| RelayTry {
         account_id,
         network: context.network,
         client: context.client,
@@ -909,7 +910,7 @@ mod tests {
         assert_eq!(name.email, "juan@example.ph");
         let old = parse_filename("123456789001-2551Qv2018-122025Q1#a@b.ph#.xml").unwrap();
         assert_eq!(old.tin.branch(), "00001");
-        // A test TIN reads; the gate refuses it (tin_test_only).
+        // A test TIN reads; its send is a dry run.
         assert!(parse_filename("00000000000000-1601Cv2018-062025#a@b.ph#.xml").unwrap().tin.is_test());
     }
 

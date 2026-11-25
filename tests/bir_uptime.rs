@@ -1367,9 +1367,8 @@ async fn the_upload_window_is_on_the_ports_set(db: PgPool) {
     assert_eq!((row.stage.as_str(), row.upload.as_str()), ("dispatcher", "none"));
 }
 
-/// Why the bridge does not look at the TIN before recording: a claim's TIN
-/// always parses (the database refuses one that would not), and a test
-/// TIN's return is refused before any Sender, so it is never recorded.
+/// A claim's TIN always parses (the database refuses one that would not),
+/// so the bridge's test-TIN check before recording reads every claim.
 #[sqlx::test]
 async fn no_tin_that_should_not_be_recorded_reaches_the_record(db: PgPool) {
     let world = World::new(db.clone()).await;
@@ -1387,9 +1386,27 @@ async fn no_tin_that_should_not_be_recorded_reaches_the_record(db: PgPool) {
     }
     let gatekeeper = Gatekeeper::new(&world, Level::Record).await;
     let (script, answers) = front_desk_down();
-    gatekeeper.send(&world, world.v1().await, script.clone(), &answers, HOME).await;
+    gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
+    assert_eq!(tries(&db).await.len(), 1);
+}
+
+/// A test TIN's send goes to the Sender, which makes it a dry run, and
+/// gets no uptime record at all: no `bir_tries` row, nothing counted, no
+/// sign or `class` on its result. It ends `dry_run`, receipt kept, as a
+/// dry run always has.
+#[sqlx::test]
+async fn a_test_tins_send_is_never_recorded(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::new(&world, Level::Public).await;
+    let (script, answers) = front_desk_down();
+    gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
     assert_eq!(tries(&db).await.len(), 1);
 
+    sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1")
+        .bind(world.account)
+        .execute(&db)
+        .await
+        .unwrap();
     let test_claim: Uuid = sqlx::query_scalar(
         "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
          VALUES ($1, 'business', '000000000', '00001', 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
@@ -1398,19 +1415,36 @@ async fn no_tin_that_should_not_be_recorded_reaches_the_record(db: PgPool) {
     .fetch_one(&db)
     .await
     .unwrap();
-    let id = world.v1().await;
-    sqlx::query("UPDATE submissions SET claim_id = $2 WHERE id = $1")
-        .bind(id)
-        .bind(test_claim)
-        .execute(&db)
-        .await
-        .unwrap();
-    let got = gatekeeper.send(&world, id, script, &answers, HOME).await;
-    // Refused before any Sender: the result alone.
-    assert_eq!(got.len(), 1);
-    let result = the_result(&got).unwrap();
-    assert_eq!(result["error"], buwiz_cloud::filing::gate::Standing::TestOnly.failure());
-    assert_eq!(tries(&db).await.len(), 1);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let claims =
+        json!({ "mode": "dry_run", "status": "dry_run", "remote_path": "/1601C/made-up.xml", "payload_sha256": "ab" });
+    let dry_run = buwiz_cloud::filing::jws::sign(&key, sender::RECEIPT_TYP, &claims);
+    for v2 in [false, true] {
+        let id = if v2 { world.v2(None).await } else { world.v1().await };
+        sqlx::query("UPDATE submissions SET claim_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(test_claim)
+            .execute(&db)
+            .await
+            .unwrap();
+        let script = vec![hello(RelayMode::DryRun), result("dry_run", None, Some(dry_run.clone()))];
+        let got = gatekeeper.send(&world, id, script, &[], HOME).await;
+        assert_eq!(texts(&got).len(), 1, "the result alone");
+        let result = the_result(&got).unwrap();
+        assert_eq!(
+            result,
+            json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run }),
+            "v2={v2}"
+        );
+        assert_eq!(status(&db, id).await, ("dry_run".to_owned(), Some("dry_run".to_owned())));
+        let kept: Option<String> = sqlx::query_scalar("SELECT receipt_jws FROM submissions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some(dry_run.as_str()));
+    }
+    assert_eq!(tries(&db).await.len(), 1, "no row for a test TIN's send");
 }
 
 /// The hourly upkeep deletes tries older than 90 days.

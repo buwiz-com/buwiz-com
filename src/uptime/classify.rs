@@ -468,15 +468,14 @@ pub fn unopened_kind(error: &str) -> Kind {
     }
 }
 
-/// A TIN or account refusal: its code in brackets at the end, or the test
-/// TIN's words.
+/// A TIN or account refusal: its code in brackets at the end (older
+/// Senders' `tin_test_only` too).
 fn is_refusal(error: &str) -> bool {
-    let trimmed = error.trim_end();
-    let bracketed = trimmed
+    error
+        .trim_end()
         .strip_suffix(')')
         .and_then(|head| head.rsplit_once('('))
-        .is_some_and(|(_, code)| code.starts_with("tin_") || code == "account_banned");
-    bracketed || error.contains(crate::filing::gate::TEST_ONLY_MESSAGE)
+        .is_some_and(|(_, code)| code.starts_with("tin_") || code == "account_banned")
 }
 
 /// What [`crate::uptime::observe`] saw of one stream.
@@ -907,9 +906,12 @@ mod tests {
                     .to_owned(),
                 Kind::Mismatch,
             ),
-            (crate::filing::gate::Standing::TestOnly.failure(), Kind::Refusal),
+            (
+                "This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR. (tin_test_only)"
+                    .to_owned(),
+                Kind::Refusal,
+            ),
             (crate::filing::gate::Standing::Paused.failure(), Kind::Refusal),
-            (crate::filing::gate::Standing::TestOnly.message(), Kind::Refusal),
             ("the ticket is not valid: bad signature".to_owned(), Kind::Ticket),
             ("the ticket expired; ask for a new one".to_owned(), Kind::Ticket),
             ("the ticket belongs to another account".to_owned(), Kind::Ticket),

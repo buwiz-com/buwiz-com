@@ -425,8 +425,9 @@ async fn mail_replaced(state: AppState, account_id: Uuid, email: String, device_
         return;
     }
     let device = Platform::device(platform.and_then(Platform::from_stored));
-    if let Err(error) = state.mailer.send_sign_in_replaced(&email, device).await {
-        tracing::error!(error = ?error, account = %account_id, device = %device_id, "the mail about a replaced sign-in could not be sent");
+    // Ids only: a mail transport's error can quote the address.
+    if state.mailer.send_sign_in_replaced(&email, device).await.is_err() {
+        tracing::error!(account = %account_id, device = %device_id, "the mail about a replaced sign-in could not be sent");
     }
 }
 

@@ -936,6 +936,8 @@ async fn the_link_page_only_offers_a_button(db: PgPool) {
     assert!(page.contains(r#"<meta name="robots" content="noindex">"#));
     assert!(page.contains("Open this on the device where you asked to sign in, or type the code there."));
     assert!(page.contains(r#"id="open-app""#) && page.contains("Open eBIRForms"), "{page}");
+    // Never a dead end: the page always says the code can be typed instead.
+    assert!(page.contains("Or type the 6-digit code from this email into the app."), "{page}");
     assert!(page.contains("hidden"), "the button is hidden until the script finds a fragment");
     assert!(page.contains(r#"src="/assets/app-sign-in.js""#));
     assert!(!page.contains("http-equiv=\"refresh\""));

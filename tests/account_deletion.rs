@@ -657,7 +657,6 @@ async fn the_hourly_upkeep_deletes_sign_in_records_after_30_days(db: PgPool) {
                   now() - interval '32 days', now() - interval '31 days'),
                  ('new@example.test', 'buwiz-ebirforms', decode(repeat('ab', 32), 'hex'), 'sign_in',
                   now() - interval '30 days', now() - interval '29 days');
-             INSERT INTO app_sign_in_unchecked (created_at) VALUES (now() - interval '3 days'), (now() - interval '1 day');
              INSERT INTO app_sign_in_alerts (day, sent_at) VALUES
                  ('2026-01-01', now() - interval '31 days'), ('2026-01-31', now() - interval '29 days');"
         ),
@@ -674,7 +673,6 @@ async fn the_hourly_upkeep_deletes_sign_in_records_after_30_days(db: PgPool) {
     assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_codes").await, 1);
     let left: Vec<String> = sqlx::query_scalar("SELECT email FROM app_sign_ins").fetch_all(&site.db).await.unwrap();
     assert_eq!(left, ["new@example.test"]);
-    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_in_unchecked").await, 1);
     assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_in_alerts").await, 1);
     // The account and its sessions are not sign-in records.
     assert!(exists(&site.db, ana).await);

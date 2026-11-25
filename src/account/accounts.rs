@@ -21,6 +21,12 @@ const NEW_ADDRESS_CODES_PER_DAY: i64 = 60;
 /// without an account are done under, so two posts at once cannot both
 /// take the last place.
 const NEW_ADDRESS_LOCK: i64 = 0x6275_7769_7a01;
+/// Codes the apps mail without an app check (Turnstile) to addresses
+/// without an account, together: a budget of their own, so token-less
+/// requests never use up the web's ([`NewAddressBudget::Unchecked`]).
+const UNCHECKED_NEW_ADDRESS_CODES_PER_HOUR: i64 = 10;
+const UNCHECKED_NEW_ADDRESS_CODES_PER_DAY: i64 = 30;
+const UNCHECKED_NEW_ADDRESS_LOCK: i64 = 0x6275_7769_7a03;
 pub(crate) const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);
 /// How long sign-in records are kept: codes from when they were made,
@@ -124,38 +130,77 @@ impl std::fmt::Debug for IssuedCode {
 /// stored the same way after the same limits, so the ten minutes and the
 /// five wrong guesses hold for both.
 pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Result<IssuedCode, CodeError> {
-    Ok(issue_code_as(db, email, admin_emails, Purpose::SignIn, CODE_TTL).await?.1)
+    let mut tx = db.begin().await?;
+    lock_address(&mut tx, email).await?;
+    let (_, issued) =
+        issue_code_in(&mut tx, email, admin_emails, Purpose::SignIn, CODE_TTL, NewAddressBudget::Web).await?;
+    tx.commit().await?;
+    Ok(issued)
 }
 
-/// [`issue_code`] for `purpose` (a sign-in, from the web or an app), for
-/// `ttl`, with the id of the stored code.
-pub(crate) async fn issue_code_as(
-    db: &PgPool,
+/// Which budget a code for an address without an account comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewAddressBudget {
+    /// The web's, 20 an hour and 60 a day: the sign-in form, and the apps
+    /// with an app check.
+    Web,
+    /// The apps' without an app check, 10 an hour and 30 a day. Its codes
+    /// are marked `unchecked` and do not count towards the web's.
+    Unchecked,
+}
+
+/// Takes the address's lock for this transaction: every code for an
+/// address, of any purpose, is counted and added under it, so requests at
+/// once cannot all pass the count of five an hour.
+pub(crate) async fn lock_address(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, email: &str) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('code ' || $1, 0))")
+        .bind(email)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// [`issue_code`] in the caller's transaction, which holds
+/// [`lock_address`]: for `purpose` (a sign-in, from the web or an app),
+/// for `ttl`, with the id of the stored code, and new addresses held to
+/// `budget`. Nothing is written unless a code is stored.
+pub(crate) async fn issue_code_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     email: &str,
     admin_emails: &[String],
     purpose: Purpose,
     ttl: Duration,
+    budget: NewAddressBudget,
 ) -> Result<(Uuid, IssuedCode), CodeError> {
-    let mut tx = db.begin().await?;
-    if codes_this_hour(&mut tx, email).await? >= CODES_PER_HOUR {
+    if codes_this_hour(tx, email).await? >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }
     let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)")
         .bind(email)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
     if !known {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(NEW_ADDRESS_LOCK).execute(&mut *tx).await?;
+        let (lock, per_hour, per_day, unchecked) = match budget {
+            NewAddressBudget::Web => (NEW_ADDRESS_LOCK, NEW_ADDRESS_CODES_PER_HOUR, NEW_ADDRESS_CODES_PER_DAY, false),
+            NewAddressBudget::Unchecked => (
+                UNCHECKED_NEW_ADDRESS_LOCK,
+                UNCHECKED_NEW_ADDRESS_CODES_PER_HOUR,
+                UNCHECKED_NEW_ADDRESS_CODES_PER_DAY,
+                true,
+            ),
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(lock).execute(&mut **tx).await?;
         let (hour, day): (i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE c.created_at > now() - interval '1 hour'), count(*)
              FROM email_codes c
-             WHERE c.created_at > now() - interval '1 day'
+             WHERE c.created_at > now() - interval '1 day' AND c.unchecked = $1
                AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = c.email)",
         )
-        .fetch_one(&mut *tx)
+        .bind(unchecked)
+        .fetch_one(&mut **tx)
         .await?;
-        if hour >= NEW_ADDRESS_CODES_PER_HOUR || day >= NEW_ADDRESS_CODES_PER_DAY {
-            tracing::warn!(hour, day, "sign-in codes for addresses without an account are at their limit");
+        if hour >= per_hour || day >= per_day {
+            tracing::warn!(hour, day, ?budget, "sign-in codes for addresses without an account are at their limit");
             return Err(CodeError::Busy);
         }
     }
@@ -166,7 +211,7 @@ pub(crate) async fn issue_code_as(
         ))
         .bind(email)
         .bind(admin_emails)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .flatten()
     } else {
@@ -179,8 +224,8 @@ pub(crate) async fn issue_code_as(
             (code_hash(email, &code), IssuedCode::Mail(code))
         }
     };
-    let id = add_code(&mut tx, email, hash, purpose, ttl).await?;
-    tx.commit().await?;
+    let unchecked = budget == NewAddressBudget::Unchecked;
+    let id = add_code(tx, email, hash, purpose, ttl, unchecked).await?;
     Ok((id, issued))
 }
 
@@ -191,17 +236,12 @@ pub(crate) async fn issue_code_as(
 /// only one that works.
 pub(crate) async fn issue_deletion_code(db: &PgPool, email: &str) -> Result<String, CodeError> {
     let mut tx = db.begin().await?;
-    // One at a time per address, so requests at once cannot all pass the
-    // count before any of them adds its code.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('delete code ' || $1, 0))")
-        .bind(email)
-        .execute(&mut *tx)
-        .await?;
+    lock_address(&mut tx, email).await?;
     if codes_this_hour(&mut tx, email).await? >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }
     let code = random_code();
-    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete, CODE_TTL).await?;
+    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete, CODE_TTL, false).await?;
     tx.commit().await?;
     Ok(code)
 }
@@ -236,18 +276,20 @@ async fn add_code(
     hash: Vec<u8>,
     purpose: Purpose,
     ttl: Duration,
+    unchecked: bool,
 ) -> sqlx::Result<Uuid> {
     // Dated when it is added, not when the transaction began: the code
     // added last (after waiting for the lock) must be the newest, because
     // only the newest can be redeemed.
     sqlx::query_scalar(
-        "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose)
-         VALUES ($1, $2, $3, clock_timestamp(), $4) RETURNING id",
+        "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose, unchecked)
+         VALUES ($1, $2, $3, clock_timestamp(), $4, $5) RETURNING id",
     )
     .bind(email)
     .bind(hash)
     .bind(OffsetDateTime::now_utc() + ttl)
     .bind(purpose.as_str())
+    .bind(unchecked)
     .fetch_one(&mut **tx)
     .await
 }
@@ -346,7 +388,7 @@ async fn try_open(
     if attempts >= CODE_ATTEMPTS {
         return Ok(Tried::Wrong { attempts_left: 0 });
     }
-    if code.len() != 6 || stored != code_hash(email, &code) {
+    if code.len() != 6 || !crypto::same(&stored, &code_hash(email, &code)) {
         sqlx::query("UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1")
             .bind(code_id)
             .execute(&mut **tx)
@@ -467,7 +509,7 @@ pub(crate) async fn end_sign_ins(
 /// Codes go 30 days after they were made (the limits per address look back
 /// an hour and a day), and device, in-app and agent sign-ins 30 days after
 /// they expired (nothing reads one after that). The in-app testing cap's
-/// counts look back a day and go after two; its alert days after 30.
+/// alert days go after 30.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM email_codes WHERE created_at < now() - make_interval(days => $1)")
         .bind(SIGN_IN_RECORDS_DAYS)
@@ -479,7 +521,6 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
             .execute(db)
             .await?;
     }
-    sqlx::query("DELETE FROM app_sign_in_unchecked WHERE created_at < now() - interval '2 days'").execute(db).await?;
     sqlx::query("DELETE FROM app_sign_in_alerts WHERE sent_at < now() - make_interval(days => $1)")
         .bind(SIGN_IN_RECORDS_DAYS)
         .execute(db)

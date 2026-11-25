@@ -15,15 +15,26 @@ use sqlx::PgPool;
 
 use common::*;
 
-/// The one token the fake Turnstile accepts.
+/// The token the fake Turnstile accepts from the sign-in form's widget.
 const GOOD_TOKEN: &str = "a-person";
+/// One it accepts from the app-check page's widget, which the form refuses.
+const APP_TOKEN: &str = "an-app";
+/// One it accepts from a sign-in widget on another host.
+const OTHER_HOST_TOKEN: &str = "elsewhere";
 
 /// A fake Turnstile: `success` only for [`GOOD_TOKEN`] with the site's
 /// secret. Its URL.
 async fn turnstile() -> String {
+    // Each token as the widget it came from and that widget's host.
     let verify = |Json(asked): Json<Value>| async move {
-        let success = asked["secret"] == TURNSTILE_SECRET_KEY && asked["response"] == GOOD_TOKEN;
-        Json(json!({ "success": success }))
+        let (action, hostname) = match asked["response"].as_str() {
+            Some(GOOD_TOKEN) => ("sign-in", "localhost"),
+            Some(APP_TOKEN) => ("app-check", "localhost"),
+            Some(OTHER_HOST_TOKEN) => ("sign-in", "evil.example.test"),
+            _ => return Json(json!({ "success": false })),
+        };
+        let success = asked["secret"] == TURNSTILE_SECRET_KEY;
+        Json(json!({ "success": success, "action": action, "hostname": hostname }))
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/siteverify", listener.local_addr().unwrap());
@@ -60,6 +71,8 @@ async fn with_turnstile_on_only_a_token_it_accepts_gets_a_code(db: PgPool) {
         "email=ana%40example.test",
         "email=ana%40example.test&cf-turnstile-response=",
         "email=ana%40example.test&cf-turnstile-response=a-script",
+        "email=ana%40example.test&cf-turnstile-response=an-app",
+        "email=ana%40example.test&cf-turnstile-response=elsewhere",
     ] {
         let response = ask(&site, form, None).await;
         assert!(refused_with(&response, "not_human"), "{form}: {}", location(&response));

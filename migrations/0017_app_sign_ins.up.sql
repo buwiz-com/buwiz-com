@@ -6,19 +6,27 @@
 -- web never takes it, and the request takes no other code. It counts
 -- towards the web's limits with every other code.
 --
--- `app_sign_in_unchecked` counts the requests that came without an app
--- check (Turnstile), for the testing cap of 20 an hour and 50 a day across
--- every address; `app_sign_in_alerts` is the day staff were mailed that
--- 25 had come. The hourly upkeep deletes all three.
+-- `email_codes.unchecked` marks a code an app asked for without an app
+-- check (Turnstile): those are counted for the testing cap (20 an hour and
+-- 50 a day across every address) and, for addresses without an account,
+-- against a budget of their own (10 an hour, 30 a day) that the web's
+-- caps do not count. `app_sign_in_alerts` is the day staff were mailed
+-- that 25 had come. The hourly upkeep deletes both tables' old rows.
 --
--- Three new tables and a wider purpose check on `email_codes` (which
--- scans it; the upkeep keeps it small). No existing row changes.
+-- Two new tables, a new column with a constant default (no row is
+-- rewritten) and a wider purpose check on `email_codes`, added NOT VALID
+-- and then validated in its own statement. Both run in this migration's
+-- one transaction, so the scan still happens under the table's lock;
+-- `email_codes` holds 30 days of codes, so it is short. No existing row
+-- changes.
 
 SET LOCAL lock_timeout = '10s';
 
+ALTER TABLE email_codes ADD COLUMN unchecked boolean NOT NULL DEFAULT false;
 ALTER TABLE email_codes DROP CONSTRAINT email_codes_purpose_check;
 ALTER TABLE email_codes ADD CONSTRAINT email_codes_purpose_check
-    CHECK (purpose IN ('sign_in', 'delete', 'app_sign_in'));
+    CHECK (purpose IN ('sign_in', 'delete', 'app_sign_in')) NOT VALID;
+ALTER TABLE email_codes VALIDATE CONSTRAINT email_codes_purpose_check;
 
 CREATE TABLE app_sign_ins (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -47,12 +55,6 @@ CREATE TABLE app_sign_ins (
 CREATE INDEX app_sign_ins_email ON app_sign_ins (email, install_id);
 CREATE INDEX app_sign_ins_expires_at ON app_sign_ins (expires_at);
 CREATE INDEX app_sign_ins_code_id ON app_sign_ins (code_id);
-
-CREATE TABLE app_sign_in_unchecked (
-    id         bigserial PRIMARY KEY,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-CREATE INDEX app_sign_in_unchecked_created_at ON app_sign_in_unchecked (created_at);
 
 CREATE TABLE app_sign_in_alerts (
     -- The Manila day.

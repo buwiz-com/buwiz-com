@@ -481,6 +481,13 @@ async fn screenshot(Path(name): Path<String>) -> Response {
 const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
      font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
+/// The two static pages around in-app sign-in (`/app-sign-in`,
+/// `/app-check/done`): their own script and the site's styles only. The
+/// pages' style attributes (the wordmark's size) are allowed.
+const STATIC_PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; manifest-src 'self'; form-action 'self'; \
+     base-uri 'none'; frame-ancestors 'none'";
+
 /// How long a public BIR status page with nothing per viewer may be kept by
 /// any cache (the page itself changes only on 5-minute marks).
 const BIR_STATUS_CACHE: &str = "public, max-age=60";
@@ -492,6 +499,7 @@ const BIR_STATUS_CACHE: &str = "public, max-age=60";
 async fn render_page(pages: &topcoat::router::Router, state: &AppState, request: axum::extract::Request) -> Response {
     let (parts, body) = request.into_parts();
     let staff = parts.uri.path() == "/staff" || parts.uri.path().starts_with("/staff/");
+    let path = parts.uri.path().to_owned();
     let bir_status = state.uptime.level.is_public() && parts.uri.path() == crate::uptime::public::STATUS_PATH;
     if bir_status && let Err(wait) = uptime::api::check_ip(state, &parts.headers, time::OffsetDateTime::now_utc()) {
         return uptime::api::rate_limited(wait);
@@ -510,6 +518,14 @@ async fn render_page(pages: &topcoat::router::Router, state: &AppState, request:
     if staff && response.status().is_success() {
         let headers = response.headers_mut();
         headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STAFF_CSP));
+    }
+    // The app-check pages hand out a Turnstile token: no other window may
+    // keep a handle on them.
+    if path == "/app-check" || path == "/app-check/done" {
+        response.headers_mut().insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
+    }
+    if (path == "/app-sign-in" || path == "/app-check/done") && response.status().is_success() {
+        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STATIC_PAGE_CSP));
     }
     response
 }

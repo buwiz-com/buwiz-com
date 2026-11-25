@@ -24,15 +24,26 @@ use common::*;
 const ANA: &str = "ana@example.test";
 /// The eBIRForms app's client id on every platform.
 const CLIENT: &str = "buwiz-desktop";
-/// The one token the fake Turnstile accepts.
-const GOOD_TOKEN: &str = "a-person";
+/// A token the fake Turnstile accepts from the app-check page's widget.
+const GOOD_TOKEN: &str = "an-app";
+/// A token it accepts from the sign-in form's widget.
+const WEB_TOKEN: &str = "a-person";
+/// A token it accepts from the app-check widget on another host.
+const OTHER_HOST_TOKEN: &str = "elsewhere";
 
-/// A fake Turnstile: `success` only for [`GOOD_TOKEN`] with the site's
-/// secret. Its URL.
+/// A fake Turnstile, with the site's secret: [`GOOD_TOKEN`] passes as the
+/// app check on the test site's host, [`WEB_TOKEN`] as the sign-in form,
+/// [`OTHER_HOST_TOKEN`] as the app check on another host. Its URL.
 async fn turnstile() -> String {
     let verify = |Json(asked): Json<Value>| async move {
-        let success = asked["secret"] == TURNSTILE_SECRET_KEY && asked["response"] == GOOD_TOKEN;
-        Json(json!({ "success": success }))
+        let (action, hostname) = match asked["response"].as_str() {
+            Some(GOOD_TOKEN) => ("app-check", "localhost"),
+            Some(WEB_TOKEN) => ("sign-in", "localhost"),
+            Some(OTHER_HOST_TOKEN) => ("app-check", "evil.example.test"),
+            _ => return Json(json!({ "success": false })),
+        };
+        let success = asked["secret"] == TURNSTILE_SECRET_KEY;
+        Json(json!({ "success": success, "action": action, "hostname": hostname }))
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/siteverify", listener.local_addr().unwrap());
@@ -571,10 +582,17 @@ async fn while_stopping_nothing_starts(db: PgPool) {
     }
 }
 
-/// Requests without an app check this long ago.
+/// Codes given without an app check this long ago, to an address with an
+/// account (so they spend the testing cap and nothing else).
 async fn unchecked(db: &PgPool, n: i64, ago: &str) {
+    sqlx::query("INSERT INTO accounts (email) VALUES ('filler@example.test') ON CONFLICT DO NOTHING")
+        .execute(db)
+        .await
+        .unwrap();
     sqlx::query(&format!(
-        "INSERT INTO app_sign_in_unchecked (created_at) SELECT now() - interval '{ago}' FROM generate_series(1, $1)"
+        "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose, unchecked)
+         SELECT 'filler@example.test', decode('00', 'hex'), now(), now() - interval '{ago}', 'app_sign_in', true
+         FROM generate_series(1, $1)"
     ))
     .bind(n)
     .execute(db)
@@ -582,9 +600,16 @@ async fn unchecked(db: &PgPool, n: i64, ago: &str) {
     .unwrap();
 }
 
+async fn unchecked_codes(db: &PgPool) -> i64 {
+    count(db, "SELECT count(*) FROM email_codes WHERE unchecked").await
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn requests_without_an_app_check_are_capped_at_twenty_an_hour(db: PgPool) {
     let site = Site::with_mailbox(db);
+    for n in 0..21 {
+        site.person(&format!("person{n}@example.test")).await;
+    }
     for n in 0..20 {
         let (status, answer, _) = start_with(&site, &format!("person{n}@example.test"), json!({})).await;
         assert_eq!(status, 200, "{n}: {answer}");
@@ -593,8 +618,127 @@ async fn requests_without_an_app_check_are_capped_at_twenty_an_hour(db: PgPool) 
     assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")));
     let wait = answer["retry_after"].as_i64().unwrap();
     assert!((3500..=3600).contains(&wait), "{wait}");
-    // Kept in the database.
-    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_in_unchecked").await, 20);
+    // Kept in the database, and the refused one wrote nothing.
+    assert_eq!(unchecked_codes(&site.db).await, 20);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, 20);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn refused_requests_leave_the_cap_and_write_nothing(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    site.person(ANA).await;
+    // Twenty starts for one address: five codes, fifteen refusals.
+    for n in 0..20 {
+        let (status, answer, _) = start_with(&site, ANA, json!({})).await;
+        let expected = if n < 5 { 200 } else { 429 };
+        assert_eq!(status, expected, "{n}: {answer}");
+    }
+    assert_eq!(unchecked_codes(&site.db).await, 5, "the refusals took no place in the cap");
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, 5, "and wrote no request");
+    // Another address still starts.
+    assert_eq!(start_with(&site, "bea@example.test", json!({})).await.0, 200);
+
+    // A network over its hour: refused before anything is written.
+    let rows = count(&site.db, "SELECT count(*) FROM app_sign_ins").await;
+    let from = |n: u32| {
+        let (_, hash) = secret();
+        let body = json!({ "client_id": CLIENT, "email": format!("net{n}@example.test"), "secret_hash": hash });
+        Request::post("/auth/email/start")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("cf-connecting-ip", format!("203.0.113.{n}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    for n in 0..10 {
+        assert_eq!(site.send(from(n)).await.status(), StatusCode::OK, "{n}");
+    }
+    assert_eq!(site.send(from(77)).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, rows + 10);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn token_less_mail_to_new_addresses_has_its_own_budget(db: PgPool) {
+    let site = Site::with_turnstile_mailbox(db, &turnstile().await);
+    for n in 0..10 {
+        let (status, answer, _) = start_with(&site, &format!("new{n}@example.test"), json!({})).await;
+        assert_eq!(status, 200, "{n}: {answer}");
+    }
+    assert_eq!(site.state.mailer.app_sign_in_mails().len(), 10);
+    // Over it: answered the same, nothing mailed.
+    let (status, answer, _) = start_with(&site, "new10@example.test", json!({})).await;
+    assert_eq!(status, 200);
+    assert!(answer["request_id"].is_string());
+    assert_eq!(site.state.mailer.app_sign_in_mails().len(), 10);
+    // The web's own budget is untouched: the sign-in form mails a new
+    // address, and so does the app with a good token.
+    let form = format!("email=web%40example.test&cf-turnstile-response={WEB_TOKEN}");
+    let sent = site.post("/auth/email/start", "", &form).await;
+    assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
+    assert_eq!(site.state.mailer.sign_in_codes().len(), 1);
+    let (status, _, _) = start_with(&site, "checked@example.test", json!({ "turnstile": GOOD_TOKEN })).await;
+    assert_eq!(status, 200);
+    assert_eq!(site.state.mailer.app_sign_in_mails().len(), 11);
+    let checked: bool = sqlx::query_scalar("SELECT unchecked FROM email_codes WHERE email = 'checked@example.test'")
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert!(!checked, "a checked request counts as the web's");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn many_starts_at_once_for_one_address_mail_five(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    site.person(ANA).await;
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let router = site.router.clone();
+        let (_, hash) = secret();
+        let body = json!({ "client_id": CLIENT, "email": ANA, "secret_hash": hash });
+        let request = Request::post("/auth/email/start")
+            .header(header::HOST, "api.localhost:3008")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        tasks.push(tokio::spawn(async move { tower::ServiceExt::oneshot(router, request).await.unwrap().status() }));
+    }
+    let mut ok = 0;
+    for task in tasks {
+        if task.await.unwrap() == StatusCode::OK {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 5);
+    assert_eq!(site.state.mailer.app_sign_in_mails().len(), 5);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM email_codes WHERE email = 'ana@example.test'").await, 5);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_install_is_held_only_while_its_code_can_be_used(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (_, _, first) = start_from(&site, ANA, PHONE).await;
+    let wrong = if last_code(&site, ANA) == "000000" { "111111" } else { "000000" };
+    for _ in 0..5 {
+        verify(&site, &first, wrong).await;
+    }
+    // Its five tries are used: a new start from the install goes through.
+    let (status, answer, _) = start_from(&site, ANA, PHONE).await;
+    assert_eq!(status, 200, "{answer}");
+
+    // No code was mailed (the new-address budget is used up): not held.
+    for n in 0..10 {
+        sqlx::query(
+            "INSERT INTO email_codes (email, code_hash, expires_at, purpose, unchecked)
+             VALUES ($1, decode('00', 'hex'), now() + interval '5 minutes', 'app_sign_in', true)",
+        )
+        .bind(format!("used{n}@example.test"))
+        .execute(&site.db)
+        .await
+        .unwrap();
+    }
+    let mails = site.state.mailer.app_sign_in_mails().len();
+    assert_eq!(start_from(&site, "bea@example.test", PHONE).await.0, 200);
+    assert_eq!(start_from(&site, "bea@example.test", PHONE).await.0, 200, "not code_already_sent");
+    assert_eq!(site.state.mailer.app_sign_in_mails().len(), mails);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -626,9 +770,15 @@ async fn a_good_token_skips_the_cap_and_a_bad_one_is_refused(db: PgPool) {
     assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")));
     let (status, answer, _) = start_with(&site, ANA, json!({ "turnstile": "a-script" })).await;
     assert_eq!((status, answer["error"].as_str()), (403, Some("turnstile_failed")));
+    // A token from the sign-in form's widget, or from another host, is not
+    // an app check.
+    for token in [WEB_TOKEN, OTHER_HOST_TOKEN] {
+        let (status, answer, _) = start_with(&site, ANA, json!({ "turnstile": token })).await;
+        assert_eq!((status, answer["error"].as_str()), (403, Some("turnstile_failed")), "{token}");
+    }
     let (status, answer, secret) = start_with(&site, ANA, json!({ "turnstile": GOOD_TOKEN })).await;
     assert_eq!(status, 200, "{answer}");
-    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_in_unchecked").await, 20);
+    assert_eq!(unchecked_codes(&site.db).await, 20);
 
     // Resend too.
     let started = Started { id: answer["request_id"].as_str().unwrap().to_owned(), secret };
@@ -733,6 +883,9 @@ async fn the_link_page_only_offers_a_button(db: PgPool) {
     let response = site.get("/app-sign-in", "").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-robots-tag"], "noindex");
+    // Its own script and the site's files only.
+    let csp = response.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_owned();
+    assert!(csp.contains("default-src 'none'") && csp.contains("script-src 'self'"), "{csp}");
     let page = text(response).await;
     assert!(page.contains(r#"<meta name="robots" content="noindex">"#));
     assert!(page.contains("Open this on the device where you asked to sign in, or type the code there."));
@@ -779,29 +932,34 @@ async fn the_app_check_page_runs_the_widget_and_hands_the_token_to_the_app(db: P
 
     let done = site.get("/app-check/done", "").await;
     assert_eq!(done.status(), StatusCode::OK);
+    assert!(done.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("script-src 'self'"));
     let done = text(done).await;
     assert!(done.contains("You can close this window"));
     assert!(!done.contains("<script src=\"/assets/app-check.js\""));
 
     let script = text(site.get("/assets/app-check.js", "").await).await;
     let nsh = script.find("window.nsh.postMessage(JSON.stringify(message))").expect("the app's bridge");
-    for later in
-        ["window.parent.postMessage", "window.opener.postMessage", "document.title = title", "/app-check/done#"]
-    {
-        assert!(script.find(later).is_some_and(|at| at > nsh), "{later} comes after window.nsh");
-    }
+    let done = script.find("window.location.assign(\"/app-check/done#\" + fragment)").expect("the /done page");
+    assert!(nsh < done, "the bridge first, then /done");
     for part in [
         "{ turnstile: token }",
-        "{ type: \"buwiz-turnstile\", token: token }",
-        "\"buwiz-turnstile:\" + token",
         "\"token=\" + encodeURIComponent(token)",
         "{ turnstile_error: code }",
-        "\"buwiz-turnstile-error:\" + code",
         "\"error=\" + encodeURIComponent(code)",
         "fail(\"expired\")",
         "fail(\"not_configured\")",
     ] {
         assert!(script.contains(part), "{part}");
+    }
+    // Only the bridge: no other window is told, and the title stays.
+    for gone in ["\"*\"", "'*'", "window.parent", "window.opener", "document.title", ".postMessage(typed"] {
+        assert!(!script.contains(gone), "{gone}");
+    }
+    assert_eq!(script.matches("postMessage(").count(), 1);
+    // No other window keeps a handle on either page.
+    for path in ["/app-check", "/app-check/done"] {
+        let response = site.get(path, "").await;
+        assert_eq!(response.headers()["cross-origin-opener-policy"], "same-origin", "{path}");
     }
     // Only on the account host.
     assert_eq!(site.on_host(FORMS_HOST, "/app-check").await.status(), StatusCode::NOT_FOUND);

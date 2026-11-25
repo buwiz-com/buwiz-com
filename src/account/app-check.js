@@ -1,47 +1,25 @@
 // /app-check (src/account/pages/app_check.rs): hands the Turnstile widget's
-// result to the app that opened the page. In this order: the app's own
-// bridge (`window.nsh`), a message to a parent or opener window, the
-// document title, and last the address of /app-check/done, which a host
-// that saw none of the others reads.
+// result to the app that opened the page, two ways only: the app's own
+// bridge (`window.nsh`) first, then the address of /app-check/done, which
+// a host without the bridge reads. Nothing is posted to any other window.
 (function () {
   "use strict";
 
-  function deliver(message, typed, title, fragment) {
+  function deliver(message, fragment) {
     try {
       if (window.nsh && typeof window.nsh.postMessage === "function") {
         window.nsh.postMessage(JSON.stringify(message));
       }
     } catch (ignored) {}
-    try {
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage(typed, "*");
-      }
-    } catch (ignored) {}
-    try {
-      if (window.opener) {
-        window.opener.postMessage(typed, "*");
-      }
-    } catch (ignored) {}
-    document.title = title;
     window.location.assign("/app-check/done#" + fragment);
   }
 
   function succeed(token) {
-    deliver(
-      { turnstile: token },
-      { type: "buwiz-turnstile", token: token },
-      "buwiz-turnstile:" + token,
-      "token=" + encodeURIComponent(token)
-    );
+    deliver({ turnstile: token }, "token=" + encodeURIComponent(token));
   }
 
   function fail(code) {
-    deliver(
-      { turnstile_error: code },
-      { type: "buwiz-turnstile", error: code },
-      "buwiz-turnstile-error:" + code,
-      "error=" + encodeURIComponent(code)
-    );
+    deliver({ turnstile_error: code }, "error=" + encodeURIComponent(code));
   }
 
   window.buwizTurnstileDone = succeed;

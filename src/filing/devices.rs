@@ -263,6 +263,31 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
             return Err(ApiError::bad_request("install_mismatch", "install_id is not the one this app signed in with"));
         }
         (None, Some(install)) => {
+            // An install another live sign-in of the account registered is
+            // not this sign-in's to take: it would re-key that device and
+            // end its sign-in. Once that sign-in is over, or its device
+            // removed, it may.
+            let in_use: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM devices d JOIN oauth_grants g ON g.id = d.grant_id
+                     WHERE d.account_id = $1 AND d.install_id = $2 AND d.revoked_at IS NULL
+                       AND d.grant_id <> $3 AND g.revoked_at IS NULL
+                       AND (EXISTS (SELECT 1 FROM oauth_refresh_tokens r
+                                    WHERE r.grant_id = g.id AND r.used_at IS NULL AND r.expires_at > now())
+                            OR EXISTS (SELECT 1 FROM oauth_access_tokens t
+                                       WHERE t.grant_id = g.id AND t.expires_at > now())))",
+            )
+            .bind(bearer.account.id)
+            .bind(install)
+            .bind(bearer.grant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if in_use {
+                return Err(ApiError::conflict(
+                    "install_in_use",
+                    "another sign-in of this account holds this install's device",
+                ));
+            }
             sqlx::query("UPDATE oauth_grants SET install_id = $2 WHERE id = $1")
                 .bind(bearer.grant_id)
                 .bind(install)
@@ -386,10 +411,10 @@ const REMOVED_SHOWN_DAYS: i32 = 30;
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<DeviceView>> {
     let mut devices: Vec<DeviceView> = sqlx::query_as(
         "SELECT d.id, d.name, g.client_id, d.grant_id, d.platform, d.model, d.os_version, d.computer_name,
-                d.created_at, d.signed_in_at, d.last_used_at, d.revoked_at
+                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at
          FROM devices d JOIN oauth_grants g ON g.id = d.grant_id
          WHERE d.account_id = $1 AND (d.revoked_at IS NULL OR d.revoked_at > now() - make_interval(days => $2))
-         ORDER BY d.revoked_at IS NOT NULL, d.signed_in_at DESC",
+         ORDER BY d.revoked_at IS NOT NULL, coalesce(d.signed_in_at, d.created_at) DESC",
     )
     .bind(account_id)
     .bind(REMOVED_SHOWN_DAYS)

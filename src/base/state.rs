@@ -77,7 +77,9 @@ impl AppState {
         sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
-        let sign_in_guard = SignInGuard::new(config.turnstile.clone());
+        let account_host = config.account_origin.split_once("://").map_or("", |(_, rest)| rest);
+        let account_host = account_host.split(':').next().unwrap_or_default();
+        let sign_in_guard = SignInGuard::new(config.turnstile.clone(), account_host);
         let downloads = Downloads::new(&config.downloads_url, downloads::APP, true);
         let bot_downloads = Downloads::new(&config.downloads_url, downloads::BOT_APP, false);
         let stars = Stars::new(&config.github_api_url);

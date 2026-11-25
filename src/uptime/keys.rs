@@ -314,11 +314,15 @@ pub const MAX_KEYS: usize = 100_000;
 
 /// A fixed-window rate limiter held in memory: at most `limit` hits per key
 /// in each `window`. Windows are shared: when one ends, every count starts
-/// again, so nothing is ever scanned. A key new in a window that already
-/// holds `cap` keys is counted in one shared overflow bucket (with the same
-/// limit) until the window ends, so the map never grows past `cap` and a
-/// flood of new addresses cannot lock out everyone who comes after it. Keys
-/// (an IP address, an account id) are never stored anywhere else.
+/// again, so nothing is ever scanned. A key whose hits are all given back
+/// ([`RateLimiter::release`]) leaves the map, so it holds only keys with a
+/// hit that counts. A key new in a window that already holds `cap` keys is
+/// counted in one shared overflow bucket (with the same limit) until the
+/// window ends, so the map never grows past `cap`. While it is full, new
+/// keys share that one bucket: a flood of distinct addresses with hits
+/// that count can hold back other new addresses until the window ends,
+/// but never the keys already in the map. Keys (an IP address, an account
+/// id) are never stored anywhere else.
 pub struct RateLimiter<K> {
     limit: u32,
     window: Duration,
@@ -394,7 +398,11 @@ impl<K: Eq + Hash> RateLimiter<K> {
         }
         let Hits { by_key, overflow, .. } = &mut *hits;
         match by_key.get_mut(key) {
-            Some(count) => *count = count.saturating_sub(1),
+            // Its last hit given back: the key leaves, making room.
+            Some(count) if *count <= 1 => {
+                by_key.remove(key);
+            }
+            Some(count) => *count -= 1,
             None => *overflow = overflow.saturating_sub(1),
         }
     }
@@ -644,6 +652,36 @@ mod tests {
         limiter.check(100, now + Duration::minutes(1)).unwrap();
         assert_eq!(limiter.len(), 1);
         assert!(!limiter.is_empty());
+    }
+
+    #[test]
+    fn keys_given_back_or_a_new_window_make_room_for_new_ones() {
+        let now = at("2026-11-11T07:12:00Z");
+        let limiter = RateLimiter::with_cap(5, Duration::minutes(1), 100);
+        // A flood of one-hit keys fills the map, and the shared bucket.
+        for key in 0..100u32 {
+            limiter.check(key, now).unwrap();
+        }
+        for key in 100..105u32 {
+            limiter.check(key, now).unwrap();
+        }
+        assert_eq!(limiter.check(200, now), Err(Duration::minutes(1)));
+        // Their hits given back, the keys leave and new ones get places.
+        for key in 0..100u32 {
+            limiter.release(&key, now);
+        }
+        assert_eq!(limiter.len(), 0);
+        for key in 200..300u32 {
+            assert_eq!(limiter.check(key, now + Duration::seconds(1)), Ok(()), "{key}");
+        }
+        assert_eq!(limiter.len(), 100);
+        // A key with hits left stays.
+        limiter.check(200, now + Duration::seconds(2)).unwrap();
+        limiter.release(&200, now + Duration::seconds(2));
+        assert_eq!(limiter.len(), 100);
+        // A new window: room for everyone.
+        assert_eq!(limiter.check(999, now + Duration::minutes(1)), Ok(()));
+        assert_eq!(limiter.len(), 1);
     }
 
     #[test]

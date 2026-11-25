@@ -1,6 +1,6 @@
 -- Back to migration 17. docs/deploy.md has the whole rollback; run this
--- file before 0017's (and the older ones, to go further). It commits on
--- its own and never refuses.
+-- file after 0019's and before 0017's (and the older ones, to go
+-- further). It commits on its own and never refuses.
 --
 --   psql -v ON_ERROR_STOP=1 -1 -c "SET lock_timeout = '10s'" -f 0018_device_installs.down.sql
 --
@@ -8,10 +8,11 @@
 -- devices (platform, model, system version, computer name, last sign-in).
 -- Every device row and grant stays and works as before; a device updated
 -- in place keeps its newest key. After the way up, an install's next
--- registration adds a row again, as before this release.
+-- registration adds a row again, as before this release. Devices removed
+-- with their grant stay removed.
 
-DROP INDEX devices_grant;
-DROP INDEX devices_account_install;
+DROP TRIGGER oauth_grants_end_devices ON oauth_grants;
+DROP FUNCTION devices_end_with_grant();
 ALTER TABLE devices
     DROP COLUMN install_id,
     DROP COLUMN platform,

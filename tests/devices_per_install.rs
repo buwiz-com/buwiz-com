@@ -374,3 +374,112 @@ async fn an_old_app_may_register_again_on_its_sign_in(db: PgPool) {
         .unwrap();
     assert!(used);
 }
+
+/// A sign-in without an install may not take an install whose device
+/// belongs to another live sign-in of the account; once that sign-in is
+/// over (ended, or its tokens expired) it may.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sign_in_without_an_install_cannot_take_a_live_devices_install(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person(ANA).await;
+    let (phone_grant, phone) = sign_in(&site.db, ana, Some(PHONE), None).await;
+    let (_, first, _) = register(&site, &phone, json!({ "install_id": PHONE })).await;
+    let (other_grant, other) = sign_in(&site.db, ana, None, None).await;
+    let (status, answer, _) = register(&site, &other, json!({ "install_id": PHONE })).await;
+    assert_eq!((status, answer["error"]["code"].as_str()), (409, Some("install_in_use")), "{answer}");
+    // Nothing changed: the phone's sign-in and device, and the other grant.
+    assert_eq!(revoked(&site.db, phone_grant).await, None);
+    assert_eq!(rows(&site.db).await, 1);
+    let stamped: Option<String> = sqlx::query_scalar("SELECT install_id FROM oauth_grants WHERE id = $1")
+        .bind(other_grant)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(stamped, None);
+    assert_eq!(list(&site, &phone).await.0, 200);
+
+    // The phone's tokens expire: the install may be taken.
+    sqlx::query("UPDATE oauth_access_tokens SET expires_at = now() - interval '1 minute' WHERE grant_id = $1")
+        .bind(phone_grant)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let (status, answer, _) = register(&site, &other, json!({ "install_id": PHONE })).await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(answer["id"], first["id"]);
+
+    // And when the holding sign-in was ended.
+    let (_, tablet) = sign_in(&site.db, ana, Some(LAPTOP), None).await;
+    register(&site, &tablet, json!({ "install_id": LAPTOP })).await;
+    let logout = Request::post("/api/auth/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {tablet}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(site.send(logout).await.status(), StatusCode::OK);
+    let (_, late) = sign_in(&site.db, ana, None, None).await;
+    assert_eq!(register(&site, &late, json!({ "install_id": LAPTOP })).await.0, 201);
+}
+
+/// However a sign-in ends, its device goes with it, and staff cannot
+/// rewrite when a sign-in ended.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_device_ends_with_its_sign_in(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person(ANA).await;
+    let (_, support) = site.staff_with_role("support@example.test", "support").await;
+    let live = |db: PgPool, id: String| async move {
+        sqlx::query_scalar::<_, bool>("SELECT revoked_at IS NULL FROM devices WHERE id = $1::uuid")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+    };
+
+    // Signing out.
+    let (_, token) = sign_in(&site.db, ana, None, None).await;
+    let (_, device, _) = register(&site, &token, json!({})).await;
+    let logout = Request::post("/api/auth/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    site.send(logout).await;
+    assert!(!live(site.db.clone(), device["id"].as_str().unwrap().to_owned()).await);
+
+    // A refresh token used twice ends the sign-in.
+    let (grant, token) = sign_in(&site.db, ana, None, None).await;
+    let (_, device, _) = register(&site, &token, json!({})).await;
+    let refresh = crypto::new_token("bwr_");
+    sqlx::query(
+        "INSERT INTO oauth_refresh_tokens (grant_id, token_hash, expires_at, used_at)
+         VALUES ($1, $2, now() + interval '30 days', now())",
+    )
+    .bind(grant)
+    .bind(crypto::hash(&refresh))
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let reuse = Request::post("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("grant_type=refresh_token&client_id=buwiz-ebirforms&refresh_token={refresh}")))
+        .unwrap();
+    assert_eq!(site.send(reuse).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(revoked(&site.db, grant).await.as_deref(), Some("refresh_token_reuse"));
+    let device_id = device["id"].as_str().unwrap().to_owned();
+    assert!(!live(site.db.clone(), device_id.clone()).await);
+
+    // Staff signing that device out afterwards change nothing.
+    let ended: String = sqlx::query_scalar("SELECT revoked_at::text FROM oauth_grants WHERE id = $1")
+        .bind(grant)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    let path = format!("/staff/users/{ana}/devices/{device_id}/sign-out");
+    let response = site.post(&path, &support, "reason=Lost+phone&tab=sign").await;
+    assert!(location(&response).contains("notice=app_already_signed_out"), "{}", location(&response));
+    let still: String = sqlx::query_scalar("SELECT revoked_at::text FROM oauth_grants WHERE id = $1")
+        .bind(grant)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(still, ended);
+}

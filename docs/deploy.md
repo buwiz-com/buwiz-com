@@ -899,13 +899,15 @@ Going further back runs 16's down file first (after 17's,
 
 The release with in-app email sign-in for the eBIRForms apps
 ([accounts.md](accounts.md#in-app-sign-in)) runs migration 17 when it
-starts. It adds three tables: `app_sign_ins` (each request), and
-`app_sign_in_unchecked` and `app_sign_in_alerts` (the testing cap's counts
-and the days staff were alerted), and lets `email_codes.purpose` be
-`app_sign_in` (the check scans `email_codes`, which the upkeep keeps
-small). No existing row changes. It needs no setting: the endpoints work
-with the Turnstile keys the web already has, and without them (local
-development) every request counts towards the cap.
+starts. It adds two tables, `app_sign_ins` (each request) and
+`app_sign_in_alerts` (the days staff were alerted), the column
+`email_codes.unchecked` (a constant default: no row is rewritten), and
+lets `email_codes.purpose` be `app_sign_in`. The check is added `NOT
+VALID` and validated in its own statement; both run in the migration's one
+transaction, so the scan of `email_codes` (30 days of codes) happens under
+its lock, briefly. No existing row changes. It needs no setting: the
+endpoints work with the Turnstile keys the web already has, and without
+them (local development) every request counts towards the cap.
 
 One optional setting: `APP_SIGN_IN_MINUTES`, how long an in-app code
 works and so how long before a new one (1 to 30; 5 when unset). Any other
@@ -923,10 +925,9 @@ SELECT max(version) FROM _sqlx_migrations;                           -- 16
 ```
 Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
 
-**Rolling back to 16.** The down file never refuses. It drops the three
-tables and deletes the in-app codes (16 knows no such purpose): sign-ins
-under way are lost (the app asks for a code again), and so are the cap's
-counts. Web codes stay; apps already signed in keep their tokens. In this
+**Rolling back to 16.** The down file never refuses. It drops the two
+tables and the column and deletes the in-app codes (16 knows no such
+purpose): sign-ins under way are lost (the app asks for a code again). Web codes stay; apps already signed in keep their tokens. In this
 order:
 1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
    `systemctl is-active buwiz.service` prints `inactive`.
@@ -941,23 +942,34 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 18's,
-[below](#migration-18-one-row-per-device)), then 16's and the others as
+Going further back runs 17's down file first (after 19's and 18's,
+[below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
-## Migration 18 (one row per device)
+## Migrations 18 and 19 (one row per device)
 
 The release with one device row per install
-([accounts.md](accounts.md#devices)) runs migration 18 when it starts. It
-adds `install_id` and `platform` to `oauth_grants`, `install_id` to
-`device_authorizations`, and to `devices` the columns an app sends
-(`install_id`, `platform`, `model`, `os_version`, `computer_name`) and
-`signed_in_at`, filled from `created_at`; a unique index keeps one row per
-account and install. `devices` is rewritten once (small). There is no
-setting. This stores more about each device (a stable install id, the
-model, the system version, and optionally the computer's name): the
-privacy policy must say so before this ships. The release before it (at
-17) refuses to start on a database at 18.
+([accounts.md](accounts.md#devices)) runs migrations 18 and 19 when it
+starts.
+- **18** adds `install_id` and `platform` to `oauth_grants`, `install_id`
+  to `device_authorizations`, and to `devices` the columns an app sends
+  (`install_id`, `platform`, `model`, `os_version`, `computer_name`) and
+  `signed_in_at`. All are nullable with no default when added, so no row
+  is rewritten or scanned; earlier devices read `signed_in_at` as
+  `created_at`. It also adds a trigger on `oauth_grants` that removes a
+  grant's live devices when the grant ends. Each lock is held a moment.
+- **19** builds the unique index of one row per account and install with
+  `CREATE UNIQUE INDEX CONCURRENTLY`, outside a transaction (its file
+  starts `-- no-transaction`), so signed requests, which update `devices`,
+  are not blocked while it is built. If it fails halfway, Postgres leaves
+  an invalid index named `devices_account_install` and records nothing,
+  and the server does not start: drop it with `DROP INDEX CONCURRENTLY
+  devices_account_install;` and start again.
+
+There is no setting. This stores more about each device (a stable install
+id, the model, the system version, and optionally the computer's name):
+the privacy policy must say so before this ships. The release before it
+(at 17) refuses to start on a database at 18 or 19.
 
 **Before you deploy.** The database is at 17 (a read-only check):
 ```sql
@@ -965,25 +977,28 @@ SELECT max(version) FROM _sqlx_migrations;                           -- 17
 ```
 Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
 
-**Rolling back to 17.** The down file never refuses. It drops the new
-columns and indexes: what the apps said about their devices and the
-install ids are lost; every device and sign-in stays and works (a row
-updated in place keeps its newest key). In this order:
+**Rolling back to 17.** The down files never refuse. 19's drops the
+index; 18's drops the trigger and the new columns: what the apps said
+about their devices and the install ids are lost; every device and
+sign-in stays and works (a row updated in place keeps its newest key;
+devices removed with their sign-in stay removed). In this order:
 1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
    `systemctl is-active buwiz.service` prints `inactive`.
-2. Run the down file, with a lock timeout set first:
+2. Run the down files, newest first, each with a lock timeout set first:
    ```sh
-   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
-     -c "SET lock_timeout = '10s'" -f migrations/0018_device_installs.down.sql
+   for down in 0019_device_install_index 0018_device_installs; do
+     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+       -c "SET lock_timeout = '10s'" -f "migrations/$down.down.sql" || break
+   done
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 17
    ```
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
-   starts instead, it runs migration 18 again, and the rollback starts
-   over at 1.
+   starts instead, it runs migrations 18 and 19 again, and the rollback
+   starts over at 1.
 
-Going further back runs 18's down file first, then 17's and the others as
-[above](#migration-17-in-app-sign-in); each commits on its own.
+Going further back runs 19's and 18's down files first, then 17's and the
+others as [above](#migration-17-in-app-sign-in); each commits on its own.
 
 ## OCR of claim documents
 

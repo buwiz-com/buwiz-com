@@ -354,13 +354,15 @@ pub async fn sign_out_device(
     let Some(grant) = grant else {
         return Ok(Notice::AppAlreadySignedOut);
     };
-    let client: String = sqlx::query_scalar(
-        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = coalesce(revoke_reason, 'signed_out_by_staff')
-         WHERE id = $1 RETURNING client_id",
+    sqlx::query(
+        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_by_staff'
+         WHERE id = $1 AND revoked_at IS NULL",
     )
     .bind(grant)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
+    let client: String =
+        sqlx::query_scalar("SELECT client_id FROM oauth_grants WHERE id = $1").bind(grant).fetch_one(&mut *tx).await?;
     let line = Line {
         account_id: target.id,
         action: "app_signed_out",

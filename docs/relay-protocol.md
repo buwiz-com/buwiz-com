@@ -292,7 +292,10 @@ removed) and answers its same `id` and `created_at`; the sign-in it had
 is ended (`device_replaced`). A sign-in that carries an install id (from
 `/auth/email/start` or `/oauth/device/code`) must register with the same
 one (`400 install_mismatch`, also when it is left out); one without gets
-the request's. `bad_install_id` for a malformed one. Without `install_id`
+the request's, unless that install's live device belongs to another live
+sign-in of the account (`409 install_in_use`, nothing changed).
+`bad_install_id` for a malformed one. Whenever a sign-in ends, its live
+device is removed with it. Without `install_id`
 registration is as before.
 
 Every v2 request then carries a signature, DPoP-style:

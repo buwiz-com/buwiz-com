@@ -35,6 +35,8 @@ pub const WIDGET_SCRIPT: &str = "https://challenges.cloudflare.com/turnstile/v0/
 
 pub struct SignInGuard {
     turnstile: Option<TurnstileConfig>,
+    /// The account site's host: a token is taken only from a widget there.
+    hostname: String,
     http: reqwest::Client,
     networks: RateLimiter<Network>,
 }
@@ -57,16 +59,29 @@ pub struct Counted {
     at: OffsetDateTime,
 }
 
-/// Turnstile's answer; its other fields are not used.
+/// The action the sign-in forms' widget sets (`data-action`).
+pub const WEB_ACTION: &str = "sign-in";
+/// The action of the app-check page's widget.
+pub const APP_ACTION: &str = "app-check";
+
+/// Turnstile's answer; its other fields are not used. A token passes only
+/// with the action of the widget it is for and the account site's host,
+/// so one widget's token never passes as another's.
 #[derive(Deserialize)]
 struct Verdict {
     success: bool,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    hostname: Option<String>,
 }
 
 impl SignInGuard {
-    pub fn new(turnstile: Option<TurnstileConfig>) -> Self {
+    /// `hostname` is the account site's host, e.g. `account.buwiz.com`.
+    pub fn new(turnstile: Option<TurnstileConfig>, hostname: &str) -> Self {
         Self {
             turnstile,
+            hostname: hostname.to_owned(),
             http: reqwest::Client::builder().timeout(VERIFY_TIMEOUT).build().unwrap_or_default(),
             networks: RateLimiter::new(CODES_PER_NETWORK, NETWORK_WINDOW),
         }
@@ -83,7 +98,7 @@ impl SignInGuard {
     pub async fn check(&self, headers: &HeaderMap, token: Option<&str>) -> Result<Counted, Refused> {
         let address = client_ip(headers);
         if let Some(turnstile) = &self.turnstile
-            && !self.is_human(turnstile, token.unwrap_or_default(), address).await
+            && !self.is_human(turnstile, token.unwrap_or_default(), address, WEB_ACTION).await
         {
             return Err(Refused::NotHuman);
         }
@@ -99,7 +114,7 @@ impl SignInGuard {
     pub async fn app_check(&self, headers: &HeaderMap, token: Option<&str>) -> Option<bool> {
         let turnstile = self.turnstile.as_ref()?;
         let token = token.filter(|token| !token.is_empty())?;
-        Some(self.is_human(turnstile, token, client_ip(headers)).await)
+        Some(self.is_human(turnstile, token, client_ip(headers), APP_ACTION).await)
     }
 
     /// Counts an in-app request for a code against its network's hour, as
@@ -132,7 +147,7 @@ impl SignInGuard {
 
     /// Asks Turnstile whether `token` is from a person on our form. No
     /// answer counts as no: a code is not worth mailing on a guess.
-    async fn is_human(&self, turnstile: &TurnstileConfig, token: &str, address: Option<IpAddr>) -> bool {
+    async fn is_human(&self, turnstile: &TurnstileConfig, token: &str, address: Option<IpAddr>, action: &str) -> bool {
         if token.is_empty() || token.len() > MAX_TOKEN_LEN {
             return false;
         }
@@ -149,7 +164,14 @@ impl SignInGuard {
             .and_then(reqwest::Response::error_for_status);
         match answer {
             Ok(response) => match response.json::<Verdict>().await {
-                Ok(verdict) => verdict.success,
+                Ok(verdict) => {
+                    let bound = verdict.action.as_deref() == Some(action)
+                        && verdict.hostname.as_deref() == Some(self.hostname.as_str());
+                    if verdict.success && !bound {
+                        tracing::warn!("a Turnstile token for another widget or host was refused");
+                    }
+                    verdict.success && bound
+                }
                 Err(error) => {
                     tracing::error!(%error, "Turnstile's answer could not be read; the sign-in is refused");
                     false
@@ -184,7 +206,7 @@ mod tests {
 
     #[test]
     fn a_network_gets_ten_codes_an_hour_whatever_address_it_posts_from() {
-        let guard = SignInGuard::new(None);
+        let guard = SignInGuard::new(None, "account.example.test");
         let now = OffsetDateTime::now_utc();
         for last in 0..CODES_PER_NETWORK {
             assert_eq!(counted(&guard, &format!("203.0.113.{last}"), now), Ok(()));
@@ -197,7 +219,7 @@ mod tests {
 
     #[test]
     fn a_forgiven_post_is_not_counted() {
-        let guard = SignInGuard::new(None);
+        let guard = SignInGuard::new(None, "account.example.test");
         let now = OffsetDateTime::now_utc();
         let first = guard.count(at("203.0.113.9"), now).unwrap();
         for _ in 1..CODES_PER_NETWORK {
@@ -214,7 +236,7 @@ mod tests {
 
     #[test]
     fn a_post_forgiven_after_its_hour_ended_takes_nothing_from_the_next() {
-        let guard = SignInGuard::new(None);
+        let guard = SignInGuard::new(None, "account.example.test");
         let now = OffsetDateTime::now_utc();
         let old = guard.count(at("203.0.113.1"), now).unwrap();
         let next = now + NETWORK_WINDOW;
@@ -227,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_post_without_an_address_is_not_counted() {
-        let guard = SignInGuard::new(None);
+        let guard = SignInGuard::new(None, "account.example.test");
         for _ in 0..CODES_PER_NETWORK * 2 {
             assert!(guard.check(&HeaderMap::new(), None).await.is_ok());
         }
@@ -237,11 +259,14 @@ mod tests {
     async fn with_turnstile_on_a_post_without_a_token_is_refused_unasked() {
         // Nothing listens on the discard port: asking would fail too, but
         // an empty or oversized token is refused before anything is asked.
-        let guard = SignInGuard::new(Some(TurnstileConfig {
-            site_key: "site".into(),
-            secret_key: "secret".into(),
-            verify_url: "http://127.0.0.1:9".into(),
-        }));
+        let guard = SignInGuard::new(
+            Some(TurnstileConfig {
+                site_key: "site".into(),
+                secret_key: "secret".into(),
+                verify_url: "http://127.0.0.1:9".into(),
+            }),
+            "account.example.test",
+        );
         let long = "x".repeat(MAX_TOKEN_LEN + 1);
         for token in [None, Some(""), Some(long.as_str())] {
             assert_eq!(guard.check(&from("203.0.113.1"), token).await.err(), Some(Refused::NotHuman));

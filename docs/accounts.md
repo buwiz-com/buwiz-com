@@ -489,8 +489,10 @@ number. The web's codes keep their ten minutes. Within it:
   a resend mails a new code for the same request and restarts its time,
   for up to an hour after the start; after that the app starts again;
 - a start for the same address from the same install (`install_id`) while
-  its code still works mails nothing and makes no request: `429
-  code_already_sent`, with `retry_after`. A start from another install is
+  its code can still be used (unspent, unexpired, tries left) mails
+  nothing and makes no request: `429 code_already_sent`, with
+  `retry_after`. Once its five tries are used, or when no code was mailed,
+  the next start goes through (under the limits). A start from another install is
   a new request with its own mail, held only by the limits above; both
   codes then work, each with its own request. A start without
   `install_id` is never held this way. A test account with a fixed code is
@@ -537,17 +539,38 @@ An unknown `platform` is stored as nothing and is never an error; no text
 from the request goes into a mail.
 
 **The app check and the testing cap.** A request may carry `turnstile`, a
-Cloudflare Turnstile token, checked exactly as the web form's
-(`src/account/guard.rs`). A token that fails is `403 turnstile_failed`.
-While the token is optional, requests without one (start and resend
-alike) are held to a testing cap of 20 an hour and 50 a day across every
-address, counted in the database (`app_sign_in_unchecked`, so the counts
-survive a restart and are shared by every server). Past it: `429
+Cloudflare Turnstile token, checked as the web form's is
+(`src/account/guard.rs`), and bound to its widget: Turnstile's answer must
+name the action `app-check` and the account site's host (the sign-in
+forms' widget is `sign-in`), so a token from one widget never passes as
+the other's. A token that fails is `403 turnstile_failed`. While the token
+is optional, codes given without one (start and resend alike) are held to
+a testing cap of 20 an hour and 50 a day across every address, counted in
+the database from the codes themselves (`email_codes.unchecked`), so the
+counts survive a restart and are shared by every server. Past it: `429
 too_many_requests` with `retry_after`. When a day's count reaches 25,
 Admins and Support are mailed once that (Manila) day, as BIR uptime's
 alerts are (`Mailer::send_notice` to `roles::staff_emails`). A request with
 a good token skips the cap, never the shared limits. Without Turnstile keys
 (local development) the token is ignored and the cap applies.
+
+Codes given without a token to addresses without an account have a
+budget of their own, 10 an hour and 30 a day, apart from the web's 20 and
+60, so the app path can never use up the web's. Over it the answer is the
+web's: 200, nothing mailed. A request with a good token counts against the
+web's caps, as the form does.
+
+**A refused request writes nothing.** Start and resend count the
+network's hour first (before asking Turnstile), then run every other
+check (`code_already_sent`, the testing cap, the address's five an hour,
+the new-address budget) in one transaction under the address's lock
+(`lock_address`, which every code of any purpose, web or app, is counted
+under, so requests at once cannot pass the five together). The request is
+written with its code in that transaction, or not at all; a refusal spends
+no place in any count, and a code that could not be mailed is taken back
+with its request. The one exception: a new address over its budget still
+gets a request without a code, so verifying it answers as a wrong code
+does; that answer keeps its network's hour spent.
 
 The cap is for testing only. **A platform's 1.0.0 needs the token
 required**: from then on, a request from that platform without a token
@@ -567,22 +590,24 @@ origin). The app opens it in a web view; the widget runs with the site's
 token as `turnstile` in start or resend, where it is checked exactly as
 the web form's token is (Turnstile itself lets a token be used once).
 
-When the widget passes, the page hands over the token in this order:
+When the widget passes, the page hands over the token two ways only, in
+this order:
 1. `window.nsh.postMessage(JSON.stringify({turnstile: token}))`, when the
    host injected `window.nsh` (the primary way);
-2. `postMessage({type: "buwiz-turnstile", token})` to `window.parent` and
-   `window.opener`, when there are any, and the document title
-   `buwiz-turnstile:<token>`;
-3. then it goes to `/app-check/done#token=<token>`, a page that says "You
-   can close this window" and reads nothing on the server: a host that saw
-   none of the above reads the token from that address's fragment.
+2. then it goes to `/app-check/done#token=<token>`, a page that says "You
+   can close this window" and reads nothing on the server: a host without
+   the bridge reads the token from that address's fragment.
 
-When the widget fails, errors, expires or times out, the same ways carry
-`{turnstile_error: "<code>"}` (title `buwiz-turnstile-error:<code>`,
-`/app-check/done#error=<code>`; parent and opener get
-`{type: "buwiz-turnstile", error}`). Codes: `expired`, `timeout`,
-`error_<Turnstile's code>`, and `not_configured` when the server has no
-Turnstile keys (local development; the page says so and sends it at once).
+Nothing is posted to a parent or opener window and the title is not
+written, and both pages send `Cross-Origin-Opener-Policy: same-origin`, so
+a page that opened `/app-check` keeps no handle on it. When the widget
+fails, errors, expires or times out, the same two ways carry
+`{turnstile_error: "<code>"}` (`/app-check/done#error=<code>`). Codes:
+`expired`, `timeout`, `error_<Turnstile's code>`, and `not_configured`
+when the server has no Turnstile keys (local development; the page says
+so and sends it at once). `/app-check/done` and `/app-sign-in` send a
+strict Content-Security-Policy (their own script, the site's files);
+`/app-check` loads Turnstile and has none of its own.
 
 Where the web view cannot run (Linux under Wayland, a view that fails to
 load) the app falls back to the browser device flow, which stays.
@@ -702,7 +727,16 @@ sign-in's grant keeps it, and an install has one device row per account
 updates that row (its key, its sign-in, what the app says about the
 device, `signed_in_at`) and ends the sign-in it had, so a reinstalled or
 signed-out-and-in app does not pile up rows. A registration whose install
-is not the sign-in's is refused (`install_mismatch`).
+is not the sign-in's is refused (`install_mismatch`). A sign-in without
+an install id may not take an install whose live device belongs to
+another live sign-in of the account (`409 install_in_use`, nothing
+changed); once that sign-in is over or the device removed, it may. A
+sign-in that carries an install id registers one device; one without (the
+apps from before) may register again, each time another row.
+
+Whenever a sign-in ends (signed out, its refresh token reused, ended by
+staff or by the person), its live device is removed with it, at the same
+time: a trigger on `oauth_grants` does it for every way a grant ends.
 
 What the app says about the device: its platform, model (an Apple code
 such as `iPhone16,1` is shown as "iPhone 15 Pro", from the table in
@@ -724,6 +758,16 @@ state, and log a live one out with a reason, under the rule for signing
 one app out (Support may not sign out an Admin): the device is removed,
 its sign-in ended (`signed_out_by_staff`), and the history gets an
 `app_signed_out` line naming the app.
+
+## Known limits of in-app sign-in
+
+Reviewed and accepted for now (PR 81's review):
+- **M5.** Five requests an hour for an address, from anyone, hold that address for the hour, as on the web.
+- **L5.** Address aliases (`name+1@`, Gmail's dots) count as other addresses for the per-address limit; the new-address budgets bound them.
+- **L6.** `code_already_sent` tells someone who knows an install id that it has a live request for that address.
+- **L7.** Response times may differ for accounts with a fixed code or when nothing is mailed (the mail is awaited); to be measured.
+- **L9.** Without `CF-Connecting-IP` there is no per-network count; safe while only the tunnel reaches the server.
+- **C1.** A code can be phished: the secret binds it to a request, not to the person's device, and only the mail's words protect.
 
 ## Licence gate
 

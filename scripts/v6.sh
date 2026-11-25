@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # V6: submission v2 end to end (submit_e2e) and the attacks it refuses
 # (submit_attacks), from scratch: a throwaway Postgres in Docker, the e2e
-# workspace built against eBIRForms (bir-submit, bir-core, bir-app-core at
-# the rev e2e/Cargo.toml pins), then everything stopped and removed.
+# workspace built against Buwiz Forms (bir-submit and bir-core from
+# hexuria/buwiz-forms at the rev e2e/Cargo.toml pins), then everything
+# stopped and removed.
 #
 #   scripts/v6.sh
-#   EBIRFORMS_PATH=../eBIRForms scripts/v6.sh   # a local eBIRForms checkout,
-#                                               # uncommitted changes included,
-#                                               # instead of the pinned rev
+#   BUWIZ_FORMS_PATH=../buwiz-forms scripts/v6.sh  # a local buwiz-forms
+#                                                  # checkout, uncommitted
+#                                                  # changes included, instead
+#                                                  # of the pinned rev
 #
 # Nothing reaches BIR: the Sender's dispatcher and upload hosts are local
 # test servers and its passphrases are fake. e2e builds the server with the
@@ -26,11 +28,15 @@ trap cleanup EXIT
 export DATABASE_URL="postgres://buwiz_e2e:buwiz_e2e@127.0.0.1:${V6_PG_PORT}/buwiz_e2e"
 
 # A local checkout replaces the pinned git source crate by crate.
-patch=()
 if [ -n "${EBIRFORMS_PATH:-}" ]; then
-  ebf="$(cd "$EBIRFORMS_PATH" && pwd)"
-  for crate in bir-app-core bir-core bir-submit; do
-    patch+=(--config "patch.\"https://github.com/eBIRForms/eBIRForms\".$crate.path=\"$ebf/crates/$crate\"")
+  echo "EBIRFORMS_PATH is gone: the client is Buwiz Forms now; set BUWIZ_FORMS_PATH" >&2
+  exit 2
+fi
+patch=()
+if [ -n "${BUWIZ_FORMS_PATH:-}" ]; then
+  forms="$(cd "$BUWIZ_FORMS_PATH" && pwd)"
+  for crate in bir-core bir-submit; do
+    patch+=(--config "patch.\"https://github.com/hexuria/buwiz-forms\".$crate.path=\"$forms/crates/$crate\"")
   done
 fi
 

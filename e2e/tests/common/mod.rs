@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bir_submit::secrets::{MemoryStore, SecretStore, StoreError};
-use bir_submit::{PollOutcome, Submission, SubmitConfig};
+use bir_submit::{ClientError, SubmitConfig, Submitter, TokenSource};
 use buwiz_cloud::bir::{self, DispatcherTarget, Mode, dispatcher};
 use buwiz_cloud::config::{Config, MailConfig};
 use buwiz_cloud::envelope::SealingKey;
@@ -27,6 +27,7 @@ use russh::keys::{HashAlg, PrivateKey};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::Mutex;
@@ -238,6 +239,95 @@ impl SecretStore for SharedStore {
     }
 }
 
+/// The device-flow client id the Buwiz desktop app signs in with.
+pub const CLIENT_ID: &str = bir_core::cloud_account::DESKTOP_CLIENT_ID;
+
+/// The host's one sign-in, as an app keeps it: the tokens of a device-flow
+/// sign-in, refreshed on the server's `/oauth/token` when bir-submit asks
+/// for it. A refused refresh signs out; so does `session_ended`.
+pub struct Tokens {
+    base: String,
+    /// (access token, refresh token); `None` once signed out.
+    tokens: std::sync::Mutex<Option<(String, String)>>,
+    /// bir-submit said the server ended the sign-in.
+    pub ended: std::sync::atomic::AtomicBool,
+}
+
+impl Tokens {
+    pub fn access(&self) -> String {
+        self.tokens.lock().unwrap().as_ref().expect("signed in").0.clone()
+    }
+
+    pub fn refresh(&self) -> String {
+        self.tokens.lock().unwrap().as_ref().expect("signed in").1.clone()
+    }
+}
+
+impl TokenSource for Tokens {
+    fn access_token(
+        &self,
+        force_refresh: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ClientError>> + Send + '_>> {
+        Box::pin(async move {
+            let Some((access, refresh)) = self.tokens.lock().unwrap().clone() else {
+                return Err(ClientError::SignedOut);
+            };
+            if !force_refresh {
+                return Ok(access);
+            }
+            let (status, body) = refresh_grant(&self.base, &refresh).await;
+            match (status, body["access_token"].as_str(), body["refresh_token"].as_str()) {
+                (200, Some(access), Some(refresh)) => {
+                    *self.tokens.lock().unwrap() = Some((access.to_owned(), refresh.to_owned()));
+                    Ok(access.to_owned())
+                }
+                _ => {
+                    *self.tokens.lock().unwrap() = None;
+                    Err(ClientError::SignedOut)
+                }
+            }
+        })
+    }
+
+    fn login(&self) -> Option<String> {
+        self.tokens.lock().unwrap().as_ref().map(|_| EMAIL.to_owned())
+    }
+
+    fn session_ended(&self) {
+        *self.tokens.lock().unwrap() = None;
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `POST /oauth/token` with a refresh token: the status and the JSON body.
+pub async fn refresh_grant(base: &str, refresh_token: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/oauth/token"))
+        .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", CLIENT_ID)])
+        .send()
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.json().await.unwrap_or_default())
+}
+
+/// An app signed in: its client, its secret store and its sign-in.
+pub struct App {
+    pub submitter: Submitter,
+    pub store: SharedStore,
+    pub tokens: Arc<Tokens>,
+}
+
+impl App {
+    pub fn submitter(&self) -> &Submitter {
+        &self.submitter
+    }
+
+    /// The device id bir-submit registered and keeps in its store.
+    pub fn device_id(&self) -> String {
+        self.store.get("device_id").unwrap().expect("a registered device")
+    }
+}
+
 /// What the harness signs into the trust list.
 pub struct TrustSpec {
     pub dispatcher_port: u16,
@@ -335,9 +425,11 @@ impl Harness {
             document_key: [0x44; 32],
             admin_emails: Vec::new(),
             mail: MailConfig::Log,
+            turnstile: None,
             trust_list: Some(trust_list),
             downloads_url: "http://127.0.0.1:9".into(),
             forms_origin: base.clone(),
+            github_api_url: "http://127.0.0.1:9".into(),
         };
         let state = AppState::new(
             config,
@@ -368,32 +460,66 @@ impl Harness {
     }
 
     /// The app's client config: this server, with the test trust key
-    /// pinned through the override.
+    /// pinned in code.
     pub fn client_config(&self) -> SubmitConfig {
-        let mut config = SubmitConfig::new(Some(&self.base));
-        config.server_url = self.base.clone();
+        let mut config = SubmitConfig::new(&self.base).expect("http to this machine");
         config.trust_keys = vec![trust_public(&TRUST_SEED)];
         config.device_name = "Juana's laptop".into();
         config
     }
 
-    /// Device-flow sign-in with the real client; Juana approves on the
-    /// account site (here: straight in the database layer).
-    pub async fn signed_in(&self) -> (Submission, SharedStore) {
+    /// Device-flow sign-in; Juana approves on the account site (here:
+    /// straight in the database layer).
+    pub async fn device_sign_in(&self) -> Arc<Tokens> {
+        let http = reqwest::Client::new();
+        let started: Value = http
+            .post(format!("{}/auth/device/start", self.base))
+            .json(&json!({ "client_id": CLIENT_ID }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let user_code = started["user_code"].as_str().expect("a user code");
+        assert!(!started["verification_uri_complete"].as_str().unwrap().contains(user_code));
+        assert_eq!(
+            buwiz_cloud::oauth::decide_device(&self.db, user_code, self.account_id, true).await.unwrap(),
+            buwiz_cloud::oauth::DeviceDecided::Done,
+            "approved"
+        );
+        let polled = http
+            .post(format!("{}/auth/device/poll", self.base))
+            .json(&json!({ "client_id": CLIENT_ID, "device_code": started["device_code"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(polled.status(), 200, "signed in");
+        let tokens: Value = polled.json().await.unwrap();
+        Arc::new(Tokens {
+            base: self.base.clone(),
+            tokens: std::sync::Mutex::new(Some((
+                tokens["access_token"].as_str().unwrap().to_owned(),
+                tokens["refresh_token"].as_str().unwrap().to_owned(),
+            ))),
+            ended: Default::default(),
+        })
+    }
+
+    /// Signed in with the real client, its device key registered.
+    pub async fn signed_in(&self) -> App {
         self.signed_in_with(self.client_config()).await
     }
 
-    pub async fn signed_in_with(&self, config: SubmitConfig) -> (Submission, SharedStore) {
+    pub async fn signed_in_with(&self, config: SubmitConfig) -> App {
         let store = SharedStore::default();
-        let submission = Submission::with(config, Box::new(store.clone()));
-        let code = submission.start_sign_in().await.expect("device flow starts");
-        assert!(!code.verification_uri_complete.contains(&code.user_code));
-        assert!(
-            buwiz_cloud::oauth::decide_device(&self.db, &code.user_code, self.account_id, true).await.unwrap(),
-            "approved"
-        );
-        assert_eq!(submission.poll_sign_in().await.expect("poll"), PollOutcome::SignedIn);
-        (submission, store)
+        let tokens = self.device_sign_in().await;
+        let submitter = Submitter::new(config, Box::new(store.clone()), tokens.clone());
+        // The first signed request registers the device key.
+        let me = submitter.signed("GET", "/me", &Value::Null).await.expect("a signed request");
+        assert_eq!(me["email"], EMAIL);
+        assert!(store.get("device_id").unwrap().is_some(), "the device is registered");
+        App { submitter, store, tokens }
     }
 
     pub async fn submission_status(&self, id: &str) -> String {

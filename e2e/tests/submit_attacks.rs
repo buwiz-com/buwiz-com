@@ -8,11 +8,11 @@ use bir_submit::device::{self, DeviceKey, HEADER_DEVICE};
 use bir_submit::pipe::Ended;
 use bir_submit::seal;
 use bir_submit::secrets::SecretStore;
-use bir_submit::{ClientError, Submitter};
+use bir_submit::{ClientError, SendError, Submitter};
 use buwiz_cloud::relay::{Control, Pipe};
 use buwiz_cloud::sender::Job;
 use buwiz_cloud::tickets::{self, TicketClaims};
-use common::{EMAIL, Harness, TIN};
+use common::{App, EMAIL, Harness, TIN};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -57,21 +57,14 @@ fn no_app() -> Pipe {
     Pipe::new(out, inbound)
 }
 
-/// A request signed with the device key in `store`, sent as is: answers
+/// A request signed with the app's device key and token, sent as is: answers
 /// the HTTP status and the server's error code.
-async fn raw_signed(
-    harness: &Harness,
-    store: &common::SharedStore,
-    method: &str,
-    path: &str,
-    body: &[u8],
-) -> (u16, String) {
-    let session: Value = serde_json::from_str(&store.get("session").unwrap().unwrap()).unwrap();
-    let key = DeviceKey::from_stored(&store.get("device_key").unwrap().unwrap()).unwrap();
+async fn raw_signed(harness: &Harness, app: &App, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+    let key = DeviceKey::from_stored(&app.store.get("device_key").unwrap().unwrap()).unwrap();
     let mut request = reqwest::Client::new()
         .request(method.parse().unwrap(), format!("{}{path}", harness.base))
-        .bearer_auth(session["access_token"].as_str().unwrap())
-        .header(HEADER_DEVICE, session["device_id"].as_str().unwrap())
+        .bearer_auth(app.tokens.access())
+        .header(HEADER_DEVICE, app.device_id())
         .header("content-type", "application/json")
         .body(body.to_vec());
     for (name, value) in key.sign(method, path, body, device::now(), &device::nonce()) {
@@ -104,7 +97,7 @@ async fn submit(submitter: &Submitter, xml_for_ticket: &[u8], sealed: &[u8], key
 #[tokio::test]
 async fn a_tin_not_active_on_the_account_gets_no_ticket() {
     let harness = Harness::start().await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let other = "00012345400000";
     let code = server_code(
         submission.submitter().signed("POST", "/api/tickets", &ticket_body(other, &xml(other), "k1")).await,
@@ -132,7 +125,7 @@ async fn a_tin_not_active_on_the_account_gets_no_ticket() {
 #[tokio::test]
 async fn a_ticket_works_once() {
     let harness = Harness::start().await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let submitter = submission.submitter();
     let body = xml(TIN);
     let (jti, jws, _) = submit(submitter, &body, &body, "once").await;
@@ -163,11 +156,10 @@ async fn a_ticket_works_once() {
 #[tokio::test]
 async fn a_replayed_or_stale_signature_is_refused() {
     let harness = Harness::start().await;
-    let (submission, store) = harness.signed_in().await;
-    let session: Value = serde_json::from_str(&store.get("session").unwrap().unwrap()).unwrap();
-    let key = DeviceKey::from_stored(&store.get("device_key").unwrap().unwrap()).unwrap();
-    let token = session["access_token"].as_str().unwrap();
-    let device_id = session["device_id"].as_str().unwrap();
+    let app = harness.signed_in().await;
+    let key = DeviceKey::from_stored(&app.store.get("device_key").unwrap().unwrap()).unwrap();
+    let token = &app.tokens.access();
+    let device_id = &app.device_id();
     let http = reqwest::Client::new();
     let body = serde_json::to_vec(&ticket_body(TIN, &xml(TIN), "replay")).unwrap();
     let send = |timestamp: i64, nonce: String| {
@@ -202,13 +194,12 @@ async fn a_replayed_or_stale_signature_is_refused() {
     }
     let tampered = request.send().await.unwrap();
     assert_eq!(tampered.json::<Value>().await.unwrap()["error"]["code"], "bad_signature");
-    let _ = submission;
 }
 
 #[tokio::test]
 async fn an_expired_ticket_is_refused_by_gatekeeper_and_sender() {
     let harness = Harness::start().await;
-    let (submission, store) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let submitter = submission.submitter();
     // A ticket like a real one but five minutes old.
     let body = xml(TIN);
@@ -239,13 +230,12 @@ async fn an_expired_ticket_is_refused_by_gatekeeper_and_sender() {
         matches!(&result, Control::Result { status, error: Some(error), .. } if status == "failed" && error.contains("expired")),
         "{result:?}"
     );
-    let _ = store;
 }
 
 #[tokio::test]
 async fn a_tampered_envelope_does_not_open() {
     let harness = Harness::start().await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let submitter = submission.submitter();
     let body = xml(TIN);
     let ticket = submitter.signed("POST", "/api/tickets", &ticket_body(TIN, &body, "tamper")).await.unwrap();
@@ -271,7 +261,7 @@ async fn a_tampered_envelope_does_not_open() {
 #[tokio::test]
 async fn an_xml_tin_other_than_the_tickets_is_refused() {
     let harness = Harness::start().await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let submitter = submission.submitter();
     // The ticket is for Juana's TIN, and its hash is of the XML sealed, but
     // that XML files for another TIN.
@@ -280,7 +270,8 @@ async fn an_xml_tin_other_than_the_tickets_is_refused() {
     let ended = submitter.relay(view["relay_path"].as_str().unwrap()).await.unwrap();
     assert!(
         matches!(&ended, Ended::Result { status, error: Some(error), .. }
-            if status == "failed" && error == "the TIN in the return is not the ticket's TIN"),
+            if status == "failed"
+                && error == "The return does not match its ticket: the TIN in the return is not the ticket's TIN. (return_mismatch)"),
         "{ended:?}"
     );
     assert!(harness.received.lock().await.is_empty());
@@ -298,20 +289,20 @@ async fn an_xml_tin_other_than_the_tickets_is_refused() {
 #[tokio::test]
 async fn a_revoked_device_is_refused_everywhere() {
     let harness = Harness::start().await;
-    let (submission, store) = harness.signed_in().await;
-    let submitter = submission.submitter();
+    let app = harness.signed_in().await;
+    let submitter = app.submitter();
     let body = xml(TIN);
     let (_, _, view) = submit(submitter, &body, &body, "revoked").await;
-    let session: Value = serde_json::from_str(&store.get("session").unwrap().unwrap()).unwrap();
-    let device_id: Uuid = session["device_id"].as_str().unwrap().parse().unwrap();
-    let token = session["access_token"].as_str().unwrap().to_owned();
+    let device_id: Uuid = app.device_id().parse().unwrap();
+    let token = app.tokens.access();
+    let refresh_token = app.tokens.refresh();
 
     // Juana removes the device on the account site.
     assert!(buwiz_cloud::devices::revoke(&harness.db, harness.account_id, device_id).await.unwrap());
 
     // Its stored submission can no longer be relayed: its sign-in is over.
     let relay_path = view["relay_path"].as_str().unwrap();
-    assert_eq!(raw_signed(&harness, &store, "GET", relay_path, b"").await, (401, "invalid_token".to_owned()));
+    assert_eq!(raw_signed(&harness, &app, "GET", relay_path, b"").await, (401, "invalid_token".to_owned()));
     let relay = submitter.relay(relay_path).await;
     assert!(matches!(&relay, Err(ClientError::Server { status: 401, .. })), "{relay:?}");
     assert_eq!(harness.submission_status(view["id"].as_str().unwrap()).await, "ready");
@@ -320,40 +311,47 @@ async fn a_revoked_device_is_refused_everywhere() {
     // It gets no ticket: the token is refused, and so is the refresh.
     let ticket_request = serde_json::to_vec(&ticket_body(TIN, &body, "revoked-2")).unwrap();
     assert_eq!(
-        raw_signed(&harness, &store, "POST", "/api/tickets", &ticket_request).await,
+        raw_signed(&harness, &app, "POST", "/api/tickets", &ticket_request).await,
         (401, "invalid_token".to_owned())
     );
     let ticket = submitter.signed("POST", "/api/tickets", &ticket_body(TIN, &body, "revoked-2")).await;
     assert!(matches!(ticket, Err(ClientError::SignedOut)), "{ticket:?}");
+    let (status, refused) = common::refresh_grant(&harness.base, &refresh_token).await;
+    assert_eq!((status, refused["error"].as_str()), (400, Some("invalid_grant")), "{refused}");
     assert!(harness.received.lock().await.is_empty());
 
     // A device revoked while its sign-in lives on is refused by its
     // signature: device_revoked, for tickets and for the relay.
-    let (second, second_store) = harness.signed_in().await;
+    let second = harness.signed_in().await;
     let (_, _, second_view) = submit(second.submitter(), &body, &body, "revoked-4").await;
-    let session: Value = serde_json::from_str(&second_store.get("session").unwrap().unwrap()).unwrap();
     sqlx::query("UPDATE devices SET revoked_at = now() WHERE id = $1::uuid")
-        .bind(session["device_id"].as_str().unwrap())
+        .bind(second.device_id())
         .execute(&harness.db)
         .await
         .unwrap();
     let ticket_request = serde_json::to_vec(&ticket_body(TIN, &body, "revoked-3")).unwrap();
     assert_eq!(
-        raw_signed(&harness, &second_store, "POST", "/api/tickets", &ticket_request).await,
+        raw_signed(&harness, &second, "POST", "/api/tickets", &ticket_request).await,
         (403, "device_revoked".to_owned())
     );
     let second_relay = second_view["relay_path"].as_str().unwrap();
-    assert_eq!(raw_signed(&harness, &second_store, "GET", second_relay, b"").await, (403, "device_revoked".to_owned()));
+    assert_eq!(raw_signed(&harness, &second, "GET", second_relay, b"").await, (403, "device_revoked".to_owned()));
     assert_eq!(harness.submission_status(second_view["id"].as_str().unwrap()).await, "ready");
     let refused = second.submitter().signed("POST", "/api/tickets", &ticket_body(TIN, &body, "revoked-3")).await;
-    assert!(matches!(&refused, Err(ClientError::Other(message)) if message.contains("removed")), "{refused:?}");
+    assert!(
+        matches!(&refused, Err(error @ ClientError::DeviceRevoked) if error.to_string().contains("removed")),
+        "{refused:?}"
+    );
+    // The client forgot the device and told the app its sign-in is over.
+    assert_eq!(second.store.get("device_id").unwrap(), None);
+    assert!(second.tokens.ended.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
 async fn a_trust_list_signed_by_another_key_is_refused_and_the_pipe_opens_nothing() {
     let harness = Harness::start().await;
     // A good client stores a sealed return...
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let body = xml(TIN);
     let (_, _, view) = submit(submission.submitter(), &body, &body, "trust").await;
 
@@ -361,13 +359,11 @@ async fn a_trust_list_signed_by_another_key_is_refused_and_the_pipe_opens_nothin
     // server serves: it sends nothing and opens no pipe.
     let mut config = harness.client_config();
     config.trust_keys = vec![common::trust_public(&[0x66; 32])];
-    let (stranger, _) = harness.signed_in_with(config).await;
+    let stranger = harness.signed_in_with(config).await;
     let refused = stranger.submitter().send(&format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"), &body).await;
     assert_eq!(
         refused.err(),
-        Some(bir_submit::SendError::NotSent(
-            "Can't send: the server's trust list is not signed by a pinned key.".into()
-        ))
+        Some(SendError::NotSent("Can't send: the server's trust list is not signed by a pinned key.".into()))
     );
     let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();
     assert_eq!(tickets, 1, "no ticket was spent on the refused send");
@@ -385,7 +381,7 @@ async fn a_host_off_the_signed_list_is_refused() {
     // The list names the dispatcher but not the SFTP server.
     let harness =
         Harness::start_with(|spec| spec.contents.hosts = vec![format!("127.0.0.1:{}", spec.dispatcher_port)]).await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let body = xml(TIN);
     let (_, _, view) = submit(submission.submitter(), &body, &body, "off-list").await;
     let ended = submission.submitter().relay(view["relay_path"].as_str().unwrap()).await.unwrap();
@@ -406,14 +402,12 @@ async fn a_sealing_key_not_in_the_signed_list_is_refused_and_nothing_is_sealed()
         spec.contents.sealing_keys = other.public_document()["keys"].as_array().unwrap().clone();
     })
     .await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let body = xml(TIN);
     let refused = submission.submitter().send(&format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"), &body).await;
     assert_eq!(
         refused.err(),
-        Some(bir_submit::SendError::NotSent(
-            "Can't send: the server's sealing key is not in the signed trust list.".into()
-        ))
+        Some(SendError::NotSent("Can't send: the server's sealing key is not in the signed trust list.".into()))
     );
     let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();
     let submissions: i64 = sqlx::query_scalar("SELECT count(*) FROM submissions").fetch_one(&harness.db).await.unwrap();
@@ -430,23 +424,18 @@ async fn a_receipt_signed_by_a_key_not_in_the_signed_list_does_not_make_the_retu
         spec.contents.receipt_keys = vec![buwiz_cloud::jws::jwk(&other.verifying_key())];
     })
     .await;
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let body = xml(TIN);
-    let transport = submission.transport();
-    let outcome = bir_core::background_cron::SubmissionTransport::store_session_reported(
-        transport.as_ref(),
-        (),
-        &format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"),
-        &body,
-    )
-    .await;
+    // What the queue's relay transport calls: a maybe-sent answer is never
+    // Sent, and never sent again.
+    let outcome = submission.submitter().send(&format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml"), &body).await;
     match outcome {
-        Err(bir_core::background_cron::StoreFailure::MaybeSent(error)) => assert!(
-            error.0.contains("its receipt does not check out")
-                && error.0.contains("signed by a key not in the signed trust list"),
+        Err(SendError::MaybeSent(error)) => assert!(
+            error.contains("its receipt does not check out")
+                && error.contains("signed by a key not in the signed trust list"),
             "{error}"
         ),
-        Ok(report) => panic!("the queue would mark it Sent: {report:?}"),
+        Ok(sent) => panic!("the queue would mark it Sent: {sent:?}"),
         Err(other) => panic!("expected needs-attention, got {other:?}"),
     }
 }
@@ -455,22 +444,15 @@ async fn a_receipt_signed_by_a_key_not_in_the_signed_list_does_not_make_the_retu
 async fn a_stall_after_the_remote_file_is_opened_is_unknown_and_never_resent() {
     let harness = Harness::start().await;
     harness.stall_sftp.store(true, std::sync::atomic::Ordering::SeqCst);
-    let (submission, _) = harness.signed_in().await;
+    let submission = harness.signed_in().await;
     let body = xml(TIN);
     let filename = format!("{TIN}-1701Qv2018-2026Q1#{EMAIL}#.xml");
-    let transport = submission.transport();
-    let outcome = bir_core::background_cron::SubmissionTransport::store_session_reported(
-        transport.as_ref(),
-        (),
-        &filename,
-        &body,
-    )
-    .await;
+    let outcome = submission.submitter().send(&filename, &body).await;
     match outcome {
-        Err(bir_core::background_cron::StoreFailure::MaybeSent(error)) => {
-            assert!(error.0.contains("once the remote file was asked for"), "{error}")
+        Err(SendError::MaybeSent(error)) => {
+            assert!(error.contains("once the remote file was asked for"), "{error}")
         }
-        Ok(report) => panic!("a stalled upload became Sent: {report:?}"),
+        Ok(sent) => panic!("a stalled upload became Sent: {sent:?}"),
         Err(other) => panic!("a stalled upload must need attention, not a retry: {other:?}"),
     }
     let (status, error): (String, Option<String>) =
@@ -480,7 +462,7 @@ async fn a_stall_after_the_remote_file_is_opened_is_unknown_and_never_resent() {
     // Trying again, as a retry would, gets no new ticket.
     let again = submission.submitter().send(&filename, &body).await;
     assert!(
-        matches!(&again, Err(bir_submit::SendError::MaybeSent(message)) if message.contains("already handed over")),
+        matches!(&again, Err(SendError::MaybeSent(message)) if message.contains("already handed over")),
         "{again:?}"
     );
     let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&harness.db).await.unwrap();

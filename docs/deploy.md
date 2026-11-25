@@ -910,6 +910,17 @@ get the lock. No existing row changes. It needs no setting: the
 endpoints work with the Turnstile keys the web already has, and without
 them (local development) every request counts towards the cap.
 
+**Step one, before you deploy it: read `SECURE_COOKIES`.** This release
+stops at start-up when the account origin is https and `SECURE_COOKIES`
+is anything but `true` (see below). Read it, read-only, after
+`aws login --profile buwiz`:
+```sh
+aws ssm get-parameter --profile buwiz --name /buwiz/SECURE_COOKIES --query Parameter.Value --output text
+```
+Expected: `ParameterNotFound` (unset, so on), or `true`. Any other value,
+an empty one included: do not deploy; the owner decides whether to change
+it (`buwiz-env`), and only then deploy.
+
 One optional setting: `APP_SIGN_IN_MINUTES`, how long an in-app code
 works and so how long before a new one (1 to 30; 5 when unset). Any other
 value stops the server at start-up. The web's codes keep their ten

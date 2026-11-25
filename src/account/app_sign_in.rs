@@ -61,6 +61,12 @@ const UNCHECKED_LOCK: i64 = 0x6275_7769_7a02;
 /// not known: the hour.
 const HOUR_S: i64 = 3600;
 
+/// Reserved: the refusal of a request without a Turnstile token from a
+/// platform that requires one (`403`). Not used yet: every platform may
+/// still go without, under the testing cap. A platform's 1.0.0 requires
+/// the token (docs/accounts.md, "The app check and the testing cap").
+pub const TURNSTILE_REQUIRED: &str = "turnstile_required";
+
 /// Whether a request is for these endpoints rather than the web's forms.
 pub fn is_json(headers: &HeaderMap) -> bool {
     headers

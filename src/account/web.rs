@@ -114,6 +114,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/account.css", get(account_stylesheet))
         .route("/assets/account.js", get(account_script))
         .route("/assets/app-sign-in.js", get(app_sign_in_script))
+        .route("/assets/app-check.js", get(app_check_script))
         .route("/assets/staff.css", get(staff_stylesheet))
         .route("/assets/staff.js", get(staff_script))
         .route("/assets/screens/{name}", get(screenshot))
@@ -274,6 +275,10 @@ async fn account_script() -> Response {
 
 async fn app_sign_in_script() -> Response {
     text(include_str!("app-sign-in.js"), "text/javascript; charset=utf-8")
+}
+
+async fn app_check_script() -> Response {
+    text(include_str!("app-check.js"), "text/javascript; charset=utf-8")
 }
 
 async fn staff_stylesheet() -> Response {

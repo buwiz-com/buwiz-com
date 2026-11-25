@@ -25,6 +25,7 @@ use crate::account::web::{link, safe_next, session_account};
 use crate::base::state::AppState;
 use crate::filing::devices;
 
+mod app_check;
 mod app_sign_in;
 mod bir_status;
 mod delete;
@@ -52,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         .page(verify_page)
         .page(device_page)
         .page(app_sign_in::app_sign_in_page)
+        .page(app_check::app_check_page)
+        .page(app_check::app_check_done_page)
         .page(delete::delete_page)
         .page(authorize_page)
         .page(tins::tins_page)
@@ -203,6 +206,9 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let forms_origin = state(cx).config.forms_origin.clone();
     let (sign_in, sign_up) = (account_url(cx, "/login"), account_url(cx, "/signup"));
     let console_admin = staff.as_ref().is_some_and(|staff| staff.can(Power::CreateLogin));
+    // The app-check pages run in an app's web view: no header, so nothing
+    // on them leads off the account host.
+    let bare = path == "/app-check" || path == "/app-check/done";
     Ok(view! {
         if staff_area {
             staff::shell::document(
@@ -242,7 +248,9 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                     <script src="/assets/account.js"></script>
                 </head>
                 <body>
-                    site_header(account: account.clone(), admin: admin, path: path.clone(), sign_in: sign_in, sign_up: sign_up)
+                    if !bare {
+                        site_header(account: account.clone(), admin: admin, path: path.clone(), sign_in: sign_in, sign_up: sign_up)
+                    }
                     (slot)
                 </body>
             </html>
@@ -281,6 +289,8 @@ fn head_for(path: &str) -> Head {
         "/login/verify" => "Check your email · Buwiz",
         "/device" => "Sign in to the app · Buwiz",
         "/app-sign-in" => app_sign_in::TITLE,
+        "/app-check" => app_check::TITLE,
+        "/app-check/done" => app_check::DONE_TITLE,
         "/delete" => delete::TITLE,
         "/oauth/authorize" => "Connect an AI app · Buwiz",
         "/tins" => "My TINs · Buwiz",

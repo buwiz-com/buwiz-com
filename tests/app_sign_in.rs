@@ -757,3 +757,60 @@ async fn the_link_page_only_offers_a_button(db: PgPool) {
     // Only on the account host.
     assert_eq!(site.on_host(FORMS_HOST, "/app-sign-in").await.status(), StatusCode::NOT_FOUND);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_app_check_page_runs_the_widget_and_hands_the_token_to_the_app(db: PgPool) {
+    let site = Site::with_turnstile(db, "http://127.0.0.1:9");
+    let response = site.get("/app-check", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-robots-tag"], "noindex");
+    let page = text(response).await;
+    assert!(page.contains(r#"<meta name="robots" content="noindex">"#));
+    assert!(page.contains(&format!(r#"data-sitekey="{TURNSTILE_SITE_KEY}""#)), "{page}");
+    assert!(page.contains(r#"data-callback="buwizTurnstileDone""#));
+    assert!(page.contains(r#"data-error-callback="buwizTurnstileError""#));
+    assert!(page.contains(r#"data-expired-callback="buwizTurnstileExpired""#));
+    assert!(page.contains("challenges.cloudflare.com/turnstile/v0/api.js"));
+    // Its functions are there before the widget calls them.
+    assert!(page.find("/assets/app-check.js").unwrap() < page.find("challenges.cloudflare.com").unwrap());
+    // No header: nothing on it leads off the account host.
+    assert!(!page.contains("top-nav") && !page.contains(r#"href="/""#), "{page}");
+
+    let done = site.get("/app-check/done", "").await;
+    assert_eq!(done.status(), StatusCode::OK);
+    let done = text(done).await;
+    assert!(done.contains("You can close this window"));
+    assert!(!done.contains("<script src=\"/assets/app-check.js\""));
+
+    let script = text(site.get("/assets/app-check.js", "").await).await;
+    let nsh = script.find("window.nsh.postMessage(JSON.stringify(message))").expect("the app's bridge");
+    for later in
+        ["window.parent.postMessage", "window.opener.postMessage", "document.title = title", "/app-check/done#"]
+    {
+        assert!(script.find(later).is_some_and(|at| at > nsh), "{later} comes after window.nsh");
+    }
+    for part in [
+        "{ turnstile: token }",
+        "{ type: \"buwiz-turnstile\", token: token }",
+        "\"buwiz-turnstile:\" + token",
+        "\"token=\" + encodeURIComponent(token)",
+        "{ turnstile_error: code }",
+        "\"buwiz-turnstile-error:\" + code",
+        "\"error=\" + encodeURIComponent(code)",
+        "fail(\"expired\")",
+        "fail(\"not_configured\")",
+    ] {
+        assert!(script.contains(part), "{part}");
+    }
+    // Only on the account host.
+    assert_eq!(site.on_host(FORMS_HOST, "/app-check").await.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn without_turnstile_keys_the_app_check_page_says_so(db: PgPool) {
+    let site = Site::new(db);
+    let page = text(site.get("/app-check", "").await).await;
+    assert!(page.contains("The app check is not set up on this server"), "{page}");
+    assert!(page.contains(r#"data-state="not-configured""#));
+    assert!(page.contains("/assets/app-check.js") && !page.contains("challenges.cloudflare.com"));
+}

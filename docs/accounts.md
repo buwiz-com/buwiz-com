@@ -551,9 +551,41 @@ a good token skips the cap, never the shared limits. Without Turnstile keys
 
 The cap is for testing only. **A platform's 1.0.0 needs the token
 required**: from then on, a request from that platform without a token
-will be refused with `403 turnstile_required` (the code is reserved, not
-used yet). Where the app's check cannot run, it falls back to the browser
-device flow.
+will be refused with `403 turnstile_required` (the code is reserved,
+`TURNSTILE_REQUIRED` in `src/account/app_sign_in.rs`, not used yet).
+Where the app's check cannot run, it falls back to the browser device
+flow ([below](#the-app-check-page)).
+
+### The app-check page
+
+An app gets its Turnstile token from `https://account.buwiz.com/app-check`
+(`src/account/pages/app_check.rs`, `src/account/app-check.js`): no
+sign-in, noindex, and no site header, so nothing on it leads off the
+account host (Cloudflare's widget frame inside it is the only other
+origin). The app opens it in a web view; the widget runs with the site's
+`TURNSTILE_SITE_KEY`, as on the sign-in forms. The app then sends the
+token as `turnstile` in start or resend, where it is checked exactly as
+the web form's token is (Turnstile itself lets a token be used once).
+
+When the widget passes, the page hands over the token in this order:
+1. `window.nsh.postMessage(JSON.stringify({turnstile: token}))`, when the
+   host injected `window.nsh` (the primary way);
+2. `postMessage({type: "buwiz-turnstile", token})` to `window.parent` and
+   `window.opener`, when there are any, and the document title
+   `buwiz-turnstile:<token>`;
+3. then it goes to `/app-check/done#token=<token>`, a page that says "You
+   can close this window" and reads nothing on the server: a host that saw
+   none of the above reads the token from that address's fragment.
+
+When the widget fails, errors, expires or times out, the same ways carry
+`{turnstile_error: "<code>"}` (title `buwiz-turnstile-error:<code>`,
+`/app-check/done#error=<code>`; parent and opener get
+`{type: "buwiz-turnstile", error}`). Codes: `expired`, `timeout`,
+`error_<Turnstile's code>`, and `not_configured` when the server has no
+Turnstile keys (local development; the page says so and sends it at once).
+
+Where the web view cannot run (Linux under Wayland, a view that fails to
+load) the app falls back to the browser device flow, which stays.
 
 ### The link in the mail
 

@@ -34,7 +34,7 @@ use crate::account::accounts::Account;
 use crate::account::notice::Notice;
 use crate::account::oauth::Bearer;
 use crate::account::roles::{self, Power, Role};
-use crate::account::tin::{TEST_ROOT, Tin};
+use crate::account::tin::Tin;
 use crate::base::config::Config;
 use crate::base::crypto;
 use crate::base::error::ApiError;
@@ -1028,8 +1028,8 @@ pub struct NewTestTin<'a> {
 
 /// An Admin adds a test TIN ([`Tin::is_test`]) to an account that carries
 /// the test label, active at once and without papers (`verified_by =
-/// 'admin'`), with a reason in its audit line. It never sends: the gate
-/// refuses it (`tin_test_only`). Refused for a TIN that is not a test TIN
+/// 'admin'`), with a reason in its audit line. It sends as a dry run only:
+/// the Sender never lets one reach the BIR. Refused for a TIN that is not a test TIN
 /// (that one is added the usual way, and verified), for an account without
 /// the label or banned, one in `ADMIN_EMAILS`, and for a test TIN already
 /// active anywhere. Locks
@@ -1594,14 +1594,12 @@ async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -
     .bind(account_id)
     .fetch_all(db)
     .await?;
-    let mut listed: Vec<(gate::Standing, ListedClaim)> = rows
-        .into_iter()
-        .map(|row| (gate::classify(row.id, &row.status, row.paused, &row.fix_reasons, row.tin_root == TEST_ROOT), row))
-        .collect();
+    let mut listed: Vec<(gate::Standing, ListedClaim)> =
+        rows.into_iter().map(|row| (gate::classify(row.id, &row.status, row.paused, &row.fix_reasons), row)).collect();
     // A stable sort keeps the oldest-first order within each group.
     listed.sort_by_key(|(standing, row)| match standing {
         gate::Standing::Sendable { .. } => (0, row.decided_at),
-        gate::Standing::Paused | gate::Standing::TestOnly => (1, row.decided_at),
+        gate::Standing::Paused => (1, row.decided_at),
         _ => (2, None),
     });
     Ok(listed.into_iter().map(|(standing, row)| listed_json(&standing, &row, full, origin)).collect())
@@ -1636,9 +1634,13 @@ fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin:
     if full {
         profile["tin"] = json!(tin.to_string());
     }
-    // Only on a test TIN, so every other row reads as before.
+    // Only on a test TIN, so every other row reads as before. One that can
+    // send says its send is a dry run.
     if tin.is_test() {
         profile["test_only"] = json!(true);
+        if standing.can_send() {
+            profile["message"] = json!(gate::TEST_TIN_MESSAGE);
+        }
     }
     if let gate::Standing::NeedsFix { reasons } = standing {
         profile["reasons"] = json!(reasons);
@@ -1654,8 +1656,8 @@ fn shown_note(note: &str) -> String {
     note.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(SHOWN_NOTE_CHARS).collect()
 }
 
-/// The account's active TINs that can send: a paused one and a test TIN
-/// are left out.
+/// The account's active TINs that can send: a paused one is left out. A
+/// test TIN is listed, with `test_only: true`: its sends are dry runs.
 /// `full` adds the raw TIN and filing permissions, for the Buwiz BIR app
 /// only.
 pub async fn active_profiles(db: &PgPool, account_id: Uuid, full: bool) -> sqlx::Result<Vec<Value>> {
@@ -1706,6 +1708,9 @@ fn profile_json(id: Uuid, tin: &Tin, registered_name: &str, activated_at: Offset
     });
     if full {
         profile["tin"] = json!(tin.to_string());
+    }
+    if tin.is_test() {
+        profile["test_only"] = json!(true);
     }
     profile
 }

@@ -777,10 +777,10 @@ mod tests {
                 (O::Failed, S::None, W::None, W::None, Some(K::Mismatch), false, false),
             ),
             (
-                "a test TIN, refused by the Sender",
+                "a paused TIN, refused by the relay",
                 vec![Says("live")],
                 "failed",
-                crate::filing::gate::Standing::TestOnly.failure(),
+                crate::filing::gate::Standing::Paused.failure(),
                 (O::Failed, S::None, W::None, W::None, Some(K::Refusal), false, false),
             ),
             (

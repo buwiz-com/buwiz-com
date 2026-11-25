@@ -127,12 +127,21 @@ test-label controls, so the label a test TIN holds in place could not come
 off; the form is not shown there). An Admin whose own account another Admin
 labelled adds one to it as to anyone's; its line names them as the actor
 ("Staff … activated their own TIN …"), and the claim is flagged
-"Activated by its owner, an admin". It never sends, whatever `BIR_RELAY_MODE` says:
-the send gate refuses it with `tin_test_only` (tickets, both submission
-calls, the relay), and the Sender refuses one too. It shows as a test TIN
-on My TINs, on the staff pages, in the apps' TIN list and in an AI
-agent's list of TIN claims (`status: test_only`, paused or not, and
-`test_only: true`); the plain licence list leaves it out. The
+"Activated by its owner, an admin". Nothing for it ever reaches the BIR,
+whatever `BIR_RELAY_MODE` says: the send gate treats it as any TIN (an
+active one sends on tickets, both submission calls and the relay; a paused
+one is refused `tin_paused`; a banned or practice account is refused
+first, `account_banned` then `account_practice`), and the Sender makes
+every send for it a dry run, deciding from the TIN in the ticket or the
+return. The send ends `dry_run`, with a receipt saying `dry_run` signed by
+the usual receipt key, and no uptime record
+([relay-protocol.md](relay-protocol.md#test-tins)). That lets the owner
+send from the real release apps against production, end to end, with
+nothing filed. (Before this, the gate refused one with `tin_test_only`.)
+It shows as a test TIN on My TINs, on the staff pages, in the apps' TIN
+list and the licence list, and in an AI agent's list of TIN claims (each
+with `test_only: true`; the TIN list's `message` says it sends as a dry
+run). The
 label cannot come off an account while it holds one that has not ended
 (`test_tins_held`): revoke it first. Migration 13 keeps it so in the
 database: such a row is only ever an Admin's or the seed tool's, active
@@ -454,15 +463,16 @@ The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 ## Licence gate
 
 `GET /api/tax-profiles` lists the account's active TINs that can send (a
-paused one and a test TIN are left out). The apps unlock their BIR tools when any profile
+paused one is left out; a test TIN is listed with `test_only: true`, and
+its sends are dry runs). The apps unlock their BIR tools when any profile
 has permissions. With `?include=pending`, it also lists TINs that are still
 being checked or were sent back. Each of those has a `status` and no
 `filing.submit` permission.
 
 With `?include=all` (also in a comma list) the answer is
 `{"include":"all","profiles":[…]}`: every TIN on the account that has not
-ended, with `status` (`approved`, `paused`, `test_only`, `unverified`,
-`pending`, `needs_fix`), `can_send`, `message` and `action` (the id-based Verify or Fix
+ended, with `status` (`approved`, `paused`, `unverified`, `pending`,
+`needs_fix`; older servers also sent `test_only` for a test TIN), `can_send`, `message` and `action` (the id-based Verify or Fix
 link). `approved` means it can send. Sent-back rows add `reasons`,
 `reason_codes` and the staff `note`. Only the BIR app's token gets the full
 TIN, filing permissions, links and the note. The golden example is

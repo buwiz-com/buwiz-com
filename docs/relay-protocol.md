@@ -92,10 +92,22 @@ app that can send treats it as a plain failed try (not sent), never as
 | `tin_pending` | Papers waiting for review | This TIN's papers are still being checked, usually within one business day. You can send once it is active. |
 | `tin_needs_fix` | Sent back for a fix | `Sent back for a fix: ` and the fixed reason sentences (never the staff's own note), or `Sent back for a fix. See what to change on My TINs at account.buwiz.com.` |
 | `tin_paused` | Active, but sending is paused | Sending is paused for this TIN. Write to support@buwiz.com. |
-| `tin_test_only` | Active, but a test TIN (root `000-000-000`, which staff add to test accounts only): it never sends, in any relay mode, and a paused one answers this code too | This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR. |
 | `tin_not_active` | Anything else | this TIN is not active on your account |
 | `account_banned` | The account is banned (every bearer call but `POST /api/auth/logout`; the token refresh still works) | This Buwiz account is banned: it can't send returns. Write to support@buwiz.com. |
 | `account_practice` | A practice account: one with a fixed sign-in code stored, the kind app-store reviewers use. `practice` on `GET /me` is narrower (it also needs no role and no ban), so the server may refuse an account whose `/me` says `false`. Tickets, both submission calls and the relay refuse it, whatever the TIN (a `POST /api/submissions` retried with the idempotency key of a return already stored gets that return first); its TIN list is as anyone's | This is a practice account: you can prepare returns, but Buwiz never sends them to the BIR. |
+
+The account's codes come before any TIN's, in this order: `account_banned`,
+then `account_practice`, then the TIN's own. A practice account holding a
+test TIN is refused `account_practice`.
+
+A **test TIN** (root `000-000-000`, any branch, which staff add to
+test-labelled accounts only) answers as any TIN does: an active one is
+sendable (a paused one answers `tin_paused`), and its send ends as a dry
+run (section 3, [Test TINs](#test-tins)). Servers before the dry run
+refused an active test TIN, paused or not, with `tin_test_only` ("This is
+a test TIN: you can prepare returns for it, but Buwiz never sends them to
+the BIR."); this server never sends that code. An app that still knows it
+treats it as the refusal it was: back to a draft, no retry.
 
 None of these is worth retrying: the return goes back to a draft with the
 words shown. Nor is `return_mismatch` (a `400` from `POST /api/submissions`,
@@ -116,15 +128,17 @@ Never resend a relay `unknown` by itself. A failure whose `class` is
 `GET /api/tax-profiles?include=all` (Bearer, any scope; `all` may come in a
 comma list, `include=all,pending`) answers
 `{"include":"all","profiles":[…]}`: every TIN on the account that has not
-ended, each with `status` (`approved`, `paused`, `test_only`,
-`unverified`, `pending`, `needs_fix`), `can_send`, a `message`, and an
-`action` link to Verify or Fix. A test TIN's row also has
-`"test_only": true` (no other row has the field). `status` is `approved` exactly when `can_send` is true; both come from
+ended, each with `status` (`approved`, `paused`, `unverified`,
+`pending`, `needs_fix`; older servers also sent `test_only`), `can_send`,
+a `message`, and an `action` link to Verify or Fix. A test TIN's row also
+has `"test_only": true` (no other row has the field), and an active one's
+`message` says its sends are dry runs. `status` is `approved` exactly when `can_send` is true; both come from
 the same rule as the refusals above. A `needs_fix` row also carries
 `reasons`, `reason_codes` and the staff `note` (at most 200 characters, BIR
 app only). Only the BIR app (`app` scope) gets `tin`, filing permissions,
 the link and the note. Without `all`, the list means what it always did,
-except that a paused TIN and a test TIN are left out. `tests/fixtures/tax_profiles_all.json`
+except that a paused TIN is left out; a test TIN that can send is listed,
+with `"test_only": true`. `tests/fixtures/tax_profiles_all.json`
 is the golden example; [accounts.md](accounts.md#licence-gate) has more.
 
 ## 2. Open the pipe
@@ -172,7 +186,7 @@ What the server does over the pipe:
 | `status` | Meaning | What the app does |
 |---|---|---|
 | `sent` | BIR's server accepted the file. `receipt` is a signed receipt. | Mark the return **Sent** and store the receipt. |
-| `dry_run` | The server is in dry-run mode. Nothing reached BIR. | Treat as a test. |
+| `dry_run` | A dry run: the Sender is in dry-run mode, or the return is for a test TIN. Nothing reached BIR. `receipt` is a signed receipt saying `dry_run`. | Treat as a test: show it as a dry run, never as filed. |
 | `failed` | Nothing reached BIR. `error` says why (`relay not built in` from a server built without the `bir` feature). | Retry later by opening the relay again (same submission, within 24 h), unless `error` ends with a refusal code in brackets (below). |
 | `unknown` | The connection broke during the upload. BIR may have the file. | Do **not** resend automatically. Ask the person to check for BIR's confirmation email. |
 
@@ -205,6 +219,21 @@ retry. What the message repeats from the return is cut at 40
 characters. A send already under way on another
 connection keeps its own outcome.
 
+### Test TINs
+
+A return for a test TIN (root `000-000-000`) goes the whole production
+route, ticket or v1 return, relay and Sender, with no new request field.
+The Sender makes its send a dry run whatever its `BIR_RELAY_MODE`, deciding
+from the TIN in the verified ticket (v2) or in the job, once the return was
+checked against it (v1): it encrypts the return and stops, with no
+dispatcher login and no upload stream. The `result` is `dry_run` with a
+receipt whose `mode` and `status` are both `dry_run`, signed with the usual
+receipt key (the one in `/.well-known/jwks.json` and the trust list). The
+submission ends `dry_run`, as every dry run does, and
+`GET /api/submissions/{id}` shows the receipt as for any send. Such a send
+has no uptime record and is never held ([bir-uptime.md](bir-uptime.md)).
+An app shows it as a dry run (a test send), never as filed.
+
 Opening the relay again for a submission that is already `sent` returns
 the same receipt and does not send again. `GET /api/submissions/{id}` and
 `GET /api/submissions` show the status at any time.
@@ -222,8 +251,8 @@ matched by `kid`.
 | `xml_sha256` | SHA-256 of the plaintext XML the app sent. Compare it with your own. |
 | `payload_sha256` | SHA-256 of the encrypted file as uploaded |
 | `remote_path` | Path on BIR's server |
-| `mode` | `live`, `lab` or `dry_run` |
-| `status` | `sent` or `dry_run` |
+| `mode` | `live`, `lab` or `dry_run` (always `dry_run` for a test TIN) |
+| `status` | `sent` or `dry_run` (always `dry_run` for a test TIN) |
 | `iat` | Time sent (Unix seconds) |
 | `iss` | The server |
 | `jti` | v2 only: the ticket the send used |
@@ -417,8 +446,9 @@ The Gatekeeper reaches the Sender at `SENDER_URL` and presents
   Sender's `result`, which it records. If the app goes away, the Gatekeeper
   closes the Sender's streams and waits up to 60 s for its outcome.
 - The Sender's first text frame on that socket is
-  `{"type":"sender","mode":"live"}` (`live`, `lab` or `dry_run`, its
-  `BIR_RELAY_MODE`), before any `open`. The Gatekeeper reads the mode for
+  `{"type":"sender","mode":"live"}` (`live`, `lab` or `dry_run`: the mode
+  it sends this job in, its `BIR_RELAY_MODE`, or `dry_run` for a test
+  TIN's job), before any `open`. The Gatekeeper reads the mode for
   its record of the try ([bir-uptime.md](bir-uptime.md#14-the-per-try-record))
   and never forwards this frame to the app, whatever its other fields
   hold. The two processes ship from one build and restart together; a try

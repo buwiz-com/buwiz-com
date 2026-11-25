@@ -1,7 +1,8 @@
 //! Test TINs: a made-up TIN (root 000-000-000) an Admin adds to a test
 //! account, active at once. It is marked as a test TIN wherever it is
-//! listed, and it never sends: the send gate refuses it (`tin_test_only`)
-//! on every path, whatever the relay mode.
+//! listed, and the send gate treats it as any TIN: an active one sends on
+//! every path, and the Sender makes each send a dry run, whatever the relay
+//! mode (see `src/sender`).
 
 mod common;
 
@@ -9,14 +10,15 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use buwiz_cloud::filing::gate;
 use buwiz_cloud::filing::submissions::{self, RelayStart};
-use buwiz_cloud::relay::Control;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use common::*;
 
-const TEST_ONLY: &str = "This is a test TIN: you can prepare returns for it, but Buwiz never sends them to the BIR.";
+const TEST_TIN: &str =
+    "A test TIN: a send for it ends as a dry run, with a signed receipt. Buwiz never sends it to the BIR.";
+const PAUSED: &str = "Sending is paused for this TIN. Write to support@buwiz.com.";
 const FORM: &str = "tin=000-000-000-00000&kind=personal&registered_name=Test+Taxpayer&reason=Trying+the+app";
 
 /// A signed-in account with the test label: (id, cookie).
@@ -79,21 +81,22 @@ async fn an_admin_adds_a_test_tin_to_a_test_account_and_every_list_marks_it(db: 
     let tins = text(site.get("/tins", &ana_cookie).await).await;
     assert!(tins.contains("Test TIN") && tins.contains("Buwiz never sends them to the BIR"), "{tins}");
 
-    // The apps' TIN list marks it and says it cannot send; the licence
-    // list (TINs that can send) leaves it out.
+    // The apps' TIN list marks it, active and able to send (as a dry
+    // run); so does the licence list (TINs that can send).
     let token = app_token(&site.db, ana).await;
     let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;
     assert_eq!(all.as_array().unwrap().len(), 1, "{all}");
     let row = &all[0];
     assert_eq!(
         (&row["test_only"], &row["status"], &row["can_send"], &row["message"], &row["tin"]),
-        (&json!(true), &json!("test_only"), &json!(false), &json!(TEST_ONLY), &json!("000-000-000-00000")),
+        (&json!(true), &json!("approved"), &json!(true), &json!(TEST_TIN), &json!("000-000-000-00000")),
         "{row}"
     );
-    assert!(!row["permissions"].as_array().unwrap().contains(&json!("filing.submit")), "{row}");
+    assert!(row["permissions"].as_array().unwrap().contains(&json!("filing.submit")), "{row}");
     for query in ["", "?include=pending"] {
         let listed = profiles(&site, &token, &format!("/api/tax-profiles{query}")).await;
-        assert_eq!(listed, json!([]), "{query}");
+        assert_eq!(listed.as_array().unwrap().len(), 1, "{query}: {listed}");
+        assert_eq!((&listed[0]["test_only"], &listed[0]["tin"]), (&json!(true), &json!("000-000-000-00000")));
     }
     // An AI agent's list of TIN claims marks it too.
     let agent = common::token(&site.db, ana, "an-agent", "mcp").await;
@@ -106,11 +109,15 @@ async fn an_admin_adds_a_test_tin_to_a_test_account_and_every_list_marks_it(db: 
     let content: Value = serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let row = &content["claims"][0];
     // The same status the apps' list gives it.
-    assert_eq!((&row["status"], &row["test_only"]), (&json!("test_only"), &json!(true)), "{content}");
+    assert_eq!((&row["status"], &row["test_only"]), (&json!("approved"), &json!(true)), "{content}");
     // Other rows read as before: no `test_only` on them.
     add_claim(&site.db, ana, "000123453", "approved").await;
     let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;
-    assert!(all[0].get("test_only").is_none() && all[0]["can_send"] == json!(true), "{all}");
+    let real = all.as_array().unwrap().iter().find(|row| row["tin"] == "000-123-453-00000").unwrap();
+    assert!(real.get("test_only").is_none() && real["can_send"] == json!(true), "{all}");
+    let listed = profiles(&site, &token, "/api/tax-profiles").await;
+    let real = listed.as_array().unwrap().iter().find(|row| row["tin"] == "000-123-453-00000").unwrap();
+    assert!(real.get("test_only").is_none(), "{listed}");
 }
 
 /// What the form refuses: an account without the test label, a TIN that
@@ -209,24 +216,23 @@ fn ticket_body(key: &str) -> Value {
     })
 }
 
-/// The send gate refuses an active test TIN with its own code on every
-/// path: a ticket (so no v2 send or test send), a v1 return, a sealed
-/// return whose claim turned out to be one, and the relay. The server runs
-/// as in production here (no BIR_RELAY_MODE of its own): it never trusts a
-/// mode to let one through.
+/// The send gate lets an active test TIN through on every path, as any
+/// active TIN: a ticket, a v1 return and the relay's lock. The server runs
+/// as in production here (no BIR_RELAY_MODE of its own): the Sender, not
+/// the gate, makes the send a dry run.
 #[sqlx::test(migrations = "./migrations")]
-async fn the_gate_refuses_a_test_tin_with_its_own_code(db: PgPool) {
+async fn the_gate_lets_an_active_test_tin_send(db: PgPool) {
     let site = Site::new(db);
     let (_, staff) = site.person(STAFF).await;
     let (ana, _) = test_account(&site, "ana@example.test").await;
     site.post(&format!("/staff/users/{ana}/test-tin"), &staff, FORM).await;
     let claim = test_tins(&site.db, ana).await[0].0;
-    let refused = (403, "tin_test_only".to_owned(), TEST_ONLY.to_owned());
 
     let device = TestDevice::new(&site.db, ana).await;
-    assert_eq!(refusal(device.post(&site, "/api/tickets", &ticket_body("t1")).await).await, refused);
+    let response = device.post(&site, "/api/tickets", &ticket_body("t1")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
     let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&site.db).await.unwrap();
-    assert_eq!(tickets, 0);
+    assert_eq!(tickets, 1);
 
     let v1 = json!({
         "filename": "00000000000000-1701Qv2018-2026Q1#ana@example.test#.xml",
@@ -237,38 +243,25 @@ async fn the_gate_refuses_a_test_tin_with_its_own_code(db: PgPool) {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(v1.to_string()))
         .unwrap();
-    assert_eq!(refusal(site.send(request).await).await, refused);
+    let response = site.send(request).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let stored: Value = serde_json::from_str(&text(response).await).unwrap();
 
     let tin = buwiz_cloud::tin::Tin::parse_any("000000000", "").unwrap();
-    assert_eq!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::TestOnly);
-    assert_eq!(gate::of_claim(&site.db, ana, claim).await.unwrap(), gate::Standing::TestOnly);
+    assert_eq!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::Sendable { claim_id: claim });
+    assert_eq!(gate::of_claim(&site.db, ana, claim).await.unwrap(), gate::Standing::Sendable { claim_id: claim });
 
-    // A return stored for it anyway (none can be, through the API) never
-    // goes to the Sender: the relay fails it with the reason.
-    let stored: Uuid = sqlx::query_scalar(
-        "INSERT INTO submissions (account_id, claim_id, form_type, period, filename, xml_sha256, status,
-             xml_nonce, xml_ciphertext)
-         VALUES ($1, $2, '1701Qv2018', '2026Q1', 'f.xml', decode('00', 'hex'), 'ready', decode('01', 'hex'), decode('02', 'hex'))
-         RETURNING id",
-    )
-    .bind(ana)
-    .bind(claim)
-    .fetch_one(&site.db)
-    .await
-    .unwrap();
-    match submissions::claim_for_relay(&site.db, ana, stored).await.unwrap() {
-        RelayStart::Answer(Control::Result { status, error, receipt: None }) => {
-            assert_eq!((status.as_str(), error), ("failed", Some(format!("{TEST_ONLY} (tin_test_only)"))));
-        }
+    let id: Uuid = stored["id"].as_str().unwrap().parse().unwrap();
+    match submissions::claim_for_relay(&site.db, ana, id).await.unwrap() {
+        RelayStart::Send(_) => {}
         RelayStart::Answer(other) => panic!("{other:?}"),
-        RelayStart::Send(_) => panic!("the relay would have sent a test TIN's return"),
     }
 }
 
-/// A paused test TIN still answers as a test TIN: never sendable, paused
-/// or not, so the gate and the apps' list say test_only first.
+/// A paused test TIN answers as any paused TIN, in the gate and in the
+/// apps' list.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_paused_test_tin_still_answers_test_only(db: PgPool) {
+async fn a_paused_test_tin_answers_as_paused(db: PgPool) {
     let site = Site::new(db);
     let (_, staff) = site.person(STAFF).await;
     let (ana, _) = test_account(&site, "ana@example.test").await;
@@ -278,13 +271,18 @@ async fn a_paused_test_tin_still_answers_test_only(db: PgPool) {
     assert_eq!(location(&response), format!("/staff/claims/{claim}?notice=tin_paused"));
 
     let device = TestDevice::new(&site.db, ana).await;
-    let refused = (403, "tin_test_only".to_owned(), TEST_ONLY.to_owned());
+    let refused = (403, "tin_paused".to_owned(), PAUSED.to_owned());
     assert_eq!(refusal(device.post(&site, "/api/tickets", &ticket_body("p1")).await).await, refused);
     let tin = buwiz_cloud::tin::Tin::parse_any("000000000", "").unwrap();
-    assert_eq!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::TestOnly);
+    assert_eq!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::Paused);
     let token = app_token(&site.db, ana).await;
     let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;
-    assert_eq!((&all[0]["status"], &all[0]["message"]), (&json!("test_only"), &json!(TEST_ONLY)), "{all}");
+    assert_eq!(
+        (&all[0]["status"], &all[0]["message"], &all[0]["test_only"]),
+        (&json!("paused"), &json!(PAUSED), &json!(true)),
+        "{all}"
+    );
+    assert_eq!(profiles(&site, &token, "/api/tax-profiles").await, json!([]));
 }
 
 /// A test TIN proves no identity: an account whose only TIN is one reads
@@ -366,41 +364,4 @@ async fn an_admin_emails_address_gets_no_test_tin(db: PgPool) {
     let response = site.post(&format!("{user}/test-tin"), &staff, FORM).await;
     assert_eq!(location(&response), format!("{user}?notice=test_label_from_server"));
     assert!(test_tins(&site.db, boss).await.is_empty());
-}
-
-/// The sealed-return call refuses a test TIN's claim itself: a ticket for
-/// one (which the Gatekeeper never issues; here the claim became one after
-/// its ticket) is refused with tin_test_only, and not spent.
-#[sqlx::test(migrations = "./migrations")]
-async fn a_sealed_return_for_a_test_tins_claim_is_refused(db: PgPool) {
-    let site = Site::new(db);
-    let (ana, _) = test_account(&site, "ana@example.test").await;
-    let claim = add_claim(&site.db, ana, "000123453", "approved").await;
-    let device = TestDevice::new(&site.db, ana).await;
-    let body = json!({
-        "tin": "00012345300000",
-        "form": "1701Qv2018",
-        "period": "2026Q1",
-        "payload_sha256": "ab".repeat(32),
-        "email": "ana@example.test",
-        "idempotency_key": "v2",
-    });
-    let response = device.post(&site, "/api/tickets", &body).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let issued: Value = serde_json::from_str(&text(response).await).unwrap();
-    sqlx::query("UPDATE tin_claims SET tin_root = '000000000', verified_by = 'admin' WHERE id = $1")
-        .bind(claim)
-        .execute(&site.db)
-        .await
-        .unwrap();
-    let envelope = json!({ "kid": "k", "enc": "e", "ct": "c" });
-    let sealed = json!({ "ticket": issued["ticket"], "envelope": envelope });
-    let refused = refusal(device.post(&site, "/api/v2/submissions", &sealed).await).await;
-    assert_eq!(refused, (403, "tin_test_only".to_owned(), TEST_ONLY.to_owned()));
-    let (used, submissions): (bool, i64) =
-        sqlx::query_as("SELECT (SELECT bool_or(used_at IS NOT NULL) FROM tickets), (SELECT count(*) FROM submissions)")
-            .fetch_one(&site.db)
-            .await
-            .unwrap();
-    assert_eq!((used, submissions), (false, 0));
 }

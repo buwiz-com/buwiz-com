@@ -607,6 +607,128 @@ async fn a_practice_account_never_sends(db: PgPool) {
     assert!(matches!(submissions::claim_for_relay(db, reviewer, v1).await.unwrap(), RelayStart::Send(_)));
 }
 
+/// Gives `account` the test label and the active test TIN
+/// `000-000-000-{branch}`, as an Admin adds one.
+async fn test_tin(db: &PgPool, account: Uuid, branch: &str) -> Uuid {
+    sql(db, "UPDATE accounts SET test_account = true WHERE id = $1", account).await;
+    sqlx::query_scalar(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'personal', '000000000', $2, 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
+    )
+    .bind(account)
+    .bind(branch)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// A ticket for `tin` (14 digits).
+fn test_ticket_body(tin: &str, key: &str) -> Value {
+    let mut body = ticket_body("000000000", key);
+    body["tin"] = json!(tin);
+    body
+}
+
+/// A v1 return for `tin` (14 digits).
+fn test_v1_body(tin: &str) -> Value {
+    json!({
+        "filename": format!("{tin}-1701Qv2018-2026Q1#ana@example.test#.xml"),
+        "xml": common::iaf_return("frm1701q", tin, "2026"),
+    })
+}
+
+/// An active test TIN sends on every route, as any active TIN does: a
+/// ticket, a v1 return, a sealed return and the relay's lock. Its send is a
+/// dry run, which the Sender forces (see `src/sender`); the gate never
+/// tells it apart. The account checks still come first, in their order:
+/// banned, then practice, then the TIN.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_active_test_tin_sends_after_the_account_checks(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (ana, _) = site.person("ana@example.test").await;
+    let (admin, _) = site.person(STAFF).await;
+    let claim = test_tin(db, ana, "00000").await;
+    let device = TestDevice::new(db, ana).await;
+    let tin = "00000000000000";
+
+    let response = device.post(&site, "/api/tickets", &test_ticket_body(tin, "t1")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let issued: Value = serde_json::from_str(&text(response).await).unwrap();
+    let envelope = json!({ "kid": "k", "enc": "e", "ct": "c" });
+    let response =
+        device.post(&site, "/api/v2/submissions", &json!({ "ticket": issued["ticket"], "envelope": envelope })).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let sealed: Value = serde_json::from_str(&text(response).await).unwrap();
+    let response = post_v1(&site, &device.token, &test_v1_body(tin)).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plain: Value = serde_json::from_str(&text(response).await).unwrap();
+    for view in [&sealed, &plain] {
+        assert_eq!(view["status"], "ready", "{view}");
+        let id: Uuid = view["id"].as_str().unwrap().parse().unwrap();
+        assert!(matches!(submissions::claim_for_relay(db, ana, id).await.unwrap(), RelayStart::Send(_)));
+    }
+
+    // A practice account holding a test TIN: the account's answer, on
+    // every route, before the TIN is looked at.
+    let v1 = submission(db, ana, claim, "ready", false).await;
+    let v2 = submission(db, ana, claim, "ready", true).await;
+    let response = device.post(&site, "/api/tickets", &test_ticket_body(tin, "t2")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let before: Value = serde_json::from_str(&text(response).await).unwrap();
+    make_practice(db, ana, admin).await;
+    let practice = (403, "account_practice".to_owned(), PRACTICE.to_owned());
+    assert_eq!(refusal(device.post(&site, "/api/tickets", &test_ticket_body(tin, "t3")).await).await, practice);
+    assert_eq!(refusal(post_v1(&site, &device.token, &test_v1_body(tin)).await).await, practice);
+    let sealed = json!({ "ticket": before["ticket"], "envelope": envelope });
+    assert_eq!(refusal(device.post(&site, "/api/v2/submissions", &sealed).await).await, practice);
+    let failed = format!("{PRACTICE} (account_practice)");
+    let (status, error) = answered(submissions::claim_for_relay(db, ana, v1).await.unwrap());
+    assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(failed.as_str())));
+
+    // Banned as well: the ban's answer comes first.
+    sqlx::query("UPDATE accounts SET banned_at = now(), banned_by = $2, ban_reason = 'Abuse.' WHERE id = $1")
+        .bind(ana)
+        .bind(admin)
+        .execute(db)
+        .await
+        .unwrap();
+    let banned = (403, "account_banned".to_owned(), BANNED.to_owned());
+    assert_eq!(refusal(device.post(&site, "/api/tickets", &test_ticket_body(tin, "t4")).await).await, banned);
+    assert_eq!(refusal(post_v1(&site, &device.token, &test_v1_body(tin)).await).await, banned);
+    assert_eq!(refusal(device.post(&site, "/api/v2/submissions", &sealed).await).await, banned);
+    let failed = format!("{BANNED} (account_banned)");
+    let (status, error) = answered(submissions::claim_for_relay(db, ana, v2).await.unwrap());
+    assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(failed.as_str())));
+    assert_eq!(count(db, "SELECT count(*) FROM submissions WHERE status = 'sending'").await, 2);
+}
+
+/// A paused test TIN answers as any paused TIN: `tin_paused`, on every
+/// route, and the relay fails a return waiting for it.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_paused_test_tin_is_refused_as_paused(db: PgPool) {
+    let site = Site::new(db);
+    let db = &site.db;
+    let (ana, _) = site.person("ana@example.test").await;
+    let claim = test_tin(db, ana, "00003").await;
+    let device = TestDevice::new(db, ana).await;
+    let tin = "00000000000003";
+    let response = device.post(&site, "/api/tickets", &test_ticket_body(tin, "p1")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let before: Value = serde_json::from_str(&text(response).await).unwrap();
+    let waiting = submission(db, ana, claim, "ready", true).await;
+    pause(db, claim).await;
+
+    let paused = (403, "tin_paused".to_owned(), PAUSED.to_owned());
+    assert_eq!(refusal(device.post(&site, "/api/tickets", &test_ticket_body(tin, "p2")).await).await, paused);
+    assert_eq!(refusal(post_v1(&site, &device.token, &test_v1_body(tin)).await).await, paused);
+    let sealed = json!({ "ticket": before["ticket"], "envelope": { "kid": "k", "enc": "e", "ct": "c" } });
+    assert_eq!(refusal(device.post(&site, "/api/v2/submissions", &sealed).await).await, paused);
+    let failed = format!("{PAUSED} (tin_paused)");
+    let (status, error) = answered(submissions::claim_for_relay(db, ana, waiting).await.unwrap());
+    assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(failed.as_str())));
+}
+
 /// The two forms of each rule agree on every status, paused and not: the
 /// SQL the relay and the licence list use, and the Rust the gate and the
 /// TIN list use. The one-live-row index holds exactly the live statuses.
@@ -646,7 +768,7 @@ async fn the_sql_and_the_rust_forms_of_the_gate_agree(db: PgPool) {
             .fetch_one(db)
             .await
             .unwrap();
-            let standing = gate::classify(id, status, paused, &[], false);
+            let standing = gate::classify(id, status, paused, &[]);
             assert_eq!(sendable, standing.can_send(), "{status} paused={paused}");
             assert_eq!(live, gate::is_live(status), "{status}");
             assert_eq!(live, standing != gate::Standing::NotActive, "{status}");
@@ -683,13 +805,15 @@ async fn the_sql_and_the_rust_forms_of_the_gate_agree(db: PgPool) {
                     .fetch_one(db)
                     .await
                     .unwrap();
-            let standing = gate::classify(id, status, paused, &[], true);
-            assert!(!sendable && !standing.can_send(), "{status} paused={paused}");
+            let standing = gate::classify(id, status, paused, &[]);
+            assert_eq!(sendable, standing.can_send(), "{status} paused={paused}");
             let tin = buwiz_cloud::tin::Tin::parse_any("000000000", &format!("{branch:05}")).unwrap();
             let own = gate::own(db, ana, &tin).await.unwrap();
-            // Paused or not, an active test TIN answers tin_test_only.
-            let expected = match status {
-                "approved" => gate::Standing::TestOnly,
+            // A test TIN stands as any TIN: active and unpaused, it sends
+            // (as a dry run, the Sender's doing); paused, it is paused.
+            let expected = match (status, paused) {
+                ("approved", false) => gate::Standing::Sendable { claim_id: id },
+                ("approved", true) => gate::Standing::Paused,
                 _ => gate::Standing::NotActive,
             };
             assert_eq!((&standing, &own), (&expected, &expected), "{status} paused={paused}");

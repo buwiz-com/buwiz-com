@@ -499,9 +499,9 @@ Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
 TIN: every page that lists one stops with an error. So the down file
 refuses while any row holds one, ended ones too, and then changes nothing.
 Revoke each test TIN on the staff pages first (the history keeps who and
-why), stop the app, delete the rows (none can have tickets or returns, as
-the gate refuses them, but the file's comment has the statements for those
-too), then:
+why), stop the app, delete the rows (since the
+[test-TIN dry run](#deploying-the-test-tin-dry-run) they may have tickets
+and returns; the file's comment has the statements for those), then:
 ```sh
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0013_test_tins.down.sql
 psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 12
@@ -511,6 +511,53 @@ and put the previous binaries back. Their audit lines stay (the TIN masked,
 then 12's and 11's as [above](#rolling-back), step by step: 13's commits
 before 12's checks run, and a refusal by 12's leaves the database at 12
 ([Rolling back from 13](#rolling-back-from-13)).
+
+## Deploying the test-TIN dry run
+
+The release with the test-TIN dry run lets an active test TIN (root
+`000-000-000`, on a test account, added by staff) send through the whole
+production route, and makes the Sender turn every such send into a dry
+run, whatever `BIR_RELAY_MODE` says. The first filings from each platform's
+release app (Mac, Windows, iPhone, iPad, Android) can then end in a signed
+`dry_run` receipt while the server stays at `BIR_RELAY_MODE=live`.
+
+What changes on deploy:
+- the gate no longer refuses a test TIN with `tin_test_only`: an active
+  one gets tickets and its returns are taken (a paused one answers
+  `tin_paused`; a banned or practice account is refused first, as before);
+- the licence list (`GET /api/tax-profiles`) lists a test TIN, with
+  `test_only: true`;
+- the Sender sends a test TIN's return in `dry_run`: no dispatcher login,
+  no upload stream. Its receipt says `"mode":"dry_run"`,
+  `"status":"dry_run"`, signed with the usual receipt key, and the
+  submission ends `dry_run`;
+- such a send gets no `bir_tries` row and moves no part of the BIR sign.
+
+It needs no setting, no migration and no new secret; the Gatekeeper and
+the Sender come from the same build and restart together, as always
+([The Sender](#the-sender)). Real TINs send exactly as before.
+
+**Checking it after deploy, without filing anything.** Only a test TIN can
+be used, so nothing reaches the BIR:
+1. On a test-labelled account that is **not** a practice one (no fixed
+   sign-in code), add a test TIN on its staff page ("Add a test TIN").
+2. From a release app signed in to it, send any return for that TIN. The
+   app should show a dry run (a test send), not "filed".
+3. `GET /api/submissions/{id}` shows `"status":"dry_run"`,
+   `"mode":"dry_run"` and the receipt; its payload's `mode` and `status`
+   are `dry_run`.
+4. The Sender's journal has the dry-run lines for that submission, and no
+   dispatcher line:
+   ```sh
+   sudo journalctl -u buwiz-sender.service --since -10min --no-pager -o cat | grep -E 'test TIN: dry run|dry run: not sent to BIR'
+   ```
+5. No uptime row was written for it (read-only):
+   ```sql
+   SELECT count(*) FROM bir_tries WHERE started_at > now() - interval '10 minutes';  -- unchanged by the test send
+   ```
+
+To roll back, put the previous binaries back: they refuse a test TIN again
+(`tin_test_only`), and the `dry_run` submissions stay as they are.
 
 ## Migration 14 (BIR uptime)
 

@@ -55,6 +55,9 @@ pub struct Mailer {
     failing: AtomicBool,
     /// Tests only: a recording mailer that fails every new-device mail.
     failing_new_devices: AtomicBool,
+    /// Tests only: new-device tasks wait at their start while this is set
+    /// ([`Mailer::hold_new_device_mails`]).
+    holding_new_devices: AtomicBool,
     /// Tests only: a recording mailer that fails every app's code.
     failing_app_codes: AtomicBool,
     /// How many new-device checks have finished, mail or not: tests wait
@@ -153,6 +156,7 @@ impl Mailer {
             failing: AtomicBool::new(false),
             failing_app_codes: AtomicBool::new(false),
             failing_new_devices: AtomicBool::new(false),
+            holding_new_devices: AtomicBool::new(false),
             new_device_checks: AtomicUsize::new(0),
         }
     }
@@ -215,6 +219,20 @@ impl Mailer {
 
     pub(crate) fn new_device_checked(&self) {
         self.new_device_checks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Tests only: a [`Mailer::recording`] holds every new-device task at
+    /// its start while `hold`, so a test can act before the task runs.
+    pub fn hold_new_device_mails(&self, hold: bool) {
+        self.holding_new_devices.store(hold, Ordering::SeqCst);
+    }
+
+    /// Where a new-device task starts: it waits while a test holds it
+    /// ([`Mailer::hold_new_device_mails`]); otherwise at once.
+    pub(crate) async fn new_device_gate(&self) {
+        while self.new_devices.is_some() && self.holding_new_devices.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Tests only: a [`Mailer::recording`] fails every new-device mail

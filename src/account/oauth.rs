@@ -415,9 +415,15 @@ pub async fn token(
                     OAuthError::new("invalid_request", "code, redirect_uri and code_verifier are required").into()
                 );
             };
-            let redeemed =
-                crate::account::agents::redeem_code(&state.db, &request.client_id, &code, &redirect_uri, &verifier)
-                    .await?;
+            let redeemed = crate::account::agents::redeem_code(
+                &state.db,
+                &state.config.admin_emails,
+                &request.client_id,
+                &code,
+                &redirect_uri,
+                &verifier,
+            )
+            .await?;
             if let Some(app) = redeemed.app {
                 crate::account::agents::mail_new_device(&state, app);
             }

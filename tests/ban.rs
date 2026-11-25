@@ -417,6 +417,7 @@ async fn a_ban_and_a_sign_in_completing_at_once_do_not_deadlock(db: PgPool) {
     let device = site.send(poll);
     let agent = buwiz_cloud::account::agents::redeem_code(
         &site.db,
+        &[],
         "agent_test",
         "code_test",
         "https://agent.example.test/cb",

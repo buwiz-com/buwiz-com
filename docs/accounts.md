@@ -889,8 +889,10 @@ why a new device is mailed.
 ### The new-device mail
 
 After the exchange (on its own task, so the token answer never waits for
-it), when the account has no `devices` row for the install
-(a device new to this account), the account is mailed "New sign-in to
+it), when the account had no `devices` row for the install at the
+exchange (a device new to this account; decided in the exchange's
+transaction, so an app that registers its device at once is still
+mailed), the account is mailed "New sign-in to
 eBIRForms on <platform>": when it happened (Philippine time), and "If
 this wasn't you, log it out at https://account.buwiz.com/tins" (My
 devices). Fixed words only: nothing from the request but the platform's

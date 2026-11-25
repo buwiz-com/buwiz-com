@@ -517,8 +517,11 @@ pub struct Redeemed {
 pub struct SignedInApp {
     pub account_id: Uuid,
     pub grant_id: Uuid,
-    pub install_id: String,
     pub platform: Option<Platform>,
+    /// The address to mail about a new device, decided in the exchange's
+    /// transaction: the account had no device row for the install then,
+    /// and does not sign in with a fixed code. `None`: no mail.
+    pub new_device_to: Option<String>,
 }
 
 /// The `authorization_code` grant: one use, ten minutes, same client and
@@ -529,15 +532,17 @@ pub struct SignedInApp {
 /// Its transaction waits at most three seconds for a connection and for
 /// each lock ([`app_sign_in::begin_waiting`]), as in-app sign-in's do;
 /// then the answer is `503 temporarily_unavailable` and the code is not
-/// used.
+/// used. `admin_emails` is `ADMIN_EMAILS`, for the fixed-code rule of the
+/// new-device mail.
 pub async fn redeem_code(
     db: &PgPool,
+    admin_emails: &[String],
     client_id: &str,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<Redeemed, OAuthFailure> {
-    match redeem_code_inner(db, client_id, code, redirect_uri, verifier).await {
+    match redeem_code_inner(db, admin_emails, client_id, code, redirect_uri, verifier).await {
         Err(OAuthFailure::Internal(error))
             if error.downcast_ref::<sqlx::Error>().is_some_and(app_sign_in::is_lock_timeout) =>
         {
@@ -554,6 +559,7 @@ pub async fn redeem_code(
 
 async fn redeem_code_inner(
     db: &PgPool,
+    admin_emails: &[String],
     client_id: &str,
     code: &str,
     redirect_uri: &str,
@@ -628,28 +634,52 @@ async fn redeem_code_inner(
     }
     let from = oauth::GrantFrom { install_id: install_id.as_deref(), platform: platform.as_deref() };
     let (grant_id, tokens) = oauth::issue_grant_with_id(&mut tx, account_id, client_id, &scope, from).await?;
-    tx.commit().await?;
-    let app = match (scope.as_str(), install_id) {
+    let app = match (scope.as_str(), install_id.as_deref()) {
         (SCOPE_APP, Some(install_id)) => Some(SignedInApp {
             account_id,
             grant_id,
-            install_id,
             platform: platform.as_deref().and_then(Platform::from_stored),
+            new_device_to: new_device_to(&mut tx, account_id, install_id, admin_emails).await?,
         }),
         _ => None,
     };
+    tx.commit().await?;
     Ok(Redeemed { tokens, app })
 }
 
-/// Mails the account when an app signs in on an install it has no device
-/// row for: "New sign-in to eBIRForms on …", with when, and where to log
-/// it out. Never for an account signing in with a fixed code (a store
-/// reviewer's). Runs on its own task after the exchange committed, so the
-/// token answer never waits for it; a mail that fails is logged, with ids
-/// only, and the sign-in stands.
+/// Whom to mail about a sign-in from `install_id`, in the exchange's
+/// transaction: the account's address when it has no device row for the
+/// install at this moment and does not sign in with a fixed code (a store
+/// reviewer's). Decided here, not on the mail's task, so an app that
+/// registers its device at once still has its new device mailed.
+async fn new_device_to(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    install_id: &str,
+    admin_emails: &[String],
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(&format!(
+        "SELECT a.email FROM accounts a
+         WHERE a.id = $1 AND NOT {}
+           AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.account_id = a.id AND d.install_id = $2)",
+        crate::account::roles::fixed_code_sql("a", "$3")
+    ))
+    .bind(account_id)
+    .bind(install_id)
+    .bind(admin_emails)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// Mails "New sign-in to eBIRForms on …", with when, and where to log it
+/// out, to the address the exchange decided on ([`new_device_to`]); none,
+/// no mail. Runs on its own task after the exchange committed, so the
+/// token answer never waits for it, and reads nothing from the database.
+/// A mail that fails is logged, with ids only, and the sign-in stands.
 pub fn mail_new_device(state: &AppState, app: SignedInApp) {
     let state = state.clone();
     tokio::spawn(async move {
+        state.mailer.new_device_gate().await;
         new_device_mail(&state, &app).await;
         state.mailer.new_device_checked();
     });
@@ -657,28 +687,12 @@ pub fn mail_new_device(state: &AppState, app: SignedInApp) {
 
 async fn new_device_mail(state: &AppState, app: &SignedInApp) {
     let at = OffsetDateTime::now_utc();
-    let to: sqlx::Result<Option<String>> = sqlx::query_scalar(&format!(
-        "SELECT a.email FROM accounts a
-         WHERE a.id = $1 AND NOT {}
-           AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.account_id = a.id AND d.install_id = $2)",
-        crate::account::roles::fixed_code_sql("a", "$3")
-    ))
-    .bind(app.account_id)
-    .bind(&app.install_id)
-    .bind(&state.config.admin_emails)
-    .fetch_optional(&state.db)
-    .await;
-    let to = match to {
-        Ok(Some(to)) => to,
-        Ok(None) => return,
-        Err(_) => {
-            tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be looked up");
-            return;
-        }
+    let Some(to) = &app.new_device_to else {
+        return;
     };
     let device = Platform::device(app.platform);
     let tins = format!("{}/tins", state.config.account_origin);
-    if state.mailer.send_new_device(&to, device, at, &tins).await.is_err() {
+    if state.mailer.send_new_device(to, device, at, &tins).await.is_err() {
         tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be sent");
     }
 }

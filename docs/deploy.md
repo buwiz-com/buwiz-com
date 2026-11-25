@@ -1001,9 +1001,12 @@ starts.
   to `device_authorizations`, and to `devices` the columns an app sends
   (`install_id`, `platform`, `model`, `os_version`, `computer_name`) and
   `signed_in_at`. All are nullable with no default when added, so no row
-  is rewritten or scanned; earlier devices read `signed_in_at` as
-  `created_at`. It also adds a trigger on `oauth_grants` that removes a
-  grant's live devices when the grant ends. Each lock is held a moment.
+  is rewritten; earlier devices read `signed_in_at` as `created_at`. Its
+  `ADD COLUMN ... CHECK` does read each of the three tables once, under
+  that table's ACCESS EXCLUSIVE lock, to check the new columns (0018's own
+  comment says no row is scanned, which is wrong). The tables are small,
+  so this is brief. It also adds a trigger on `oauth_grants` that removes
+  a grant's live devices when the grant ends. Each lock is held a moment.
 - **19** builds the unique index of one row per account and install with
   `CREATE UNIQUE INDEX CONCURRENTLY`, outside a transaction (its file
   starts `-- no-transaction`), so signed requests, which update `devices`,

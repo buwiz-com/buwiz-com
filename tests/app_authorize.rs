@@ -640,6 +640,27 @@ async fn a_new_install_is_mailed_and_a_known_device_is_not(db: PgPool) {
     assert_eq!(mails[1].subject, "New sign-in to eBIRForms on Mac");
 }
 
+/// Whether the device is new is decided in the exchange, not on the mail's
+/// task: an app that registers its device before the task runs still has
+/// its new device mailed.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_device_registered_before_the_mail_task_runs_is_still_mailed(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (_, cookie) = site.person(ANA).await;
+    site.state.mailer.hold_new_device_mails(true);
+    let code = approve(&site, &cookie, &[]).await;
+    let (status, tokens) = exchange(&site, CLIENT, &code, SCHEME, &verifier()).await;
+    assert_eq!(status, 200, "{tokens}");
+    assert_eq!(register(&site, tokens["access_token"].as_str().unwrap(), PHONE).await.0, 201);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM devices").await, 1);
+    assert_eq!(site.state.mailer.new_device_checks(), 0, "the task is still held");
+    site.state.mailer.hold_new_device_mails(false);
+    settled(&site, 1).await;
+    let mails = site.state.mailer.new_device_mails();
+    assert_eq!(mails.len(), 1);
+    assert_eq!((mails[0].to.as_str(), mails[0].subject.as_str()), (ANA, "New sign-in to eBIRForms on iPhone"));
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn a_fixed_code_account_is_not_mailed(db: PgPool) {
     let site = Site::with_mailbox(db);

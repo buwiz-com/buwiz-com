@@ -13,10 +13,11 @@
 //! counts, whatever comes of it, and none is given back. They never touch
 //! the web form's count. Tries at a code, the app's and the web form's
 //! together, have another ([`SignInGuard::count_verify_try`]), counted the
-//! same way. Both of these let a new network through uncounted when their
-//! map is full ([`RateLimiter::fail_open_when_full`]), so a flood of
-//! networks locks no other out; behind them the per-address limits, the
-//! testing cap and the database slots still hold.
+//! same way. When their map is full, the networks new that hour share one
+//! budget of tries for the hour, not counted by network
+//! ([`RateLimiter::with_overflow_budget`]), so a flood of networks does not
+//! lock the others out at once; when that is spent too, new networks are
+//! refused until the hour ends.
 
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -40,17 +41,41 @@ const NETWORK_WINDOW: Duration = Duration::hours(1);
 /// anything else is done for them, and never given back, `503 busy`
 /// included: giving those back would let a flood go on trying for nothing
 /// just when the database is saturated. Room for the people behind one
-/// carrier's or office's network.
-pub const APP_ATTEMPTS_PER_NETWORK: u32 = 40;
+/// carrier's or office's network: a carrier's NAT puts many phones behind
+/// one /24, and many of them sign in at once near a filing deadline. A
+/// person needs a start or two; what bounds one address is its five codes
+/// an hour, whatever the network.
+pub const APP_ATTEMPTS_PER_NETWORK: u32 = 200;
 
 /// Tries at a code, `POST /auth/email/verify`, the apps' JSON and the web
 /// form's together, one network may make in an hour, whatever comes of
-/// them. Counted before the body is read, and never given back.
-pub const VERIFY_TRIES_PER_NETWORK: u32 = 60;
+/// them. Counted before the body is read, and never given back. As wide
+/// as start's, for the same carrier networks; guessing is bounded per code
+/// (five tries) and per address (five codes an hour), not by this.
+pub const VERIFY_TRIES_PER_NETWORK: u32 = 300;
+
+/// The tries at start and resend, across every network new in an hour
+/// once the map of networks is full (100,000 networks this hour): one
+/// budget for them all, not counted by network, refused once spent. Real
+/// use does not reach it: it is used only after 100,000 networks have
+/// tried this hour, and it is the tries of 100 more full networks. What it
+/// costs is bounded: about 6 tries a second over the hour against start's
+/// 4 places, where a try that is refused holds a place for a few short
+/// queries, and at most this many Turnstile calls. Mail is bounded apart
+/// from it (five codes an hour per address, the new-address budgets, the
+/// testing cap).
+pub const APP_ATTEMPTS_PAST_FULL: u32 = 20_000;
+
+/// The same for tries at a code: about 8 a second over the hour against
+/// verify's 3 places, and again the tries of 100 full networks. Guessing
+/// stays bounded per code (five tries) and per address (five codes an
+/// hour).
+pub const VERIFY_TRIES_PAST_FULL: u32 = 30_000;
 
 /// How often, at most, staff are mailed that Turnstile's answers lack the
-/// hostname or action ([`SignInGuard::take_unbound_alert`]).
-const UNBOUND_ALERT_EVERY: Duration = Duration::hours(1);
+/// hostname or action ([`SignInGuard::take_unbound_alert`]), or that an
+/// in-app request was stuck ([`SignInGuard::take_stuck_alert`]).
+const ALERT_EVERY: Duration = Duration::hours(1);
 
 /// How long Turnstile may take to answer before the sign-in is refused.
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -74,15 +99,38 @@ pub struct SignInGuard {
     /// Tries at a code per network, the apps' and the web form's.
     verify_tries: RateLimiter<Network>,
     /// Turnstile's answers without a hostname or action, for the staff alert.
-    unbound: Mutex<Unbound>,
+    unbound: HourlyAlert,
+    /// An in-app request that could be neither taken back nor ended after
+    /// its mail failed, for the staff alert.
+    stuck: HourlyAlert,
 }
 
+/// A staff alert raised at most once an hour, and taken once per raise.
 #[derive(Default)]
-struct Unbound {
+struct HourlyAlert(Mutex<Raised>);
+
+#[derive(Default)]
+struct Raised {
     /// When it was last raised.
-    raised: Option<OffsetDateTime>,
+    at: Option<OffsetDateTime>,
     /// Raised and not yet taken for the staff mail.
     alert: bool,
+}
+
+impl HourlyAlert {
+    /// Raises it at `now`, unless it was raised less than an hour before.
+    fn raise(&self, now: OffsetDateTime) {
+        let mut raised = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if raised.at.is_none_or(|at| now - at >= ALERT_EVERY || now < at) {
+            raised.at = Some(now);
+            raised.alert = true;
+        }
+    }
+
+    /// Whether staff are to be told now: once per raise.
+    fn take(&self) -> bool {
+        std::mem::take(&mut self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).alert)
+    }
 }
 
 /// Which widget a token must come from, and how a Turnstile answer without
@@ -157,10 +205,20 @@ impl SignInGuard {
             http: reqwest::Client::builder().timeout(VERIFY_TIMEOUT).build().unwrap_or_default(),
             networks: RateLimiter::new(CODES_PER_NETWORK, NETWORK_WINDOW),
             // Nothing is given back to these two, so a full map must not
-            // lock new networks out (it would, sharing the overflow).
-            app_attempts: RateLimiter::fail_open_when_full(APP_ATTEMPTS_PER_NETWORK, NETWORK_WINDOW),
-            verify_tries: RateLimiter::fail_open_when_full(VERIFY_TRIES_PER_NETWORK, NETWORK_WINDOW),
-            unbound: Mutex::new(Unbound::default()),
+            // lock new networks out at once (it would, sharing an overflow
+            // of one network's size): they share a budget of their own.
+            app_attempts: RateLimiter::with_overflow_budget(
+                APP_ATTEMPTS_PER_NETWORK,
+                NETWORK_WINDOW,
+                APP_ATTEMPTS_PAST_FULL,
+            ),
+            verify_tries: RateLimiter::with_overflow_budget(
+                VERIFY_TRIES_PER_NETWORK,
+                NETWORK_WINDOW,
+                VERIFY_TRIES_PAST_FULL,
+            ),
+            unbound: HourlyAlert::default(),
+            stuck: HourlyAlert::default(),
         }
     }
 
@@ -223,16 +281,19 @@ impl SignInGuard {
     /// Whether staff are to be told now that Turnstile answered without the
     /// hostname or action: once per raise, at most once an hour.
     pub fn take_unbound_alert(&self) -> bool {
-        std::mem::take(&mut self.unbound.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).alert)
+        self.unbound.take()
     }
 
-    /// Notes an answer without the hostname or action, at `now`.
-    fn raise_unbound(&self, now: OffsetDateTime) {
-        let mut unbound = self.unbound.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if unbound.raised.is_none_or(|at| now - at >= UNBOUND_ALERT_EVERY || now < at) {
-            unbound.raised = Some(now);
-            unbound.alert = true;
-        }
+    /// Notes an in-app request that could be neither taken back nor ended
+    /// after its mail failed ([`crate::account::app_sign_in`]).
+    pub fn raise_stuck(&self) {
+        self.stuck.raise(OffsetDateTime::now_utc());
+    }
+
+    /// Whether staff are to be told now of a stuck request: once per raise,
+    /// at most once an hour.
+    pub fn take_stuck_alert(&self) -> bool {
+        self.stuck.take()
     }
 
     /// Counts a post from `address` at `now` against its network's hour.
@@ -337,7 +398,7 @@ impl SignInGuard {
             }
             _ => {
                 tracing::warn!("Turnstile's answer has no hostname or action; the web form's token was let through");
-                self.raise_unbound(now);
+                self.unbound.raise(now);
                 true
             }
         }
@@ -487,11 +548,12 @@ mod tests {
     }
 
     /// A flood of one try each from as many networks as the map holds does
-    /// not lock out a network that comes after it, at start/resend or at
-    /// verify; a network already in the map is still limited. The web
-    /// form's limiter, which gives refusals back, keeps its overflow.
+    /// not lock out a network that comes after it, at once: the new
+    /// networks share one budget for the hour, at start/resend and at
+    /// verify apart, and are refused once it is spent, until the next hour.
+    /// A network already in the map is counted on its own as before.
     #[test]
-    fn a_full_map_of_tries_locks_no_new_network_out() {
+    fn a_full_map_gives_new_networks_one_budget_then_refuses_them() {
         let guard = SignInGuard::new(None, "account.example.test");
         let now = OffsetDateTime::now_utc();
         let max = crate::uptime::keys::MAX_KEYS;
@@ -501,12 +563,27 @@ mod tests {
         }
         assert_eq!(guard.app_attempts.len(), max);
         assert_eq!(guard.verify_tries.len(), max);
+        // One newcomer may take more than a network's own limit, and many
+        // newcomers share the rest.
         let newcomer = network(max + 1);
-        for n in 0..VERIFY_TRIES_PER_NETWORK * 3 {
+        for n in 0..APP_ATTEMPTS_PER_NETWORK * 2 {
             assert_eq!(guard.count_app_attempt_at(newcomer, now), Ok(()), "{n}");
-            assert_eq!(guard.count_verify_try_at(newcomer, now), Ok(()), "{n}");
+        }
+        for n in APP_ATTEMPTS_PER_NETWORK * 2..APP_ATTEMPTS_PAST_FULL {
             assert_eq!(guard.count_app_attempt_at(network(max + 2 + n as usize), now), Ok(()), "{n}");
         }
+        for n in 0..VERIFY_TRIES_PAST_FULL {
+            assert_eq!(guard.count_verify_try_at(network(max + 1 + n as usize), now), Ok(()), "{n}");
+        }
+        // Spent: every new network is refused for the rest of the hour,
+        // with the wait the per-network limit gives.
+        for late in [newcomer, network(max * 3)] {
+            let wait = guard.count_app_attempt_at(late, now).unwrap_err();
+            assert!((3599..=3600).contains(&wait), "{wait}");
+            let wait = guard.count_verify_try_at(late, now).unwrap_err();
+            assert!((3599..=3600).contains(&wait), "{wait}");
+        }
+        // A network in the map goes on, up to its own limit.
         let known = network(7);
         for _ in 1..APP_ATTEMPTS_PER_NETWORK {
             guard.count_app_attempt_at(known, now).unwrap();
@@ -517,6 +594,28 @@ mod tests {
         }
         assert!(guard.count_verify_try_at(known, now).is_err());
         assert_eq!(guard.app_attempts.len(), max);
+        // The next hour starts again: the newcomer is counted as a network.
+        let next = now + NETWORK_WINDOW;
+        assert_eq!(guard.count_app_attempt_at(newcomer, next), Ok(()));
+        assert_eq!(guard.count_verify_try_at(newcomer, next), Ok(()));
+        assert_eq!(guard.app_attempts.len(), 1);
+    }
+
+    #[test]
+    fn a_stuck_request_raises_an_alert_taken_once_an_hour_at_most() {
+        let guard = SignInGuard::new(None, "account.example.test");
+        assert!(!guard.take_stuck_alert());
+        let now = OffsetDateTime::now_utc();
+        guard.stuck.raise(now);
+        guard.stuck.raise(now + Duration::minutes(5));
+        assert!(guard.take_stuck_alert());
+        assert!(!guard.take_stuck_alert());
+        guard.stuck.raise(now + Duration::minutes(59));
+        assert!(!guard.take_stuck_alert());
+        guard.stuck.raise(now + Duration::minutes(60));
+        assert!(guard.take_stuck_alert());
+        // Apart from the Turnstile alert.
+        assert!(!guard.take_unbound_alert());
     }
 
     fn verdict(action: Option<&str>, hostname: Option<&str>) -> Verdict {

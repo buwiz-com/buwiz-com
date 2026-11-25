@@ -74,10 +74,7 @@ pub const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnst
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let account_origin = origin(&var_or("ACCOUNT_ORIGIN", "http://localhost:3008"))?;
-        let secure_cookies = match std::env::var("SECURE_COOKIES") {
-            Ok(value) => value == "true",
-            Err(_) => account_origin.starts_with("https://"),
-        };
+        let secure_cookies = secure_cookies(&account_origin, std::env::var("SECURE_COOKIES").ok().as_deref())?;
         // Without an explicit MAIL_TRANSPORT, a Resend key means send email;
         // no key means print codes to the log.
         let has_resend_key = std::env::var("RESEND_API_KEY").is_ok_and(|key| !key.trim().is_empty());
@@ -197,6 +194,18 @@ pub fn app_sign_in_minutes(raw: Option<&str>) -> anyhow::Result<i64> {
         Ok(minutes) if (1..=30).contains(&minutes) => Ok(minutes),
         _ => bail!("APP_SIGN_IN_MINUTES must be a whole number of minutes from 1 to 30, not `{raw}`"),
     }
+}
+
+/// `SECURE_COOKIES` as read: when unset, on for an https account origin.
+/// Off with an https origin stops the server at start-up: off means "not a
+/// public deployment", which also lets a loopback host take sign-in.
+pub fn secure_cookies(account_origin: &str, raw: Option<&str>) -> anyhow::Result<bool> {
+    let public = account_origin.starts_with("https://");
+    let on = raw.map_or(public, |value| value == "true");
+    if public && !on {
+        bail!("SECURE_COOKIES must be true with an https ACCOUNT_ORIGIN; leave it unset");
+    }
+    Ok(on)
 }
 
 fn list(name: &str) -> Vec<String> {
@@ -400,6 +409,18 @@ mod tests {
             assert_eq!(bad, list, "{raw}");
             assert_eq!(bad.len(), 1, "{raw}");
         }
+    }
+
+    #[test]
+    fn an_https_origin_needs_secure_cookies() {
+        assert!(secure_cookies("https://account.buwiz.com", None).unwrap());
+        assert!(secure_cookies("https://account.buwiz.com", Some("true")).unwrap());
+        for off in ["false", "", "1", "TRUE"] {
+            assert!(secure_cookies("https://account.buwiz.com", Some(off)).is_err(), "{off}");
+        }
+        assert!(!secure_cookies("http://localhost:3008", None).unwrap());
+        assert!(!secure_cookies("http://localhost:3008", Some("false")).unwrap());
+        assert!(secure_cookies("http://localhost:3008", Some("true")).unwrap());
     }
 
     #[test]

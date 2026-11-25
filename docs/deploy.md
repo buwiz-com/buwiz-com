@@ -915,10 +915,20 @@ works and so how long before a new one (1 to 30; 5 when unset). Any other
 value stops the server at start-up. The web's codes keep their ten
 minutes.
 
+In production `SECURE_COOKIES` must be on: leave it unset (an https
+`ACCOUNT_ORIGIN` turns it on) or set it to `true`. Off is what marks a
+deployment as not public, and that lets a loopback host (`localhost`,
+`127.0.0.1`, `[::1]`) take the form's and the apps' sign-in. With an
+https `ACCOUNT_ORIGIN`, any other value stops the server at start-up
+(`src/base/config.rs`, `secure_cookies`).
+
 The rest are constants in the code, with nothing to set or deploy beyond
-the release itself: per network, 40 tries an hour at start and resend
-(`APP_ATTEMPTS_PER_NETWORK`) and 60 at verify, the app's and the web
+the release itself: per network, 200 tries an hour at start and resend
+(`APP_ATTEMPTS_PER_NETWORK`) and 300 at verify, the app's and the web
 form's together (`VERIFY_TRIES_PER_NETWORK`, `src/account/guard.rs`);
+once 100,000 networks are counted in an hour, one budget for every new
+network, 20,000 and 30,000 (`APP_ATTEMPTS_PAST_FULL`,
+`VERIFY_TRIES_PAST_FULL`), refused once spent;
 4 places for start's and resend's database work and 3 for verify's
 (`DATABASE_SLOTS`, `VERIFY_SLOTS`, `src/account/app_sign_in.rs`), under
 the pool's 10 connections.

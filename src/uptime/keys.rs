@@ -317,18 +317,18 @@ pub const MAX_KEYS: usize = 100_000;
 /// again, so nothing is ever scanned. A key whose hits are all given back
 /// ([`RateLimiter::release`]) leaves the map, so it holds only keys with a
 /// hit that counts. The map never grows past `cap` keys; keys already in it
-/// always count normally, and what a key new in a full window gets depends
-/// on how the limiter was made:
-/// - [`RateLimiter::new`]: it is counted in one shared overflow bucket
-///   (with the same limit) until the window ends. While the map is full, a
-///   flood of distinct addresses with hits that count can use up that
+/// always count normally, and a key new in a full window is counted in one
+/// shared overflow bucket until the window ends. How many hits that bucket
+/// takes depends on how the limiter was made:
+/// - [`RateLimiter::new`]: the same limit as a key. While the map is full,
+///   a flood of distinct addresses with hits that count can use up that
 ///   bucket and so hold back every other new address until the window
 ///   ends. Fit for a limiter whose hits are given back when they come to
 ///   nothing (the web form's), so a flood's keys leave and make room.
-/// - [`RateLimiter::fail_open_when_full`]: it is let through and not
-///   counted ([`Bucket::Uncounted`]), so a flood that fills the map locks
-///   no new address out; what bounds such a key is then whatever else
-///   stands behind the limiter.
+/// - [`RateLimiter::with_overflow_budget`]: a budget of its own, much
+///   larger than a key's limit, so a flood that fills the map does not lock
+///   new addresses out at once; once that budget is spent too, new
+///   addresses are refused until the window ends.
 ///
 /// Each hit says which bucket it went to ([`Bucket`]), so giving it back
 /// takes it from that bucket and no other. Keys (an IP address, an account
@@ -337,20 +337,17 @@ pub struct RateLimiter<K> {
     limit: u32,
     window: Duration,
     cap: usize,
-    /// When the map is full: let a new key through uncounted, rather than
-    /// count it in the overflow bucket.
-    fail_open: bool,
+    /// How many hits the overflow bucket takes in a window.
+    overflow_limit: u32,
     hits: Mutex<Hits<K>>,
 }
 
-/// Where a hit was counted: under its own key, in the shared overflow
-/// bucket (the map was full when its key was new), or nowhere (the same,
-/// for a limiter made with [`RateLimiter::fail_open_when_full`]).
+/// Where a hit was counted: under its own key, or in the shared overflow
+/// bucket (the map was full when its key was new).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bucket {
     Key,
     Overflow,
-    Uncounted,
 }
 
 struct Hits<K> {
@@ -367,22 +364,22 @@ impl<K: Eq + Hash> RateLimiter<K> {
     }
 
     pub fn with_cap(limit: u32, window: Duration, cap: usize) -> Self {
-        Self::made(limit, window, cap, false)
+        Self::made(limit, window, cap, limit)
     }
 
-    /// As [`Self::new`], except that a key new in a full window is let
-    /// through and not counted, instead of sharing the overflow bucket: a
-    /// flood of distinct keys never locks new ones out.
-    pub fn fail_open_when_full(limit: u32, window: Duration) -> Self {
-        Self::made(limit, window, MAX_KEYS, true)
+    /// As [`Self::new`], except that the keys new in a full window share
+    /// `budget` hits in it, not `limit`: room for many new keys while a
+    /// flood fills the map, and a refusal once that is spent too.
+    pub fn with_overflow_budget(limit: u32, window: Duration, budget: u32) -> Self {
+        Self::made(limit, window, MAX_KEYS, budget)
     }
 
-    fn made(limit: u32, window: Duration, cap: usize, fail_open: bool) -> Self {
+    fn made(limit: u32, window: Duration, cap: usize, overflow_limit: u32) -> Self {
         Self {
             limit,
             window,
             cap,
-            fail_open,
+            overflow_limit,
             hits: Mutex::new(Hits { since: None, by_key: HashMap::new(), overflow: 0 }),
         }
     }
@@ -417,8 +414,7 @@ impl<K: Eq + Hash> RateLimiter<K> {
                     *count += 1;
                     Ok(Bucket::Key)
                 }
-                None if full && self.fail_open => Ok(Bucket::Uncounted),
-                None if full && *overflow >= self.limit => Err(wait),
+                None if full && *overflow >= self.overflow_limit => Err(wait),
                 None if full => {
                     *overflow += 1;
                     Ok(Bucket::Overflow)
@@ -447,7 +443,6 @@ impl<K: Eq + Hash> RateLimiter<K> {
         }
         let Hits { by_key, overflow, .. } = &mut *hits;
         match (bucket, by_key.get_mut(key)) {
-            (Bucket::Uncounted, _) => {}
             (Bucket::Overflow, _) => *overflow = overflow.saturating_sub(1),
             // Its last hit given back: the key leaves, making room.
             (Bucket::Key, Some(count)) if *count <= 1 => {
@@ -760,29 +755,30 @@ mod tests {
     }
 
     #[test]
-    fn a_fail_open_limiter_lets_new_keys_through_uncounted_when_full() {
+    fn with_an_overflow_budget_new_keys_share_it_when_full_then_are_refused() {
         let now = at("2026-11-11T07:12:00Z");
-        let limiter = RateLimiter::made(3, Duration::minutes(1), 100, true);
+        let limiter = RateLimiter::made(3, Duration::minutes(1), 100, 50);
         for key in 0..100u32 {
             limiter.check(key, now).unwrap();
         }
-        // Full: a new key passes as often as it likes, uncounted, and so
-        // does every other new one; the map does not grow.
-        for _ in 0..50 {
-            assert_eq!(limiter.hit(100, now + Duration::seconds(10)), Ok(Bucket::Uncounted));
+        // Full: new keys share the 50 of the budget, one key or many, past
+        // their own limit of 3; the map does not grow.
+        for _ in 0..20 {
+            assert_eq!(limiter.hit(100, now + Duration::seconds(10)), Ok(Bucket::Overflow));
         }
-        for key in 101..200u32 {
-            assert_eq!(limiter.check(key, now + Duration::seconds(10)), Ok(()), "{key}");
+        for key in 101..131u32 {
+            assert_eq!(limiter.hit(key, now + Duration::seconds(10)), Ok(Bucket::Overflow), "{key}");
         }
         assert_eq!(limiter.len(), 100);
-        // A key already in the map still counts: two hits left, then refused.
+        // Spent: every new key is refused until the window ends.
+        assert_eq!(limiter.check(100, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        assert_eq!(limiter.check(500, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        // A key already in the map still counts on its own: two hits left.
         assert_eq!(limiter.hit(7, now + Duration::seconds(10)), Ok(Bucket::Key));
         assert_eq!(limiter.hit(7, now + Duration::seconds(10)), Ok(Bucket::Key));
         assert_eq!(limiter.check(7, now + Duration::seconds(10)), Err(Duration::seconds(50)));
-        // Giving back an uncounted hit takes nothing from anyone.
-        limiter.release(&100, now, Bucket::Uncounted);
-        assert_eq!(limiter.check(7, now + Duration::seconds(10)), Err(Duration::seconds(50)));
-        // The next window starts empty: the new key is counted again.
+        // The next window starts empty: the new key is counted again, with
+        // its own limit.
         for _ in 0..3 {
             limiter.check(100, now + Duration::minutes(1)).unwrap();
         }

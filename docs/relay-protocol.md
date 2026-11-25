@@ -288,9 +288,9 @@ most 80 characters (`bad_model`), `os_version` 40 (`bad_os_version`),
 The sign-in before it may be the in-app one (`/auth/email/start`,
 `/resend`, `/verify` on api.buwiz.com; [accounts.md](accounts.md#the-api)
 has the whole contract). What a client must handle there besides the
-answers it already knows: start and resend allow 40 tries an hour per
+answers it already knows: start and resend allow 200 tries an hour per
 network (`429 too_many_requests`, `retry_after` in the body and
-`Retry-After`); verify allows 60 tries at a code an hour per network
+`Retry-After`); verify allows 300 tries at a code an hour per network
 (the same `429 too_many_requests`) and can answer `503 busy`
 (`Retry-After: 5`) as start does; and on verify's link path an expired
 code is `code_expired`, before `link_used`, as on the code path.

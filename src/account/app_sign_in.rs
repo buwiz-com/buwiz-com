@@ -20,14 +20,14 @@
 //! What a flood of requests can cost is bounded before any of it is done:
 //! every try at start and resend counts against its network's hour
 //! ([`SignInGuard::count_app_attempt`](crate::account::guard::SignInGuard::count_app_attempt),
-//! 40, never given back), then the body is read, then Turnstile is asked
+//! 200, never given back), then the body is read, then Turnstile is asked
 //! (when a token came), and only then is the database used, by at most
 //! [`DATABASE_SLOTS`] requests at once, each waiting at most
 //! [`SLOT_WAIT`] for a place and [`LOCK_WAIT`] for a lock (else `503
 //! busy`). Verify, the app's and the web form's, is bounded the same way
 //! with its own count
 //! ([`SignInGuard::count_verify_try`](crate::account::guard::SignInGuard::count_verify_try),
-//! 60 an hour, before the body) and its own [`VERIFY_SLOTS`] places, so a
+//! 300 an hour, before the body) and its own [`VERIFY_SLOTS`] places, so a
 //! flood of guesses cannot take start's.
 
 use std::borrow::Cow;
@@ -494,11 +494,19 @@ async fn usable_code_until(
 /// back, in one transaction, and with them their place in every count and
 /// their hold on the install. If that fails, the request is at least ended
 /// (`used_at`), so it holds the install no more ([`usable_code_until`]).
-/// If that fails too, only the ids are logged. The caller answers
-/// `mail_failed` whatever happens here.
+/// Both run in one of start's and resend's places ([`database_slot`]),
+/// and each waits at most [`LOCK_WAIT`] for a lock, so a mail outage in a
+/// flood cannot leave them waiting without end. If no place comes, or both
+/// fail, only the ids are logged and staff are told, at most once an hour
+/// (the request then holds the install until its code expires). The caller
+/// answers `mail_failed` whatever happens here.
 async fn take_back(state: &AppState, request_id: Uuid, code_id: Uuid) {
+    let Some(_slot) = slot(&state.app_sign_in_slots).await else {
+        stuck(state, request_id, code_id);
+        return;
+    };
     let deleted = async {
-        let mut tx = state.db.begin().await?;
+        let mut tx = begin_waiting(&state.db).await?;
         sqlx::query("DELETE FROM app_sign_ins WHERE id = $1").bind(request_id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM email_codes WHERE id = $1").bind(code_id).execute(&mut *tx).await?;
         tx.commit().await
@@ -509,8 +517,29 @@ async fn take_back(state: &AppState, request_id: Uuid, code_id: Uuid) {
     }
     tracing::warn!(%request_id, %code_id, "in-app sign-in: an unmailed request could not be taken back; ending it");
     if end(state, request_id).await.is_err() {
-        tracing::error!(%request_id, %code_id, "in-app sign-in: an unmailed request could be neither taken back nor ended");
+        stuck(state, request_id, code_id);
     }
+}
+
+/// An unmailed request that could be neither taken back nor ended: its
+/// ids are logged (no address), and staff are mailed at most once an hour.
+fn stuck(state: &AppState, request_id: Uuid, code_id: Uuid) {
+    tracing::error!(%request_id, %code_id, "in-app sign-in: an unmailed request could be neither taken back nor ended");
+    state.sign_in_guard.raise_stuck();
+    if state.sign_in_guard.take_stuck_alert() {
+        tokio::spawn(stuck_alert(state.clone()));
+    }
+}
+
+/// Mails staff that a request was stuck. A failure is logged.
+async fn stuck_alert(state: AppState) {
+    let subject = "In-app sign-in: a request could not be taken back";
+    let text = "A code for an app's sign-in could not be mailed, and its request could be neither taken back \
+                nor ended in the database. Until its code expires, that install cannot ask for a new code for \
+                that address. The logs have the request's and code's ids (\"could be neither taken back nor \
+                ended\"); look at the database and the mail service.\n\n\
+                This is mailed at most once an hour. See docs/accounts.md, \"What a flood can cost\".";
+    mail_staff(&state, subject, text).await;
 }
 
 /// `429 code_already_sent`: a code mailed to this install for this address
@@ -530,10 +559,12 @@ fn already_sent(seconds: i64) -> Refusal {
     }
 }
 
-/// Ends a request that can no longer be used.
+/// Ends a request that can no longer be used, waiting at most
+/// [`LOCK_WAIT`] for its row.
 async fn end(state: &AppState, request_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("UPDATE app_sign_ins SET used_at = now() WHERE id = $1").bind(request_id).execute(&state.db).await?;
-    Ok(())
+    let mut tx = begin_waiting(&state.db).await?;
+    sqlx::query("UPDATE app_sign_ins SET used_at = now() WHERE id = $1").bind(request_id).execute(&mut *tx).await?;
+    tx.commit().await
 }
 
 /// What start and resend answer, whether or not the address has an

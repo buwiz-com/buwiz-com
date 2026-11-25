@@ -679,7 +679,7 @@ async fn refused_requests_leave_the_cap_and_write_nothing(db: PgPool) {
         let (status, answer) = start_from_network(&site, &format!("net{n}@example.test"), n, json!({})).await;
         assert_eq!(status, 200, "{n}: {answer}");
     }
-    for n in 10..40 {
+    for n in 10..200 {
         let (status, answer) = start_from_network(&site, "not an address", n, json!({})).await;
         assert_eq!(status, 400, "{n}: {answer}");
     }
@@ -1153,11 +1153,11 @@ async fn a_start_that_could_not_mail_answers_and_behaves_as_one_that_did(db: PgP
     );
 }
 
-/// The 41st try at start or resend from one network in an hour is refused,
+/// The 201st try at start or resend from one network in an hour is refused,
 /// even when every try before it was refused, and no Turnstile call is
 /// made for it; the web form's count per network is untouched.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_network_gets_forty_tries_an_hour_whatever_comes_of_them(db: PgPool) {
+async fn a_network_gets_two_hundred_tries_an_hour_whatever_comes_of_them(db: PgPool) {
     let (url, calls) = turnstile_counted().await;
     let site = Site::with_turnstile_mailbox(db, &url);
     for n in 0..10 {
@@ -1166,11 +1166,11 @@ async fn a_network_gets_forty_tries_an_hour_whatever_comes_of_them(db: PgPool) {
         assert_eq!((status, answer["error"].as_str()), (403, Some("turnstile_failed")), "{n}");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 10);
-    for n in 10..40 {
+    for n in 10..200 {
         let (status, answer) = start_from_network(&site, "not an address", n, json!({})).await;
         assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_email")), "{n}");
     }
-    let (status, answer) = start_from_network(&site, ANA, 41, json!({ "turnstile": "a-script" })).await;
+    let (status, answer) = start_from_network(&site, ANA, 201, json!({ "turnstile": "a-script" })).await;
     assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
     let wait = answer["retry_after"].as_i64().unwrap();
     assert!((3500..=3600).contains(&wait), "{wait}");
@@ -1433,21 +1433,21 @@ async fn app_verify_from(site: &Site, n: u32, body: &Value) -> Response {
     site.send(request).await
 }
 
-/// The 61st try at a code from one network in an hour is refused, the
+/// The 301st try at a code from one network in an hour is refused, the
 /// app's and the web form's counted together, whatever came of the tries
 /// before; another network goes on, and the network's tries at start are
 /// apart.
 #[sqlx::test(migrations = "./migrations")]
-async fn the_sixty_first_verify_try_from_a_network_is_refused_for_the_app_and_the_web(db: PgPool) {
+async fn the_three_hundred_and_first_verify_try_from_a_network_is_refused_for_the_app_and_the_web(db: PgPool) {
     let site = Site::with_mailbox(db);
     let unknown = json!({ "request_id": Uuid::new_v4(), "secret": secret().0, "code": "123456" });
-    for n in 0..30 {
+    for n in 0..150 {
         let (status, answer) = read(app_verify_from(&site, n, &unknown).await).await;
         assert_eq!((status, answer), (400, refused("invalid_request")), "{n}");
         let wrong = web_verify_from(&site, n, "email=bea%40example.test&code=000000").await;
         assert!(location(&wrong).contains("notice=code_invalid"), "{n}: {}", location(&wrong));
     }
-    let response = app_verify_from(&site, 61, &unknown).await;
+    let response = app_verify_from(&site, 201, &unknown).await;
     let header_wait: i64 = response.headers()[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
     let (status, answer) = read(response).await;
     assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
@@ -1455,7 +1455,7 @@ async fn the_sixty_first_verify_try_from_a_network_is_refused_for_the_app_and_th
     assert!((3500..=3600).contains(&wait), "{wait}");
     assert_eq!(header_wait, wait);
     let refused_web =
-        web_verify_from(&site, 62, "email=bea%40example.test&code=000000&next=%2Ftins&expires=1700000000000").await;
+        web_verify_from(&site, 202, "email=bea%40example.test&code=000000&next=%2Ftins&expires=1700000000000").await;
     assert_eq!(refused_web.status(), StatusCode::SEE_OTHER);
     let back = location(&refused_web);
     assert!(back.starts_with("/login/verify?"), "{back}");
@@ -1473,7 +1473,7 @@ async fn the_sixty_first_verify_try_from_a_network_is_refused_for_the_app_and_th
         .body(Body::from(unknown.to_string()))
         .unwrap();
     assert_eq!(site.send(other).await.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(start_from_network(&site, ANA, 63, json!({})).await.0, 200);
+    assert_eq!(start_from_network(&site, ANA, 203, json!({})).await.0, 200);
 }
 
 /// With every place for a verify's database work taken and every pool
@@ -1672,4 +1672,68 @@ async fn when_taking_back_fails_the_request_is_ended_and_mail_failed_answered(db
     site.state.mailer.fail_app_codes(true);
     let (status, answer, _) = start_from(&site, ANA, LAPTOP).await;
     assert_eq!((status, answer["error"].as_str()), (502, Some("mail_failed")), "{answer}");
+}
+
+/// Makes every `op` (`DELETE`, `UPDATE`) on `app_sign_ins` wait for the
+/// advisory lock `key` (held by the test).
+async fn wait_on_app_sign_ins(db: &PgPool, op: &str, key: i64) {
+    sqlx::query(&format!(
+        "CREATE OR REPLACE FUNCTION test_wait_{op}() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN PERFORM pg_advisory_xact_lock({key}); IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; RETURN NEW; END $$"
+    ))
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_wait_{op} BEFORE {op} ON app_sign_ins FOR EACH ROW EXECUTE FUNCTION test_wait_{op}()"
+    ))
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// After a mail failure, taking back (and then ending) a request waits at
+/// most three seconds for each lock, in one of start's places: a lock held
+/// elsewhere makes it give up rather than wait, and the answer is still
+/// `mail_failed`. Neither step done, staff are mailed once (no address).
+#[sqlx::test(migrations = "./migrations")]
+async fn taking_back_waits_for_a_lock_at_most_three_seconds_in_a_place(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    const HELD: i64 = 0x7465_7374;
+    wait_on_app_sign_ins(&site.db, "DELETE", HELD).await;
+    wait_on_app_sign_ins(&site.db, "UPDATE", HELD).await;
+    let mut holder = site.db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(HELD).execute(&mut *holder).await.unwrap();
+    site.state.mailer.fail_app_codes(true);
+
+    let began = Instant::now();
+    let starting = start_from(&site, ANA, PHONE);
+    let meanwhile = async {
+        // In the take-back's first wait: it holds one of start's places.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        site.state.app_sign_in_slots.available_permits()
+    };
+    let ((status, answer, _), free) = tokio::join!(starting, meanwhile);
+    let took = began.elapsed();
+    assert_eq!((status, answer["error"].as_str()), (502, Some("mail_failed")), "{answer}");
+    assert_eq!(free, 3, "the take-back runs in a place");
+    assert!(took >= Duration::from_millis(5800) && took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(site.state.app_sign_in_slots.available_permits(), 4);
+    holder.rollback().await.unwrap();
+    // Neither step was done: the request is still there and open.
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins WHERE used_at IS NULL").await, 1);
+
+    let notices = notices_settle(&site, 1).await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].to, STAFF);
+    assert_eq!(notices[0].subject, "In-app sign-in: a request could not be taken back");
+    assert!(!notices[0].text.contains(ANA), "no address in the alert");
+
+    // Once an hour: a second stuck request mails nothing more.
+    let mut holder = site.db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(HELD).execute(&mut *holder).await.unwrap();
+    let (status, _, _) = start_from(&site, ANA, LAPTOP).await;
+    assert_eq!(status, 502);
+    holder.rollback().await.unwrap();
+    assert_eq!(notices_settle(&site, 2).await.len(), 1);
 }

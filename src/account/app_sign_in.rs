@@ -179,6 +179,23 @@ impl Platform {
         Self::ALL.into_iter().find(|platform| platform.as_str() == value)
     }
 
+    /// A stored value (`app_sign_ins`, `oauth_grants`, `devices`).
+    pub fn from_stored(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|platform| platform.as_str() == value)
+    }
+
+    /// The device's kind as the Devices lists name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ios => "iPhone",
+            Self::Ipados => "iPad",
+            Self::Android => "Android",
+            Self::Macos => "Mac",
+            Self::Windows => "Windows",
+            Self::Linux => "Linux",
+        }
+    }
+
     /// What the mail calls the app on this device: fixed words only.
     pub fn device(platform: Option<Self>) -> &'static str {
         match platform {
@@ -238,17 +255,17 @@ fn ttl(state: &AppState) -> time::Duration {
     time::Duration::minutes(state.config.app_sign_in_minutes)
 }
 
-/// An `install_id` as the app makes one: 16 to 64 of `[A-Za-z0-9_-]`. An
-/// identifier, not a secret.
+/// Whether `id` is an `install_id` as the app makes one: 16 to 64 of
+/// `[A-Za-z0-9_-]`. An identifier, not a secret.
+pub fn is_install_id(id: &str) -> bool {
+    (16..=64).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// [`is_install_id`], or `bad_install_id`.
 fn install_id(raw: Option<&str>) -> Result<Option<&str>, Refusal> {
     match raw {
         None => Ok(None),
-        Some(id)
-            if (16..=64).contains(&id.len())
-                && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') =>
-        {
-            Ok(Some(id))
-        }
+        Some(id) if is_install_id(id) => Ok(Some(id)),
         Some(_) => {
             Err(Refusal::bad("bad_install_id", "install_id must be 16 to 64 characters of A-Z, a-z, 0-9, - and _."))
         }
@@ -555,6 +572,7 @@ struct Stored {
     secret_hash: Vec<u8>,
     intent: String,
     platform: Option<String>,
+    install_id: Option<String>,
     code_id: Option<Uuid>,
     link_token_hash: Option<Vec<u8>>,
     attempts: i32,
@@ -580,7 +598,7 @@ impl Stored {
 }
 
 const STORED: &str =
-    "SELECT email, client_id, secret_hash, intent, platform, code_id, link_token_hash, attempts, created_at,
+    "SELECT email, client_id, secret_hash, intent, platform, install_id, code_id, link_token_hash, attempts, created_at,
                              expires_at, used_at
                       FROM app_sign_ins WHERE id = $1";
 
@@ -765,7 +783,9 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
         tx.commit().await?;
         return Err(Refusal::new(StatusCode::FORBIDDEN, "account_banned", oauth::BANNED_MESSAGE));
     }
-    let tokens = oauth::issue_grant(&mut tx, account.id, &stored.client_id, SCOPE_APP).await?;
+    // The grant keeps the install and platform the request named.
+    let from = oauth::GrantFrom { install_id: stored.install_id.as_deref(), platform: stored.platform.as_deref() };
+    let tokens = oauth::issue_grant_from(&mut tx, account.id, &stored.client_id, SCOPE_APP, from).await?;
     tx.commit().await?;
     Ok(answer(tokens))
 }

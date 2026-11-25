@@ -80,6 +80,10 @@ pub fn normalize_user_code(raw: &str) -> Option<String> {
 #[derive(Deserialize)]
 pub struct DeviceStart {
     client_id: String,
+    /// The app's own id for its install (docs/accounts.md, "Devices"),
+    /// stamped on the grant the sign-in makes.
+    #[serde(default)]
+    install_id: Option<String>,
 }
 
 /// `POST /auth/device/start` (also `/oauth/device/code`).
@@ -88,17 +92,26 @@ pub async fn device_start(
     Json(request): Json<DeviceStart>,
 ) -> Result<Json<Value>, OAuthFailure> {
     known_client(&request.client_id)?;
+    if request.install_id.as_deref().is_some_and(|id| !crate::account::app_sign_in::is_install_id(id)) {
+        return Err(OAuthError::new(
+            "bad_install_id",
+            "install_id must be 16 to 64 characters of A-Z, a-z, 0-9, - and _",
+        )
+        .into());
+    }
     let device_code = crypto::new_token("bwd_");
     let user_code = new_user_code();
     sqlx::query(
-        "INSERT INTO device_authorizations (client_id, device_code_hash, user_code, interval_seconds, expires_at)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO device_authorizations
+             (client_id, device_code_hash, user_code, interval_seconds, expires_at, install_id)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&request.client_id)
     .bind(crypto::hash(&device_code))
     .bind(&user_code)
     .bind(DEVICE_INTERVAL)
     .bind(OffsetDateTime::now_utc() + DEVICE_TTL)
+    .bind(request.install_id.as_deref())
     .execute(&state.db)
     .await?;
     // No link carries the code: the person types the one the app shows,
@@ -140,6 +153,7 @@ struct DeviceRow {
     account_id: Option<Uuid>,
     decision: Option<String>,
     consumed_at: Option<OffsetDateTime>,
+    install_id: Option<String>,
 }
 
 async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> Result<TokenResponse, OAuthFailure> {
@@ -159,7 +173,8 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
         None => None,
     };
     let row: Option<DeviceRow> = sqlx::query_as(
-        "SELECT id, client_id, interval_seconds, expires_at, last_polled_at, account_id, decision, consumed_at
+        "SELECT id, client_id, interval_seconds, expires_at, last_polled_at, account_id, decision, consumed_at,
+                install_id
          FROM device_authorizations WHERE device_code_hash = $1 FOR UPDATE",
     )
     .bind(crypto::hash(device_code))
@@ -198,7 +213,8 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
                 tx.commit().await?;
                 return Err(OAuthError::new("access_denied", "this account is banned").into());
             }
-            let tokens = issue_grant(&mut tx, account_id, client_id, client_scope(client_id)).await?;
+            let from = GrantFrom { install_id: row.install_id.as_deref(), platform: None };
+            let tokens = issue_grant_from(&mut tx, account_id, client_id, client_scope(client_id), from).await?;
             tx.commit().await?;
             return Ok(tokens);
         }
@@ -294,13 +310,37 @@ pub(crate) async fn issue_grant(
     client_id: &str,
     scope: &str,
 ) -> sqlx::Result<TokenResponse> {
-    let grant_id: Uuid =
-        sqlx::query_scalar("INSERT INTO oauth_grants (account_id, client_id, scope) VALUES ($1, $2, $3) RETURNING id")
-            .bind(account_id)
-            .bind(client_id)
-            .bind(scope)
-            .fetch_one(&mut **tx)
-            .await?;
+    issue_grant_from(tx, account_id, client_id, scope, GrantFrom::default()).await
+}
+
+/// What an app said about itself when it signed in, kept on the grant:
+/// its install (one device row per install, [`crate::filing::devices`])
+/// and, from in-app sign-in, its platform.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GrantFrom<'a> {
+    pub install_id: Option<&'a str>,
+    pub platform: Option<&'a str>,
+}
+
+/// [`issue_grant`], keeping `from` on the grant.
+pub(crate) async fn issue_grant_from(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    client_id: &str,
+    scope: &str,
+    from: GrantFrom<'_>,
+) -> sqlx::Result<TokenResponse> {
+    let grant_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_grants (account_id, client_id, scope, install_id, platform) VALUES ($1, $2, $3, $4, $5)
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(client_id)
+    .bind(scope)
+    .bind(from.install_id)
+    .bind(from.platform)
+    .fetch_one(&mut **tx)
+    .await?;
     issue_tokens(tx, grant_id, scope).await
 }
 

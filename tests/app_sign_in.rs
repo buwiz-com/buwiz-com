@@ -814,3 +814,14 @@ async fn without_turnstile_keys_the_app_check_page_says_so(db: PgPool) {
     assert!(page.contains(r#"data-state="not-configured""#));
     assert!(page.contains("/assets/app-check.js") && !page.contains("challenges.cloudflare.com"));
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_grant_keeps_the_install_and_platform_the_request_named(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (_, answer, secret) = start_with(&site, ANA, json!({ "install_id": PHONE, "platform": "android" })).await;
+    let started = Started { id: answer["request_id"].as_str().unwrap().to_owned(), secret };
+    assert_eq!(verify(&site, &started, &last_code(&site, ANA)).await.0, 200);
+    let (install, platform): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT install_id, platform FROM oauth_grants").fetch_one(&site.db).await.unwrap();
+    assert_eq!((install.as_deref(), platform.as_deref()), (Some(PHONE), Some("android")));
+}

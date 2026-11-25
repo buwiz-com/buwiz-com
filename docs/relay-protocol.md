@@ -271,11 +271,28 @@ buwiz-timestamp: 1767225600
 buwiz-nonce: 3q2-7wEAAAAAAAAAAAAAAA
 buwiz-signature: <base64url Ed25519 signature, made with the new key>
 
-{"public_key": "<base64url, 32 bytes>", "name": "Juana's laptop"}
+{"public_key": "<base64url, 32 bytes>", "name": "Juana's laptop",
+ "install_id": "<optional, 16 to 64 of A-Z a-z 0-9 - _>", "platform": "macos",
+ "model": "Mac14,2", "os_version": "15.1", "computer_name": "Juana's MacBook Air"}
 ```
 
 Answer `201 {"id","name","created_at"}`. The device belongs to this
-sign-in (OAuth grant).
+sign-in (OAuth grant), and one sign-in registers one device (else `409
+device_registered`). The optional fields are trimmed and refused with
+control characters: `platform` is one of `ios`, `ipados`, `android`,
+`macos`, `windows`, `linux` (anything else is kept as nothing), `model` at
+most 80 characters (`bad_model`), `os_version` 40 (`bad_os_version`),
+`computer_name` 80 (`bad_computer_name`).
+
+With `install_id` ([accounts.md](accounts.md#devices)) an install has one
+row per account: a registration from an install that has one updates it
+in place (new key, new sign-in, the fields above, `signed_in_at`, not
+removed) and answers its same `id` and `created_at`; the sign-in it had
+is ended (`device_replaced`). A sign-in that carries an install id (from
+`/auth/email/start` or `/oauth/device/code`) must register with the same
+one (`400 install_mismatch`, also when it is left out); one without gets
+the request's. `bad_install_id` for a malformed one. Without `install_id`
+registration is as before.
 
 Every v2 request then carries a signature, DPoP-style:
 
@@ -300,9 +317,29 @@ buwiz-request-v1
 Errors: `401 signature_required`, `bad_signature`, `bad_nonce`,
 `clock_skew`, `nonce_reused`, `unknown_device`; `403 device_revoked`.
 
-`GET /api/devices` lists the account's devices; `POST /api/devices/{id}/revoke`
-revokes one. The account site lists them under **My devices** with a
-**Remove** button. A revoked device is refused everywhere: its signatures
+`GET /api/devices` lists the account's devices, and in `pending` its BIR
+app sign-ins that have not registered one yet (the app's "Add this iPhone
+to your Buwiz account?" was not tapped):
+
+```json
+{"devices": [{"id": "<uuid>", "name": "Juana's phone", "client_id": "buwiz-ebirforms",
+              "current": true, "platform": "ios", "model": "iPhone16,1",
+              "model_name": "iPhone 15 Pro", "os_version": "18.1", "computer_name": null,
+              "created_at": "…", "signed_in_at": "…", "last_used_at": "…", "revoked_at": null}],
+ "pending": [{"grant_id": "<uuid>", "client_id": "buwiz-ebirforms", "platform": "android",
+              "signed_in_at": "…", "current": false}]}
+```
+
+`current` marks the caller's own sign-in. `model_name` is the name an
+Apple model code is sold under (`src/filing/apple_models.rs`), else the
+model as sent. Devices removed more than 30 days ago are left out.
+`POST /api/devices/{id}/revoke` revokes one device; `POST
+/api/sign-ins/{grant_id}/sign-out` ends one of the account's BIR app
+sign-ins (its device too, if it has one), this app's own included,
+answering `{"signed_out": true}` or `404` for another account's or an
+unknown one. Both work for a banned account, as signing out does. The
+account site lists the same two lists under **My devices**, with
+**Remove** and **Log out**. A revoked device is refused everywhere: its signatures
 fail, its sign-in is ended (tokens stop working), and a submission it
 sealed can no longer be relayed.
 

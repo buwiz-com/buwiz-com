@@ -3,6 +3,7 @@
 //! to the Sender. The pipe is [`crate::relay`] and the Sender is
 //! [`crate::sender`]. See `docs/relay.md`.
 
+pub mod apple_models;
 pub mod devices;
 pub mod envelope;
 pub mod gate;

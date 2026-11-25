@@ -55,6 +55,8 @@ struct Target {
     paused_before: Uuid,
     document: Uuid,
     grant: Uuid,
+    /// A device, on a sign-in of its own.
+    device: Uuid,
 }
 
 async fn target(site: &Site, n: u32) -> Target {
@@ -96,7 +98,8 @@ async fn target(site: &Site, n: u32) -> Target {
         .fetch_one(&site.db)
         .await
         .unwrap();
-    Target { account, open, unverified, spare, active, paused_before, document, grant }
+    let device = TestDevice::new(&site.db, account).await.device_id;
+    Target { account, open, unverified, spare, active, paused_before, document, grant, device }
 }
 
 /// The actors of the matrix, each signed in (but the first).
@@ -182,6 +185,7 @@ const MATRIX: &[&str] = &[
     "/staff/users/{account_id}",
     "/staff/users/{account_id}/sign-out",
     "/staff/users/{account_id}/apps/{grant_id}/sign-out",
+    "/staff/users/{account_id}/devices/{device_id}/sign-out",
     "/staff/users/{account_id}/role",
     "/staff/users/{account_id}/ban",
     "/staff/users/{account_id}/unban",
@@ -195,7 +199,7 @@ const MATRIX: &[&str] = &[
 /// `path` with its ids put back as the route's placeholders.
 fn route_of(path: &str) -> String {
     let path = path.split('?').next().unwrap();
-    let names = ["claim_id", "document_id", "account_id", "grant_id"];
+    let names = ["claim_id", "document_id", "account_id", "grant_id", "device_id"];
     let mut parts = Vec::new();
     for (index, part) in path.split('/').enumerate() {
         if Uuid::parse_str(part).is_ok() {
@@ -204,6 +208,7 @@ fn route_of(path: &str) -> String {
                 "claims" => names[0],
                 "documents" => names[1],
                 "users" => names[2],
+                "devices" => names[4],
                 _ => names[3],
             };
             parts.push(format!("{{{name}}}"));
@@ -409,6 +414,17 @@ async fn roles_on_the_account_decide_staff_powers(db: PgPool) {
         let done = format!("{user}?notice=app_signed_out");
         expect_post(site, (who, &cookie), &path, "reason=Lost+phone", false, &user, &done).await;
         assert_eq!(grant_revoked(&site.db, t.grant).await, who.may(false), "{who:?}");
+
+        // One device: Support and Admins.
+        let path = format!("{user}/devices/{}/sign-out", t.device);
+        let done = format!("{user}?notice=app_signed_out");
+        expect_post(site, (who, &cookie), &path, "reason=Lost+phone", false, &user, &done).await;
+        let removed: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM devices WHERE id = $1")
+            .bind(t.device)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+        assert_eq!(removed, who.may(false), "{who:?}");
 
         // Everywhere: Support and Admins.
         let path = format!("{user}/sign-out");
@@ -1115,6 +1131,7 @@ fn staff_posts(t: &Target, user: &str) -> Vec<(String, String)> {
         (claim(t.active, "confirm"), String::new()),
         (format!("{user}/sign-out"), "reason=Lost+laptop".into()),
         (format!("{user}/apps/{}/sign-out", t.grant), "reason=Lost+phone".into()),
+        (format!("{user}/devices/{}/sign-out", t.device), "reason=Lost+phone".into()),
         (format!("{user}/role"), "role=support&reason=Joins".into()),
         (format!("{user}/ban"), "reason=Abuse".into()),
         (format!("{user}/unban"), "reason=Sorted".into()),

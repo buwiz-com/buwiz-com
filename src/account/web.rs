@@ -153,6 +153,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         // Submission v2: device keys, tickets, sealed returns.
         .route("/api/devices", post(devices::register).get(devices::list))
         .route("/api/devices/{id}/revoke", post(devices::revoke_api))
+        .route("/api/sign-ins/{grant_id}/sign-out", post(devices::sign_out_api))
         .route("/api/tickets", starts_send(&state, signed(&state, post(tickets::issue))))
         .route(
             "/api/v2/submissions",
@@ -207,6 +208,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/new", post(create_login))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
+        .route("/staff/users/{account_id}/devices/{device_id}/sign-out", post(sign_out_user_device))
         .route("/staff/users/{account_id}/role", post(change_role))
         .route("/staff/users/{account_id}/ban", post(ban_user))
         .route("/staff/users/{account_id}/unban", post(unban_user))
@@ -216,7 +218,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/{account_id}/fixed-code/clear", post(clear_fixed_code))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
-        .route("/devices/{device_id}/revoke", post(revoke_device));
+        .route("/devices/{device_id}/revoke", post(revoke_device))
+        .route("/apps/{grant_id}/sign-out", post(sign_out_own_app));
     // BIR uptime's reads exist from `public`; below it they are not routed,
     // so they answer the site's own 404 as before.
     let router = if state.uptime.level.is_public() {
@@ -1284,6 +1287,23 @@ async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Path(d
     }
 }
 
+/// The person logs out one of their app sign-ins that has no device yet
+/// (My TINs, "Signed in · not added as a device yet").
+async fn sign_out_own_app(State(state): State<AppState>, headers: HeaderMap, Path(grant_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, "/tins").await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    match devices::sign_out_grant(&state.db, account.id, grant_id).await {
+        Ok(true) => see_other(link("/tins", Some(Notice::AppSignedOut), &[])),
+        Ok(false) => see_other(link("/tins", None, &[])),
+        Err(error) => internal(error),
+    }
+}
+
 /// A signed-in staff member with `power`, or the response to send instead:
 /// a 404 for everyone who is not staff, as if the page did not exist; for
 /// staff without the power, back to `back_to` with `admin_only` and nothing
@@ -1547,6 +1567,25 @@ async fn sign_out_user_app(
         Err(response) => return response,
     };
     let outcome = admin::sign_out_app(&state.db, &state.config, &staff, account_id, grant_id, &form.reason).await;
+    staff_outcome(&back_to, outcome)
+}
+
+/// Staff log out one of an account's devices, with a reason.
+async fn sign_out_user_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, device_id)): Path<(Uuid, Uuid)>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = user_page(account_id, &form.tab);
+    let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let outcome = admin::sign_out_device(&state.db, &state.config, &staff, account_id, device_id, &form.reason).await;
     staff_outcome(&back_to, outcome)
 }
 

@@ -941,8 +941,49 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first, then 16's and the others as
+Going further back runs 17's down file first (after 18's,
+[below](#migration-18-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
+
+## Migration 18 (one row per device)
+
+The release with one device row per install
+([accounts.md](accounts.md#devices)) runs migration 18 when it starts. It
+adds `install_id` and `platform` to `oauth_grants`, `install_id` to
+`device_authorizations`, and to `devices` the columns an app sends
+(`install_id`, `platform`, `model`, `os_version`, `computer_name`) and
+`signed_in_at`, filled from `created_at`; a unique index keeps one row per
+account and install. `devices` is rewritten once (small). There is no
+setting. This stores more about each device (a stable install id, the
+model, the system version, and optionally the computer's name): the
+privacy policy must say so before this ships. The release before it (at
+17) refuses to start on a database at 18.
+
+**Before you deploy.** The database is at 17 (a read-only check):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 17
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 17.** The down file never refuses. It drops the new
+columns and indexes: what the apps said about their devices and the
+install ids are lost; every device and sign-in stays and works (a row
+updated in place keeps its newest key). In this order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0018_device_installs.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 17
+   ```
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 18 again, and the rollback starts
+   over at 1.
+
+Going further back runs 18's down file first, then 17's and the others as
+[above](#migration-17-in-app-sign-in); each commits on its own.
 
 ## OCR of claim documents
 

@@ -690,6 +690,39 @@ flow's do.
 | 502 | `mail_failed` | The mail provider failed; the request cannot be used (start again) |
 | 503 | `restarting` | The server is stopping (deploy.md, "What a deploy does at stop"); `Retry-After: 30` |
 
+## Devices
+
+An app that signs in can register a device key
+([relay-protocol.md](relay-protocol.md#51-device-key)); the account's
+devices are under **My devices** on My TINs. An app sends `install_id`,
+its own id for its install (an identifier, not a secret), when it signs
+in (`/auth/email/start`, `/oauth/device/code`) and when it registers. The
+sign-in's grant keeps it, and an install has one device row per account
+(a unique index): signing in again on the same install and registering
+updates that row (its key, its sign-in, what the app says about the
+device, `signed_in_at`) and ends the sign-in it had, so a reinstalled or
+signed-out-and-in app does not pile up rows. A registration whose install
+is not the sign-in's is refused (`install_mismatch`).
+
+What the app says about the device: its platform, model (an Apple code
+such as `iPhone16,1` is shown as "iPhone 15 Pro", from the table in
+`src/filing/apple_models.rs`; others as sent), system version and, on a
+computer, its name. The list shows those, when it was added, last signed
+in and last used, and keeps a removed device for 30 days.
+
+The owner's app asks "Add this iPhone to your Buwiz account?" before it
+registers, so an app can stay signed in without a device. The list also
+shows each such sign-in ("Signed in · not added as a device yet", with
+the app, the platform the sign-in named, and when) with **Log out**
+(`POST /apps/{grant_id}/sign-out`, the person's own only), the same list
+`GET /api/devices` gives as `pending`.
+
+Staff see the devices on the account's page (Sign-ins tab) with their
+state, and log a live one out with a reason, under the rule for signing
+one app out (Support may not sign out an Admin): the device is removed,
+its sign-in ended (`signed_out_by_staff`), and the history gets an
+`app_signed_out` line naming the app.
+
 ## Licence gate
 
 `GET /api/tax-profiles` lists the account's active TINs that can send (a

@@ -11,6 +11,9 @@ pub async fn tins_page(cx: &Cx) -> Result<impl View> {
     let account = signed_in(cx).await?;
     let mut claims = claims::for_account(&state(cx).db, account.id).await?;
     let devices = devices::for_account(&state(cx).db, account.id).await?;
+    // Apps signed in that have not added this device yet: the same list
+    // `GET /api/devices` gives as `pending`.
+    let pending = devices::pending_for_account(&state(cx).db, account.id).await?;
     // Newest first. A rejected or revoked claim stays until the TIN is added
     // again; a removed TIN is gone from here.
     let mut seen = Vec::new();
@@ -49,13 +52,17 @@ pub async fn tins_page(cx: &Cx) -> Result<impl View> {
                 <section class="devices" aria-labelledby="devices-h">
                     <h2 id="devices-h">"My devices"</h2>
                     <p class="page-lead">"Computers and phones that can send returns for you. Remove one you no longer use or don't recognise; it is signed out and can't send until it signs in again."</p>
-                    if devices.is_empty() {
+                    if devices.is_empty() && pending.is_empty() {
                         <p class="device-empty">"No devices yet. One appears here the first time you send a return from the Buwiz app."</p>
                     } else {
                         <ul class="device-list">
                             #[key(device.id.as_u128())]
                             for device in devices {
                                 device_row(device: device)
+                            }
+                            #[key(sign_in.grant_id.as_u128())]
+                            for sign_in in pending {
+                                pending_row(sign_in: sign_in)
                             }
                         </ul>
                     }
@@ -65,18 +72,40 @@ pub async fn tins_page(cx: &Cx) -> Result<impl View> {
     })
 }
 
-/// A device that can send returns, with a button to remove it.
+/// The kind of device a stored platform names, if one is stored.
+fn platform_label(platform: Option<&str>) -> Option<&'static str> {
+    platform.and_then(crate::account::app_sign_in::Platform::from_stored).map(|platform| platform.label())
+}
+
+/// A device that can send returns, with a button to remove it: what it
+/// is (its model's name, the system and its version, the computer's name),
+/// and when it was added, signed in and last used.
 #[component]
 async fn device_row(device: devices::DeviceView) -> Result<impl View> {
     let revoke = format!("/devices/{}/revoke", device.id);
     let app = oauth::client_name(&device.client_id).unwrap_or("Buwiz");
     let used = device.last_used_at.map(short_date).unwrap_or_else(|| "never".to_owned());
+    let title = device.model_name.clone().unwrap_or_else(|| device.name.clone());
+    let system = match (platform_label(device.platform.as_deref()), device.os_version.as_deref()) {
+        (Some(platform), Some(version)) => Some(format!("{platform} {version}")),
+        (Some(platform), None) => Some(platform.to_owned()),
+        (None, Some(version)) => Some(version.to_owned()),
+        (None, None) => None,
+    };
+    let what: Vec<String> =
+        [Some(app.to_owned()), system, device.computer_name.clone()].into_iter().flatten().collect();
+    let when = format!(
+        "added {} · signed in {} · last used {used}",
+        short_date(device.created_at),
+        short_date(device.signed_in_at)
+    );
     Ok(view! {
         <li class="device-row">
             <span class="device-icon">icon(name: "devices")</span>
             <span class="device-text">
-                <strong>(device.name.clone())</strong>
-                <span>(format!("{app} · added {} · last used {used}", short_date(device.created_at)))</span>
+                <strong>(title)</strong>
+                <span>(what.join(" · "))</span>
+                <span>(when)</span>
             </span>
             if device.revoked_at.is_some() {
                 <span class="tagpill status-withdrawn">"Removed"</span>
@@ -85,6 +114,31 @@ async fn device_row(device: devices::DeviceView) -> Result<impl View> {
                     <button class="btn btn-ghost device-remove" type="submit">"Remove"</button>
                 </form>
             }
+        </li>
+    })
+}
+
+/// An app signed in that has not added this device yet, with a button to
+/// log it out.
+#[component]
+async fn pending_row(sign_in: devices::PendingSignIn) -> Result<impl View> {
+    let sign_out = format!("/apps/{}/sign-out", sign_in.grant_id);
+    let app = oauth::client_name(&sign_in.client_id).unwrap_or("Buwiz");
+    let what: Vec<String> = [Some(app.to_owned()), platform_label(sign_in.platform.as_deref()).map(str::to_owned)]
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(view! {
+        <li class="device-row device-pending">
+            <span class="device-icon">icon(name: "devices")</span>
+            <span class="device-text">
+                <strong>"Signed in · not added as a device yet"</strong>
+                <span>(what.join(" · "))</span>
+                <span>(format!("signed in {}", short_date(sign_in.signed_in_at)))</span>
+            </span>
+            <form method="post" action=(sign_out)>
+                <button class="btn btn-ghost device-remove" type="submit">"Log out"</button>
+            </form>
         </li>
     })
 }

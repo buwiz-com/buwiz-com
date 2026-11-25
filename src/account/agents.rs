@@ -5,6 +5,11 @@
 //! Agents are public clients. The person approves each one on the account
 //! site. Their tokens carry the `mcp` scope: they read through `/mcp` but
 //! can never file returns.
+//!
+//! The same endpoints sign the eBIRForms apps in ("Sign in with Buwiz",
+//! docs/accounts.md): a built-in client ([`oauth::CLIENTS`]) with a fixed
+//! list of redirect addresses ([`app_redirects`]), never registered, whose
+//! code carries the `app` scope and the app's install.
 
 use std::collections::HashMap;
 
@@ -22,8 +27,9 @@ use time::{Duration, OffsetDateTime};
 use url::Url;
 use uuid::Uuid;
 
+use crate::account::app_sign_in::{self, Platform};
 use crate::account::notice::Notice;
-use crate::account::oauth::{self, SCOPE_MCP, TokenResponse};
+use crate::account::oauth::{self, SCOPE_APP, SCOPE_MCP, TokenResponse};
 use crate::base::config::Config;
 use crate::base::crypto;
 use crate::base::error::{OAuthError, OAuthFailure};
@@ -31,6 +37,50 @@ use crate::base::state::AppState;
 
 const CODE_TTL: Duration = Duration::minutes(10);
 const MAX_REDIRECT_URIS: usize = 5;
+/// The shortest `state` an app may send: it must be the app's own random
+/// value, not a constant.
+const MIN_APP_STATE: usize = 16;
+/// The eBIRForms apps' own URL scheme. No agent may register it, so a code
+/// sent there is always the app's.
+const APP_SCHEME: &str = "ebirforms";
+
+/// A redirect address a built-in app client may use. Fixed here; never
+/// registered, never in `oauth_clients`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppRedirect {
+    /// This string exactly.
+    Exact(&'static str),
+    /// `http://127.0.0.1:<port>/callback`: the loopback address (RFC 8252
+    /// §7.3) on any port, which must be written out; nothing else.
+    Loopback,
+}
+
+/// The redirect addresses of a built-in client. Only the eBIRForms app
+/// (`buwiz-desktop`) has any; the other built-in clients cannot use
+/// `/oauth/authorize`.
+pub fn app_redirects(client_id: &str) -> &'static [AppRedirect] {
+    match client_id {
+        "buwiz-desktop" => &[AppRedirect::Exact("ebirforms://signin-callback"), AppRedirect::Loopback],
+        _ => &[],
+    }
+}
+
+impl AppRedirect {
+    pub fn matches(self, requested: &str) -> bool {
+        match self {
+            Self::Exact(address) => requested == address,
+            Self::Loopback => requested
+                .strip_prefix("http://127.0.0.1:")
+                .and_then(|rest| rest.strip_suffix("/callback"))
+                .is_some_and(|port| {
+                    (1..=5).contains(&port.len())
+                        && port.bytes().all(|byte| byte.is_ascii_digit())
+                        && !port.starts_with('0')
+                        && port.parse::<u16>().is_ok()
+                }),
+        }
+    }
+}
 
 /// The origin this request came in on, if it is one of ours; otherwise the
 /// account site. Discovery documents use it so a client sees the URLs it
@@ -85,6 +135,7 @@ pub fn redirect_uri_allowed(raw: &str) -> bool {
         return false;
     }
     match uri.scheme() {
+        APP_SCHEME => false,
         "https" => uri.host().is_some(),
         "http" => is_loopback(&uri),
         "javascript" | "data" | "file" | "vbscript" | "blob" | "about" | "ftp" | "ws" | "wss" => false,
@@ -125,7 +176,9 @@ fn registration_error(error: &'static str, description: &'static str) -> Respons
     (StatusCode::BAD_REQUEST, Json(json!({ "error": error, "error_description": description }))).into_response()
 }
 
-/// `POST /oauth/register` (RFC 7591). Public clients only.
+/// `POST /oauth/register` (RFC 7591). Public clients only. The id is
+/// always `agent_` and a fresh UUID, so it can never be a built-in
+/// client's ([`oauth::CLIENTS`]).
 pub async fn register(State(state): State<AppState>, Json(request): Json<Registration>) -> Response {
     if request.redirect_uris.is_empty() || request.redirect_uris.len() > MAX_REDIRECT_URIS {
         return registration_error("invalid_redirect_uri", "register 1 to 5 redirect_uris");
@@ -133,7 +186,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registr
     if !request.redirect_uris.iter().all(|uri| uri.len() <= 2000 && redirect_uri_allowed(uri)) {
         return registration_error(
             "invalid_redirect_uri",
-            "redirect_uris must be https, http on localhost, or an app scheme, without a fragment",
+            "redirect_uris must be https, http on localhost, or an app scheme of your own, without a fragment",
         );
     }
     if request.token_endpoint_auth_method.as_deref().is_some_and(|method| method != "none") {
@@ -174,6 +227,22 @@ pub struct AuthorizeRequest {
     pub redirect_uri: String,
     pub state: Option<String>,
     pub code_challenge: String,
+    /// Set for a built-in app client; `None` for an agent.
+    pub app: Option<AppRequest>,
+}
+
+/// What an app's authorization request adds: its install and platform,
+/// kept with the code for the grant.
+#[derive(Clone, Debug)]
+pub struct AppRequest {
+    pub install_id: String,
+    pub platform: Platform,
+}
+
+impl AuthorizeRequest {
+    fn scope(&self) -> &'static str {
+        if self.app.is_some() { SCOPE_APP } else { SCOPE_MCP }
+    }
 }
 
 /// Why an authorization request cannot go on.
@@ -194,6 +263,11 @@ pub async fn check_authorize(
 ) -> Result<AuthorizeRequest, AuthorizeProblem> {
     let param = |name: &str| params.get(name).map(String::as_str).filter(|value| !value.is_empty());
     let client_id = param("client_id").ok_or(AuthorizeProblem::Untrusted("The request has no client_id."))?;
+    // A built-in client never reads `oauth_clients`: only its fixed list
+    // of addresses counts, whatever a row there might say.
+    if let Some(name) = oauth::client_name(client_id) {
+        return check_app_authorize(client_id, name, params);
+    }
     let client: Option<(String, Vec<String>)> =
         sqlx::query_as("SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = $1")
             .bind(client_id)
@@ -242,6 +316,62 @@ pub async fn check_authorize(
         redirect_uri,
         state,
         code_challenge: code_challenge.to_owned(),
+        app: None,
+    })
+}
+
+/// [`check_authorize`] for a built-in app client: one of its fixed
+/// redirect addresses, PKCE, a `state` of at least 16 characters, its
+/// install and platform; the scope is `app`.
+fn check_app_authorize(
+    client_id: &str,
+    client_name: &str,
+    params: &HashMap<String, String>,
+) -> Result<AuthorizeRequest, AuthorizeProblem> {
+    let param = |name: &str| params.get(name).map(String::as_str).filter(|value| !value.is_empty());
+    let redirects = app_redirects(client_id);
+    if redirects.is_empty() {
+        return Err(AuthorizeProblem::Untrusted("This app cannot sign in here."));
+    }
+    let redirect_uri = match param("redirect_uri") {
+        Some(uri) if redirects.iter().any(|known| known.matches(uri)) => uri.to_owned(),
+        _ => return Err(AuthorizeProblem::Untrusted("The app sent a redirect address it may not use.")),
+    };
+    let state = param("state").map(str::to_owned);
+    let refuse = |error, description| AuthorizeProblem::Redirect {
+        redirect_uri: redirect_uri.clone(),
+        state: state.clone(),
+        error,
+        description,
+    };
+    if param("response_type") != Some("code") {
+        return Err(refuse("unsupported_response_type", "only response_type=code"));
+    }
+    let Some(code_challenge) = param("code_challenge") else {
+        return Err(refuse("invalid_request", "PKCE is required: send code_challenge"));
+    };
+    if param("code_challenge_method") != Some("S256") || code_challenge.len() != 43 {
+        return Err(refuse("invalid_request", "use code_challenge_method=S256"));
+    }
+    if state.as_ref().is_none_or(|state| state.chars().count() < MIN_APP_STATE) {
+        return Err(refuse("invalid_request", "state is required: at least 16 characters"));
+    }
+    let Some(install_id) = param("install_id").filter(|id| app_sign_in::is_install_id(id)) else {
+        return Err(refuse("invalid_request", "install_id must be 16 to 64 characters of A-Z, a-z, 0-9, - and _"));
+    };
+    let Some(platform) = param("platform").and_then(Platform::from_stored) else {
+        return Err(refuse("invalid_request", "platform must be ios, ipados, android, macos, windows or linux"));
+    };
+    if param("scope").is_some_and(|scope| scope != SCOPE_APP) {
+        return Err(refuse("invalid_scope", "this app's scope is app"));
+    }
+    Ok(AuthorizeRequest {
+        client_id: client_id.to_owned(),
+        client_name: client_name.to_owned(),
+        redirect_uri,
+        state,
+        code_challenge: code_challenge.to_owned(),
+        app: Some(AppRequest { install_id: install_id.to_owned(), platform }),
     })
 }
 
@@ -298,16 +428,19 @@ async fn approve(
     }
     let code = crypto::new_token("bwc_");
     sqlx::query(
-        "INSERT INTO oauth_codes (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO oauth_codes
+             (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at, install_id, platform)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(crypto::hash(&code))
     .bind(&request.client_id)
     .bind(account_id)
     .bind(&request.redirect_uri)
     .bind(&request.code_challenge)
-    .bind(SCOPE_MCP)
+    .bind(request.scope())
     .bind(OffsetDateTime::now_utc() + CODE_TTL)
+    .bind(request.app.as_ref().map(|app| app.install_id.as_str()))
+    .bind(request.app.as_ref().map(|app| app.platform.as_str()))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -318,16 +451,23 @@ async fn approve(
     Ok(Some(redirect_with(&request.redirect_uri, &params)))
 }
 
-/// `POST /oauth/authorize/decision`: the consent form.
+/// `POST /oauth/authorize/decision`: the consent form, and an app's
+/// Continue or Cancel. Never shown in a frame.
 pub async fn decide(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    if let Err(refused) = crate::account::web::same_origin(&state, &headers) {
+    let mut response = decide_inner(&state, &headers, &form).await;
+    crate::account::web::no_frames(response.headers_mut());
+    response
+}
+
+async fn decide_inner(state: &AppState, headers: &HeaderMap, form: &HashMap<String, String>) -> Response {
+    if let Err(refused) = crate::account::web::same_origin(state, headers) {
         return refused;
     }
-    let account = match crate::account::web::session_account(&state, &headers).await {
+    let account = match crate::account::web::session_account(state, headers).await {
         Ok(Some(account)) => account,
         Ok(None) => return (StatusCode::FORBIDDEN, "Sign in first.").into_response(),
         Err(error) => {
@@ -336,7 +476,7 @@ pub async fn decide(
         }
     };
     let issuer = &state.config.account_origin;
-    let request = match check_authorize(&state.db, &state.config, &form).await {
+    let request = match check_authorize(&state.db, &state.config, form).await {
         Ok(request) => request,
         Err(problem) => {
             return match problem_redirect(&problem, issuer) {
@@ -355,7 +495,8 @@ pub async fn decide(
     match approve(&state.db, &request, account.id, issuer).await {
         Ok(None) => (StatusCode::FORBIDDEN, Notice::AccountBanned.message()).into_response(),
         Ok(Some(location)) => {
-            tracing::info!(client_id = %request.client_id, account = %account.id, "agent approved");
+            let what = if request.app.is_some() { "app sign-in approved" } else { "agent approved" };
+            tracing::info!(client_id = %request.client_id, account = %account.id, "{what}");
             Redirect::to(&location).into_response()
         }
         Err(error) => {
@@ -365,17 +506,61 @@ pub async fn decide(
     }
 }
 
+/// What redeeming a code gave: the tokens and, for an app, the install
+/// it signed in, for the new-device mail.
+pub struct Redeemed {
+    pub tokens: TokenResponse,
+    pub app: Option<SignedInApp>,
+}
+
+/// An app's sign-in made by a code.
+pub struct SignedInApp {
+    pub account_id: Uuid,
+    pub grant_id: Uuid,
+    pub install_id: String,
+    pub platform: Option<Platform>,
+}
+
 /// The `authorization_code` grant: one use, ten minutes, same client and
-/// redirect URI, and a verifier that hashes to the challenge.
+/// redirect URI, and a verifier that hashes to the challenge. The grant
+/// gets the scope stored with the code (`mcp` for an agent, `app` for an
+/// app), and an app's install and platform.
+///
+/// Its transaction waits at most three seconds for a connection and for
+/// each lock ([`app_sign_in::begin_waiting`]), as in-app sign-in's do;
+/// then the answer is `503 temporarily_unavailable` and the code is not
+/// used.
 pub async fn redeem_code(
     db: &PgPool,
     client_id: &str,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
-) -> Result<TokenResponse, OAuthFailure> {
+) -> Result<Redeemed, OAuthFailure> {
+    match redeem_code_inner(db, client_id, code, redirect_uri, verifier).await {
+        Err(OAuthFailure::Internal(error))
+            if error.downcast_ref::<sqlx::Error>().is_some_and(app_sign_in::is_lock_timeout) =>
+        {
+            tracing::warn!("code exchange: a lock or a connection was not had in time; answered busy");
+            Err(OAuthFailure::from(OAuthError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "temporarily_unavailable",
+                description: "Buwiz is busy; try again in a few seconds",
+            }))
+        }
+        redeemed => redeemed,
+    }
+}
+
+async fn redeem_code_inner(
+    db: &PgPool,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<Redeemed, OAuthFailure> {
     let invalid = || OAuthFailure::from(OAuthError::new("invalid_grant", "the code is not valid"));
-    let mut tx = db.begin().await?;
+    let mut tx = app_sign_in::begin_waiting(db).await?;
     // The account before the code row, in the order a ban takes them (it
     // locks the account, then ends the code rows). A code's account never
     // changes, so the unlocked read names the same one.
@@ -387,14 +572,37 @@ pub async fn redeem_code(
         return Err(invalid());
     };
     let banned = oauth::banned_now(&mut tx, owner).await?;
-    let row: Option<(String, Uuid, String, String, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
-        "SELECT client_id, account_id, redirect_uri, code_challenge, expires_at, used_at
+    #[derive(sqlx::FromRow)]
+    struct Stored {
+        client_id: String,
+        account_id: Uuid,
+        redirect_uri: String,
+        code_challenge: String,
+        scope: String,
+        expires_at: OffsetDateTime,
+        used_at: Option<OffsetDateTime>,
+        install_id: Option<String>,
+        platform: Option<String>,
+    }
+    let row: Option<Stored> = sqlx::query_as(
+        "SELECT client_id, account_id, redirect_uri, code_challenge, scope, expires_at, used_at, install_id, platform
          FROM oauth_codes WHERE code_hash = $1 FOR UPDATE",
     )
     .bind(crypto::hash(code))
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((code_client, account_id, code_redirect, challenge, expires_at, used_at)) = row else {
+    let Some(Stored {
+        client_id: code_client,
+        account_id,
+        redirect_uri: code_redirect,
+        code_challenge: challenge,
+        scope,
+        expires_at,
+        used_at,
+        install_id,
+        platform,
+    }) = row
+    else {
         return Err(invalid());
     };
     sqlx::query("UPDATE oauth_codes SET used_at = now() WHERE code_hash = $1")
@@ -418,9 +626,61 @@ pub async fn redeem_code(
         tx.commit().await?;
         return Err(OAuthFailure::from(OAuthError::new("access_denied", "this account is banned")));
     }
-    let tokens = oauth::issue_grant(&mut tx, account_id, client_id, SCOPE_MCP).await?;
+    let from = oauth::GrantFrom { install_id: install_id.as_deref(), platform: platform.as_deref() };
+    let (grant_id, tokens) = oauth::issue_grant_with_id(&mut tx, account_id, client_id, &scope, from).await?;
     tx.commit().await?;
-    Ok(tokens)
+    let app = match (scope.as_str(), install_id) {
+        (SCOPE_APP, Some(install_id)) => Some(SignedInApp {
+            account_id,
+            grant_id,
+            install_id,
+            platform: platform.as_deref().and_then(Platform::from_stored),
+        }),
+        _ => None,
+    };
+    Ok(Redeemed { tokens, app })
+}
+
+/// Mails the account when an app signs in on an install it has no device
+/// row for: "New sign-in to eBIRForms on …", with when, and where to log
+/// it out. Never for an account signing in with a fixed code (a store
+/// reviewer's). Runs on its own task after the exchange committed, so the
+/// token answer never waits for it; a mail that fails is logged, with ids
+/// only, and the sign-in stands.
+pub fn mail_new_device(state: &AppState, app: SignedInApp) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        new_device_mail(&state, &app).await;
+        state.mailer.new_device_checked();
+    });
+}
+
+async fn new_device_mail(state: &AppState, app: &SignedInApp) {
+    let at = OffsetDateTime::now_utc();
+    let to: sqlx::Result<Option<String>> = sqlx::query_scalar(&format!(
+        "SELECT a.email FROM accounts a
+         WHERE a.id = $1 AND NOT {}
+           AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.account_id = a.id AND d.install_id = $2)",
+        crate::account::roles::fixed_code_sql("a", "$3")
+    ))
+    .bind(app.account_id)
+    .bind(&app.install_id)
+    .bind(&state.config.admin_emails)
+    .fetch_optional(&state.db)
+    .await;
+    let to = match to {
+        Ok(Some(to)) => to,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be looked up");
+            return;
+        }
+    };
+    let device = Platform::device(app.platform);
+    let tins = format!("{}/tins", state.config.account_origin);
+    if state.mailer.send_new_device(&to, device, at, &tins).await.is_err() {
+        tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be sent");
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +731,44 @@ mod tests {
         assert!(!redirect_uri_matches("http://127.0.0.1:1000/cb", "http://127.0.0.1:2000/other"));
         assert!(!redirect_uri_matches("https://a.example/cb", "https://a.example:8443/cb"));
         assert!(redirect_uri_matches("https://a.example/cb", "https://a.example/cb"));
+    }
+
+    #[test]
+    fn only_buwiz_desktop_has_app_redirects_and_they_are_strict() {
+        assert!(app_redirects("buwiz-ebirforms").is_empty() && app_redirects("buwiz-books").is_empty());
+        assert!(app_redirects("agent_x").is_empty());
+        let ok = |uri: &str| app_redirects("buwiz-desktop").iter().any(|known| known.matches(uri));
+        for good in ["ebirforms://signin-callback", "http://127.0.0.1:1/callback", "http://127.0.0.1:65535/callback"] {
+            assert!(ok(good), "{good}");
+        }
+        for bad in [
+            "ebirforms://signin-callback/",
+            "http://127.0.0.1:080/callback",
+            "http://127.0.0.1:0/callback",
+            "http://127.0.0.1:99999/callback",
+            "http://127.0.0.1:+80/callback",
+            "http://127.0.0.1:80/callback?",
+            "http://127.0.0.1:80/callback#",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
+        assert!(!redirect_uri_allowed("ebirforms://signin-callback"));
+    }
+
+    #[test]
+    fn no_frames_adds_to_a_policy_already_there() {
+        let mut headers = HeaderMap::new();
+        crate::account::web::no_frames(&mut headers);
+        assert_eq!(headers["content-security-policy"], "frame-ancestors 'none'");
+        assert_eq!(headers["x-frame-options"], "DENY");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-security-policy", "default-src 'self';".parse().unwrap());
+        crate::account::web::no_frames(&mut headers);
+        assert_eq!(headers["content-security-policy"], "default-src 'self'; frame-ancestors 'none'");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-security-policy", "frame-ancestors 'none'; img-src 'self'".parse().unwrap());
+        crate::account::web::no_frames(&mut headers);
+        assert_eq!(headers["content-security-policy"], "frame-ancestors 'none'; img-src 'self'");
     }
 
     #[test]

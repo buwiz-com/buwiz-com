@@ -1,4 +1,4 @@
-//! Migrations 11 to 20 on a database at migration 10 with a row in every
+//! Migrations 11 to 21 on a database at migration 10 with a row in every
 //! claim status, files, readings, audit lines, tickets and returns: the
 //! rows survive and read as before, and going back down to 10 leaves a
 //! database the release before this one starts on, every return kept.
@@ -8,7 +8,8 @@
 //! sign-in) to 16, and 18 (one device row per install) to 17. Migration
 //! 20 (an index on devices' sign-ins) and the server's migration
 //! connection ([`buwiz_cloud::migrate`]) fail, rather than wait, behind a
-//! long transaction, and recover as docs/deploy.md says.
+//! long transaction, and recover as docs/deploy.md says. Migration 21
+//! (Sign in with Buwiz) goes back to 20.
 //! Each test gets its own empty database (`migrations = false`).
 
 use std::borrow::Cow;
@@ -324,7 +325,7 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     let before = rows(&db).await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
     let after = rows(&db).await;
     assert_eq!(only_columns_at_10(&after, &before), before, "no row or old column changed");
 
@@ -776,6 +777,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
     for (down, set) in [
+        (include_str!("../migrations/0021_app_authorize.down.sql"), ""),
         (include_str!("../migrations/0020_devices_grant_index.down.sql"), ""),
         (include_str!("../migrations/0019_device_install_index.down.sql"), ""),
         (include_str!("../migrations/0018_device_installs.down.sql"), ""),
@@ -914,7 +916,7 @@ async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgP
     assert_eq!(versions(&db).await, (1..=10).collect::<Vec<_>>());
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
 }
 
 /// Migration 13: a test TIN (root 000-000-000) is only ever one an Admin or
@@ -991,7 +993,7 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
             .unwrap();
     assert_eq!(checks, 0);
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
 }
 
 /// The migrations of the release before BIR uptime: 1 to 13.
@@ -1040,7 +1042,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     release_13().run(&db).await.unwrap();
     let schema_13 = schema(&db).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
 
     // What a try may hold: a live failure has a class and a kind, a lab
     // try neither and is never counted, times are to the minute, keys are
@@ -1195,6 +1197,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     // By hand, as psql runs it, the down file does the same (after 17's,
     // 16's and 15's, newest first).
     for down in [
+        include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
         include_str!("../migrations/0019_device_install_index.down.sql"),
         include_str!("../migrations/0018_device_installs.down.sql"),
@@ -1290,7 +1293,7 @@ async fn a_stray_open_transaction_fails_migration_14(db: PgPool, table: &str) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>(), "{table}");
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
     let validated: bool =
         sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tickets_bir_admission_check'")
             .fetch_one(&db)
@@ -1329,7 +1332,7 @@ async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
     let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
     let boss = id(&db, "INSERT INTO accounts (email, role) VALUES ('boss@example.test', 'admin') RETURNING id").await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
 
     let hash = "decode(repeat('ab', 32), 'hex')";
     let set = |columns: &str| format!("UPDATE accounts SET {columns} WHERE id = '{ana}'");
@@ -1384,6 +1387,7 @@ async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
     exec(&db, &set(&whole)).await;
     exec(&db, &line("fixed_code_set")).await;
     for down in [
+        include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
         include_str!("../migrations/0019_device_install_index.down.sql"),
         include_str!("../migrations/0018_device_installs.down.sql"),
@@ -1423,7 +1427,7 @@ async fn account_deletion_goes_back_to_15(db: PgPool) {
     let code = "INSERT INTO email_codes (email, code_hash, expires_at) VALUES ('ana@example.test', decode('01', 'hex'), now())";
     exec(&db, code).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
     let purposes: Vec<String> = sqlx::query_scalar("SELECT purpose FROM email_codes").fetch_all(&db).await.unwrap();
     assert_eq!(purposes, ["sign_in"]);
 
@@ -1461,6 +1465,7 @@ async fn account_deletion_goes_back_to_15(db: PgPool) {
     exec(&db, &with_purpose("delete")).await;
     exec(&db, &line("deleted")).await;
     for down in [
+        include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
         include_str!("../migrations/0019_device_install_index.down.sql"),
         include_str!("../migrations/0018_device_installs.down.sql"),
@@ -1498,7 +1503,7 @@ async fn in_app_sign_in_goes_back_to_16(db: PgPool) {
     let code = "INSERT INTO email_codes (email, code_hash, expires_at) VALUES ('ana@example.test', decode('01', 'hex'), now())";
     exec(&db, code).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
 
     let request = |intent: &str, platform: &str, hash_bytes: usize| {
         format!(
@@ -1551,6 +1556,7 @@ async fn in_app_sign_in_goes_back_to_16(db: PgPool) {
     MIGRATOR.run(&db).await.unwrap();
     exec(&db, &request("sign_in", "'android'", 32)).await;
     for down in [
+        include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
         include_str!("../migrations/0019_device_install_index.down.sql"),
         include_str!("../migrations/0018_device_installs.down.sql"),
@@ -1600,7 +1606,7 @@ async fn one_device_row_per_install_goes_back_to_17(db: PgPool) {
     )
     .await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
     // No row was rewritten: an earlier device reads its sign-in as its
     // creation.
     let (signed_in, install): (Option<String>, Option<String>) =
@@ -1651,6 +1657,7 @@ async fn one_device_row_per_install_goes_back_to_17(db: PgPool) {
     // Up again, then back by hand.
     MIGRATOR.run(&db).await.unwrap();
     for down in [
+        include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
         include_str!("../migrations/0019_device_install_index.down.sql"),
         include_str!("../migrations/0018_device_installs.down.sql"),
@@ -1707,7 +1714,7 @@ async fn migration_20_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
     // ... and works once it is dropped.
     exec(&db, "DROP INDEX CONCURRENTLY IF EXISTS devices_grant_id").await;
     buwiz_cloud::migrate(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
     let valid: bool = sqlx::query_scalar(
         "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'devices_grant_id'",
     )
@@ -1719,4 +1726,102 @@ async fn migration_20_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
         let setting: String = sqlx::query_scalar("SHOW lock_timeout").fetch_one(&db).await.unwrap();
         assert_eq!(setting, "0", "the pool's connections keep the default");
     }
+}
+
+/// The migrations of the release before Sign in with Buwiz: 1 to 20.
+fn release_20() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 20).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// Migration 21, on a database at 20 with an agent's code, an app's
+/// sign-in and its device: a code may belong to a built-in client, which
+/// is no row of `oauth_clients`, and keeps the app's install and platform,
+/// checked. The rows there are stay as they were. Going back to 20 drops
+/// the apps' codes only, keeps the agents' and every grant and device,
+/// and leaves 20's schema exactly; the way up works again, by sqlx and by
+/// hand.
+#[sqlx::test(migrations = false)]
+async fn app_codes_go_back_to_20(db: PgPool) {
+    release_20().run(&db).await.unwrap();
+    let schema_20 = schema(&db).await;
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    exec(
+        &db,
+        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+         VALUES ('agent_test', 'Test agent', ARRAY['https://agent.example.test/cb'])",
+    )
+    .await;
+    let grant = id(
+        &db,
+        &format!(
+            "INSERT INTO oauth_grants (account_id, client_id, install_id, platform)
+             VALUES ('{ana}', 'buwiz-ebirforms', 'install-phone-0001', 'ios') RETURNING id"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO devices (account_id, grant_id, public_key, name, install_id, platform, signed_in_at)
+             VALUES ('{ana}', '{grant}', decode(repeat('01', 32), 'hex'), 'Phone', 'install-phone-0001', 'ios', now())"
+        ),
+    )
+    .await;
+    let code = |hash: &str, client: &str, extra: &str| {
+        format!(
+            "INSERT INTO oauth_codes (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at{})
+             VALUES (decode('{hash}', 'hex'), '{client}', '{ana}', 'ebirforms://signin-callback', 'c', 'app',
+                     now() + interval '10 minutes'{})",
+            if extra.is_empty() { "" } else { ", install_id, platform" },
+            if extra.is_empty() { String::new() } else { format!(", {extra}") }
+        )
+    };
+    exec(&db, &code("01", "agent_test", "")).await;
+    fails_with(&db, &code("02", "buwiz-desktop", ""), "oauth_codes_client_id_fkey").await;
+    let rows = |db: PgPool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT concat_ws(' ', 'grant', client_id, install_id, platform, revoked_at) FROM oauth_grants
+             UNION ALL SELECT concat_ws(' ', 'device', name, install_id, platform, revoked_at) FROM devices
+             ORDER BY 1",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap()
+    };
+    let before = rows(db.clone()).await;
+
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
+    assert_eq!(rows(db.clone()).await, before, "no grant or device changed");
+    exec(&db, &code("02", "buwiz-desktop", "'install-phone-0001', 'ios'")).await;
+    fails_with(&db, &code("03", "buwiz-desktop", "'short', 'ios'"), "oauth_codes_install_id_check").await;
+    fails_with(&db, &code("04", "buwiz-desktop", "'install-phone-0001', 'symbian'"), "oauth_codes_platform_check")
+        .await;
+    let codes = |db: PgPool| async move {
+        sqlx::query_scalar::<_, String>("SELECT client_id FROM oauth_codes ORDER BY 1").fetch_all(&db).await.unwrap()
+    };
+    assert_eq!(codes(db.clone()).await, ["agent_test", "buwiz-desktop"]);
+
+    // Back to 20 the way sqlx reverts: the app's code goes, the agent's stays.
+    MIGRATOR.undo(&db, 20).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_20, "the schema is migration 20's");
+    assert_eq!(codes(db.clone()).await, ["agent_test"]);
+    assert_eq!(rows(db.clone()).await, before, "every grant and device stays");
+    release_20().run(&db).await.unwrap();
+
+    // Up again, then back by hand.
+    MIGRATOR.run(&db).await.unwrap();
+    exec(&db, &code("05", "buwiz-desktop", "'install-phone-0001', 'android'")).await;
+    let mut tx = db.begin().await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0021_app_authorize.down.sql")).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_20);
+    assert_eq!(codes(db.clone()).await, ["agent_test"]);
+    assert_eq!(rows(db.clone()).await, before);
+    release_20().run(&db).await.unwrap();
 }

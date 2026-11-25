@@ -214,10 +214,10 @@ fn text_field(
 /// updates it in place, with the new key and sign-in, and ends the sign-in
 /// it had. A sign-in without one may register again, each time a new row.
 ///
-/// A sign-in that named its install when it began (the in-app start, or
-/// the device flow's `/oauth/device/code`) and was completed is proof of
-/// the account, so its registration replaces that install's row whatever
-/// sign-in held it: by design. Someone who knows a device's install id and
+/// A sign-in that named its install when it began (the in-app start, the
+/// device flow's `/oauth/device/code`, or `/oauth/authorize`) and was
+/// completed is proof of the account, so its registration replaces that
+/// install's row whatever sign-in held it: by design. Someone who knows a device's install id and
 /// can complete a sign-in on the account replaces that device's sign-in;
 /// when the sign-in replaced was still live, the account is mailed
 /// ([`mail_replaced`]).

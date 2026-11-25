@@ -3,7 +3,7 @@
 //! plain-text notices to staff (BIR uptime's alerts, [`crate::uptime::alerts`]).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -48,10 +48,18 @@ pub struct Mailer {
     /// Tests only ([`Mailer::recording`]): codes the apps asked for, as
     /// mailed, kept here, not sent.
     app_codes: Option<Mutex<Vec<AppCodeMail>>>,
+    /// Tests only ([`Mailer::recording`]): new-device mails, kept here, not
+    /// sent.
+    new_devices: Option<Mutex<Vec<Notice>>>,
     /// Tests only: a recording mailer that fails every notice.
     failing: AtomicBool,
+    /// Tests only: a recording mailer that fails every new-device mail.
+    failing_new_devices: AtomicBool,
     /// Tests only: a recording mailer that fails every app's code.
     failing_app_codes: AtomicBool,
+    /// How many new-device checks have finished, mail or not: tests wait
+    /// on it, as the check runs on its own task.
+    new_device_checks: AtomicUsize,
 }
 
 /// A sign-in code an app asked for, as mailed.
@@ -141,8 +149,11 @@ impl Mailer {
             codes: None,
             deletion_codes: None,
             app_codes: None,
+            new_devices: None,
             failing: AtomicBool::new(false),
             failing_app_codes: AtomicBool::new(false),
+            failing_new_devices: AtomicBool::new(false),
+            new_device_checks: AtomicUsize::new(0),
         }
     }
 
@@ -154,6 +165,7 @@ impl Mailer {
             codes: Some(Mutex::new(Vec::new())),
             deletion_codes: Some(Mutex::new(Vec::new())),
             app_codes: Some(Mutex::new(Vec::new())),
+            new_devices: Some(Mutex::new(Vec::new())),
             ..Self::new(MailConfig::Log, site_origin)
         }
     }
@@ -186,6 +198,29 @@ impl Mailer {
     /// `fail`.
     pub fn fail_app_codes(&self, fail: bool) {
         self.failing_app_codes.store(fail, Ordering::SeqCst);
+    }
+
+    /// The new-device mails a [`Mailer::recording`] kept, oldest first.
+    pub fn new_device_mails(&self) -> Vec<Notice> {
+        self.new_devices
+            .as_ref()
+            .map_or_else(Vec::new, |mails| mails.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// How many new-device checks have finished, whether they mailed or
+    /// not ([`crate::account::agents::mail_new_device`]).
+    pub fn new_device_checks(&self) -> usize {
+        self.new_device_checks.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn new_device_checked(&self) {
+        self.new_device_checks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Tests only: a [`Mailer::recording`] fails every new-device mail
+    /// while `fail`.
+    pub fn fail_new_device_mails(&self, fail: bool) {
+        self.failing_new_devices.store(fail, Ordering::SeqCst);
     }
 
     /// Tests only: a [`Mailer::recording`] fails every notice while `fail`.
@@ -326,6 +361,45 @@ impl Mailer {
         }
     }
 
+    /// Tells `to` that `device` (fixed words, such as "eBIRForms on
+    /// iPhone") signed in to the account at `at`, and where its devices
+    /// are listed (`devices_page`), as plain text.
+    pub async fn send_new_device(
+        &self,
+        to: &str,
+        device: &'static str,
+        at: time::OffsetDateTime,
+        devices_page: &str,
+    ) -> anyhow::Result<()> {
+        let (subject, text) = new_device_message(device, at, devices_page);
+        if let Some(mails) = &self.new_devices {
+            if self.failing_new_devices.load(Ordering::SeqCst) {
+                anyhow::bail!("made-up mail failure");
+            }
+            let mail = Notice { to: to.into(), subject, text };
+            mails.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(mail);
+            return Ok(());
+        }
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(device, "new-device mail (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .bearer_auth(api_key)
+                    .json(&json!({ "from": from, "to": [to], "subject": subject, "text": text }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
+        }
+    }
+
     /// The code for deleting the account at `to`, as plain text: a short
     /// message of its own, so it is never taken for a sign-in code.
     pub async fn send_deletion_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
@@ -356,8 +430,28 @@ impl Mailer {
     }
 }
 
-/// The subject and text of the email with a code for deleting an account.
-/// As in the sign-in email, the code is the only number.
+/// The subject and text of the mail about a new device: fixed words, the
+/// device's, and the time in the Philippines.
+fn new_device_message(device: &str, at: time::OffsetDateTime, devices_page: &str) -> (String, String) {
+    let at = at.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"));
+    let (hour, half) = match at.hour() {
+        0 => (12, "AM"),
+        hour @ 1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        hour => (hour - 12, "PM"),
+    };
+    let when = format!("{} {}, {} at {hour}:{:02} {half}", at.month(), at.day(), at.year(), at.minute());
+    (
+        format!("New sign-in to {device}"),
+        format!(
+            "Your Buwiz account was signed in to {device} on {when}, Philippine time.\n\n\
+             If this was you, there is nothing to do.\n\n\
+             If this wasn't you, log it out at {devices_page}\n\n\
+             Buwiz - https://buwiz.com"
+        ),
+    )
+}
+
 /// The subject and text of [`Mailer::send_sign_in_replaced`].
 fn sign_in_replaced_message(device: &str, site_origin: &str) -> (String, String) {
     let subject = format!("New sign-in to {device}");
@@ -372,6 +466,8 @@ fn sign_in_replaced_message(device: &str, site_origin: &str) -> (String, String)
     (subject, text)
 }
 
+/// The subject and text of the email with a code for deleting an account.
+/// As in the sign-in email, the code is the only number.
 fn deletion_message(code: &str) -> (String, String) {
     (
         format!("{code} is your code to delete your Buwiz account"),
@@ -542,6 +638,24 @@ mod tests {
         assert_eq!(subject, "New sign-in to eBIRForms on iPhone");
         assert!(text.contains("The earlier sign-in on that device was ended."), "{text}");
         assert!(text.contains("https://account.buwiz.com/tins#devices-h"), "{text}");
+    }
+
+    #[test]
+    fn the_new_device_mail_says_where_and_when_in_philippine_time() {
+        let at = time::OffsetDateTime::from_unix_timestamp(1_795_590_240).unwrap();
+        let (subject, text) = new_device_message("eBIRForms on iPhone", at, "https://account.buwiz.com/tins");
+        assert_eq!(subject, "New sign-in to eBIRForms on iPhone");
+        assert!(
+            text.contains("signed in to eBIRForms on iPhone on November 25, 2026 at 3:04 PM, Philippine time"),
+            "{text}"
+        );
+        assert!(text.contains("If this wasn't you, log it out at https://account.buwiz.com/tins\n"), "{text}");
+        let (_, midnight) = new_device_message(
+            "eBIRForms on Mac",
+            time::OffsetDateTime::from_unix_timestamp(1_795_624_200).unwrap(),
+            "x",
+        );
+        assert!(midnight.contains("November 26, 2026 at 12:30 AM"), "{midnight}");
     }
 
     #[test]

@@ -988,7 +988,7 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 20's, 19's and 18's,
+Going further back runs 17's down file first (after 21's, 20's, 19's and 18's,
 [below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
@@ -1044,9 +1044,9 @@ devices removed with their sign-in stay removed). In this order:
    starts instead, it runs migrations 18 to 20 again, and the rollback
    starts over at 1.
 
-Going further back runs 20's, 19's and 18's down files first, then 17's
-and the others as [above](#migration-17-in-app-sign-in); each commits on
-its own.
+Going further back runs 20's, 19's and 18's down files first (after
+21's, [below](#migration-21-sign-in-with-buwiz)), then 17's and the others
+as [above](#migration-17-in-app-sign-in); each commits on its own.
 
 ## Migration 20 (an index on devices' sign-ins)
 
@@ -1088,7 +1088,54 @@ nothing is recorded in `_sqlx_migrations`. The next start then fails with
    ```
    (for 19, `devices_account_install`).
 3. `sudo systemctl restart buwiz.service`, then check
-   `SELECT max(version) FROM _sqlx_migrations` is 20.
+   `SELECT max(version) FROM _sqlx_migrations` is 21 (20 on a release
+   without [migration 21](#migration-21-sign-in-with-buwiz)).
+
+## Migration 21 (Sign in with Buwiz)
+
+The release with Sign in with Buwiz for the eBIRForms apps
+([accounts.md](accounts.md#sign-in-with-buwiz)) runs migration 21 when it
+starts. It adds `install_id` and `platform` to `oauth_codes`, and drops
+the reference from `oauth_codes.client_id` to `oauth_clients`: the app's
+client is built in and never a row there, and the code checks the client
+instead. It runs in a transaction and sets its own `lock_timeout` (10 s).
+Both columns are nullable with no default, so no row is rewritten, and
+dropping the reference scans nothing. Postgres reads `oauth_codes` once,
+under the lock, to check the new columns (one short row per code given
+out), so each lock is held a moment. No existing row changes. There is
+no setting. The release before it (at 20) refuses to start on a database
+at 21.
+
+**Before you deploy.** The database is at 20, and no code belongs to a
+client that is not registered (a read-only check):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 20
+SELECT count(*) FROM oauth_codes
+ WHERE client_id NOT IN (SELECT client_id FROM oauth_clients);       -- 0
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 20.** The down file never refuses. It deletes the apps'
+codes not yet exchanged (ten minutes old at most: the app signs in again),
+drops the two columns and puts the reference back. Agents' codes stay;
+apps already signed in keep their tokens, and their grants keep the
+install and platform. In this order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0021_app_authorize.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 20
+   ```
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 21 again, and the rollback starts
+   over at 1.
+
+Going further back runs 21's down file first, then 20's, 19's, 18's and
+the others as [above](#migrations-18-and-19-one-row-per-device); each
+commits on its own.
 
 ## Cloudflare rules for sign-in
 

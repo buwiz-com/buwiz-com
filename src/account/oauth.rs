@@ -304,15 +304,6 @@ pub struct TokenResponse {
     scope: String,
 }
 
-pub(crate) async fn issue_grant(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    account_id: Uuid,
-    client_id: &str,
-    scope: &str,
-) -> sqlx::Result<TokenResponse> {
-    issue_grant_from(tx, account_id, client_id, scope, GrantFrom::default()).await
-}
-
 /// What an app said about itself when it signed in, kept on the grant:
 /// its install (one device row per install, [`crate::filing::devices`])
 /// and, from in-app sign-in, its platform.
@@ -322,7 +313,8 @@ pub(crate) struct GrantFrom<'a> {
     pub platform: Option<&'a str>,
 }
 
-/// [`issue_grant`], keeping `from` on the grant.
+/// A new grant for `account_id` and its first tokens, keeping `from` on
+/// the grant.
 pub(crate) async fn issue_grant_from(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
@@ -330,6 +322,17 @@ pub(crate) async fn issue_grant_from(
     scope: &str,
     from: GrantFrom<'_>,
 ) -> sqlx::Result<TokenResponse> {
+    Ok(issue_grant_with_id(tx, account_id, client_id, scope, from).await?.1)
+}
+
+/// [`issue_grant_from`], with the new grant's id.
+pub(crate) async fn issue_grant_with_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    client_id: &str,
+    scope: &str,
+    from: GrantFrom<'_>,
+) -> sqlx::Result<(Uuid, TokenResponse)> {
     let grant_id: Uuid = sqlx::query_scalar(
         "INSERT INTO oauth_grants (account_id, client_id, scope, install_id, platform) VALUES ($1, $2, $3, $4, $5)
          RETURNING id",
@@ -341,7 +344,7 @@ pub(crate) async fn issue_grant_from(
     .bind(from.platform)
     .fetch_one(&mut **tx)
     .await?;
-    issue_tokens(tx, grant_id, scope).await
+    Ok((grant_id, issue_tokens(tx, grant_id, scope).await?))
 }
 
 async fn issue_tokens(
@@ -385,7 +388,8 @@ pub struct TokenRequest {
 }
 
 /// `POST /oauth/token` (form-encoded): `refresh_token`, the RFC 8628
-/// `device_code` grant, and `authorization_code` with PKCE for agents.
+/// `device_code` grant, and `authorization_code` with PKCE for agents and
+/// the eBIRForms apps.
 pub async fn token(
     State(state): State<AppState>,
     Form(request): Form<TokenRequest>,
@@ -411,9 +415,13 @@ pub async fn token(
                     OAuthError::new("invalid_request", "code, redirect_uri and code_verifier are required").into()
                 );
             };
-            crate::account::agents::redeem_code(&state.db, &request.client_id, &code, &redirect_uri, &verifier)
-                .await
-                .map(Json)
+            let redeemed =
+                crate::account::agents::redeem_code(&state.db, &request.client_id, &code, &redirect_uri, &verifier)
+                    .await?;
+            if let Some(app) = redeemed.app {
+                crate::account::agents::mail_new_device(&state, app);
+            }
+            Ok(Json(redeemed.tokens))
         }
         _ => {
             Err(OAuthError::new("unsupported_grant_type", "use authorization_code, refresh_token or device_code")

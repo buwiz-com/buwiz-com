@@ -10,7 +10,7 @@ use topcoat::context::{Cx, app_context, memoize};
 use topcoat::router::error::redirect;
 use topcoat::router::request::{headers, uri};
 use topcoat::router::{Router, Slot, layout, page};
-use topcoat::view::{View, component, view};
+use topcoat::view::{View, ViewExt, component, view};
 use uuid::Uuid;
 
 use crate::account::accounts::{self, Account};
@@ -190,6 +190,9 @@ async fn root_layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
         _ => Default::default(),
     };
     let mut head = head_for(&path);
+    if path == "/oauth/authorize" && query(cx, "client_id").is_some_and(|id| oauth::client_name(&id).is_some()) {
+        head.title = "Sign in to eBIRForms · Buwiz";
+    }
     // Search engines find the download page once there is something on it.
     if path == "/download" && state(cx).downloads.latest().await.is_none() {
         head.index = false;
@@ -668,7 +671,8 @@ async fn device_page(cx: &Cx) -> Result<impl View> {
     })
 }
 
-/// An AI agent asks to read the account (OAuth consent).
+/// An AI agent asks to read the account (OAuth consent), or an eBIRForms
+/// app asks to sign in ("Sign in with Buwiz", [`app_authorize`]).
 #[page("/oauth/authorize")]
 async fn authorize_page(cx: &Cx) -> Result<impl View> {
     let params: HashMap<String, String> =
@@ -691,11 +695,20 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
         "state",
         "scope",
         "resource",
+        "install_id",
+        "platform",
     ]
     .iter()
     .filter_map(|name| params.get(*name).map(|value| ((*name).to_owned(), value.clone())))
     .collect();
     let email = signed_in(cx).await?.email;
+    let app = params.get("client_id").is_some_and(|id| oauth::client_name(id).is_some());
+    if let Some(platform) = request.as_ref().and_then(|request| request.app.as_ref()).map(|app| app.platform) {
+        let here = uri(cx).path_and_query().map_or("/oauth/authorize", |path| path.as_str()).to_owned();
+        return Ok(
+            view! { app_authorize(platform: platform.label(), email: email, fields: fields, here: here) }.boxed()
+        );
+    }
     let redirect_origin =
         request.as_ref().map(|request| agents::redirect_origin(&request.redirect_uri)).unwrap_or_default();
     Ok(view! {
@@ -753,9 +766,50 @@ async fn authorize_page(cx: &Cx) -> Result<impl View> {
                     <span class="auth-badge">icon(name: "link_off")</span>
                     <h1>"This sign-in request cannot be used"</h1>
                     <p class="auth-notice error" role="status">icon(name: "error") <span>(problem)</span></p>
-                    <p class="auth-lead">"Go back to the AI app and connect to Buwiz again."</p>
+                    if app {
+                        <p class="auth-lead">"Go back to the app and sign in again."</p>
+                    } else {
+                        <p class="auth-lead">"Go back to the AI app and connect to Buwiz again."</p>
+                    }
                 </section>
             }
+            <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
+        </main>
+    }
+    .boxed())
+}
+
+/// An eBIRForms app's sign-in: Buwiz's own app, so no consent wording,
+/// but never approved without the tap, even with a session. "Use another
+/// account" signs the website out and comes back here after signing in.
+#[component]
+async fn app_authorize(
+    platform: &'static str,
+    email: String,
+    fields: Vec<(String, String)>,
+    here: String,
+) -> Result<impl View> {
+    Ok(view! {
+        <main class="home auth">
+            <section class="auth-card">
+                auth_brand()
+                <span class="auth-badge">icon(name: "devices")</span>
+                <h1>"Sign in to eBIRForms on " (platform)</h1>
+                <p class="auth-lead">"Continue only if you are signing in to eBIRForms yourself, on your own device."</p>
+                <form class="auth-form" method="post" action="/oauth/authorize/decision">
+                    for (name, value) in fields {
+                        <input type="hidden" name=(name) value=(value)>
+                    }
+                    <div class="auth-actions">
+                        <button class="btn btn-solid" type="submit" name="decision" value="approve">"Continue as " (email)</button>
+                        <button class="btn btn-ghost" type="submit" name="decision" value="deny">"Cancel"</button>
+                    </div>
+                </form>
+                <form class="auth-switch" method="post" action="/logout">
+                    <input type="hidden" name="next" value=(here)>
+                    <button class="auth-link" type="submit">"Use another account"</button>
+                </form>
+            </section>
             <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
         </main>
     })

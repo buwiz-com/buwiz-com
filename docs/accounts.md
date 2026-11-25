@@ -916,8 +916,15 @@ word.
 - At most 3 a day per account (`new_device_mails`, counted in the
   exchange's transaction). A person adds a phone, a computer, maybe
   reinstalls one; more in a day is a script with the web session, whose
-  mails would bury a real alert. Past it the sign-in stands, nothing is
-  mailed, and one log line has the account and grant ids.
+  mails would bury a real alert. The third says it is the last notice
+  that day and asks the person to check My devices; no other mail is
+  sent. Past it the sign-in stands, nothing is mailed, and one log line
+  has the account and grant ids.
+- Counting fails the sign-in only when the count itself cannot be made:
+  its lock not had within 3 seconds is `503 temporarily_unavailable`
+  (the device flow's poll too), any other database error is `500`. Either
+  way the sign-in is rolled back, nothing is mailed, and the code or
+  device code stays unspent, so the app may try again.
 - The device flow sends it the same way, when its sign-in named an
   install (`/oauth/device/code` with `install_id`): it is approved in a
   browser too. Its device word is "eBIRForms", as the device flow names
@@ -965,23 +972,20 @@ Answers `200` with the device flow's token answer, scope `app`; refresh
 as for every app (`grant_type=refresh_token`). The code works once,
 within ten minutes, for its client, address and verifier: anything else
 is `400 invalid_grant` (and uses the code up), and a banned account gets
-`400 access_denied`. What a flood of made-up codes can cost is bounded
-as for in-app sign-in:
-1. **The network's failures.** Every grant on `/oauth/token`
+`400 access_denied`.
+
+What a flood of made-up codes can cost:
+1. **Counted and alerted, never refused.** Every grant on `/oauth/token`
    (`authorization_code`, `refresh_token`, the device code) and
-   `/auth/device/poll` counts against its network's hour (IPv4 /24, IPv6
-   /48, from `CF-Connecting-IP`), and only tries that fail with
+   `/auth/device/poll` is counted against its network's hour (IPv4 /24,
+   IPv6 /48, from `CF-Connecting-IP`), and only tries that fail with
    `invalid_grant` stay counted: a refresh or an exchange that works, and
-   a poll told to wait, are given back. A network with 300 failures in the
-   hour (`TOKEN_FAILURES_PER_NETWORK`, deploy.md) gets `429
-   too_many_requests` before any database work, for every grant, until
-   the hour ends, with `Retry-After` and `retry_after` (the seconds left
-   in the hour). A try is counted before it runs and given back after, so
-   a burst of more than 300 valid tries in flight at once from one
-   network can briefly see a 429 too. A working app rarely fails (a refresh token a sign-out
-   ended, once), so 300 leaves room for hundreds of apps behind one
-   carrier's address. Refusals are in the hourly log line and the staff
-   alert with the other sign-in limits.
+   a poll told to wait, are given back. The tries a network makes past 300
+   failures in the hour (`TOKEN_FAILURES_PER_NETWORK`, deploy.md) are in
+   the hourly log line and the staff alert with the other sign-in limits,
+   and are served as any other: one stuck app or a neighbour behind a
+   carrier's address must never lock that address out, and main has no
+   such lockout. A slow lane for such networks is issue #84.
 2. A code, refresh token or device code that is not its prefix (`bwc_`,
    `bwr_`, `bwd_`) and 43 characters of base64url was never given out:
    `400 invalid_grant` before any database work.
@@ -992,8 +996,17 @@ as for in-app sign-in:
 4. Its transaction waits at most 3 seconds for a connection and for each
    lock (`begin_waiting`).
 
-Past 3 or 4 it is `503 temporarily_unavailable`, the code is not used,
-and the app may try again in a few seconds.
+When no place comes within 2 seconds (3), or a connection or a lock does
+not come within 3 (4), the answer is `503 temporarily_unavailable`: the
+code is not used, and the app may try again in a few seconds.
+
+What is left, plainly:
+- A stream of well-shaped made-up codes can keep Sign in with Buwiz busy
+  (`503`, its 2 places) while it lasts. In-app sign-in and filing keep
+  working: they have their own places.
+- The device-code path (`/auth/device/poll`, and the device code on
+  `/oauth/token`) costs a pooled connection per poll, as on main, and is
+  not changed here (#84).
 
 ## Devices
 

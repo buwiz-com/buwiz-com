@@ -443,7 +443,6 @@ async fn a_ban_and_a_sign_in_completing_at_once_do_not_deadlock(db: PgPool) {
     match agent {
         Err(buwiz_cloud::error::OAuthFailure::OAuth(_)) => {}
         Err(buwiz_cloud::error::OAuthFailure::Internal(error)) => panic!("the agent's sign-in failed: {error:#}"),
-        Err(buwiz_cloud::error::OAuthFailure::TooMany { .. }) => panic!("the agent's sign-in was limited"),
         Ok(_) => panic!("tokens issued to a banned account"),
     }
     let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_grants WHERE account_id = $1")

@@ -242,7 +242,16 @@ async fn redeem_device_code(
                         install_id,
                         &state.config.admin_emails,
                     )
-                    .await?,
+                    .await
+                    .map_err(|error| {
+                        // Its lock not had within three seconds: busy, and
+                        // the device code stays unspent for the next poll.
+                        if crate::account::app_sign_in::is_lock_timeout(&error) {
+                            crate::account::agents::token_busy()
+                        } else {
+                            error.into()
+                        }
+                    })?,
                 }),
                 _ => None,
             };
@@ -421,12 +430,12 @@ pub struct TokenRequest {
     code_verifier: Option<String>,
 }
 
-/// Runs a try at a token under its network's failures
-/// ([`crate::account::guard::SignInGuard::count_token_try`]): a network
-/// that failed too often this hour is `429 too_many_requests` (with
-/// `Retry-After`, the seconds left in its hour) before `attempt` runs, so
-/// before the database. The try is given back unless it
-/// failed with `invalid_grant` (an unknown or wrong code or token).
+/// Runs a try at a token, counted against its network's failures
+/// ([`crate::account::guard::SignInGuard::count_token_try`]) for the
+/// hourly log line and the staff alert. Counted and alerted, never
+/// refused: a network far over the count is served as main serves it. The
+/// try is given back unless it failed with `invalid_grant` (an unknown or
+/// wrong code or token).
 async fn counted<T>(
     state: &AppState,
     headers: &http::HeaderMap,
@@ -434,10 +443,6 @@ async fn counted<T>(
 ) -> Result<T, OAuthFailure> {
     let tried = state.sign_in_guard.count_token_try(headers);
     crate::account::app_sign_in::alert_if_refused_many(state);
-    let tried = match tried {
-        Ok(tried) => tried,
-        Err(retry_after) => return Err(OAuthFailure::TooMany { retry_after }),
-    };
     let outcome = attempt.await;
     let failed = matches!(&outcome, Err(OAuthFailure::OAuth(error)) if error.error == "invalid_grant");
     if !failed {

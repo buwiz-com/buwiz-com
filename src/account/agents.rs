@@ -545,7 +545,7 @@ pub fn is_code(code: &str) -> bool {
     crypto::is_token(code, CODE_PREFIX)
 }
 
-fn token_busy() -> OAuthFailure {
+pub(crate) fn token_busy() -> OAuthFailure {
     OAuthFailure::from(OAuthError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         error: "temporarily_unavailable",
@@ -593,7 +593,7 @@ pub struct SignedInApp {
     /// The address to mail about a new device, decided in the exchange's
     /// transaction: the account had no device row for the install then,
     /// and does not sign in with a fixed code. `None`: no mail.
-    pub new_device_to: Option<String>,
+    pub new_device_to: Option<NewDeviceNotice>,
 }
 
 /// The `authorization_code` grant: one use, ten minutes, same client and
@@ -734,7 +734,7 @@ pub(crate) async fn new_device_to(
     grant_id: Uuid,
     install_id: &str,
     admin_emails: &[String],
-) -> sqlx::Result<Option<String>> {
+) -> sqlx::Result<Option<NewDeviceNotice>> {
     let to: Option<String> = sqlx::query_scalar(&format!(
         "SELECT a.email FROM accounts a
          WHERE a.id = $1 AND NOT {}
@@ -751,6 +751,10 @@ pub(crate) async fn new_device_to(
     let Some(to) = to else {
         return Ok(None);
     };
+    // Waited for at most three seconds, on the device flow's transaction
+    // too (the exchange's already waits no longer): then the sign-in fails,
+    // rolled back, its code or device code unspent.
+    sqlx::query("SET LOCAL lock_timeout = '3s'").execute(&mut **tx).await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
         .bind(NEW_DEVICE_MAIL_LOCK)
         .bind(account_id)
@@ -767,7 +771,15 @@ pub(crate) async fn new_device_to(
         return Ok(None);
     }
     sqlx::query("INSERT INTO new_device_mails (account_id) VALUES ($1)").bind(account_id).execute(&mut **tx).await?;
-    Ok(Some(to))
+    Ok(Some(NewDeviceNotice { to, last_today: sent + 1 == NEW_DEVICE_MAILS_PER_DAY }))
+}
+
+/// A new-device mail the exchange decided on ([`new_device_to`]).
+pub struct NewDeviceNotice {
+    pub to: String,
+    /// The day's last ([`NEW_DEVICE_MAILS_PER_DAY`]): it says so, and asks
+    /// the person to check My devices for others.
+    pub last_today: bool,
 }
 
 /// Mails "New sign-in to eBIRForms on …", with when, and where to log it
@@ -786,12 +798,12 @@ pub fn mail_new_device(state: &AppState, app: SignedInApp) {
 
 async fn new_device_mail(state: &AppState, app: &SignedInApp) {
     let at = OffsetDateTime::now_utc();
-    let Some(to) = &app.new_device_to else {
+    let Some(notice) = &app.new_device_to else {
         return;
     };
     let device = Platform::device(app.platform);
     let tins = format!("{}/tins#devices-h", state.config.account_origin);
-    if state.mailer.send_new_device(to, device, at, &tins).await.is_err() {
+    if state.mailer.send_new_device(&notice.to, device, at, &tins, notice.last_today).await.is_err() {
         tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be sent");
     }
 }

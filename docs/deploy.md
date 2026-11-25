@@ -946,13 +946,14 @@ restart (`sudo systemctl restart buwiz.service`) and no release:
 | `SIGN_IN_VERIFIES_PER_NETWORK` | 300 | 1 to 1,000,000 | Tries at a code an hour, the apps' and the web form's together, per network |
 | `APP_SIGN_IN_STARTS_PAST_FULL` | 20,000 | 0 to 10,000,000 | Once 100,000 networks are counted in an hour: start and resend tries an hour for every new network together |
 | `SIGN_IN_VERIFIES_PAST_FULL` | 30,000 | 0 to 10,000,000 | The same for tries at a code |
-| `TOKEN_FAILURES_PER_NETWORK` | 300 | 1 to 1,000,000 | Failed tries at a token an hour per network: an unknown or wrong code, refresh token or device code on `/oauth/token` and `/auth/device/poll`. Tries that do not fail are not counted. Over it, `429 too_many_requests` before the database |
+| `TOKEN_FAILURES_PER_NETWORK` | 300 | 1 to 1,000,000 | Failed tries at a token an hour per network (an unknown or wrong code, refresh token or device code on `/oauth/token` and `/auth/device/poll`) past which its tries are reported. Tries that do not fail are not counted. It sets an alert threshold only: nothing is ever refused by it |
 | `TOKEN_FAILURES_PAST_FULL` | 30,000 | 0 to 10,000,000 | The same for every new network together once 100,000 are counted |
-| `SIGN_IN_REFUSALS_ALERT_AT` | 100 | 1 to 10,000,000 | Refusals by the six limits above in an hour at which staff are mailed (at most once an hour) |
+| `SIGN_IN_REFUSALS_ALERT_AT` | 100 | 1 to 10,000,000 | Refusals by the four sign-in limits above, plus tries at a token past the two counts above, in an hour at which staff are mailed (at most once an hour) |
 
 Every hour with refusals, the log has one line (`tries refused in the
-last hour`) with how many starts, tries at a code and tries at a token
-were refused by a network's limit and by the shared budget. Many refusals by a
+last hour`) with how many starts and tries at a code were refused by a
+network's limit and by the shared budget, and how many tries at a token
+came past the counts (served, never refused). Many refusals by a
 network's limit near a filing deadline can be a carrier's range being
 squeezed: raise the per-network settings and restart. The line is
 written at the first try after the hour ends.
@@ -1129,7 +1130,8 @@ No existing row changes. There is no setting. The release before them (at
 
 **When one times out.** 21 waits for any transaction open on
 `oauth_codes` or `devices`, even one that only read them; 22 only for a
-schema change or another VALIDATE on them. Behind one past 10 s it fails,
+schema change, another VALIDATE, or a VACUUM or ANALYZE of them (an
+autovacuum gives way, unless it runs to prevent wraparound). Behind one past 10 s it fails,
 records nothing, and the server does not start (the journal says
 `migrations failed` with `canceling statement due to lock timeout`). End
 that transaction (the query in [migration

@@ -381,15 +381,17 @@ impl Mailer {
 
     /// Tells `to` that `device` (fixed words, such as "eBIRForms on
     /// iPhone") signed in to the account at `at`, and where its devices
-    /// are listed (`devices_page`), as plain text.
+    /// are listed (`devices_page`), as plain text. The day's last
+    /// (`last_today`) says so and asks the person to check their devices.
     pub async fn send_new_device(
         &self,
         to: &str,
         device: &'static str,
         at: time::OffsetDateTime,
         devices_page: &str,
+        last_today: bool,
     ) -> anyhow::Result<()> {
-        let (subject, text) = new_device_message(device, at, devices_page);
+        let (subject, text) = new_device_message(device, at, devices_page, last_today);
         if let Some(mails) = &self.new_devices {
             if self.failing_new_devices.load(Ordering::SeqCst) {
                 anyhow::bail!("made-up mail failure");
@@ -450,7 +452,12 @@ impl Mailer {
 
 /// The subject and text of the mail about a new device: fixed words, the
 /// device's, and the time in the Philippines.
-fn new_device_message(device: &str, at: time::OffsetDateTime, devices_page: &str) -> (String, String) {
+fn new_device_message(
+    device: &str,
+    at: time::OffsetDateTime,
+    devices_page: &str,
+    last_today: bool,
+) -> (String, String) {
     let at = at.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"));
     let (hour, half) = match at.hour() {
         0 => (12, "AM"),
@@ -465,7 +472,16 @@ fn new_device_message(device: &str, at: time::OffsetDateTime, devices_page: &str
             "Your Buwiz account was signed in to {device} on {when}, Philippine time.\n\n\
              If this was you, there is nothing to do.\n\n\
              If this wasn't you, log it out at {devices_page}\n\n\
-             Buwiz - https://buwiz.com"
+             {last}\
+             Buwiz - https://buwiz.com",
+            last = if last_today {
+                format!(
+                    "This is the last new-device notice we send you today. Check My devices at {devices_page} \
+                     for any other device signed in to your account.\n\n"
+                )
+            } else {
+                String::new()
+            }
         ),
     )
 }
@@ -661,7 +677,7 @@ mod tests {
     #[test]
     fn the_new_device_mail_says_where_and_when_in_philippine_time() {
         let at = time::OffsetDateTime::from_unix_timestamp(1_795_590_240).unwrap();
-        let (subject, text) = new_device_message("eBIRForms on iPhone", at, "https://account.buwiz.com/tins");
+        let (subject, text) = new_device_message("eBIRForms on iPhone", at, "https://account.buwiz.com/tins", false);
         assert_eq!(subject, "New device signed in: eBIRForms on iPhone");
         let (replaced, _) = sign_in_replaced_message("eBIRForms on iPhone", "https://account.buwiz.com");
         assert_ne!(subject, replaced, "the two mails are told apart by their subjects");
@@ -674,8 +690,15 @@ mod tests {
             "eBIRForms on Mac",
             time::OffsetDateTime::from_unix_timestamp(1_795_624_200).unwrap(),
             "x",
+            false,
         );
         assert!(midnight.contains("November 26, 2026 at 12:30 AM"), "{midnight}");
+        assert!(!text.contains("last new-device notice"), "{text}");
+        let (_, last) = new_device_message("eBIRForms on iPhone", at, "https://account.buwiz.com/tins", true);
+        assert!(
+            last.contains("This is the last new-device notice we send you today. Check My devices at https://account.buwiz.com/tins "),
+            "{last}"
+        );
     }
 
     #[test]

@@ -72,19 +72,19 @@ pub const APP_ATTEMPTS_PAST_FULL: u32 = 20_000;
 /// hour).
 pub const VERIFY_TRIES_PAST_FULL: u32 = 30_000;
 
-/// Failed tries at a token one network may make in an hour: an unknown or
-/// wrong code, refresh token or device code on `/oauth/token` and
-/// `/auth/device/poll`. Only failures count (a try that did not fail is
-/// given back), and a network over the limit is refused before the
-/// database. A working app fails rarely: a refresh token that a sign-out
-/// ended, once, or a device code it polls after its sign-in was used. So
-/// 300 is room for hundreds of apps behind one carrier's or office's
-/// address failing in the same hour, and still holds a script to 300
-/// lookups an hour, under one every ten seconds.
+/// Failed tries at a token one network makes in an hour before its further
+/// tries are reported: an unknown or wrong code, refresh token or device
+/// code on `/oauth/token` and `/auth/device/poll`. Only failures count (a
+/// try that did not fail is given back). It never refuses anything: a try
+/// past it is served as any other, and only counted in the hourly log line
+/// and the staff alert ([`SignInGuard::take_refusal_alert`]), so the real
+/// rates are learnt. A working app fails rarely (a refresh token that a
+/// sign-out ended, once), so 300 is room for hundreds of apps behind one
+/// carrier's address.
 pub const TOKEN_FAILURES_PER_NETWORK: u32 = 300;
 
 /// The same for networks new in an hour once the map is full, as
-/// [`VERIFY_TRIES_PAST_FULL`].
+/// [`VERIFY_TRIES_PAST_FULL`]: past it, their tries are reported too.
 pub const TOKEN_FAILURES_PAST_FULL: u32 = 30_000;
 
 /// Refusals by those limits in an hour (start/resend's and verify's, by a
@@ -141,9 +141,10 @@ pub struct RefusalCounts {
     pub verifies_by_network: u64,
     /// Tries at a code of new networks refused by the shared budget.
     pub verifies_by_budget: u64,
-    /// Tries at a token refused by their network's own failures.
+    /// Tries at a token past their network's count of failures: served,
+    /// never refused, and counted here only.
     pub tokens_by_network: u64,
-    /// Tries at a token of new networks refused by the shared budget.
+    /// Tries at a token of new networks past the shared budget: served too.
     pub tokens_by_budget: u64,
 }
 
@@ -514,29 +515,26 @@ impl SignInGuard {
     }
 
     /// Counts a try at a token (`/oauth/token`, `/auth/device/poll`)
-    /// against its network's failures this hour, before the database:
-    /// `Err` with the seconds to wait when the network failed
-    /// [`TOKEN_FAILURES_PER_NETWORK`] times. A try that did not fail is
-    /// given back ([`Self::forgive_token_try`]), so only failures stay
-    /// counted. Without `CF-Connecting-IP` there is no network to count.
-    pub fn count_token_try(&self, headers: &HeaderMap) -> Result<TokenTry, i64> {
+    /// against its network's failures this hour. It never refuses: a try
+    /// past [`TOKEN_FAILURES_PER_NETWORK`] is noted for the hourly log line
+    /// and the staff alert, and served as any other. A try that did not
+    /// fail is given back ([`Self::forgive_token_try`]), so only failures
+    /// stay counted. Without `CF-Connecting-IP` there is no network to
+    /// count.
+    pub fn count_token_try(&self, headers: &HeaderMap) -> TokenTry {
         self.count_token_try_at(client_ip(headers), OffsetDateTime::now_utc())
     }
 
-    fn count_token_try_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<TokenTry, i64> {
+    fn count_token_try_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> TokenTry {
         let Some(address) = address else {
-            return Ok(TokenTry { network: None, at: now });
+            return TokenTry { network: None, at: now };
         };
         let network = Network::of(address);
         let verdict = self.token_failures.hit_or_refused(network.clone(), now);
         self.note(Tries::Tokens, verdict.as_ref().err().map(|(bucket, _)| *bucket), now);
-        match verdict {
-            Ok(bucket) => Ok(TokenTry { network: Some((network, bucket)), at: now }),
-            Err((_, wait)) => {
-                let seconds = wait.whole_seconds();
-                Err(if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds })
-            }
-        }
+        // Past the count the try was not added, so there is nothing to give
+        // back.
+        TokenTry { network: verdict.ok().map(|bucket| (network, bucket)), at: now }
     }
 
     /// Gives back a try at a token that did not fail.

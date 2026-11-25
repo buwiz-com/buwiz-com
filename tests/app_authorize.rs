@@ -563,37 +563,15 @@ async fn token_from(site: &Site, address: &str, form: &[(&str, &str)]) -> (u16, 
 }
 
 const NETWORK_A: &str = "198.51.100.7";
-const NETWORK_B: &str = "203.0.113.9";
 
-/// A site whose networks may fail `n` tries at a token an hour.
+/// A site that counts `n` failed tries at a token per network an hour
+/// before it reports further ones (it never refuses them).
 fn site_with_token_failures(db: PgPool, n: u32) -> Site {
     Site::with_config(db, |config| config.sign_in_limits.token_failures_per_network = n)
 }
 
 fn made_up(prefix: &str) -> String {
     crypto::new_token(prefix)
-}
-
-/// Made-up codes of the right shape from one network: each fails, and
-/// past the limit the network is refused at once. A real exchange from
-/// another network meanwhile signs in.
-#[sqlx::test(migrations = "./migrations")]
-async fn made_up_codes_from_one_network_leave_another_networks_exchange_working(db: PgPool) {
-    let site = site_with_token_failures(db, 5);
-    let (_, cookie) = site.person(ANA).await;
-    let code = approve(&site, &cookie, &[]).await;
-    for _ in 0..5 {
-        let (status, answer) = exchange_from(&site, NETWORK_A, &made_up("bwc_")).await;
-        assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_grant")), "{answer}");
-    }
-    let (status, answer) = exchange_from(&site, NETWORK_A, &made_up("bwc_")).await;
-    assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
-    // The real code, from the refused network, is refused before it is
-    // looked at, and so still works from another.
-    assert_eq!(exchange_from(&site, NETWORK_A, &code).await.0, 429);
-    let (status, tokens) = exchange_from(&site, NETWORK_B, &code).await;
-    assert_eq!(status, 200, "{tokens}");
-    assert_eq!(site.state.sign_in_guard.refusals_this_hour().tokens_by_network, 2);
 }
 
 async fn refresh_from(site: &Site, address: &str, refresh_token: &str) -> (u16, Value) {
@@ -603,44 +581,6 @@ async fn refresh_from(site: &Site, address: &str, refresh_token: &str) -> (u16, 
         &[("grant_type", "refresh_token"), ("client_id", CLIENT), ("refresh_token", refresh_token)],
     )
     .await
-}
-
-/// Made-up refresh tokens from one network are limited the same way; a
-/// real refresh from another network works meanwhile.
-#[sqlx::test(migrations = "./migrations")]
-async fn made_up_refresh_tokens_from_one_network_leave_another_networks_refresh_working(db: PgPool) {
-    let site = site_with_token_failures(db, 5);
-    let (_, cookie) = site.person(ANA).await;
-    let tokens = sign_in(&site, &cookie, PHONE, "ios").await;
-    for _ in 0..5 {
-        let (status, answer) = refresh_from(&site, NETWORK_A, &made_up("bwr_")).await;
-        assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_grant")), "{answer}");
-    }
-    // A token of another shape is refused too, without the database.
-    let (status, answer) = refresh_from(&site, NETWORK_A, "bwr_short").await;
-    assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
-    let (status, answer) = refresh_from(&site, NETWORK_B, tokens["refresh_token"].as_str().unwrap()).await;
-    assert_eq!(status, 200, "{answer}");
-    let (status, answer) = refresh_from(&site, NETWORK_B, "bwr_short").await;
-    assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_grant")), "{answer}");
-}
-
-/// A refresh that works is never counted: many in a row from one network
-/// leave its failures untouched.
-#[sqlx::test(migrations = "./migrations")]
-async fn a_valid_refresh_is_never_counted(db: PgPool) {
-    let site = site_with_token_failures(db, 3);
-    let (_, cookie) = site.person(ANA).await;
-    let mut refresh = sign_in(&site, &cookie, PHONE, "ios").await["refresh_token"].as_str().unwrap().to_owned();
-    for _ in 0..10 {
-        let (status, answer) = refresh_from(&site, NETWORK_A, &refresh).await;
-        assert_eq!(status, 200, "{answer}");
-        refresh = answer["refresh_token"].as_str().unwrap().to_owned();
-    }
-    for _ in 0..3 {
-        assert_eq!(refresh_from(&site, NETWORK_A, &made_up("bwr_")).await.0, 400);
-    }
-    assert_eq!(refresh_from(&site, NETWORK_A, &refresh).await.0, 429, "three failures and no more");
 }
 
 async fn poll_from(site: &Site, address: &str, device_code: &str) -> (u16, Value) {
@@ -655,92 +595,85 @@ async fn poll_from(site: &Site, address: &str, device_code: &str) -> (u16, Value
     (status, serde_json::from_str(&text(response).await).unwrap())
 }
 
-/// `/auth/device/poll` with made-up device codes is limited per network.
-/// An app polling its own pending sign-in is not counted, however often
-/// it is told to wait.
+/// Counted and alerted, never refused: a network far over its count of
+/// failed tries still has its valid refresh, exchange and poll served, as
+/// on main. The tries past the count are in the hour's counts, and staff
+/// are alerted.
 #[sqlx::test(migrations = "./migrations")]
-async fn device_polls_with_made_up_codes_are_limited(db: PgPool) {
-    let site = site_with_token_failures(db, 3);
+async fn a_network_far_over_its_failures_is_still_served(db: PgPool) {
+    let site = Site::with_config(db, |config| {
+        config.sign_in_limits.token_failures_per_network = 2;
+        config.sign_in_limits.refusals_alert_at = 5;
+    });
+    let (_, cookie) = site.person(ANA).await;
+    let tokens = sign_in(&site, &cookie, PHONE, "ios").await;
+    let code = approve(&site, &cookie, &[]).await;
     let request = Request::post("/auth/device/start")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({ "client_id": CLIENT }).to_string()))
         .unwrap();
     let started: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
     let pending = started["device_code"].as_str().unwrap();
-    for _ in 0..5 {
-        let (status, answer) = poll_from(&site, NETWORK_A, pending).await;
-        assert_eq!(status, 400);
-        assert!(matches!(answer["error"].as_str(), Some("authorization_pending" | "slow_down")), "{answer}");
+
+    for _ in 0..10 {
+        assert_eq!(refresh_from(&site, NETWORK_A, &made_up("bwr_")).await.0, 400);
+        assert_eq!(exchange_from(&site, NETWORK_A, &made_up("bwc_")).await.0, 400);
+        assert_eq!(poll_from(&site, NETWORK_A, &made_up("bwd_")).await.0, 400);
     }
-    for _ in 0..3 {
-        let (status, answer) = poll_from(&site, NETWORK_A, &made_up("bwd_")).await;
-        assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_grant")), "{answer}");
-    }
+    let counts = site.state.sign_in_guard.refusals_this_hour();
+    assert_eq!(counts.tokens_by_network, 28, "every failure past the first two is counted");
+
+    let (status, answer) = refresh_from(&site, NETWORK_A, tokens["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(status, 200, "{answer}");
+    let (status, answer) = exchange_from(&site, NETWORK_A, &code).await;
+    assert_eq!(status, 200, "{answer}");
     let (status, answer) = poll_from(&site, NETWORK_A, pending).await;
-    assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
-    // The device-code grant on /oauth/token counts in the same network.
-    let (status, _) = token_from(
-        &site,
-        NETWORK_A,
-        &[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("client_id", CLIENT),
-            ("device_code", pending),
-        ],
-    )
-    .await;
-    assert_eq!(status, 429);
-    assert_eq!(poll_from(&site, NETWORK_B, pending).await.0, 400);
-}
+    assert_eq!((status, answer["error"].as_str()), (400, Some("authorization_pending")), "{answer}");
 
-/// The refusal says when to try again, as the in-app sign-in's 429s do:
-/// `Retry-After` and `retry_after`, the seconds left in the network's
-/// hour.
-#[sqlx::test(migrations = "./migrations")]
-async fn the_failure_limits_429_says_when_to_try_again(db: PgPool) {
-    let site = site_with_token_failures(db, 1);
-    assert_eq!(refresh_from(&site, NETWORK_A, &made_up("bwr_")).await.0, 400);
-    for path in ["/oauth/token", "/auth/device/poll"] {
-        let request = if path == "/oauth/token" {
-            let form = format!("grant_type=refresh_token&client_id={CLIENT}&refresh_token={}", made_up("bwr_"));
-            Request::post(path)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header("cf-connecting-ip", NETWORK_A)
-                .body(Body::from(form))
-                .unwrap()
-        } else {
-            Request::post(path)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("cf-connecting-ip", NETWORK_A)
-                .body(Body::from(json!({ "client_id": CLIENT, "device_code": made_up("bwd_") }).to_string()))
-                .unwrap()
-        };
-        let response = site.send(request).await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
-        let header: i64 = response.headers()[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
-        assert!((3500..=3600).contains(&header), "{path}: {header}");
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        let answer: Value = serde_json::from_str(&text(response).await).unwrap();
-        assert_eq!(answer["error"], "too_many_requests", "{path}");
-        assert_eq!(answer["retry_after"].as_i64(), Some(header), "{path}");
+    // Staff were told, once.
+    for _ in 0..100 {
+        if !site.state.mailer.notices().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    let notices = site.state.mailer.notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].text.contains("served and never refused"), "{}", notices[0].text);
 }
 
-/// A network over its limit is refused before the database: here with the
-/// pool closed.
+/// A try that does not fail is given back: many valid refreshes from one
+/// network leave its count of failures at nothing.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_network_over_its_failures_is_refused_without_the_database(db: PgPool) {
-    let site = site_with_token_failures(db, 2);
-    for _ in 0..2 {
+async fn a_valid_refresh_is_never_counted(db: PgPool) {
+    let site = site_with_token_failures(db, 3);
+    let (_, cookie) = site.person(ANA).await;
+    let mut refresh = sign_in(&site, &cookie, PHONE, "ios").await["refresh_token"].as_str().unwrap().to_owned();
+    for _ in 0..10 {
+        let (status, answer) = refresh_from(&site, NETWORK_A, &refresh).await;
+        assert_eq!(status, 200, "{answer}");
+        refresh = answer["refresh_token"].as_str().unwrap().to_owned();
+    }
+    for _ in 0..4 {
         assert_eq!(refresh_from(&site, NETWORK_A, &made_up("bwr_")).await.0, 400);
     }
+    // Three failures fill the count; only the fourth is past it.
+    assert_eq!(site.state.sign_in_guard.refusals_this_hour().tokens_by_network, 1);
+}
+
+/// A refresh token, device code or code of another shape than minted is
+/// `invalid_grant` before the database: here with the pool closed.
+#[sqlx::test(migrations = "./migrations")]
+async fn tokens_of_another_shape_are_refused_without_the_database(db: PgPool) {
+    let site = Site::new(db);
     site.db.close().await;
     for (status, answer) in [
-        refresh_from(&site, NETWORK_A, &made_up("bwr_")).await,
-        poll_from(&site, NETWORK_A, &made_up("bwd_")).await,
-        exchange_from(&site, NETWORK_A, &made_up("bwc_")).await,
+        refresh_from(&site, NETWORK_A, "bwr_short").await,
+        refresh_from(&site, NETWORK_A, &format!("bwr_{}=", "A".repeat(42))).await,
+        poll_from(&site, NETWORK_A, "bwd_short").await,
+        exchange_from(&site, NETWORK_A, "bwc_short").await,
     ] {
-        assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
+        assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_grant")), "{answer}");
     }
 }
 
@@ -1141,7 +1074,14 @@ async fn the_new_device_mail_is_limited_to_three_a_day(db: PgPool) {
         let tokens = sign_in(&site, &cookie, &format!("install-number-{n:04}"), "ios").await;
         assert!(tokens["access_token"].as_str().unwrap().starts_with("bwa_"));
     }
-    assert_eq!(site.state.mailer.new_device_mails().len(), 3);
+    let mails = site.state.mailer.new_device_mails();
+    assert_eq!(mails.len(), 3);
+    // The third says it is the day's last, and asks them to check.
+    for mail in &mails[..2] {
+        assert!(!mail.text.contains("last new-device notice"), "{}", mail.text);
+    }
+    assert!(mails[2].text.contains("This is the last new-device notice we send you today."), "{}", mails[2].text);
+    assert!(mails[2].text.contains(&format!("Check My devices at {ORIGIN}/tins#devices-h")), "{}", mails[2].text);
     assert_eq!(count(&site.db, "SELECT count(*) FROM new_device_mails").await, 3);
     assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_grants WHERE revoked_at IS NULL").await, 5);
 
@@ -1196,6 +1136,44 @@ async fn a_decision_that_cannot_have_its_lock_in_time_is_busy(db: PgPool) {
     holder.rollback().await.unwrap();
     assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_codes").await, 0);
     assert!(location(&decide(&site, &cookie, &[], "approve").await).contains("code="));
+}
+
+/// The device flow waits at most three seconds for the lock the day's
+/// new-device mails are counted under (held here); then the poll is `503`,
+/// nothing is written, and the next poll signs in.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_device_flows_mail_lock_is_waited_for_three_seconds_at_most(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, cookie) = site.person(ANA).await;
+    let request = Request::post("/auth/device/start")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "client_id": CLIENT, "install_id": LAPTOP }).to_string()))
+        .unwrap();
+    let started: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+    let user_code = started["user_code"].as_str().unwrap();
+    let response = site.post("/device/decision", &cookie, &format!("user_code={user_code}&decision=approve")).await;
+    assert_eq!(location(&response), "/device?notice=device_approved");
+    let device_code = started["device_code"].as_str().unwrap();
+
+    let mut holder = site.db.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1, hashtext($2::text))")
+        .bind(0x6277_6e64_i32)
+        .bind(ana)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let started_at = std::time::Instant::now();
+    let (status, answer) = poll_from(&site, NETWORK_A, device_code).await;
+    assert_eq!((status, answer["error"].as_str()), (503, Some("temporarily_unavailable")), "{answer}");
+    assert!(started_at.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_grants").await, 0);
+    sqlx::query("SELECT pg_advisory_unlock_all()").execute(&mut *holder).await.unwrap();
+    drop(holder);
+
+    let (status, tokens) = poll_from(&site, NETWORK_A, device_code).await;
+    assert_eq!(status, 200, "{tokens}");
+    settled(&site, 1).await;
+    assert_eq!(site.state.mailer.new_device_mails().len(), 1);
 }
 
 async fn device_flow(site: &Site, cookie: &str, install: Option<&str>) -> Value {

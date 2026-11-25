@@ -7,8 +7,9 @@
 -- read once; the columns are new, so every one passes.
 --
 -- The lock_timeout below bounds the wait for the lock, held by schema
--- changes and other VALIDATEs, not by plain reads and writes. Behind one
--- it fails, records nothing, and starting again works.
+-- changes, other VALIDATEs, VACUUM and ANALYZE (an autovacuum gives way,
+-- unless it runs to prevent wraparound), not by plain reads and writes.
+-- Behind one it fails, records nothing, and starting again works.
 
 SET LOCAL lock_timeout = '10s';
 

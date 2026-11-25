@@ -807,6 +807,7 @@ async fn email_verify_or_app(State(state): State<AppState>, request: axum::extra
     // Counted before the form is read; a refusal reads it only to send
     // the person back to their code page, and touches no database.
     let counted = state.sign_in_guard.count_verify_try(&headers);
+    app_sign_in::alert_if_refused_many(&state);
     let form = match Form::<EmailVerify>::from_request(request, &state).await {
         Ok(Form(form)) => form,
         Err(rejection) => return rejection.into_response(),
@@ -919,14 +920,15 @@ struct EmailVerify {
 
 /// The web form's verify, once [`email_verify_or_app`] counted it: in one
 /// of verify's places for the database work (waited for at most two
-/// seconds, else "try again in a moment"), held to the end, and in a
-/// transaction whose locks are waited for at most three.
+/// seconds, else "try again in a moment"), held until the code is spent,
+/// and in a transaction whose locks and connection are waited for at most
+/// three.
 async fn email_verify(state: &AppState, form: EmailVerify) -> Response {
     let next = safe_next(form.next.as_deref());
     let Ok(email) = accounts::normalize_email(&form.email) else {
         return see_other(link("/login", Some(Notice::EmailInvalid), &[("next", &next)]));
     };
-    let Some(_slot) = app_sign_in::verify_slot(state).await else {
+    let Some(slot) = app_sign_in::verify_slot(state).await else {
         return back_to_code_page(form, Notice::SignInBusy);
     };
     let redeemed = match app_sign_in::begin_waiting(&state.db).await {
@@ -941,11 +943,14 @@ async fn email_verify(state: &AppState, form: EmailVerify) -> Response {
         Err(CodeError::Internal(error))
             if error.downcast_ref::<sqlx::Error>().is_some_and(app_sign_in::is_lock_timeout) =>
         {
-            tracing::warn!("web sign-in: a lock was not had in time; sent back to try again");
+            tracing::warn!("web sign-in: a lock or a connection was not had in time; sent back to try again");
             return back_to_code_page(form, Notice::SignInBusy);
         }
         Err(CodeError::Internal(error)) => return internal(error),
     };
+    // The code is spent: what follows is a signed-in person's, not a guess,
+    // and needs no place.
+    drop(slot);
     // The code was right, but a banned account gets no session. Its code
     // was emailed like any other, so typing an email tells nothing. Only
     // to delete itself does it get one, which no page but `/delete` takes

@@ -933,16 +933,32 @@ deployment as not public, and that lets a loopback host (`localhost`,
 https `ACCOUNT_ORIGIN`, any other value stops the server at start-up
 (`src/base/config.rs`, `secure_cookies`).
 
-The rest are constants in the code, with nothing to set or deploy beyond
-the release itself: per network, 200 tries an hour at start and resend
-(`APP_ATTEMPTS_PER_NETWORK`) and 300 at verify, the app's and the web
-form's together (`VERIFY_TRIES_PER_NETWORK`, `src/account/guard.rs`);
-once 100,000 networks are counted in an hour, one budget for every new
-network, 20,000 and 30,000 (`APP_ATTEMPTS_PAST_FULL`,
-`VERIFY_TRIES_PAST_FULL`), refused once spent;
-4 places for start's and resend's database work and 3 for verify's
-(`DATABASE_SLOTS`, `VERIFY_SLOTS`, `src/account/app_sign_in.rs`), under
-the pool's 10 connections.
+Five optional settings for the sign-in limits per network
+(`src/account/guard.rs`). Each is a whole number in its range; unset, it
+is today's value; any other value stops the server at start-up. Each is a
+parameter `/buwiz/<NAME>`, which `buwiz-env` writes to the Gatekeeper's
+settings at each start. They are read at start, so raising one needs a
+restart (`sudo systemctl restart buwiz.service`) and no release:
+
+| Setting | Default | Range | What |
+|---|---|---|---|
+| `APP_SIGN_IN_STARTS_PER_NETWORK` | 200 | 1 to 1,000,000 | Tries an hour at the apps' start and resend, per network (IPv4 /24, IPv6 /48) |
+| `SIGN_IN_VERIFIES_PER_NETWORK` | 300 | 1 to 1,000,000 | Tries at a code an hour, the apps' and the web form's together, per network |
+| `APP_SIGN_IN_STARTS_PAST_FULL` | 20,000 | 0 to 10,000,000 | Once 100,000 networks are counted in an hour: start and resend tries an hour for every new network together |
+| `SIGN_IN_VERIFIES_PAST_FULL` | 30,000 | 0 to 10,000,000 | The same for tries at a code |
+| `SIGN_IN_REFUSALS_ALERT_AT` | 100 | 1 to 10,000,000 | Refusals by the four limits above in an hour at which staff are mailed (at most once an hour) |
+
+Every hour with refusals, the log has one line (`tries refused in the
+last hour`) with how many starts and how many tries at a code were refused
+by a network's limit and by the shared budget. Many refusals by a
+network's limit near a filing deadline can be a carrier's range being
+squeezed: raise the per-network settings and restart. The line is
+written at the first try after the hour ends.
+
+The rest are constants in the code: 4 places for start's and resend's
+database work and 3 for verify's (`DATABASE_SLOTS`, `VERIFY_SLOTS`,
+`src/account/app_sign_in.rs`), under the pool's 10 connections, each
+waiting at most 3 seconds for a lock and for a connection.
 
 The cap on requests without an app check (20 an hour, 50 a day, one staff
 alert at 25) is for testing only. A platform's 1.0.0 needs the Turnstile

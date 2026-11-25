@@ -5,6 +5,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
+pub use crate::account::guard::SignInLimits;
 use crate::base::storage::{DocumentStore, ObjectStore};
 #[cfg(feature = "bir")]
 use crate::bir;
@@ -45,6 +46,10 @@ pub struct Config {
     /// sign-in code works, which is also how long before the app may ask
     /// for a new one ([`crate::account::app_sign_in`]).
     pub app_sign_in_minutes: i64,
+    /// The per-network limits of sign-in tries and the shared budgets past
+    /// a full map, and when staff are told of refusals
+    /// ([`sign_in_limits`]).
+    pub sign_in_limits: SignInLimits,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +132,7 @@ impl Config {
             forms_origin: origin(&var_or("FORMS_ORIGIN", "https://ebirforms.buwiz.com")).context("FORMS_ORIGIN")?,
             github_api_url: origin(&var_or("GITHUB_API_URL", "https://api.github.com")).context("GITHUB_API_URL")?,
             app_sign_in_minutes: app_sign_in_minutes(optional("APP_SIGN_IN_MINUTES").as_deref())?,
+            sign_in_limits: sign_in_limits(optional)?,
         })
     }
 
@@ -206,6 +212,29 @@ pub fn secure_cookies(account_origin: &str, raw: Option<&str>) -> anyhow::Result
         bail!("SECURE_COOKIES must be true with an https ACCOUNT_ORIGIN; leave it unset");
     }
     Ok(on)
+}
+
+/// The sign-in limits as set, each a whole number in its range, else
+/// today's value ([`SignInLimits::default`]). Any other value stops the
+/// server at start-up. `var` reads a setting (trimmed, `None` when unset).
+pub fn sign_in_limits(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<SignInLimits> {
+    let today = SignInLimits::default();
+    let read = |name: &str, default: u32, low: u32, high: u32| -> anyhow::Result<u32> {
+        let Some(raw) = var(name) else {
+            return Ok(default);
+        };
+        match raw.parse::<u32>() {
+            Ok(value) if (low..=high).contains(&value) => Ok(value),
+            _ => bail!("{name} must be a whole number from {low} to {high}, not `{raw}`"),
+        }
+    };
+    Ok(SignInLimits {
+        starts_per_network: read("APP_SIGN_IN_STARTS_PER_NETWORK", today.starts_per_network, 1, 1_000_000)?,
+        verifies_per_network: read("SIGN_IN_VERIFIES_PER_NETWORK", today.verifies_per_network, 1, 1_000_000)?,
+        starts_past_full: read("APP_SIGN_IN_STARTS_PAST_FULL", today.starts_past_full, 0, 10_000_000)?,
+        verifies_past_full: read("SIGN_IN_VERIFIES_PAST_FULL", today.verifies_past_full, 0, 10_000_000)?,
+        refusals_alert_at: read("SIGN_IN_REFUSALS_ALERT_AT", today.refusals_alert_at, 1, 10_000_000)?,
+    })
 }
 
 fn list(name: &str) -> Vec<String> {
@@ -408,6 +437,56 @@ mod tests {
             let (list, bad) = parse_admin_emails(raw);
             assert_eq!(bad, list, "{raw}");
             assert_eq!(bad.len(), 1, "{raw}");
+        }
+    }
+
+    #[test]
+    fn sign_in_limits_are_todays_unless_set_to_a_whole_number_in_range() {
+        let from = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            sign_in_limits(move |name| pairs.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone()))
+        };
+        assert_eq!(from(&[]).unwrap(), SignInLimits::default());
+        assert_eq!(
+            from(&[]).unwrap(),
+            SignInLimits {
+                starts_per_network: 200,
+                verifies_per_network: 300,
+                starts_past_full: 20_000,
+                verifies_past_full: 30_000,
+                refusals_alert_at: 100,
+            }
+        );
+        let set = from(&[
+            ("APP_SIGN_IN_STARTS_PER_NETWORK", "1000"),
+            ("SIGN_IN_VERIFIES_PER_NETWORK", "1500"),
+            ("APP_SIGN_IN_STARTS_PAST_FULL", "0"),
+            ("SIGN_IN_VERIFIES_PAST_FULL", "10000000"),
+            ("SIGN_IN_REFUSALS_ALERT_AT", "1"),
+        ])
+        .unwrap();
+        assert_eq!(
+            set,
+            SignInLimits {
+                starts_per_network: 1000,
+                verifies_per_network: 1500,
+                starts_past_full: 0,
+                verifies_past_full: 10_000_000,
+                refusals_alert_at: 1,
+            }
+        );
+        for (name, bad) in [
+            ("APP_SIGN_IN_STARTS_PER_NETWORK", "0"),
+            ("APP_SIGN_IN_STARTS_PER_NETWORK", "1000001"),
+            ("SIGN_IN_VERIFIES_PER_NETWORK", "-1"),
+            ("SIGN_IN_VERIFIES_PER_NETWORK", "2.5"),
+            ("APP_SIGN_IN_STARTS_PAST_FULL", "20,000"),
+            ("SIGN_IN_VERIFIES_PAST_FULL", "10000001"),
+            ("SIGN_IN_REFUSALS_ALERT_AT", "0"),
+            ("SIGN_IN_REFUSALS_ALERT_AT", "many"),
+        ] {
+            let error = from(&[(name, bad)]).unwrap_err().to_string();
+            assert!(error.starts_with(name) && error.contains(bad), "{name}={bad}: {error}");
         }
     }
 

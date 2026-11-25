@@ -72,9 +72,80 @@ pub const APP_ATTEMPTS_PAST_FULL: u32 = 20_000;
 /// hour).
 pub const VERIFY_TRIES_PAST_FULL: u32 = 30_000;
 
+/// Refusals by those limits in an hour (start/resend's and verify's, by a
+/// network's own limit or by the shared budget) at which staff are mailed:
+/// [`SignInGuard::take_refusal_alert`]. Any refusal already means one
+/// network used 200 starts or 300 tries at a code in the hour, more than a
+/// few people do; a person who is refused tries again a few times at most,
+/// so 100 is some tens of people turned away, not one network at the edge
+/// of its limit.
+pub const REFUSALS_ALERT_AT: u32 = 100;
+
+/// The limits a deployment may set (`APP_SIGN_IN_STARTS_PER_NETWORK` and
+/// the others, docs/deploy.md), today's values when unset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignInLimits {
+    /// [`APP_ATTEMPTS_PER_NETWORK`].
+    pub starts_per_network: u32,
+    /// [`VERIFY_TRIES_PER_NETWORK`].
+    pub verifies_per_network: u32,
+    /// [`APP_ATTEMPTS_PAST_FULL`].
+    pub starts_past_full: u32,
+    /// [`VERIFY_TRIES_PAST_FULL`].
+    pub verifies_past_full: u32,
+    /// [`REFUSALS_ALERT_AT`].
+    pub refusals_alert_at: u32,
+}
+
+impl Default for SignInLimits {
+    fn default() -> Self {
+        Self {
+            starts_per_network: APP_ATTEMPTS_PER_NETWORK,
+            verifies_per_network: VERIFY_TRIES_PER_NETWORK,
+            starts_past_full: APP_ATTEMPTS_PAST_FULL,
+            verifies_past_full: VERIFY_TRIES_PAST_FULL,
+            refusals_alert_at: REFUSALS_ALERT_AT,
+        }
+    }
+}
+
+/// The tries refused in an hour, by which limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefusalCounts {
+    /// Starts and resends refused by their network's own limit.
+    pub starts_by_network: u64,
+    /// Starts and resends of new networks refused by the shared budget.
+    pub starts_by_budget: u64,
+    /// Tries at a code refused by their network's own limit.
+    pub verifies_by_network: u64,
+    /// Tries at a code of new networks refused by the shared budget.
+    pub verifies_by_budget: u64,
+}
+
+impl RefusalCounts {
+    pub fn total(&self) -> u64 {
+        self.starts_by_network + self.starts_by_budget + self.verifies_by_network + self.verifies_by_budget
+    }
+}
+
+/// Which limiter a try was counted in.
+#[derive(Clone, Copy)]
+enum Tries {
+    Starts,
+    Verifies,
+}
+
+/// The current hour's refusals.
+#[derive(Default)]
+struct RefusalHour {
+    since: Option<OffsetDateTime>,
+    counts: RefusalCounts,
+}
+
 /// How often, at most, staff are mailed that Turnstile's answers lack the
-/// hostname or action ([`SignInGuard::take_unbound_alert`]), or that an
-/// in-app request was stuck ([`SignInGuard::take_stuck_alert`]).
+/// hostname or action ([`SignInGuard::take_unbound_alert`]), that an
+/// in-app request was stuck ([`SignInGuard::take_stuck_alert`]), or that
+/// many tries were refused ([`SignInGuard::take_refusal_alert`]).
 const ALERT_EVERY: Duration = Duration::hours(1);
 
 /// How long Turnstile may take to answer before the sign-in is refused.
@@ -103,6 +174,11 @@ pub struct SignInGuard {
     /// An in-app request that could be neither taken back nor ended after
     /// its mail failed, for the staff alert.
     stuck: HourlyAlert,
+    /// The hour's refusals by the two limiters above, for the hourly log
+    /// line and the staff alert.
+    refusals: Mutex<RefusalHour>,
+    refused_many: HourlyAlert,
+    refusals_alert_at: u64,
 }
 
 /// A staff alert raised at most once an hour, and taken once per raise.
@@ -198,7 +274,13 @@ struct Verdict {
 
 impl SignInGuard {
     /// `hostname` is the account site's host, e.g. `account.buwiz.com`.
+    /// With today's limits ([`SignInLimits::default`]).
     pub fn new(turnstile: Option<TurnstileConfig>, hostname: &str) -> Self {
+        Self::with_limits(turnstile, hostname, SignInLimits::default())
+    }
+
+    /// [`Self::new`] with the limits the deployment set.
+    pub fn with_limits(turnstile: Option<TurnstileConfig>, hostname: &str, limits: SignInLimits) -> Self {
         Self {
             turnstile,
             hostname: hostname.to_owned(),
@@ -208,17 +290,20 @@ impl SignInGuard {
             // lock new networks out at once (it would, sharing an overflow
             // of one network's size): they share a budget of their own.
             app_attempts: RateLimiter::with_overflow_budget(
-                APP_ATTEMPTS_PER_NETWORK,
+                limits.starts_per_network,
                 NETWORK_WINDOW,
-                APP_ATTEMPTS_PAST_FULL,
+                limits.starts_past_full,
             ),
             verify_tries: RateLimiter::with_overflow_budget(
-                VERIFY_TRIES_PER_NETWORK,
+                limits.verifies_per_network,
                 NETWORK_WINDOW,
-                VERIFY_TRIES_PAST_FULL,
+                limits.verifies_past_full,
             ),
             unbound: HourlyAlert::default(),
             stuck: HourlyAlert::default(),
+            refusals: Mutex::new(RefusalHour::default()),
+            refused_many: HourlyAlert::default(),
+            refusals_alert_at: u64::from(limits.refusals_alert_at),
         }
     }
 
@@ -262,7 +347,7 @@ impl SignInGuard {
     }
 
     fn count_app_attempt_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
-        count_try(&self.app_attempts, address, now)
+        self.count_try(Tries::Starts, address, now)
     }
 
     /// Counts a try at a code (`POST /auth/email/verify`, an app's or the
@@ -275,7 +360,74 @@ impl SignInGuard {
     }
 
     fn count_verify_try_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
-        count_try(&self.verify_tries, address, now)
+        self.count_try(Tries::Verifies, address, now)
+    }
+
+    /// Counts a try from `address` at `now` in the limiter of `tries`:
+    /// `Err` with the whole seconds to wait. No address, no count. Every
+    /// counted try notes the hour's refusals ([`Self::note`]).
+    fn count_try(&self, tries: Tries, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
+        let Some(address) = address else {
+            return Ok(());
+        };
+        let limiter = match tries {
+            Tries::Starts => &self.app_attempts,
+            Tries::Verifies => &self.verify_tries,
+        };
+        let verdict = limiter.hit_or_refused(Network::of(address), now);
+        self.note(tries, verdict.as_ref().err().map(|(bucket, _)| *bucket), now);
+        verdict.map(|_| ()).map_err(|(_, wait)| {
+            let seconds = wait.whole_seconds();
+            if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds }
+        })
+    }
+
+    /// Notes a try at `now`, `refused` by a network's own count
+    /// ([`Bucket::Key`]) or the shared budget ([`Bucket::Overflow`]). When
+    /// an hour with refusals has ended, logs one line of its counts (no
+    /// network, no address). When the hour's refusals reach
+    /// `refusals_alert_at`, raises the staff alert.
+    fn note(&self, tries: Tries, refused: Option<Bucket>, now: OffsetDateTime) {
+        let (ended, total) = {
+            let mut hour = self.refusals.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut ended = None;
+            if hour.since.is_none_or(|since| now - since >= NETWORK_WINDOW || now < since) {
+                ended = Some(std::mem::take(&mut hour.counts)).filter(|counts| counts.total() > 0);
+                hour.since = Some(now);
+            }
+            let counts = &mut hour.counts;
+            match (tries, refused) {
+                (_, None) => {}
+                (Tries::Starts, Some(Bucket::Key)) => counts.starts_by_network += 1,
+                (Tries::Starts, Some(Bucket::Overflow)) => counts.starts_by_budget += 1,
+                (Tries::Verifies, Some(Bucket::Key)) => counts.verifies_by_network += 1,
+                (Tries::Verifies, Some(Bucket::Overflow)) => counts.verifies_by_budget += 1,
+            }
+            (ended, counts.total())
+        };
+        if let Some(counts) = ended {
+            tracing::warn!(
+                starts_by_network = counts.starts_by_network,
+                starts_by_budget = counts.starts_by_budget,
+                verifies_by_network = counts.verifies_by_network,
+                verifies_by_budget = counts.verifies_by_budget,
+                "sign-in: tries refused in the last hour by the per-network limits and the shared budgets"
+            );
+        }
+        if refused.is_some() && total >= self.refusals_alert_at {
+            self.refused_many.raise(now);
+        }
+    }
+
+    /// The refusals of the hour so far.
+    pub fn refusals_this_hour(&self) -> RefusalCounts {
+        self.refusals.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).counts
+    }
+
+    /// When staff are to be told now that many tries were refused this
+    /// hour (once per raise, at most once an hour): the hour's counts.
+    pub fn take_refusal_alert(&self) -> Option<RefusalCounts> {
+        self.refused_many.take().then(|| self.refusals_this_hour())
     }
 
     /// Whether staff are to be told now that Turnstile answered without the
@@ -284,8 +436,8 @@ impl SignInGuard {
         self.unbound.take()
     }
 
-    /// Notes an in-app request that could be neither taken back nor ended
-    /// after its mail failed ([`crate::account::app_sign_in`]).
+    /// Notes an in-app request that could not be taken back after its mail
+    /// failed ([`crate::account::app_sign_in`]).
     pub fn raise_stuck(&self) {
         self.stuck.raise(OffsetDateTime::now_utc());
     }
@@ -359,18 +511,6 @@ impl SignInGuard {
             }
         }
     }
-}
-
-/// Counts a try from `address` at `now` in `limiter`: `Err` with the whole
-/// seconds to wait. No address, no count.
-fn count_try(limiter: &RateLimiter<Network>, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
-    let Some(address) = address else {
-        return Ok(());
-    };
-    limiter.check(Network::of(address), now).map_err(|wait| {
-        let seconds = wait.whole_seconds();
-        if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds }
-    })
 }
 
 impl SignInGuard {
@@ -594,11 +734,57 @@ mod tests {
         }
         assert!(guard.count_verify_try_at(known, now).is_err());
         assert_eq!(guard.app_attempts.len(), max);
+        // Each refusal is counted by the limit that made it.
+        let counts =
+            RefusalCounts { starts_by_network: 1, starts_by_budget: 2, verifies_by_network: 1, verifies_by_budget: 2 };
+        assert_eq!(guard.refusals_this_hour(), counts);
         // The next hour starts again: the newcomer is counted as a network.
         let next = now + NETWORK_WINDOW;
         assert_eq!(guard.count_app_attempt_at(newcomer, next), Ok(()));
         assert_eq!(guard.count_verify_try_at(newcomer, next), Ok(()));
         assert_eq!(guard.app_attempts.len(), 1);
+    }
+
+    /// The hour's refusals are counted by limit, and the staff alert is
+    /// raised once they reach the threshold, once in the hour; the next
+    /// hour counts from nothing.
+    #[test]
+    fn refusals_are_counted_and_alert_staff_once_past_the_threshold() {
+        let limits = SignInLimits {
+            starts_per_network: 2,
+            verifies_per_network: 3,
+            refusals_alert_at: 5,
+            ..SignInLimits::default()
+        };
+        let guard = SignInGuard::with_limits(None, "account.example.test", limits);
+        let now = OffsetDateTime::now_utc();
+        let home = at("203.0.113.1");
+        for _ in 0..2 {
+            guard.count_app_attempt_at(home, now).unwrap();
+        }
+        for _ in 0..3 {
+            guard.count_verify_try_at(home, now).unwrap();
+        }
+        assert_eq!(guard.refusals_this_hour(), RefusalCounts::default());
+        for _ in 0..2 {
+            assert!(guard.count_app_attempt_at(home, now).is_err());
+            assert!(guard.count_verify_try_at(home, now).is_err());
+        }
+        // No address, no count; no refusal either.
+        guard.count_app_attempt_at(None, now).unwrap();
+        let four = RefusalCounts { starts_by_network: 2, verifies_by_network: 2, ..RefusalCounts::default() };
+        assert_eq!(guard.refusals_this_hour(), four);
+        assert_eq!(guard.take_refusal_alert(), None, "4 is below 5");
+        assert!(guard.count_verify_try_at(home, now + Duration::minutes(1)).is_err());
+        let five = RefusalCounts { verifies_by_network: 3, ..four };
+        assert_eq!(guard.take_refusal_alert(), Some(five));
+        assert_eq!(guard.take_refusal_alert(), None);
+        assert!(guard.count_app_attempt_at(home, now + Duration::minutes(2)).is_err());
+        assert_eq!(guard.take_refusal_alert(), None, "once an hour");
+        // The next hour: the counts start again.
+        let next = now + NETWORK_WINDOW + Duration::minutes(1);
+        guard.count_app_attempt_at(home, next).unwrap();
+        assert_eq!(guard.refusals_this_hour(), RefusalCounts::default());
     }
 
     #[test]

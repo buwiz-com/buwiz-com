@@ -83,9 +83,9 @@ pub const VERIFY_SLOTS: usize = 3;
 /// How long a request waits for one of those places before `503 busy`.
 /// While it waits it holds no connection.
 pub const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long a start or resend waits for a lock (`lock_timeout`) before
-/// `503 busy`.
-const LOCK_WAIT: &str = "3s";
+/// How long a start, resend, verify or take-back waits for a lock
+/// (`lock_timeout`), and for a connection from the pool, before `503 busy`.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// What `503 busy` asks to wait.
 const BUSY_RETRY_S: i64 = 5;
 
@@ -165,15 +165,17 @@ impl Refusal {
 const INVALID_REQUEST: Refusal =
     Refusal::bad("invalid_request", "This sign-in request is not valid any more. Start again.");
 
-/// Whether `error` is `lock_timeout` ([`LOCK_WAIT`]) running out.
+/// Whether `error` is [`LOCK_WAIT`] running out: for a lock
+/// (`lock_timeout`), or for a connection from the pool.
 pub(crate) fn is_lock_timeout(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03"))
+    matches!(error, sqlx::Error::PoolTimedOut)
+        || matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03"))
 }
 
 impl From<sqlx::Error> for Refusal {
     fn from(error: sqlx::Error) -> Self {
         if is_lock_timeout(&error) {
-            tracing::warn!("in-app sign-in: a lock was not had in time; answered busy");
+            tracing::warn!("in-app sign-in: a lock or a connection was not had in time; answered busy");
             return Self::busy();
         }
         Self::internal(error)
@@ -430,7 +432,47 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
 
 /// Counts the try against its network's hour, or refuses it.
 fn count_attempt(state: &AppState, headers: &HeaderMap) -> Result<(), Refusal> {
-    state.sign_in_guard.count_app_attempt(headers).map_err(Refusal::too_many)
+    let counted = state.sign_in_guard.count_app_attempt(headers);
+    alert_if_refused_many(state);
+    counted.map_err(Refusal::too_many)
+}
+
+/// Mails staff, at most once an hour, when the hour's refusals by the
+/// per-network limits and the shared budgets reached the threshold
+/// ([`crate::account::guard::SignInGuard::take_refusal_alert`]). Called
+/// after every count, start's and verify's.
+pub(crate) fn alert_if_refused_many(state: &AppState) {
+    if let Some(counts) = state.sign_in_guard.take_refusal_alert() {
+        tokio::spawn(refusal_alert(state.clone(), counts));
+    }
+}
+
+async fn refusal_alert(state: AppState, counts: crate::account::guard::RefusalCounts) {
+    let subject = "Sign-in: many tries refused by the network limits this hour";
+    let limits = state.config.sign_in_limits;
+    let text = format!(
+        "{} sign-in tries were refused this hour.\n\n\
+         Starts and resends (the apps'): {} by their network's limit of {} an hour, {} by the shared budget of \
+         {} for new networks once 100,000 are counted.\n\
+         Tries at a code (the apps' and the web form's): {} by their network's limit of {} an hour, {} by the \
+         shared budget of {}.\n\n\
+         Refusals by a network's limit can be a flood from one network, or many people behind one carrier's or \
+         office's network (near a filing deadline). Look at Cloudflare's analytics for the sign-in paths. To \
+         let more through, raise APP_SIGN_IN_STARTS_PER_NETWORK, SIGN_IN_VERIFIES_PER_NETWORK or the budgets \
+         and restart (docs/deploy.md). Refusals by the shared budget mean a flood from many networks.\n\n\
+         This is mailed at most once an hour (at {} refusals). The log has one line an hour with the counts.",
+        counts.total(),
+        counts.starts_by_network,
+        limits.starts_per_network,
+        counts.starts_by_budget,
+        limits.starts_past_full,
+        counts.verifies_by_network,
+        limits.verifies_per_network,
+        counts.verifies_by_budget,
+        limits.verifies_past_full,
+        limits.refusals_alert_at,
+    );
+    mail_staff(&state, subject, &text).await;
 }
 
 /// One of the [`DATABASE_SLOTS`] places for the database work, waited for
@@ -463,9 +505,12 @@ async fn begin(state: &AppState) -> Result<sqlx::Transaction<'static, sqlx::Post
 }
 
 /// [`begin`], with the error as it came ([`is_lock_timeout`] tells it).
+/// A connection is waited for at most [`LOCK_WAIT`] too (else
+/// `PoolTimedOut`), so a busy pool never holds a place for the pool's own
+/// 30 s.
 pub(crate) async fn begin_waiting(db: &sqlx::PgPool) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-    let mut tx = db.begin().await?;
-    sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).execute(&mut *tx).await?;
+    let mut tx = tokio::time::timeout(LOCK_WAIT, db.begin()).await.map_err(|_| sqlx::Error::PoolTimedOut)??;
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{}ms'", LOCK_WAIT.as_millis())).execute(&mut *tx).await?;
     Ok(tx)
 }
 
@@ -497,12 +542,13 @@ async fn usable_code_until(
 /// Both run in one of start's and resend's places ([`database_slot`]),
 /// and each waits at most [`LOCK_WAIT`] for a lock, so a mail outage in a
 /// flood cannot leave them waiting without end. If no place comes, or both
-/// fail, only the ids are logged and staff are told, at most once an hour
+/// fail ([`Stuck`]), only the ids are logged and staff are told, at most
+/// once an hour
 /// (the request then holds the install until its code expires). The caller
 /// answers `mail_failed` whatever happens here.
 async fn take_back(state: &AppState, request_id: Uuid, code_id: Uuid) {
     let Some(_slot) = slot(&state.app_sign_in_slots).await else {
-        stuck(state, request_id, code_id);
+        stuck(state, request_id, code_id, Stuck::NoPlace);
         return;
     };
     let deleted = async {
@@ -517,29 +563,59 @@ async fn take_back(state: &AppState, request_id: Uuid, code_id: Uuid) {
     }
     tracing::warn!(%request_id, %code_id, "in-app sign-in: an unmailed request could not be taken back; ending it");
     if end(state, request_id).await.is_err() {
-        stuck(state, request_id, code_id);
+        stuck(state, request_id, code_id, Stuck::Failed);
     }
 }
 
-/// An unmailed request that could be neither taken back nor ended: its
-/// ids are logged (no address), and staff are mailed at most once an hour.
-fn stuck(state: &AppState, request_id: Uuid, code_id: Uuid) {
-    tracing::error!(%request_id, %code_id, "in-app sign-in: an unmailed request could be neither taken back nor ended");
+/// Why an unmailed request was left open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stuck {
+    /// No place for the take-back came in time: nothing was tried.
+    NoPlace,
+    /// Both the take-back and the ending were tried, and failed.
+    Failed,
+}
+
+impl Stuck {
+    /// The log line, and the staff mail's subject and first sentence.
+    fn words(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::NoPlace => (
+                "in-app sign-in: an unmailed request was left open: no place to take it back in",
+                "In-app sign-in: no place to take a request back in",
+                "A code for an app's sign-in could not be mailed, and there was no place to take its request back \
+                 in: every place for the database work stayed taken, so nothing was tried.",
+            ),
+            Self::Failed => (
+                "in-app sign-in: an unmailed request could be neither taken back nor ended",
+                "In-app sign-in: a request could not be taken back",
+                "A code for an app's sign-in could not be mailed, and its request could be neither taken back nor \
+                 ended in the database.",
+            ),
+        }
+    }
+}
+
+/// An unmailed request left open: its ids are logged (no address), and
+/// staff are mailed at most once an hour.
+fn stuck(state: &AppState, request_id: Uuid, code_id: Uuid, why: Stuck) {
+    let (line, _, _) = why.words();
+    tracing::error!(%request_id, %code_id, "{line}");
     state.sign_in_guard.raise_stuck();
     if state.sign_in_guard.take_stuck_alert() {
-        tokio::spawn(stuck_alert(state.clone()));
+        tokio::spawn(stuck_alert(state.clone(), why));
     }
 }
 
-/// Mails staff that a request was stuck. A failure is logged.
-async fn stuck_alert(state: AppState) {
-    let subject = "In-app sign-in: a request could not be taken back";
-    let text = "A code for an app's sign-in could not be mailed, and its request could be neither taken back \
-                nor ended in the database. Until its code expires, that install cannot ask for a new code for \
-                that address. The logs have the request's and code's ids (\"could be neither taken back nor \
-                ended\"); look at the database and the mail service.\n\n\
-                This is mailed at most once an hour. See docs/accounts.md, \"What a flood can cost\".";
-    mail_staff(&state, subject, text).await;
+/// Mails staff that a request was left open. A failure is logged.
+async fn stuck_alert(state: AppState, why: Stuck) {
+    let (line, subject, first) = why.words();
+    let text = format!(
+        "{first} Until its code expires, that install cannot ask for a new code for that address. The logs have \
+         the request's and code's ids (\"{line}\"); look at the database and the mail service.\n\n\
+         This is mailed at most once an hour. See docs/accounts.md, \"What a flood can cost\"."
+    );
+    mail_staff(&state, subject, &text).await;
 }
 
 /// `429 code_already_sent`: a code mailed to this install for this address
@@ -826,7 +902,10 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
     let asked: Resend = body(request).await?;
     let checked = app_check(state, headers, asked.turnstile.as_deref()).await?;
     let slot = database_slot(state).await?;
-    let stored: Option<Stored> = sqlx::query_as(STORED).bind(asked.request_id).fetch_optional(&state.db).await?;
+    // Every read in the transaction, so the pool is waited for at most
+    // [`LOCK_WAIT`].
+    let mut tx = begin(state).await?;
+    let stored: Option<Stored> = sqlx::query_as(STORED).bind(asked.request_id).fetch_optional(&mut *tx).await?;
     let now = OffsetDateTime::now_utc();
     let Some(stored) = stored.filter(|stored| {
         stored.used_at.is_none() && stored.created_at + RESEND_WITHIN > now && stored.belongs_to(&asked.secret)
@@ -840,7 +919,6 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
     // Every refusal before anything is written, and the request's new code
     // and time in one transaction. The request's row is locked, so two
     // resends at once give one code.
-    let mut tx = begin(state).await?;
     accounts::lock_address(&mut tx, &stored.email).await?;
     let open: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM app_sign_ins WHERE id = $1 AND used_at IS NULL AND expires_at <= now() FOR UPDATE",
@@ -934,7 +1012,9 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
     // The cheap refusals first: the network's tries at a code (shared with
     // the web form's), then the body; then one of verify's own places for
     // the database work, held to the end.
-    state.sign_in_guard.count_verify_try(request.headers()).map_err(Refusal::too_many_tries)?;
+    let counted = state.sign_in_guard.count_verify_try(request.headers());
+    alert_if_refused_many(state);
+    counted.map_err(Refusal::too_many_tries)?;
     let asked: Verify = body(request).await?;
     let _slot = verify_slot(state).await.ok_or_else(Refusal::busy)?;
     let mut tx = begin(state).await?;
@@ -1004,6 +1084,21 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_left_open_says_why_without_an_address() {
+        let (line, subject, first) = Stuck::NoPlace.words();
+        assert!(line.ends_with("no place to take it back in"), "{line}");
+        assert_eq!(subject, "In-app sign-in: no place to take a request back in");
+        assert!(first.contains("nothing was tried"), "{first}");
+        let (line, subject, first) = Stuck::Failed.words();
+        assert!(line.ends_with("could be neither taken back nor ended"), "{line}");
+        assert_eq!(subject, "In-app sign-in: a request could not be taken back");
+        assert!(first.contains("neither taken back nor ended"), "{first}");
+        for words in [Stuck::NoPlace.words(), Stuck::Failed.words()] {
+            assert!(!format!("{words:?}").contains('@'));
+        }
+    }
 
     #[test]
     fn only_known_platforms_name_a_device() {

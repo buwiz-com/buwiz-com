@@ -634,7 +634,7 @@ five tries a code), whatever the network.
 are never given back (start/resend's, verify's) hold at most 100,000
 networks an hour. When full, the networks new that hour share one budget
 for the hour, not counted by network: 20,000 tries at start and resend,
-30,000 at verify (`APP_ATTEMPTS_PAST_FULL`, `VERIFY_TRIES_PAST_FULL`).
+30,000 at verify (settable, [deploy.md](deploy.md#migration-17-in-app-sign-in)).
 Once it is spent, every new network is refused (`429
 too_many_requests`, as past its own limit) until the hour ends; networks
 already counted go on as before. So a flood of distinct networks cannot
@@ -655,10 +655,12 @@ all; a refusal writes nothing and spends no place in any count, and a
 code that could not be mailed is taken back with its request, in one
 transaction. If that fails, the request is ended (`used_at`), so it holds
 the install no more. Both run in one of start's places, each waiting at
-most 3 seconds for a lock, so a mail outage in a flood cannot leave them
-waiting without end. If no place comes or both fail, the request's and
-code's ids are logged (no address) and staff are mailed, at most once an
-hour. The app is answered `mail_failed` either way.
+most 3 seconds for a lock and for a pool connection, so a mail outage in
+a flood cannot leave them waiting without end. If no place comes ("no
+place to take it back in") or both fail ("could be neither taken back
+nor ended"), the request's and code's ids are logged (no address) and
+staff are mailed, at most once an hour. The app is answered
+`mail_failed` either way.
 
 The cap is for testing only. **A platform's 1.0.0 needs the token
 required**: from then on, a request from that platform without a token
@@ -888,7 +890,11 @@ Reviewed and accepted for now (PR 81's review):
 - **Fixed-code test accounts** are never held by `code_already_sent`, so a second start from one install tells them apart; only staff make them.
 - **The web form's new-address cap** stores nothing when full (unlike the apps' unmailed codes), so on the web an unknown address over that cap is not refused at its sixth start in the hour, as an address with an account is. It needs the web's 20 codes an hour for new addresses spent, through Turnstile.
 - **The network's 200 tries** at start and resend, and its 300 at verify, are shared by everyone on one /24 or /48 (an office, a carrier): a flood from it holds the others there for the hour. A `503 busy` counts too, by design.
-- **A full map of networks** (100,000 in an hour) gives the networks new that hour one budget (20,000 tries at start and resend, 30,000 at verify); once a flood spends it, new networks are refused until the hour ends, real people among them.
+- **The per-network limits are a guess** (200 and 300 an hour): a large carrier range at a filing deadline may carry more. Refusals are counted, logged once an hour, and mailed to staff past 100 in an hour; the limits are settings, raised with a restart ([deploy.md](deploy.md#migration-17-in-app-sign-in)).
+- **A full map of networks** (100,000 in an hour) gives the networks new that hour one shared budget (20,000 tries at start and resend, 30,000 at verify), with no limit per network inside it. So one new network can spend the whole budget, and a burst can spend it in minutes (about 100 seconds when the start places are saturated); then every new network is refused until the hour ends, real people among them. An attacker needs 100,000 distinct networks in one hour first. What still holds: mail and guessing stay bounded (five codes an hour and five tries a code per address, the new-address budgets, the testing cap), and networks already counted keep their own limits. At that scale Cloudflare's rules in front are the control; there is no second map.
+- **NEW-5.** The stuck-request alert goes over the mail service whose failure caused the stuck state, so it may not arrive; and the hour's alert is taken before the send, so a failed send is not tried again that hour (the log line stays).
+- **NEW-7.** In a mail outage during a flood, take-back may find no place, so more unmailed codes hold their installs until they expire (5 minutes).
+- **NEW-9.** "Public" is still only the https scheme of `ACCOUNT_ORIGIN` (with `SECURE_COOKIES`), not the ingress.
 - **L9, NL9.** Without `CF-Connecting-IP` there is no per-network count, at start, resend or verify. Production always sets it (the tunnel), and a missing header raises an hourly staff alert (BIR uptime's `NetworkReader`).
 - **NC1.** Unmailed codes count toward the address's five an hour and hold installs, by design, so an address without an account looks the same as one with an account; while the budgets of mail are full an address can be held for the hour, as M5 says.
 - **NW1.** The web form lets through a Turnstile answer that lacks the hostname or action (the app's check refuses it), with a staff alert at most once an hour.

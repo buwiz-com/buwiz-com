@@ -87,7 +87,7 @@ impl AppState {
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
         let account_host = crate::account::guard::account_host(&config.account_origin);
-        let sign_in_guard = SignInGuard::new(config.turnstile.clone(), &account_host);
+        let sign_in_guard = SignInGuard::with_limits(config.turnstile.clone(), &account_host, config.sign_in_limits);
         let downloads = Downloads::new(&config.downloads_url, downloads::APP, true);
         let bot_downloads = Downloads::new(&config.downloads_url, downloads::BOT_APP, false);
         let stars = Stars::new(&config.github_api_url);

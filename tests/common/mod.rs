@@ -301,6 +301,7 @@ fn test_config(downloads_url: &str, admin_emails: Vec<String>) -> Config {
         // Nothing listens there: the star count is unknown.
         github_api_url: "http://127.0.0.1:9".into(),
         app_sign_in_minutes: 5,
+        sign_in_limits: Default::default(),
     }
 }
 

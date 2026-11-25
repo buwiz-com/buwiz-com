@@ -1737,3 +1737,113 @@ async fn taking_back_waits_for_a_lock_at_most_three_seconds_in_a_place(db: PgPoo
     holder.rollback().await.unwrap();
     assert_eq!(notices_settle(&site, 2).await.len(), 1);
 }
+
+/// With every pool connection held (the places free), start, resend and
+/// verify wait at most three seconds for one, then answer `503 busy`, and
+/// their place is free again: a busy pool never holds a place for the
+/// pool's own 30 s.
+#[sqlx::test(migrations = "./migrations")]
+async fn with_the_pool_taken_start_resend_and_verify_are_busy_in_three_seconds(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let started = start(&site, ANA).await;
+    expire(&site, &started).await;
+    let mut connections = Vec::new();
+    for _ in 0..site.db.options().get_max_connections() {
+        connections.push(site.db.acquire().await.unwrap());
+    }
+    for (path, body) in [
+        ("/auth/email/start", json!({ "client_id": CLIENT, "email": ANA, "secret_hash": secret().1 })),
+        ("/auth/email/resend", json!({ "request_id": started.id, "secret": started.secret })),
+        ("/auth/email/verify", json!({ "request_id": started.id, "secret": started.secret, "code": "000000" })),
+    ] {
+        let began = Instant::now();
+        let (status, answer) = read(post_json(&site, path, &body).await).await;
+        let took = began.elapsed();
+        assert_eq!((status, answer["error"].as_str()), (503, Some("busy")), "{path}: {answer}");
+        assert!(took >= Duration::from_millis(2900) && took < Duration::from_secs(6), "{path}: {took:?}");
+        assert_eq!(site.state.app_sign_in_slots.available_permits(), 4, "{path}");
+        assert_eq!(site.state.verify_slots.available_permits(), 3, "{path}");
+    }
+    drop(connections);
+    assert_eq!(resend(&site, &started).await.0, 200);
+}
+
+/// When the pool is taken while a request is being taken back, ending it
+/// waits at most three seconds for a connection too: `mail_failed` comes
+/// in about six seconds (the lock, then the connection), the place is
+/// free again, and staff are told it could be neither taken back nor
+/// ended.
+#[sqlx::test(migrations = "./migrations")]
+async fn taking_back_waits_for_a_connection_at_most_three_seconds(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    const HELD: i64 = 0x7465_7375;
+    wait_on_app_sign_ins(&site.db, "DELETE", HELD).await;
+    let mut holder = site.db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(HELD).execute(&mut *holder).await.unwrap();
+    site.state.mailer.fail_app_codes(true);
+
+    let max = site.db.options().get_max_connections() as usize;
+    let began = Instant::now();
+    let starting = start_from(&site, ANA, PHONE);
+    let take_the_pool = async {
+        // The take-back waits for its lock: take every other connection,
+        // then the take-back's own as soon as it lets it go.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let mut connections = Vec::new();
+        for _ in 0..max - 2 {
+            connections.push(site.db.acquire().await.unwrap());
+        }
+        connections.push(site.db.acquire().await.unwrap());
+        connections
+    };
+    let ((status, answer, _), connections) = tokio::join!(starting, take_the_pool);
+    let took = began.elapsed();
+    assert_eq!((status, answer["error"].as_str()), (502, Some("mail_failed")), "{answer}");
+    assert!(took >= Duration::from_millis(5800) && took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(site.state.app_sign_in_slots.available_permits(), 4);
+    drop(connections);
+    holder.rollback().await.unwrap();
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins WHERE used_at IS NULL").await, 1);
+    let notices = notices_settle(&site, 1).await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].subject, "In-app sign-in: a request could not be taken back");
+    assert!(notices[0].text.contains("could be neither taken back nor ended"), "{}", notices[0].text);
+    assert!(!notices[0].text.contains(ANA));
+}
+
+/// The limits come from the settings: with 2 starts and 3 verify tries a
+/// network and an alert at 4 refusals, the third start is refused, and
+/// staff are mailed once when the refusals, start's and verify's (the
+/// app's and the web form's), reach 4.
+#[sqlx::test(migrations = "./migrations")]
+async fn set_limits_hold_and_many_refusals_mail_staff_once(db: PgPool) {
+    let site = Site::with_config(db, |config| {
+        config.sign_in_limits.starts_per_network = 2;
+        config.sign_in_limits.verifies_per_network = 3;
+        config.sign_in_limits.refusals_alert_at = 4;
+    });
+    for n in 0..2 {
+        assert_eq!(start_from_network(&site, &format!("s{n}@example.test"), n, json!({})).await.0, 200);
+    }
+    let (status, answer) = start_from_network(&site, "s9@example.test", 9, json!({})).await;
+    assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
+    let unknown = json!({ "request_id": Uuid::new_v4(), "secret": secret().0, "code": "123456" });
+    for n in 0..3 {
+        assert_eq!(app_verify_from(&site, n, &unknown).await.status(), StatusCode::BAD_REQUEST, "{n}");
+    }
+    assert_eq!(app_verify_from(&site, 3, &unknown).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    let web = web_verify_from(&site, 4, "email=bea%40example.test&code=000000").await;
+    assert!(location(&web).contains("notice=code_tries_too_many"), "{}", location(&web));
+    assert!(notices_settle(&site, 1).await.is_empty(), "3 refusals are below 4");
+    assert_eq!(start_from_network(&site, "s8@example.test", 8, json!({})).await.0, 429);
+    let notices = notices_settle(&site, 1).await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].to, STAFF);
+    assert_eq!(notices[0].subject, "Sign-in: many tries refused by the network limits this hour");
+    assert!(notices[0].text.starts_with("4 sign-in tries were refused this hour."), "{}", notices[0].text);
+    assert!(notices[0].text.contains("2 by their network's limit of 2 an hour"), "{}", notices[0].text);
+    assert!(!notices[0].text.contains("203.0.113"), "no network in the mail");
+    // Once an hour.
+    assert_eq!(start_from_network(&site, "s7@example.test", 7, json!({})).await.0, 429);
+    assert_eq!(notices_settle(&site, 2).await.len(), 1);
+}

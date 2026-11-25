@@ -392,6 +392,12 @@ impl<K: Eq + Hash> RateLimiter<K> {
     /// [`Self::check`], saying which bucket the hit went to, for
     /// [`Self::release`].
     pub fn hit(&self, key: K, now: OffsetDateTime) -> Result<Bucket, Duration> {
+        self.hit_or_refused(key, now).map_err(|(_, wait)| wait)
+    }
+
+    /// [`Self::hit`], saying which bucket refused it: the key's own count,
+    /// or the overflow bucket (the map was full when its key was new).
+    pub fn hit_or_refused(&self, key: K, now: OffsetDateTime) -> Result<Bucket, (Bucket, Duration)> {
         let (verdict, ended) = {
             let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             // A window that ended (or a clock that went back) starts a new
@@ -409,12 +415,12 @@ impl<K: Eq + Hash> RateLimiter<K> {
             let full = hits.by_key.len() >= self.cap;
             let Hits { by_key, overflow, .. } = &mut *hits;
             let verdict = match by_key.get_mut(&key) {
-                Some(count) if *count >= self.limit => Err(wait),
+                Some(count) if *count >= self.limit => Err((Bucket::Key, wait)),
                 Some(count) => {
                     *count += 1;
                     Ok(Bucket::Key)
                 }
-                None if full && *overflow >= self.overflow_limit => Err(wait),
+                None if full && *overflow >= self.overflow_limit => Err((Bucket::Overflow, wait)),
                 None if full => {
                     *overflow += 1;
                     Ok(Bucket::Overflow)
@@ -770,13 +776,18 @@ mod tests {
             assert_eq!(limiter.hit(key, now + Duration::seconds(10)), Ok(Bucket::Overflow), "{key}");
         }
         assert_eq!(limiter.len(), 100);
-        // Spent: every new key is refused until the window ends.
+        // Spent: every new key is refused until the window ends, by the
+        // overflow bucket.
         assert_eq!(limiter.check(100, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        assert_eq!(
+            limiter.hit_or_refused(501, now + Duration::seconds(10)),
+            Err((Bucket::Overflow, Duration::seconds(50)))
+        );
         assert_eq!(limiter.check(500, now + Duration::seconds(10)), Err(Duration::seconds(50)));
         // A key already in the map still counts on its own: two hits left.
         assert_eq!(limiter.hit(7, now + Duration::seconds(10)), Ok(Bucket::Key));
         assert_eq!(limiter.hit(7, now + Duration::seconds(10)), Ok(Bucket::Key));
-        assert_eq!(limiter.check(7, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        assert_eq!(limiter.hit_or_refused(7, now + Duration::seconds(10)), Err((Bucket::Key, Duration::seconds(50))));
         // The next window starts empty: the new key is counted again, with
         // its own limit.
         for _ in 0..3 {

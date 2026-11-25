@@ -663,3 +663,97 @@ async fn the_web_form_still_signs_in_on_the_same_paths(db: PgPool) {
     assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
     assert!(signed_in.headers().contains_key(header::SET_COOKIE));
 }
+
+/// The request id and link token of the newest link mailed to `email`.
+fn last_link(site: &Site, email: &str) -> (String, String) {
+    let mails = site.state.mailer.app_sign_in_mails();
+    let mail = mails.iter().rev().find(|mail| mail.to == email).unwrap();
+    let link = mail.link.clone().unwrap();
+    assert!(mail.text.contains(&link), "{}", mail.text);
+    let fragment = link.strip_prefix(&format!("{ORIGIN}/app-sign-in#")).unwrap_or_else(|| panic!("{link}"));
+    assert!(!link.contains('?'), "the values are in the fragment only: {link}");
+    let (r, t) = fragment.split_once('&').unwrap();
+    (r.strip_prefix("r=").unwrap().to_owned(), t.strip_prefix("t=").unwrap().to_owned())
+}
+
+async fn verify_link(site: &Site, started: &Started, token: &str) -> (u16, Value) {
+    let body = json!({ "request_id": started.id, "secret": started.secret, "link_token": token });
+    read(post_json(site, "/auth/email/verify", &body).await).await
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_mails_link_signs_in_only_the_device_that_asked_and_once(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let started = start(&site, ANA).await;
+    let (request, token) = last_link(&site, ANA);
+    assert_eq!(request, started.id);
+    let mail = site.state.mailer.app_sign_in_mails().pop().unwrap();
+    assert!(mail.text.contains(&mail.code) && mail.html.contains(&mail.code));
+    assert!(mail.html.contains("Open in eBIRForms"));
+
+    // Someone else's app, holding its own secret, gets nothing from it.
+    let other = Started { id: started.id.clone(), secret: secret().0 };
+    assert_eq!(verify_link(&site, &other, &token).await, (400, refused("invalid_request")));
+    let (status, answer) = verify_link(&site, &started, "a-made-up-token").await;
+    assert_eq!((status, answer["error"].as_str()), (400, Some("link_used")));
+    // Neither code nor token, or both.
+    let both = json!({ "request_id": started.id, "secret": started.secret, "code": mail.code, "link_token": token });
+    assert_eq!(read(post_json(&site, "/auth/email/verify", &both).await).await.0, 400);
+
+    let (status, tokens) = verify_link(&site, &started, &token).await;
+    assert_eq!((status, tokens["scope"].as_str()), (200, Some("app")), "{tokens}");
+    assert_eq!(verify_link(&site, &started, &token).await, (400, refused("invalid_request")));
+    // The code went with it.
+    let code = json!({ "request_id": started.id, "secret": started.secret, "code": mail.code });
+    assert_eq!(read(post_json(&site, "/auth/email/verify", &code).await).await, (400, refused("invalid_request")));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_new_code_ends_the_old_link(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let started = start(&site, ANA).await;
+    let (_, first) = last_link(&site, ANA);
+    expire(&site, &started).await;
+    assert_eq!(resend(&site, &started).await.0, 200);
+    let (_, second) = last_link(&site, ANA);
+    assert_ne!(first, second);
+    let (status, answer) = verify_link(&site, &started, &first).await;
+    assert_eq!((status, answer["error"].as_str()), (400, Some("link_used")));
+
+    // A web code leaves it alone: the link is the request's own.
+    let sent = site.post("/auth/email/start", "", "email=ana%40example.test").await;
+    assert_eq!(sent.status(), StatusCode::SEE_OTHER);
+    assert_eq!(verify_link(&site, &started, &second).await.0, 200);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_link_page_only_offers_a_button(db: PgPool) {
+    let site = Site::new(db);
+    let response = site.get("/app-sign-in", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-robots-tag"], "noindex");
+    let page = text(response).await;
+    assert!(page.contains(r#"<meta name="robots" content="noindex">"#));
+    assert!(page.contains("Open this on the device where you asked to sign in, or type the code there."));
+    assert!(page.contains(r#"id="open-app""#) && page.contains("Open eBIRForms"), "{page}");
+    assert!(page.contains("hidden"), "the button is hidden until the script finds a fragment");
+    assert!(page.contains(r#"src="/assets/app-sign-in.js""#));
+    assert!(!page.contains("http-equiv=\"refresh\""));
+
+    let script = text(site.get("/assets/app-sign-in.js", "").await).await;
+    assert!(script.contains("ebirforms://signin?r=") && script.contains("&t="), "{script}");
+    assert!(script.contains("window.location.hash"));
+    for redirect in [
+        "location.href =",
+        "location.replace",
+        "location.assign",
+        "window.open",
+        "fetch(",
+        "XMLHttpRequest",
+        ".click()",
+    ] {
+        assert!(!script.contains(redirect), "{redirect}");
+    }
+    // Only on the account host.
+    assert_eq!(site.on_host(FORMS_HOST, "/app-sign-in").await.status(), StatusCode::NOT_FOUND);
+}

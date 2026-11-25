@@ -26,6 +26,8 @@ const SIGN_IN_CODE_HTML: &str = include_str!("email/sign_in_code.html");
 /// The HTML of the code an app asked for ([`crate::account::app_sign_in`]);
 /// `{{code}}`, `{{logo_url}}` and fixed words are filled in.
 const APP_SIGN_IN_CODE_HTML: &str = include_str!("email/app_sign_in_code.html");
+/// The link's button in it; `{{link}}` is filled in.
+const APP_SIGN_IN_LINK_HTML: &str = include_str!("email/app_sign_in_link.html");
 
 pub struct Mailer {
     config: MailConfig,
@@ -58,6 +60,8 @@ pub struct AppCodeMail {
     pub subject: String,
     pub text: String,
     pub html: String,
+    /// The one-time link to the request that the mail carries.
+    pub link: Option<String>,
 }
 
 /// What an app's code mail says besides the code. Only fixed words: no
@@ -259,8 +263,14 @@ impl Mailer {
     /// A sign-in code an app asked for: its own message, which names the
     /// app and the device ([`AppCodeWords`]). The web's sign-in mail is
     /// [`Self::send_sign_in_code`].
-    pub async fn send_app_sign_in_code(&self, to: &str, code: &str, words: AppCodeWords) -> anyhow::Result<()> {
-        let message = CodeMessage::app(code, words, &self.logo_url);
+    pub async fn send_app_sign_in_code(
+        &self,
+        to: &str,
+        code: &str,
+        link: Option<&str>,
+        words: AppCodeWords,
+    ) -> anyhow::Result<()> {
+        let message = CodeMessage::app(code, link, words, &self.logo_url);
         if let Some(codes) = &self.app_codes {
             if self.failing_app_codes.load(Ordering::SeqCst) {
                 anyhow::bail!("made-up mail failure");
@@ -271,6 +281,7 @@ impl Mailer {
                 subject: message.subject,
                 text: message.text,
                 html: message.html,
+                link: link.map(str::to_owned),
             };
             codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(mail);
             return Ok(());
@@ -375,7 +386,7 @@ impl CodeMessage {
 
     /// The mail of a code an app asked for. The code is still the only
     /// number; the subject names the device instead.
-    fn app(code: &str, words: AppCodeWords, logo_url: &str) -> Self {
+    fn app(code: &str, link: Option<&str>, words: AppCodeWords, logo_url: &str) -> Self {
         let device = words.device;
         let minutes = minutes_in_words(words.minutes);
         let (heading, lead, asked) = if words.create {
@@ -394,11 +405,21 @@ impl CodeMessage {
                 format!("Someone asked to sign in to {device} with this address. If it wasn't you, ignore this mail."),
             )
         };
+        // The link opens a page that offers to open the app; it approves
+        // nothing on its own (docs/accounts.md, "The link in the mail").
+        let (link_text, link_block) = match link {
+            Some(link) => (
+                format!("Or open this link on the device where you asked to sign in:\n{link}\n\n"),
+                APP_SIGN_IN_LINK_HTML.replace("{{link}}", &link.replace('&', "&amp;")),
+            ),
+            None => (String::new(), String::new()),
+        };
         Self {
             subject: format!("Your Buwiz sign-in code for {device}"),
             text: format!(
                 "Your Buwiz verification code is {code}\n\n\
                  {lead} It expires in {minutes} and works once.\n\n\
+                 {link_text}\
                  Never give this code to anyone. Buwiz will never ask for it by phone, chat or email, \
                  not even someone who says they are from Buwiz or the BIR.\n\n\
                  {asked} Nobody can get into your account without this code.\n\n\
@@ -410,6 +431,7 @@ impl CodeMessage {
                 .replace("{{lead}}", &lead)
                 .replace("{{asked}}", &asked)
                 .replace("{{minutes}}", &minutes)
+                .replace("{{link_block}}", &link_block)
                 .replace("{{code}}", code)
                 .replace("{{logo_url}}", logo_url),
         }
@@ -455,7 +477,7 @@ mod tests {
     fn an_app_code_names_the_device_and_is_still_the_only_number() {
         for create in [false, true] {
             let words = AppCodeWords { device: "eBIRForms on iPhone", create, minutes: 5 };
-            let message = CodeMessage::app("042917", words, "https://account.buwiz.com/assets/brand/x.png");
+            let message = CodeMessage::app("042917", None, words, "https://account.buwiz.com/assets/brand/x.png");
             assert_eq!(message.subject, "Your Buwiz sign-in code for eBIRForms on iPhone");
             assert!(message.text.contains("Never give this code to anyone"));
             assert!(message.text.contains("It expires in five minutes"), "{}", message.text);
@@ -465,6 +487,25 @@ mod tests {
                 assert!(numbers(part).iter().all(|number| *number == "042917"), "{part}");
                 assert!(part.contains("042917"));
             }
+        }
+    }
+
+    #[test]
+    fn an_app_code_carries_its_link_and_the_webs_mail_none() {
+        let link = "https://account.buwiz.com/app-sign-in#r=8f0e&t=abc_-9";
+        let words = AppCodeWords { device: "eBIRForms on Mac", create: false, minutes: 5 };
+        let message = CodeMessage::app("042917", Some(link), words, "https://account.buwiz.com/x.png");
+        assert!(message.text.contains(link), "{}", message.text);
+        assert!(message.html.contains(r#"href="https://account.buwiz.com/app-sign-in#r=8f0e&amp;t=abc_-9""#));
+        assert!(visible(&message.html).contains("Open in eBIRForms"));
+        assert!(!message.html.contains("{{"));
+        let without_link = message.text.replace(link, "");
+        assert!(numbers(&without_link).iter().all(|number| *number == "042917"), "{without_link}");
+        assert!(numbers(&visible(&message.html)).iter().all(|number| *number == "042917"));
+
+        let web = CodeMessage::new("042917", "https://account.buwiz.com/x.png");
+        for part in [&web.subject, &web.text, &web.html] {
+            assert!(!part.contains("app-sign-in") && !part.contains("eBIRForms"), "{part}");
         }
     }
 

@@ -37,6 +37,7 @@ use crate::account::guard::{Counted, Refused};
 use crate::account::mail::AppCodeWords;
 use crate::account::oauth::{self, SCOPE_APP};
 use crate::account::roles;
+use crate::base::crypto;
 use crate::base::state::AppState;
 
 const CODE_LENGTH: usize = 6;
@@ -438,7 +439,8 @@ fn forgiven(state: &AppState, counted: &Counted, refusal: Refusal) -> Refusal {
     refusal
 }
 
-/// Ties what [`issue`] made to the request and mails it. A fixed code (a
+/// Ties what [`issue`] made to the request and mails it, with a link
+/// ([`take_link`]). A fixed code (a
 /// test account) is not mailed: its holder has it.
 async fn mail(
     state: &AppState,
@@ -447,14 +449,20 @@ async fn mail(
     issued: Issued,
     words: AppCodeWords,
 ) -> Result<(), Refusal> {
-    sqlx::query("UPDATE app_sign_ins SET code_id = $2 WHERE id = $1")
+    // A one-time link to the request goes with a mailed code; only its
+    // hash is kept, and a new code replaces it.
+    let token = matches!(issued, Some((_, IssuedCode::Mail(_)))).then(|| crypto::new_token(""));
+    sqlx::query("UPDATE app_sign_ins SET code_id = $2, link_token_hash = $3 WHERE id = $1")
         .bind(request_id)
         .bind(issued.as_ref().map(|(code_id, _)| *code_id))
+        .bind(token.as_deref().map(crypto::hash))
         .execute(&state.db)
         .await?;
     match issued {
         Some((_, IssuedCode::Mail(code))) => {
-            state.mailer.send_app_sign_in_code(email, &code, words).await.map_err(|error| {
+            let link =
+                token.map(|token| format!("{}/app-sign-in#r={request_id}&t={token}", state.config.account_origin));
+            state.mailer.send_app_sign_in_code(email, &code, link.as_deref(), words).await.map_err(|error| {
                 tracing::error!(error = ?error, "an app's sign-in code could not be mailed");
                 Refusal::new(StatusCode::BAD_GATEWAY, "mail_failed", "The code could not be mailed. Try again.")
             })
@@ -542,6 +550,7 @@ struct Stored {
     intent: String,
     platform: Option<String>,
     code_id: Option<Uuid>,
+    link_token_hash: Option<Vec<u8>>,
     attempts: i32,
     created_at: OffsetDateTime,
     expires_at: OffsetDateTime,
@@ -565,8 +574,8 @@ impl Stored {
 }
 
 const STORED: &str =
-    "SELECT email, client_id, secret_hash, intent, platform, code_id, attempts, created_at, expires_at,
-                             used_at
+    "SELECT email, client_id, secret_hash, intent, platform, code_id, link_token_hash, attempts, created_at,
+                             expires_at, used_at
                       FROM app_sign_ins WHERE id = $1";
 
 #[derive(Deserialize)]
@@ -648,7 +657,31 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
 pub struct Verify {
     request_id: Uuid,
     secret: String,
-    code: String,
+    /// The code typed in the app, or ...
+    #[serde(default)]
+    code: Option<String>,
+    /// ... the token of the link in the mail, which the app got from
+    /// `ebirforms://signin?r=…&t=…`.
+    #[serde(default)]
+    link_token: Option<String>,
+}
+
+/// The link's token, checked against the request: it uses up the
+/// request's code as the code itself would. A token that is not the
+/// request's newest (a resend replaced it) is `link_used`.
+async fn take_link(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    stored: &Stored,
+    token: &str,
+) -> Result<Tried, Refusal> {
+    let matches = stored.link_token_hash.as_deref().is_some_and(|hash| same(&crypto::hash(token), hash));
+    let (true, Some(code_id)) = (matches, stored.code_id) else {
+        return Err(Refusal::bad("link_used", "This link was used or replaced by a newer code."));
+    };
+    match accounts::spend_code_row(tx, code_id).await? {
+        Tried::NoCode => Err(Refusal::bad("link_used", "This link was used or replaced by a newer code.")),
+        tried => Ok(tried),
+    }
 }
 
 /// `POST /auth/email/verify`: the tokens, as the device flow gives them.
@@ -687,9 +720,11 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
     }
     // Only the request's own code: the same digits from another request,
     // or a code from the web, are wrong here.
-    let tried = match stored.code_id {
-        Some(code_id) => accounts::try_code_row(&mut tx, code_id, &email, &asked.code).await?,
-        None => Tried::NoCode,
+    let tried = match (&asked.code, &asked.link_token, stored.code_id) {
+        (Some(code), None, Some(code_id)) => accounts::try_code_row(&mut tx, code_id, &email, code).await?,
+        (Some(_), None, None) => Tried::NoCode,
+        (None, Some(token), _) => take_link(&mut tx, &stored, token).await?,
+        _ => return Err(Refusal::bad("invalid_request", "Send either the code or the link's token.")),
     };
     let attempts_left = match tried {
         Tried::Taken => None,

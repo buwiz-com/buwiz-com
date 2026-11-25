@@ -306,6 +306,32 @@ pub(crate) async fn try_code_row(
     try_open(tx, email, row, code).await
 }
 
+/// Uses up the code `code_id` without its digits, for the link mailed
+/// with it ([`crate::account::app_sign_in`]): only while it is open and
+/// has tries left.
+pub(crate) async fn spend_code_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    code_id: Uuid,
+) -> sqlx::Result<Tried> {
+    let attempts: Option<i32> = sqlx::query_scalar(
+        "SELECT attempts FROM email_codes WHERE id = $1 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE",
+    )
+    .bind(code_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match attempts {
+        None => Ok(Tried::NoCode),
+        Some(attempts) if attempts >= CODE_ATTEMPTS => Ok(Tried::Wrong { attempts_left: 0 }),
+        Some(_) => {
+            sqlx::query("UPDATE email_codes SET consumed_at = now() WHERE id = $1")
+                .bind(code_id)
+                .execute(&mut **tx)
+                .await?;
+            Ok(Tried::Taken)
+        }
+    }
+}
+
 /// Tries `code` on an open code row (id, hash, tries so far).
 async fn try_open(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

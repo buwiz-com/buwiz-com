@@ -900,12 +900,13 @@ Going further back runs 16's down file first (after 17's,
 The release with in-app email sign-in for the eBIRForms apps
 ([accounts.md](accounts.md#in-app-sign-in)) runs migration 17 when it
 starts. It adds two tables, `app_sign_ins` (each request) and
-`app_sign_in_alerts` (the days staff were alerted), the column
-`email_codes.unchecked` (a constant default: no row is rewritten), and
-lets `email_codes.purpose` be `app_sign_in`. The check is added `NOT
-VALID` and validated in its own statement; both run in the migration's one
-transaction, so the scan of `email_codes` (30 days of codes) happens under
-its lock, briefly. No existing row changes. It needs no setting: the
+`app_sign_in_alerts` (the days staff were alerted), the columns
+`email_codes.unchecked` and `email_codes.mailed` (constant defaults: no
+row is rewritten), and lets `email_codes.purpose` be `app_sign_in`.
+Adding that check reads `email_codes` (30 days of codes, so briefly) under
+its ACCESS EXCLUSIVE lock, which is held until the migration commits; the
+migration's 10 s lock timeout makes it fail rather than wait if it cannot
+get the lock. No existing row changes. It needs no setting: the
 endpoints work with the Turnstile keys the web already has, and without
 them (local development) every request counts towards the cap.
 
@@ -942,7 +943,7 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 19's and 18's,
+Going further back runs 17's down file first (after 20's, 19's and 18's,
 [below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
@@ -969,7 +970,8 @@ starts.
 There is no setting. This stores more about each device (a stable install
 id, the model, the system version, and optionally the computer's name):
 the privacy policy must say so before this ships. The release before it
-(at 17) refuses to start on a database at 18 or 19.
+(at 17) refuses to start on a database at 18, 19 or 20. The same release
+runs migration 20 ([below](#migration-20-an-index-on-devices-sign-ins)).
 
 **Before you deploy.** The database is at 17 (a read-only check):
 ```sql
@@ -986,7 +988,7 @@ devices removed with their sign-in stay removed). In this order:
    `systemctl is-active buwiz.service` prints `inactive`.
 2. Run the down files, newest first, each with a lock timeout set first:
    ```sh
-   for down in 0019_device_install_index 0018_device_installs; do
+   for down in 0020_devices_grant_index 0019_device_install_index 0018_device_installs; do
      psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
        -c "SET lock_timeout = '10s'" -f "migrations/$down.down.sql" || break
    done
@@ -994,11 +996,80 @@ devices removed with their sign-in stay removed). In this order:
    ```
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
-   starts instead, it runs migrations 18 and 19 again, and the rollback
+   starts instead, it runs migrations 18 to 20 again, and the rollback
    starts over at 1.
 
-Going further back runs 19's and 18's down files first, then 17's and the
-others as [above](#migration-17-in-app-sign-in); each commits on its own.
+Going further back runs 20's, 19's and 18's down files first, then 17's
+and the others as [above](#migration-17-in-app-sign-in); each commits on
+its own.
+
+## Migration 20 (an index on devices' sign-ins)
+
+Migration 20 adds the index `devices_grant_id` on `devices (grant_id)`:
+ending a grant (its trigger), a registration's check and the account's
+sign-ins without a device look devices up by it. It is built `CREATE
+INDEX CONCURRENTLY`, outside a transaction (`-- no-transaction`), so
+signed requests, which update `devices`, are not blocked while it is
+built. Rolling it back alone: `migrations/0020_devices_grant_index.down.sql`
+(it never refuses), with the service stopped, as for 18 and 19 above.
+
+**The migrations' lock timeout.** A file that runs outside a transaction
+cannot `SET LOCAL`, so the server runs every migration on one connection
+whose `lock_timeout` is 10 s for the whole session (`buwiz_cloud::migrate`
+in `src/lib.rs`), then closes it, so the pool never has the setting. The
+other migrations still set their own. One consequence: a second server
+starting at the same moment waits at most 10 s for the first one's
+migration lock, then fails and is restarted by systemd.
+
+**When a concurrent build times out.** `CREATE INDEX CONCURRENTLY` waits
+for every transaction that was open on `devices` when it began. Behind a
+long one (a `psql` session left in `BEGIN`, a stuck job) it fails after
+10 s instead of holding the deploy, and the server does not start. What
+the operator sees: `systemctl status buwiz.service` is failed (or
+restarting), and the journal says `migrations failed` with `canceling
+statement due to lock timeout` (19: `devices_account_install`; 20:
+`devices_grant_id`). Postgres leaves an invalid index of that name, and
+nothing is recorded in `_sqlx_migrations`. The next start then fails with
+`relation "devices_grant_id" already exists`. To recover:
+1. Find and end the long transaction:
+   ```sql
+   SELECT pid, state, xact_start, left(query, 60) FROM pg_stat_activity
+   WHERE xact_start < now() - interval '1 minute' ORDER BY xact_start;
+   ```
+   (end it at its source, or `SELECT pg_terminate_backend(<pid>)`).
+2. Drop the invalid index (it is not used while invalid):
+   ```sh
+   psql "$DATABASE_URL" -c "DROP INDEX CONCURRENTLY IF EXISTS devices_grant_id"
+   ```
+   (for 19, `devices_account_install`).
+3. `sudo systemctl restart buwiz.service`, then check
+   `SELECT max(version) FROM _sqlx_migrations` is 20.
+
+## Cloudflare rules for sign-in
+
+Set in the Cloudflare dashboard on the buwiz.com zone, not by this
+repository. They are an outer layer only: the server's own limits
+([accounts.md](accounts.md#who-can-be-mailed-a-code)) are the real ones.
+1. A rate limiting rule, "Limit sign-in code requests per IP": URI path
+   contains `/auth/email/`, more than 10 requests in 10 seconds from one
+   IP: Block for 10 seconds.
+2. A custom rule, "Challenge the sign-in form": hostname
+   `account.buwiz.com` and path in `/login`, `/signup`,
+   `/auth/email/start`: Managed Challenge.
+3. A custom rule blocking ASN 212743 on `account.buwiz.com`.
+
+What follows from them:
+- The apps post `/auth/email/start`, `/resend` and `/verify` to
+  api.buwiz.com only: no app can pass a Managed Challenge. The server
+  enforces it: the apps' JSON is `404` on any other host, and the web's
+  form is `404` on any host but account.buwiz.com.
+- Never add `/app-check`, `/app-check/done`, `/app-sign-in` or
+  `/oauth/authorize` on account.buwiz.com to the challenge rule's paths:
+  an app's web view cannot pass a Managed Challenge. (`/oauth/authorize`
+  opens in a real browser and may send the person to `/login`, which is
+  challenged, and that is fine.)
+- Tests and scripts never hammer production paths: run them against a
+  local server (`scripts/smoke.sh` uses `account.localhost`).
 
 ## OCR of claim documents
 

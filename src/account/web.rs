@@ -175,7 +175,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/oauth/authorize/decision", post(agents::decide))
         // Account site forms.
         // The same two paths take the apps' JSON (in-app sign-in,
-        // [`app_sign_in`]); `/auth/email/resend` is the apps' only.
+        // [`app_sign_in`]) on the API host only; the web's form only on the
+        // account host. `/auth/email/resend` is the apps' only.
         .route("/auth/email/start", post(email_start_or_app))
         .route("/auth/email/verify", post(email_verify_or_app))
         .route("/auth/email/resend", post(app_resend))
@@ -742,11 +743,26 @@ struct EmailStart {
     human: Option<String>,
 }
 
-/// `POST /auth/email/start`: an app's JSON ([`app_sign_in::start`]), or the
-/// web's form.
+/// Which of the sign-in endpoints' two kinds a request to them is, by its
+/// host: an app's JSON on the API host only, the web's form on the account
+/// host only (where Cloudflare challenges the form; docs/deploy.md,
+/// "Cloudflare rules for sign-in"). `None`: answered `404`, as if there
+/// were no such path there.
+fn sign_in_kind(headers: &HeaderMap) -> Option<bool> {
+    let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let json = app_sign_in::is_json(headers);
+    let site = crate::sites::canonical::Site::for_host(host);
+    let expected = if json { crate::sites::canonical::Site::Api } else { crate::sites::canonical::Site::Account };
+    (site == expected).then_some(json)
+}
+
+/// `POST /auth/email/start`: an app's JSON ([`app_sign_in::start`]) on the
+/// API host, or the web's form on the account host.
 async fn email_start_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    if app_sign_in::is_json(request.headers()) {
-        return app_sign_in::start(state, request).await;
+    match sign_in_kind(request.headers()) {
+        None => return StatusCode::NOT_FOUND.into_response(),
+        Some(true) => return app_sign_in::start(state, request).await,
+        Some(false) => {}
     }
     let headers = request.headers().clone();
     match Form::<EmailStart>::from_request(request, &state).await {
@@ -758,8 +774,10 @@ async fn email_start_or_app(State(state): State<AppState>, request: axum::extrac
 /// `POST /auth/email/verify`: an app's JSON ([`app_sign_in::verify`]), or
 /// the web's form.
 async fn email_verify_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    if app_sign_in::is_json(request.headers()) {
-        return app_sign_in::verify(state, request).await;
+    match sign_in_kind(request.headers()) {
+        None => return StatusCode::NOT_FOUND.into_response(),
+        Some(true) => return app_sign_in::verify(state, request).await,
+        Some(false) => {}
     }
     let headers = request.headers().clone();
     match Form::<EmailVerify>::from_request(request, &state).await {
@@ -768,9 +786,24 @@ async fn email_verify_or_app(State(state): State<AppState>, request: axum::extra
     }
 }
 
-/// `POST /auth/email/resend`: the apps' only.
+/// `POST /auth/email/resend`: the apps' only, JSON on the API host.
 async fn app_resend(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    if sign_in_kind(request.headers()) != Some(true) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     app_sign_in::resend(state, request).await
+}
+
+/// Mails staff, at most once an hour ([`crate::account::guard`]), that
+/// Turnstile answered without the hostname or action, so the web form took
+/// its tokens unbound.
+async fn unbound_alert(state: AppState) {
+    let subject = "Sign-in: Turnstile's answers lack the hostname or action";
+    let text = "Cloudflare Turnstile answered a sign-in form's check without the hostname or the action. \
+                The web form lets such answers through, as before these fields were checked, so web sign-in \
+                goes on; the apps' checks are refused until the fields are back.\n\n\
+                This is mailed at most once an hour. See docs/accounts.md, \"The app check and the testing cap\".";
+    app_sign_in::mail_staff(&state, subject, text).await;
 }
 
 async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailStart>) -> Response {
@@ -782,7 +815,11 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Ok(email) => email,
         Err(notice) => return see_other(link("/login", Some(notice), &[("next", &next)])),
     };
-    let counted = match state.sign_in_guard.check(&headers, form.human.as_deref()).await {
+    let counted = state.sign_in_guard.check(&headers, form.human.as_deref()).await;
+    if state.sign_in_guard.take_unbound_alert() {
+        tokio::spawn(unbound_alert(state.clone()));
+    }
+    let counted = match counted {
         Ok(counted) => counted,
         Err(refused) => {
             let notice = match refused {

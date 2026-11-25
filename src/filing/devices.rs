@@ -213,6 +213,14 @@ fn text_field(
 /// has one row per account: registering again (after a new sign-in)
 /// updates it in place, with the new key and sign-in, and ends the sign-in
 /// it had. A sign-in without one may register again, each time a new row.
+///
+/// A sign-in that named its install when it began (the in-app start, or
+/// the device flow's `/oauth/device/code`) and was completed is proof of
+/// the account, so its registration replaces that install's row whatever
+/// sign-in held it: by design. Someone who knows a device's install id and
+/// can complete a sign-in on the account replaces that device's sign-in;
+/// when the sign-in replaced was still live, the account is mailed
+/// ([`mail_replaced`]).
 pub async fn register(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
     let bearer = <Bearer as axum::extract::FromRequestParts<AppState>>::from_request_parts(&mut parts, &state).await?;
@@ -262,6 +270,13 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
         (Some(signed_in_as), asked) if asked != Some(signed_in_as) => {
             return Err(ApiError::bad_request("install_mismatch", "install_id is not the one this app signed in with"));
         }
+        // The sign-in named this install when it began, and was completed:
+        // that is proof of the account, so it takes the install's row below
+        // (ending the sign-in that held it, with a mail when that one was
+        // live). No check that the row's sign-in is over: that is the
+        // designed behaviour, not a gap (docs/accounts.md, "Devices").
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => unreachable!("refused as install_mismatch above"),
         (None, Some(install)) => {
             // An install another live sign-in of the account registered is
             // not this sign-in's to take: it would re-key that device and
@@ -294,7 +309,8 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
                 .execute(&mut *tx)
                 .await?;
         }
-        _ => {}
+        // Apps from before install ids.
+        (None, None) => {}
     }
     // A sign-in with an install registers one device. One without (apps
     // from before install ids) may register again, as it always could:
@@ -317,9 +333,20 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
         }
         None => None,
     };
+    // Whether the sign-in this registration ends was still live: not
+    // ended, with a refresh token that works.
+    let mut replaced_live = false;
     let written: Result<(Uuid, OffsetDateTime), sqlx::Error> = match known {
         Some((id, old_grant)) => {
             if old_grant != bearer.grant_id {
+                replaced_live = sqlx::query_scalar(&format!(
+                    "SELECT revoked_at IS NULL AND {} FROM oauth_grants g WHERE g.id = $1 FOR UPDATE",
+                    HAS_REFRESH
+                ))
+                .bind(old_grant)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or(false);
                 sqlx::query(
                     "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'device_replaced'
                      WHERE id = $1 AND revoked_at IS NULL",
@@ -371,8 +398,36 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
     };
     tx.commit().await?;
     tracing::info!(device = %id, account = %bearer.account.id, again = known.is_some(), "device registered");
+    if replaced_live {
+        tokio::spawn(mail_replaced(state.clone(), bearer.account.id, bearer.account.email.clone(), id, platform));
+    }
     let created_at = created_at.format(&time::format_description::well_known::Rfc3339).map_err(anyhow::Error::from)?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id, "name": name, "created_at": created_at }))).into_response())
+}
+
+/// SQL: the grant `g` has a refresh token that still works.
+const HAS_REFRESH: &str = "EXISTS (SELECT 1 FROM oauth_refresh_tokens r
+                                   WHERE r.grant_id = g.id AND r.used_at IS NULL AND r.expires_at > now())";
+
+/// Mails the account that a registration replaced a live sign-in on one of
+/// its devices ([`register`]): after the commit, off the request. Not to a
+/// test account with a fixed code (nothing is mailed to those). A failure
+/// is logged with ids only; the registration stands.
+async fn mail_replaced(state: AppState, account_id: Uuid, email: String, device_id: Uuid, platform: Option<&str>) {
+    let fixed =
+        crate::account::accounts::has_fixed_code(&state.db, &email, &state.config.admin_emails).await.unwrap_or_else(
+            |error| {
+                tracing::error!(%error, account = %account_id, device = %device_id, "could not read whether the account has a fixed code");
+                true
+            },
+        );
+    if fixed {
+        return;
+    }
+    let device = Platform::device(platform.and_then(Platform::from_stored));
+    if let Err(error) = state.mailer.send_sign_in_replaced(&email, device).await {
+        tracing::error!(error = ?error, account = %account_id, device = %device_id, "the mail about a replaced sign-in could not be sent");
+    }
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -401,6 +456,10 @@ pub struct DeviceView {
     pub last_used_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
+    /// `live` (its sign-in has a refresh token that works), `expired` (its
+    /// sign-in's tokens all ran out: signed out, though nobody removed
+    /// it) or `removed`.
+    pub state: String,
 }
 
 /// How long a removed device stays on the lists.
@@ -409,13 +468,16 @@ const REMOVED_SHOWN_DAYS: i32 = 30;
 /// The account's devices, live first, without those removed more than 30
 /// days ago.
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<DeviceView>> {
-    let mut devices: Vec<DeviceView> = sqlx::query_as(
+    let mut devices: Vec<DeviceView> = sqlx::query_as(&format!(
         "SELECT d.id, d.name, g.client_id, d.grant_id, d.platform, d.model, d.os_version, d.computer_name,
-                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at
+                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at,
+                CASE WHEN d.revoked_at IS NOT NULL THEN 'removed'
+                     WHEN g.revoked_at IS NULL AND {HAS_REFRESH} THEN 'live'
+                     ELSE 'expired' END AS state
          FROM devices d JOIN oauth_grants g ON g.id = d.grant_id
          WHERE d.account_id = $1 AND (d.revoked_at IS NULL OR d.revoked_at > now() - make_interval(days => $2))
-         ORDER BY d.revoked_at IS NOT NULL, coalesce(d.signed_in_at, d.created_at) DESC",
-    )
+         ORDER BY d.revoked_at IS NOT NULL, coalesce(d.signed_in_at, d.created_at) DESC"
+    ))
     .bind(account_id)
     .bind(REMOVED_SHOWN_DAYS)
     .fetch_all(db)

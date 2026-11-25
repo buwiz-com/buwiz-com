@@ -132,8 +132,12 @@ impl std::fmt::Debug for IssuedCode {
 pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Result<IssuedCode, CodeError> {
     let mut tx = db.begin().await?;
     lock_address(&mut tx, email).await?;
-    let (_, issued) =
-        issue_code_in(&mut tx, email, admin_emails, Purpose::SignIn, CODE_TTL, NewAddressBudget::Web).await?;
+    let (hash, issued) = match plan_code(&mut tx, email, admin_emails, NewAddressBudget::Web).await? {
+        Planned::Code(hash, issued) => (hash, issued),
+        // The web form stores nothing and answers as if mailed.
+        Planned::Busy => return Err(CodeError::Busy),
+    };
+    add_code(&mut tx, email, hash, Purpose::SignIn, CODE_TTL, false, true).await?;
     tx.commit().await?;
     Ok(issued)
 }
@@ -160,18 +164,27 @@ pub(crate) async fn lock_address(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     Ok(())
 }
 
-/// [`issue_code`] in the caller's transaction, which holds
-/// [`lock_address`]: for `purpose` (a sign-in, from the web or an app),
-/// for `ttl`, with the id of the stored code, and new addresses held to
-/// `budget`. Nothing is written unless a code is stored.
-pub(crate) async fn issue_code_in(
+/// What [`plan_code`] found a sign-in code for an address may be.
+pub(crate) enum Planned {
+    /// A code to store with this hash (for [`add_code`]) and mail, or not
+    /// (a fixed code).
+    Code(Vec<u8>, IssuedCode),
+    /// The address has no account and `budget`'s mail to new addresses is
+    /// used up: nothing may be mailed to it now.
+    Busy,
+}
+
+/// The checks before a sign-in code for `email` is stored, in the caller's
+/// transaction, which holds [`lock_address`]: the address's five codes an
+/// hour ([`CodeError::TooMany`]), then, for an address without an account,
+/// `budget`'s mail to new addresses, whose lock is held until the caller
+/// commits. Writes nothing; [`add_code`] stores what it found.
+pub(crate) async fn plan_code(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     email: &str,
     admin_emails: &[String],
-    purpose: Purpose,
-    ttl: Duration,
     budget: NewAddressBudget,
-) -> Result<(Uuid, IssuedCode), CodeError> {
+) -> Result<Planned, CodeError> {
     if codes_this_hour(tx, email).await? >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
     }
@@ -190,10 +203,11 @@ pub(crate) async fn issue_code_in(
             ),
         };
         sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(lock).execute(&mut **tx).await?;
+        // Codes mailed: one held back ([`add_code`]'s `mailed`) is no mail.
         let (hour, day): (i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE c.created_at > now() - interval '1 hour'), count(*)
              FROM email_codes c
-             WHERE c.created_at > now() - interval '1 day' AND c.unchecked = $1
+             WHERE c.created_at > now() - interval '1 day' AND c.unchecked = $1 AND c.mailed
                AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = c.email)",
         )
         .bind(unchecked)
@@ -201,7 +215,7 @@ pub(crate) async fn issue_code_in(
         .await?;
         if hour >= per_hour || day >= per_day {
             tracing::warn!(hour, day, ?budget, "sign-in codes for addresses without an account are at their limit");
-            return Err(CodeError::Busy);
+            return Ok(Planned::Busy);
         }
     }
     let fixed: Option<Vec<u8>> = if known {
@@ -217,16 +231,22 @@ pub(crate) async fn issue_code_in(
     } else {
         None
     };
-    let (hash, issued) = match fixed {
-        Some(hash) => (hash, IssuedCode::Fixed),
+    Ok(match fixed {
+        Some(hash) => Planned::Code(hash, IssuedCode::Fixed),
         None => {
             let code = random_code();
-            (code_hash(email, &code), IssuedCode::Mail(code))
+            Planned::Code(code_hash(email, &code), IssuedCode::Mail(code))
         }
-    };
-    let unchecked = budget == NewAddressBudget::Unchecked;
-    let id = add_code(tx, email, hash, purpose, ttl, unchecked).await?;
-    Ok((id, issued))
+    })
+}
+
+/// A real code for `email`, made and stored as a mailed one is (the same
+/// digits' generator and hash), that is never mailed: for an app's request
+/// when [`plan_code`] found the address [`Planned::Busy`], so the request
+/// has a code and is answered and held exactly as one that was mailed.
+/// Nobody knows its digits; it can only be guessed, at a mailed code's odds.
+pub(crate) fn unmailed_code(email: &str) -> Vec<u8> {
+    code_hash(email, &random_code())
 }
 
 /// Stores a code for deleting the account of `email` and returns it, for
@@ -241,14 +261,18 @@ pub(crate) async fn issue_deletion_code(db: &PgPool, email: &str) -> Result<Stri
         return Err(CodeError::TooMany);
     }
     let code = random_code();
-    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete, CODE_TTL, false).await?;
+    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete, CODE_TTL, false, true).await?;
     tx.commit().await?;
     Ok(code)
 }
 
 /// Whether the account of `email` signs in with a fixed code
 /// ([`roles::fixed_code_sql`]), so nothing is mailed to it.
-pub(crate) async fn has_fixed_code(db: &PgPool, email: &str, admin_emails: &[String]) -> sqlx::Result<bool> {
+pub(crate) async fn has_fixed_code(
+    db: impl sqlx::PgExecutor<'_>,
+    email: &str,
+    admin_emails: &[String],
+) -> sqlx::Result<bool> {
     let fixed: Option<bool> =
         sqlx::query_scalar(&format!("SELECT {} FROM accounts a WHERE a.email = $1", roles::fixed_code_sql("a", "$2")))
             .bind(email)
@@ -270,26 +294,33 @@ async fn codes_this_hour(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, email: 
         .await
 }
 
-async fn add_code(
+/// Stores a code for `email` and returns its id. `unchecked`: an app asked
+/// for it without an app check. `mailed`: false for an
+/// [`unmailed_code`], which counts towards the address's five an hour as
+/// every code does, and towards no budget of mail (the new addresses', the
+/// apps' testing cap).
+pub(crate) async fn add_code(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     email: &str,
     hash: Vec<u8>,
     purpose: Purpose,
     ttl: Duration,
     unchecked: bool,
+    mailed: bool,
 ) -> sqlx::Result<Uuid> {
     // Dated when it is added, not when the transaction began: the code
     // added last (after waiting for the lock) must be the newest, because
     // only the newest can be redeemed.
     sqlx::query_scalar(
-        "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose, unchecked)
-         VALUES ($1, $2, $3, clock_timestamp(), $4, $5) RETURNING id",
+        "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose, unchecked, mailed)
+         VALUES ($1, $2, $3, clock_timestamp(), $4, $5, $6) RETURNING id",
     )
     .bind(email)
     .bind(hash)
     .bind(OffsetDateTime::now_utc() + ttl)
     .bind(purpose.as_str())
     .bind(unchecked)
+    .bind(mailed)
     .fetch_one(&mut **tx)
     .await
 }

@@ -28,6 +28,11 @@ pub struct Inner {
     pub mailer: Mailer,
     /// What a request for a sign-in code passes before one is mailed.
     pub sign_in_guard: SignInGuard,
+    /// Places for the database work of the apps' `/auth/email/start` and
+    /// `/resend` ([`crate::account::app_sign_in::DATABASE_SLOTS`] of them,
+    /// below the pool's 10): a flood of them waits here, holding no
+    /// connection, and the rest of the site keeps the pool.
+    pub app_sign_in_slots: tokio::sync::Semaphore,
     pub documents: DocumentStore,
     /// Signs tickets.
     pub ticket_key: SigningKey,
@@ -77,9 +82,8 @@ impl AppState {
         sender: SenderLink,
     ) -> Self {
         let mailer = Mailer::new(config.mail.clone(), &config.account_origin);
-        let account_host = config.account_origin.split_once("://").map_or("", |(_, rest)| rest);
-        let account_host = account_host.split(':').next().unwrap_or_default();
-        let sign_in_guard = SignInGuard::new(config.turnstile.clone(), account_host);
+        let account_host = crate::account::guard::account_host(&config.account_origin);
+        let sign_in_guard = SignInGuard::new(config.turnstile.clone(), &account_host);
         let downloads = Downloads::new(&config.downloads_url, downloads::APP, true);
         let bot_downloads = Downloads::new(&config.downloads_url, downloads::BOT_APP, false);
         let stars = Stars::new(&config.github_api_url);
@@ -89,6 +93,7 @@ impl AppState {
             db,
             mailer,
             sign_in_guard,
+            app_sign_in_slots: tokio::sync::Semaphore::new(crate::account::app_sign_in::DATABASE_SLOTS),
             documents,
             ticket_key,
             sender,

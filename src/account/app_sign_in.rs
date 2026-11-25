@@ -16,6 +16,15 @@
 //! the secret itself to resend or verify. A code lasts
 //! `APP_SIGN_IN_MINUTES` (5), and no new one is mailed for the request,
 //! or for the address to the same install, until it has expired.
+//!
+//! What a flood of requests can cost is bounded before any of it is done:
+//! every try at start and resend counts against its network's hour
+//! ([`SignInGuard::count_app_attempt`](crate::account::guard::SignInGuard::count_app_attempt),
+//! 20, never given back), then the body is read, then Turnstile is asked
+//! (when a token came), and only then is the database used, by at most
+//! [`DATABASE_SLOTS`] requests at once, each waiting at most
+//! [`SLOT_WAIT`] for a place and [`LOCK_WAIT`] for a lock (else `503
+//! busy`).
 
 use std::borrow::Cow;
 
@@ -32,8 +41,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::account::accounts::{self, CODE_ATTEMPTS, CodeError, IssuedCode, NewAddressBudget, Purpose, Tried};
-use crate::account::guard::{Counted, Refused};
+use crate::account::accounts::{self, CODE_ATTEMPTS, CodeError, IssuedCode, NewAddressBudget, Planned, Purpose, Tried};
 use crate::account::mail::AppCodeWords;
 use crate::account::oauth::{self, SCOPE_APP};
 use crate::account::roles;
@@ -60,6 +68,18 @@ const UNCHECKED_LOCK: i64 = 0x6275_7769_7a02;
 /// How long a refusal by a per-hour limit asks to wait, when the wait is
 /// not known: the hour.
 const HOUR_S: i64 = 3600;
+
+/// How many start and resend requests may use the database at once: below
+/// the pool's 10 connections, so the rest of the site always has some.
+pub const DATABASE_SLOTS: usize = 4;
+/// How long a request waits for one of those places before `503 busy`.
+/// While it waits it holds no connection.
+pub const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a start or resend waits for a lock (`lock_timeout`) before
+/// `503 busy`.
+const LOCK_WAIT: &str = "3s";
+/// What `503 busy` asks to wait.
+const BUSY_RETRY_S: i64 = 5;
 
 /// Reserved: the refusal of a request without a Turnstile token from a
 /// platform that requires one (`403`). Not used yet: every platform may
@@ -111,6 +131,19 @@ impl Refusal {
         tracing::error!(error = ?error.into(), "in-app sign-in failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "Something went wrong. Try again.")
     }
+
+    /// `503 busy`: too many requests at once (no place for the database
+    /// work, or a lock not had in time). Nothing was done.
+    fn busy() -> Self {
+        Self {
+            retry_after: Some(BUSY_RETRY_S),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "Buwiz is busy. Nothing was sent; try again in a few seconds.",
+            )
+        }
+    }
 }
 
 const INVALID_REQUEST: Refusal =
@@ -118,6 +151,13 @@ const INVALID_REQUEST: Refusal =
 
 impl From<sqlx::Error> for Refusal {
     fn from(error: sqlx::Error) -> Self {
+        // `lock_timeout` ([`LOCK_WAIT`]) ran out.
+        if let sqlx::Error::Database(database) = &error
+            && database.code().as_deref() == Some("55P03")
+        {
+            tracing::warn!("in-app sign-in: a lock was not had in time; answered busy");
+            return Self::busy();
+        }
         Self::internal(error)
     }
 }
@@ -297,6 +337,9 @@ pub async fn start(state: AppState, request: Request) -> Response {
 
 async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) -> Result<Response, Refusal> {
     refuse_while_stopping(state)?;
+    // The cheap refusals first, none of which takes a connection: the
+    // network's tries, the body, Turnstile.
+    count_attempt(state, headers)?;
     let asked: Start = body(request).await?;
     if oauth::client_scope_of(&asked.client_id) != Some(SCOPE_APP) {
         return Err(Refusal::bad("unknown_client", "This app is not one that can sign in here."));
@@ -312,19 +355,15 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
     let create = asked.intent.as_ref().and_then(Value::as_str) == Some("create");
     let platform = Platform::parse(asked.platform.as_ref());
     let words = AppCodeWords { device: Platform::device(platform), create, minutes: state.config.app_sign_in_minutes };
+    let checked = app_check(state, headers, asked.turnstile.as_deref()).await?;
 
-    // The network's hour first, so a flood from one network costs no
-    // call to Turnstile and no database work.
-    let counted = count_network(state, headers)?;
-    let checked = app_check(state, headers, asked.turnstile.as_deref())
-        .await
-        .map_err(|refusal| forgiven(state, &counted, refusal))?;
-    let fixed = accounts::has_fixed_code(&state.db, &email, &state.config.admin_emails).await?;
-    // Every refusal comes before anything is written, in one transaction
-    // under the address's lock; the request is added with its code, or
-    // not at all.
-    let mut tx = state.db.begin().await?;
+    // Then the database, in one transaction under the address's lock:
+    // every refusal comes before anything is written, and the request is
+    // added with its code (mailed or not), or not at all.
+    let slot = database_slot(state).await?;
+    let mut tx = begin(state).await?;
     accounts::lock_address(&mut tx, &email).await?;
+    let fixed = accounts::has_fixed_code(&mut *tx, &email, &state.config.admin_emails).await?;
     if let Some(install) = install {
         if fixed {
             // Nothing is mailed to a test account with a fixed code, so it
@@ -338,15 +377,11 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
             .execute(&mut *tx)
             .await?;
         } else if let Some(ends) = usable_code_until(&mut tx, &email, install).await? {
-            return Err(forgiven(state, &counted, already_sent(whole_seconds(ends - OffsetDateTime::now_utc()))));
+            return Err(already_sent(whole_seconds(ends - OffsetDateTime::now_utc())));
         }
     }
-    let (issued, alert) =
-        code_in(&mut tx, state, &email, checked).await.map_err(|refusal| forgiven(state, &counted, refusal))?;
-    let token = matches!(issued, Some((_, IssuedCode::Mail(_)))).then(|| crypto::new_token(""));
-    // With no code (the limit on addresses without an account) the request
-    // is still made, so verifying it answers as a wrong code does; the
-    // network's hour is not given back for it.
+    let ((code_id, code), alert) = code_in(&mut tx, state, &email, checked).await?;
+    let token = code.has_link().then(|| crypto::new_token(""));
     let request_id: Uuid = sqlx::query_scalar(
         "INSERT INTO app_sign_ins
              (email, client_id, secret_hash, intent, platform, install_id, code_id, link_token_hash, expires_at)
@@ -358,29 +393,55 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
     .bind(if create { "create" } else { "sign_in" })
     .bind(platform.map(Platform::as_str))
     .bind(install)
-    .bind(issued.as_ref().map(|(code_id, _)| *code_id))
+    .bind(code_id)
     .bind(token.as_deref().map(crypto::hash))
     .bind(OffsetDateTime::now_utc() + ttl(state))
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
+    drop(slot);
     if let Some(count) = alert {
         alert_staff(state, count).await;
     }
-    if let Err(refusal) = mail(state, request_id, &email, issued.as_ref(), token, words).await {
+    if let Err(refusal) = mail(state, request_id, &email, &code, token, words).await {
         // Nothing went out: the request and its code are taken back, and
         // with them their place in every count.
-        let code_id = issued.as_ref().map(|(code_id, _)| *code_id);
         sqlx::query("DELETE FROM app_sign_ins WHERE id = $1").bind(request_id).execute(&state.db).await?;
-        delete_code(state, code_id).await?;
-        return Err(forgiven(state, &counted, refusal));
+        delete_code(state, Some(code_id)).await?;
+        return Err(refusal);
     }
     Ok(sent(state, request_id))
 }
 
-/// Until when a code mailed for `email` to `install` still works: open,
+/// Counts the try against its network's hour, or refuses it.
+fn count_attempt(state: &AppState, headers: &HeaderMap) -> Result<(), Refusal> {
+    state.sign_in_guard.count_app_attempt(headers).map_err(Refusal::too_many)
+}
+
+/// One of the [`DATABASE_SLOTS`] places for the database work, waited for
+/// at most [`SLOT_WAIT`]; `503 busy` when none came.
+async fn database_slot(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, Refusal> {
+    match tokio::time::timeout(SLOT_WAIT, state.app_sign_in_slots.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!("in-app sign-in: every place for the database work is taken; answered busy");
+            Err(Refusal::busy())
+        }
+    }
+}
+
+/// The transaction of a start or resend, whose locks are waited for at
+/// most [`LOCK_WAIT`].
+async fn begin(state: &AppState) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Refusal> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).execute(&mut *tx).await?;
+    Ok(tx)
+}
+
+/// Until when a code given for `email` to `install` still works: open,
 /// unexpired, with tries left, on a live request. `None` when there is no
-/// such code (none was mailed, or its tries are used up).
+/// such code (its tries are used up). A code that was not mailed (a
+/// budget was full) holds the install exactly as a mailed one does.
 async fn usable_code_until(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     email: &str,
@@ -396,14 +457,6 @@ async fn usable_code_until(
     .bind(CODE_ATTEMPTS)
     .fetch_one(&mut **tx)
     .await
-}
-
-/// Counts the request against its network's hour, or refuses it.
-fn count_network(state: &AppState, headers: &HeaderMap) -> Result<Counted, Refusal> {
-    match state.sign_in_guard.count_network(headers) {
-        Ok(counted) => Ok(counted),
-        Err(Refused::NetworkTooMany | Refused::NotHuman) => Err(Refusal::too_many(HOUR_S)),
-    }
 }
 
 async fn delete_code(state: &AppState, code_id: Option<Uuid>) -> sqlx::Result<()> {
@@ -437,7 +490,7 @@ async fn end(state: &AppState, request_id: Uuid) -> sqlx::Result<()> {
 }
 
 /// What start and resend answer, whether or not the address has an
-/// account, and whether or not a code was mailed.
+/// account, and whether or not its code was mailed.
 fn sent(state: &AppState, request_id: Uuid) -> Response {
     let seconds = ttl(state).whole_seconds();
     answer(json!({
@@ -461,33 +514,67 @@ async fn app_check(state: &AppState, headers: &HeaderMap, turnstile: Option<&str
     }
 }
 
-/// A code [`code_in`] made: its row, and what to mail.
-type Issued = Option<(Uuid, IssuedCode)>;
+/// What a request's code is.
+enum Code {
+    /// A random code, to mail with its link.
+    Mail(String),
+    /// A test account's fixed code: nothing is mailed.
+    Fixed,
+    /// A random code that is not mailed, because a budget of mail was full
+    /// ([`Planned::Busy`]). Everything else about it is as for [`Code::Mail`]:
+    /// its request is answered, held and verified the same way.
+    Unmailed,
+}
+
+impl Code {
+    /// Whether its request gets a link token, as a mailed code's does.
+    fn has_link(&self) -> bool {
+        matches!(self, Self::Mail(_) | Self::Unmailed)
+    }
+}
+
+/// A code [`code_in`] stored: its row, and what it is.
+type Issued = (Uuid, Code);
 
 /// The code, in the caller's transaction under the address's lock: the
 /// testing cap (unless `checked`), then the web's limits per address and
-/// for new addresses ([`accounts::issue_code_in`]; without an app check,
-/// the apps' own budget for new addresses). Nothing is written unless a
-/// code is stored, so a refused request spends no place in any count.
-/// `None` for the code when nothing is to be mailed and the answer must
-/// not say so (a new address over its budget). With it, the day's count
-/// of unchecked codes when staff are to be told now.
+/// for new addresses ([`accounts::plan_code`]; without an app check, the
+/// apps' own budget for new addresses). A refusal writes nothing. When a
+/// budget of mail is full, a code is stored all the same and not mailed
+/// ([`Code::Unmailed`]), so the answer and everything after it are those
+/// of a mailed code. With the code, the day's count of unchecked codes
+/// when staff are to be told now.
 async fn code_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &AppState,
     email: &str,
     checked: bool,
 ) -> Result<(Issued, Option<i64>), Refusal> {
-    let day = if checked { None } else { Some(testing_cap(tx).await?) };
+    // A full cap refuses here, before any lock but the address's.
+    if !checked {
+        testing_cap(tx, false).await?;
+    }
     let budget = if checked { NewAddressBudget::Web } else { NewAddressBudget::Unchecked };
+    let unchecked = !checked;
     let admins = &state.config.admin_emails;
-    let issued = match accounts::issue_code_in(tx, email, admins, Purpose::AppSignIn, ttl(state), budget).await {
-        Ok(issued) => issued,
+    let planned = match accounts::plan_code(tx, email, admins, budget).await {
+        Ok(planned) => planned,
         Err(CodeError::TooMany) => return Err(Refusal::too_many(HOUR_S)),
-        // As on the web: answered as if mailed.
-        Err(CodeError::Busy) => return Ok((None, None)),
         Err(error) => return Err(Refusal::internal(anyhow::anyhow!(error))),
     };
+    let (hash, code) = match planned {
+        Planned::Code(hash, IssuedCode::Mail(code)) => (hash, Code::Mail(code)),
+        Planned::Code(hash, IssuedCode::Fixed) => (hash, Code::Fixed),
+        Planned::Busy => {
+            tracing::info!("in-app sign-in: a budget of mail is full; a code is stored and not mailed");
+            let hash = accounts::unmailed_code(email);
+            let id = accounts::add_code(tx, email, hash, Purpose::AppSignIn, ttl(state), unchecked, false).await?;
+            return Ok(((id, Code::Unmailed), None));
+        }
+    };
+    // The cap again, under its lock, for the code that takes a place.
+    let day = if checked { None } else { Some(testing_cap(tx, true).await?) };
+    let id = accounts::add_code(tx, email, hash, Purpose::AppSignIn, ttl(state), unchecked, true).await?;
     let mut alert = None;
     if let Some(day) = day.map(|day| day + 1)
         && day >= UNCHECKED_ALERT_AT
@@ -502,21 +589,26 @@ async fn code_in(
             == 1;
         alert = first.then_some(day);
     }
-    Ok((Some(issued), alert))
+    Ok(((id, code), alert))
 }
 
-/// The testing cap: codes the apps were given without an app check, across
-/// every address, an hour and a day. Counted under its own lock, so two
-/// requests at once cannot both take the last place; the day's count so
-/// far, or the refusal with how long to wait.
-async fn testing_cap(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<i64, Refusal> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(UNCHECKED_LOCK).execute(&mut **tx).await?;
+/// The testing cap: codes mailed to the apps without an app check, across
+/// every address, an hour and a day (a code not mailed takes no place).
+/// The day's count so far, or the refusal with how long to wait. With
+/// `locked`, counted under the cap's own lock, held until the caller
+/// commits, so two requests at once cannot both take the last place; the
+/// caller adds its code under it. Without, a first look that takes no lock,
+/// so a full cap refuses without waiting for one.
+async fn testing_cap(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, locked: bool) -> Result<i64, Refusal> {
+    if locked {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(UNCHECKED_LOCK).execute(&mut **tx).await?;
+    }
     let (hour, day, hour_wait, day_wait): (i64, i64, Option<f64>, Option<f64>) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE created_at > now() - interval '1 hour'), count(*),
                 extract(epoch FROM min(created_at) FILTER (WHERE created_at > now() - interval '1 hour')
                                   + interval '1 hour' - now())::float8,
                 extract(epoch FROM min(created_at) + interval '1 day' - now())::float8
-         FROM email_codes WHERE unchecked AND created_at > now() - interval '1 day'",
+         FROM email_codes WHERE unchecked AND mailed AND created_at > now() - interval '1 day'",
     )
     .fetch_one(&mut **tx)
     .await?;
@@ -532,24 +624,19 @@ async fn testing_cap(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<i
     Ok(day)
 }
 
-fn forgiven(state: &AppState, counted: &Counted, refusal: Refusal) -> Refusal {
-    state.sign_in_guard.forgive(counted);
-    refusal
-}
-
 /// Mails what [`code_in`] made, with the one-time link to the request
 /// ([`take_link`]) whose token is `token`. A fixed code (a test account)
-/// is not mailed: its holder has it.
+/// is not mailed: its holder has it. Nor is an unmailed one.
 async fn mail(
     state: &AppState,
     request_id: Uuid,
     email: &str,
-    issued: Option<&(Uuid, IssuedCode)>,
+    code: &Code,
     token: Option<String>,
     words: AppCodeWords,
 ) -> Result<(), Refusal> {
-    match issued {
-        Some((_, IssuedCode::Mail(code))) => {
+    match code {
+        Code::Mail(code) => {
             let link =
                 token.map(|token| format!("{}/app-sign-in#r={request_id}&t={token}", state.config.account_origin));
             state.mailer.send_app_sign_in_code(email, code, link.as_deref(), words).await.map_err(|error| {
@@ -557,24 +644,34 @@ async fn mail(
                 Refusal::new(StatusCode::BAD_GATEWAY, "mail_failed", "The code could not be mailed. Try again.")
             })
         }
-        Some((_, IssuedCode::Fixed)) => {
+        Code::Fixed => {
             tracing::info!("an app asked a code for a test account with a fixed code: nothing is mailed");
             Ok(())
         }
-        None => Ok(()),
+        Code::Unmailed => Ok(()),
     }
 }
 
-/// Mails Admins and Support (as BIR uptime's alerts do) that the testing
-/// cap is filling. A failure is logged; it is not tried again that day.
-async fn alert_staff(state: &AppState, count: i64) {
+/// Mails Admins and Support (as BIR uptime's alerts do) `subject` and
+/// `text`. A failure is logged.
+pub(crate) async fn mail_staff(state: &AppState, subject: &str, text: &str) {
     let to = match roles::staff_emails(&state.db, &state.config.admin_emails).await {
         Ok(to) => to,
         Err(error) => {
-            tracing::error!(%error, "in-app sign-in: staff to alert could not be read");
+            tracing::error!(%error, "sign-in: staff to alert could not be read");
             return;
         }
     };
+    for address in &to {
+        if let Err(error) = state.mailer.send_notice(address, subject, text).await {
+            tracing::error!(error = ?error, "sign-in: a staff alert could not be sent to one address");
+        }
+    }
+}
+
+/// Mails staff that the testing cap is filling. A failure is logged; it is
+/// not tried again that day.
+async fn alert_staff(state: &AppState, count: i64) {
     let subject = "In-app sign-in: many requests without an app check today";
     let text = format!(
         "{count} in-app sign-in requests came without an app check (Turnstile) in the last day.\n\n\
@@ -583,11 +680,7 @@ async fn alert_staff(state: &AppState, count: i64) {
          This is mailed at most once a day.\n\n\
          See docs/accounts.md, \"In-app sign-in\"."
     );
-    for address in &to {
-        if let Err(error) = state.mailer.send_notice(address, subject, &text).await {
-            tracing::error!(error = ?error, "in-app sign-in: a staff alert could not be sent to one address");
-        }
-    }
+    mail_staff(state, subject, &text).await;
 }
 
 /// A request as stored.
@@ -601,7 +694,6 @@ struct Stored {
     install_id: Option<String>,
     code_id: Option<Uuid>,
     link_token_hash: Option<Vec<u8>>,
-    attempts: i32,
     created_at: OffsetDateTime,
     expires_at: OffsetDateTime,
     used_at: Option<OffsetDateTime>,
@@ -624,7 +716,7 @@ impl Stored {
 }
 
 const STORED: &str =
-    "SELECT email, client_id, secret_hash, intent, platform, install_id, code_id, link_token_hash, attempts, created_at,
+    "SELECT email, client_id, secret_hash, intent, platform, install_id, code_id, link_token_hash, created_at,
                              expires_at, used_at
                       FROM app_sign_ins WHERE id = $1";
 
@@ -650,7 +742,12 @@ pub async fn resend(state: AppState, request: Request) -> Response {
 
 async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -> Result<Response, Refusal> {
     refuse_while_stopping(state)?;
+    // As at the start: the network's tries, the body and Turnstile before
+    // the database.
+    count_attempt(state, headers)?;
     let asked: Resend = body(request).await?;
+    let checked = app_check(state, headers, asked.turnstile.as_deref()).await?;
+    let slot = database_slot(state).await?;
     let stored: Option<Stored> = sqlx::query_as(STORED).bind(asked.request_id).fetch_optional(&state.db).await?;
     let now = OffsetDateTime::now_utc();
     let Some(stored) = stored.filter(|stored| {
@@ -662,14 +759,10 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
     if stored.expires_at > now {
         return Err(Refusal::too_many(whole_seconds(stored.expires_at - now)));
     }
-    let counted = count_network(state, headers)?;
-    let checked = app_check(state, headers, asked.turnstile.as_deref())
-        .await
-        .map_err(|refusal| forgiven(state, &counted, refusal))?;
-    // As at the start: every refusal before anything is written, and the
-    // request's new code and time in one transaction. The request's row is
-    // locked, so two resends at once mail one code.
-    let mut tx = state.db.begin().await?;
+    // Every refusal before anything is written, and the request's new code
+    // and time in one transaction. The request's row is locked, so two
+    // resends at once give one code.
+    let mut tx = begin(state).await?;
     accounts::lock_address(&mut tx, &stored.email).await?;
     let open: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM app_sign_ins WHERE id = $1 AND used_at IS NULL AND expires_at <= now() FOR UPDATE",
@@ -678,33 +771,31 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
     .fetch_optional(&mut *tx)
     .await?;
     if open.is_none() {
-        return Err(forgiven(state, &counted, Refusal::too_many(ttl(state).whole_seconds())));
+        return Err(Refusal::too_many(ttl(state).whole_seconds()));
     }
-    let (issued, alert) =
-        code_in(&mut tx, state, &stored.email, checked).await.map_err(|refusal| forgiven(state, &counted, refusal))?;
-    let token = matches!(issued, Some((_, IssuedCode::Mail(_)))).then(|| crypto::new_token(""));
-    // A new code: the old one (and its link) ends, the request's tries
-    // start again with it, and its time from now.
-    sqlx::query(
-        "UPDATE app_sign_ins SET code_id = $2, link_token_hash = $3, expires_at = $4, attempts = 0 WHERE id = $1",
-    )
-    .bind(asked.request_id)
-    .bind(issued.as_ref().map(|(code_id, _)| *code_id))
-    .bind(token.as_deref().map(crypto::hash))
-    .bind(OffsetDateTime::now_utc() + ttl(state))
-    .execute(&mut *tx)
-    .await?;
+    let ((code_id, code), alert) = code_in(&mut tx, state, &stored.email, checked).await?;
+    let token = code.has_link().then(|| crypto::new_token(""));
+    // A new code: the old one (and its link) ends, and the request's time
+    // starts again from now.
+    sqlx::query("UPDATE app_sign_ins SET code_id = $2, link_token_hash = $3, expires_at = $4 WHERE id = $1")
+        .bind(asked.request_id)
+        .bind(code_id)
+        .bind(token.as_deref().map(crypto::hash))
+        .bind(OffsetDateTime::now_utc() + ttl(state))
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
+    drop(slot);
     if let Some(count) = alert {
         alert_staff(state, count).await;
     }
     let words = stored.words(state.config.app_sign_in_minutes);
-    if let Err(refusal) = mail(state, asked.request_id, &stored.email, issued.as_ref(), token, words).await {
+    if let Err(refusal) = mail(state, asked.request_id, &stored.email, &code, token, words).await {
         // Nothing went out: the code is taken back, and the request, whose
         // old code ended, can no longer be used.
         end(state, asked.request_id).await?;
-        delete_code(state, issued.as_ref().map(|(code_id, _)| *code_id)).await?;
-        return Err(forgiven(state, &counted, refusal));
+        delete_code(state, Some(code_id)).await?;
+        return Err(refusal);
     }
     Ok(sent(state, asked.request_id))
 }
@@ -775,7 +866,8 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
         return Err(Refusal::bad("code_expired", "This code expired. Ask for a new one."));
     }
     // Only the request's own code: the same digits from another request,
-    // or a code from the web, are wrong here.
+    // or a code from the web, are wrong here. Every live request has its
+    // code, mailed or not, and both are tried the same way.
     let tried = match (&asked.code, &asked.link_token, stored.code_id) {
         (Some(code), None, Some(code_id)) => accounts::try_code_row(&mut tx, code_id, &email, code).await?,
         (Some(_), None, None) => Tried::NoCode,
@@ -785,16 +877,8 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
     let attempts_left = match tried {
         Tried::Taken => None,
         Tried::Wrong { attempts_left } => Some(attempts_left),
-        // No code is open (none was mailed, the limit on addresses without
-        // an account): the tries are counted on the request instead, so
-        // the answer is the one a wrong code gets.
-        Tried::NoCode => {
-            sqlx::query("UPDATE app_sign_ins SET attempts = attempts + 1 WHERE id = $1")
-                .bind(asked.request_id)
-                .execute(&mut *tx)
-                .await?;
-            Some((CODE_ATTEMPTS - stored.attempts - 1).max(0))
-        }
+        // The code ended a moment before its request (or was deleted).
+        Tried::NoCode => return Err(Refusal::bad("code_expired", "This code expired. Ask for a new one.")),
     };
     if let Some(attempts_left) = attempts_left {
         tx.commit().await?;

@@ -110,6 +110,9 @@ async fn device_row(device: devices::DeviceView) -> Result<impl View> {
             if device.revoked_at.is_some() {
                 <span class="tagpill status-withdrawn">"Removed"</span>
             } else {
+                if device.state == "expired" {
+                    <span class="tagpill status-withdrawn">"Signed out (expired)"</span>
+                }
                 <form method="post" action=(revoke)>
                     <button class="btn btn-ghost device-remove" type="submit">"Remove"</button>
                 </form>

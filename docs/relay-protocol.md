@@ -298,6 +298,13 @@ sign-in of the account (`409 install_in_use`, nothing changed).
 device is removed with it. Without `install_id`
 registration is as before.
 
+Replacing an install's row is by design: a sign-in that named the install
+when it began and was completed is proof of the account, so it takes the
+row whatever sign-in held it. When the sign-in it ends was still live
+(not ended, with a refresh token that works), the account is mailed "New
+sign-in to eBIRForms on <platform>" (after the registration commits; a
+failed mail never fails it), except a test account with a fixed code.
+
 Every v2 request then carries a signature, DPoP-style:
 
 | Header | |
@@ -329,12 +336,16 @@ to your Buwiz account?" was not tapped):
 {"devices": [{"id": "<uuid>", "name": "Juana's phone", "client_id": "buwiz-desktop",
               "current": true, "platform": "ios", "model": "iPhone16,1",
               "model_name": "iPhone 15 Pro", "os_version": "18.1", "computer_name": null,
-              "created_at": "…", "signed_in_at": "…", "last_used_at": "…", "revoked_at": null}],
+              "created_at": "…", "signed_in_at": "…", "last_used_at": "…", "revoked_at": null,
+              "state": "live"}],
  "pending": [{"grant_id": "<uuid>", "client_id": "buwiz-desktop", "platform": "android",
               "signed_in_at": "…", "current": false}]}
 ```
 
-`current` marks the caller's own sign-in. `model_name` is the name an
+`current` marks the caller's own sign-in. `state` is `live` (its sign-in
+has a refresh token that works), `expired` (its sign-in's tokens all ran
+out, though nobody removed it: shown as "Signed out (expired)") or
+`removed`. `model_name` is the name an
 Apple model code is sold under (`src/filing/apple_models.rs`); an Apple
 code not listed there is the platform's word with the code ("iPhone
 (iPhone18,1)", "iPad (iPad15,3)", "Mac (Mac16,12)"); any other model is as

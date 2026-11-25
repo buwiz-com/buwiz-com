@@ -1,0 +1,12 @@
+-- no-transaction
+-- An index on the sign-in each device belongs to (`devices.grant_id`): the
+-- trigger that ends a grant's devices (migration 18), a registration's
+-- check for the sign-in's device, and the account's sign-ins without one
+-- all look devices up by it. Built CONCURRENTLY so signed requests, which
+-- update `devices`, are never blocked while it is built. It runs outside a
+-- transaction (the first line), so this file holds this one statement only
+-- and cannot SET LOCAL: the server runs its migrations on a connection
+-- whose lock_timeout is 10 s (`buwiz_cloud::migrate`). If it fails halfway
+-- (a lock not had in time), Postgres leaves an invalid index of that name:
+-- docs/deploy.md says how to drop it and start again.
+CREATE INDEX CONCURRENTLY devices_grant_id ON devices (grant_id)

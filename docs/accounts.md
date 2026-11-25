@@ -28,7 +28,17 @@ flood of made-up addresses cannot stop people from signing in. While that
 limit is reached, a new address is answered exactly like one with an
 account, so the page tells nothing about who has one; the server logs a
 warning each time. A post that mails nothing (the last limit, or the
-address's own) is not counted against its network.
+address's own) is not counted against its network. The per-network count
+here is the web form's only: the apps' requests have their own
+([In-app sign-in](#in-app-sign-in)) and never touch it.
+
+Turnstile's answer must name the form's widget (action `sign-in`) and the
+account site's host. One that names another is refused. One that lacks
+either field (only Cloudflare changing its answer can do that) is let
+through on the web form, as every answer was before these were checked,
+with a warning in the log and a mail to Admins and Support at most once an
+hour ("Sign-in: Turnstile's answers lack the hostname or action"), so web
+sign-in never stops for it. The apps' check refuses such an answer.
 
 The widget shows only when Turnstile wants a click. With Turnstile on,
 signing in needs JavaScript. If Turnstile cannot be reached, no code is
@@ -473,8 +483,9 @@ its hash). The same six digits typed into another device's request are a
 wrong try on that request's code; a web code typed in the app is wrong
 there, and an app code typed on the web's form is wrong there. The limits
 of [Who can be mailed a code](#who-can-be-mailed-a-code) count both
-together: five codes an hour per address, per network, and the totals
-for addresses without an account. Test accounts with a fixed code get a
+together: five codes an hour per address, and the totals for addresses
+without an account. The count per network is not shared: the apps have
+their own, of tries rather than codes (below). Test accounts with a fixed code get a
 copy of its hash on each request, and nothing is mailed. A banned account
 gets no sign-in. The browser device flow above stays: it is what an app
 falls back to where its in-app check cannot run.
@@ -491,8 +502,10 @@ number. The web's codes keep their ten minutes. Within it:
 - a start for the same address from the same install (`install_id`) while
   its code can still be used (unspent, unexpired, tries left) mails
   nothing and makes no request: `429 code_already_sent`, with
-  `retry_after`. Once its five tries are used, or when no code was mailed,
-  the next start goes through (under the limits). A start from another install is
+  `retry_after`. A code that was not mailed because a budget was full
+  ([below](#what-a-flood-can-cost)) holds the install exactly the same
+  way. Once its five tries are used the next start goes through (under the
+  limits). A start from another install is
   a new request with its own mail, held only by the limits above; both
   codes then work, each with its own request. A start without
   `install_id` is never held this way. A test account with a fixed code is
@@ -510,9 +523,20 @@ app's secret, not the victim's, and the victim's code works only in the
 app that asked.
 
 **Nothing tells whether an address has an account.** Start answers the
-same whether or not it has one, whether a code was mailed or not (the
-new-address limit mails nothing, as on the web), and for a test account
-with a fixed code (nothing is mailed; the fixed code works). There is no
+same whether or not it has one, and whether its code was mailed or not.
+When a budget of mail is full (the new-address budgets below), the
+request still gets a real code, made and stored as a mailed one is (the
+same random six digits, the same hash, expiry and five tries), that is
+simply never mailed (`email_codes.mailed` is false). So everything after
+the answer is the same too: the install is held (`code_already_sent`),
+wrong codes count down (`invalid_code` with `attempts_left`, then
+`too_many_attempts` on the same try), and the address's sixth start in
+the hour is refused. Nobody knows such a code's digits; it can only be
+guessed, at a mailed code's odds. A code not mailed counts towards the
+address's five an hour and towards no budget of mail (the new-address
+budgets, the testing cap). A test account with a fixed code is answered
+the same (nothing is mailed; the fixed code works) but is never held, as
+above: accepted, since only staff make such accounts. There is no
 "unknown email" error; an address without an account gets one when its
 code is verified. `intent` (`sign_in` or `create`) only picks the mail's
 words.
@@ -543,7 +567,9 @@ Cloudflare Turnstile token, checked as the web form's is
 (`src/account/guard.rs`), and bound to its widget: Turnstile's answer must
 name the action `app-check` and the account site's host (the sign-in
 forms' widget is `sign-in`), so a token from one widget never passes as
-the other's. A token that fails is `403 turnstile_failed`. While the token
+the other's. An answer that lacks either field fails the app's check
+(the web form lets it through, [above](#who-can-be-mailed-a-code)). A
+token that fails is `403 turnstile_failed`. While the token
 is optional, codes given without one (start and resend alike) are held to
 a testing cap of 20 an hour and 50 a day across every address, counted in
 the database from the codes themselves (`email_codes.unchecked`), so the
@@ -556,21 +582,37 @@ a good token skips the cap, never the shared limits. Without Turnstile keys
 
 Codes given without a token to addresses without an account have a
 budget of their own, 10 an hour and 30 a day, apart from the web's 20 and
-60, so the app path can never use up the web's. Over it the answer is the
-web's: 200, nothing mailed. A request with a good token counts against the
-web's caps, as the form does.
+60, so the app path can never use up the web's. Over it the answer is
+200 and a code is stored and not mailed (above). A request with a good
+token counts against the web's caps, as the form does.
 
-**A refused request writes nothing.** Start and resend count the
-network's hour first (before asking Turnstile), then run every other
-check (`code_already_sent`, the testing cap, the address's five an hour,
-the new-address budget) in one transaction under the address's lock
-(`lock_address`, which every code of any purpose, web or app, is counted
-under, so requests at once cannot pass the five together). The request is
-written with its code in that transaction, or not at all; a refusal spends
-no place in any count, and a code that could not be mailed is taken back
-with its request. The one exception: a new address over its budget still
-gets a request without a code, so verifying it answers as a wrong code
-does; that answer keeps its network's hour spent.
+<a id="what-a-flood-can-cost"></a>
+**What a flood can cost.** Start and resend do the cheap refusals first,
+none of which uses the database, in this order:
+1. **The network's tries.** Per network (an IPv4 /24 or IPv6 /48, from
+   `CF-Connecting-IP`), 20 tries an hour at start and resend together,
+   counted for every request whatever comes of it (refused, bad
+   Turnstile token, bad body, mailed) and never given back. Past it: `429
+   too_many_requests` with `retry_after`. It is a limiter of its own, in
+   memory, apart from the web form's (which the apps never touch), so
+   filling it cannot hold back the web. Past it no Turnstile call is made.
+2. The body.
+3. Turnstile, when a token came.
+4. **A place for the database work.** At most 4 starts and resends use
+   the database at once (the pool has 10 connections). One waits at most 2
+   seconds for a place, holding no connection, then is `503 busy` with
+   `Retry-After: 5`. In its transaction it waits at most 3 seconds for a
+   lock (`lock_timeout`), else `503 busy` too.
+
+Then, in one transaction under the address's lock (`lock_address`, which
+every code of any purpose, web or app, is counted under, so requests at
+once cannot pass the five together): whether the account has a fixed
+code, `code_already_sent`, the testing cap (read without its lock, so a
+full cap refuses at once; its lock is taken only to add a code that
+counts), the address's five an hour, the new-address budget. The request
+is written with its code (mailed or not) in that transaction, or not at
+all; a refusal writes nothing and spends no place in any count, and a
+code that could not be mailed is taken back with its request.
 
 The cap is for testing only. **A platform's 1.0.0 needs the token
 required**: from then on, a request from that platform without a token
@@ -647,10 +689,16 @@ Deleting an account deletes its requests, by address, with its codes.
 
 ### The API
 
-On the API host (`api.buwiz.com`), like `/oauth/token` and `/me`. Each
-takes and gives JSON (`Content-Type: application/json`: the web's form
-posts to the same two paths are told apart by it) and answers
-`Cache-Control: no-store`. Every refusal is
+On api.buwiz.com only, like `/oauth/token` and `/me`. On any other host
+(account.buwiz.com among them) these three answer `404`: Cloudflare puts a
+Managed Challenge on the account host's sign-in paths, which no app can
+pass (deploy.md, "Cloudflare rules for sign-in"). Each takes and gives
+JSON (`Content-Type: application/json`) and answers `Cache-Control:
+no-store`. The web's form posts to the same two paths, start and verify,
+are told apart by the content type, and the shared paths do not mean
+either host takes both: the form is served on account.buwiz.com only
+(`404` elsewhere, api.buwiz.com included), the JSON on api.buwiz.com
+only. Every refusal is
 `{"error": "<code>", "message": "<sentence>"}`, with `retry_after`
 (seconds, also as `Retry-After`) or `attempts_left` where they apply.
 
@@ -711,8 +759,9 @@ flow's do.
 | 403 | `turnstile_failed` | A `turnstile` token that Turnstile refused |
 | 403 | `turnstile_required` | Reserved: not used yet (see the 1.0.0 rule above) |
 | 429 | `code_already_sent` | A start from the same install for an address whose code from it still works; `retry_after` |
-| 429 | `too_many_requests` | A resend before the request's code expired, the testing cap, or the web's limits (per address, per network); `retry_after` |
+| 429 | `too_many_requests` | The network's 20 tries an hour, a resend before the request's code expired, the testing cap, or the address's five codes an hour; `retry_after` |
 | 502 | `mail_failed` | The mail provider failed; the request cannot be used (start again) |
+| 503 | `busy` | Too many requests at once: no place for the database work within 2 seconds, or a lock not had within 3. Nothing was done; `Retry-After: 5` (try again in a few seconds) |
 | 503 | `restarting` | The server is stopping (deploy.md, "What a deploy does at stop"); `Retry-After: 30` |
 
 ## Devices
@@ -734,6 +783,21 @@ changed); once that sign-in is over or the device removed, it may. A
 sign-in that carries an install id registers one device; one without (the
 apps from before) may register again, each time another row.
 
+**Replacing a device's sign-in, by design.** A sign-in that named its
+install when it began (the in-app start, or the device flow's
+`/oauth/device/code`) and was completed is proof of the account: its
+registration replaces that install's row, whatever sign-in held it, and
+ends that sign-in (`device_replaced`). The residual risk: someone who
+knows a device's install id and can complete a sign-in on the account
+replaces that device's sign-in. When the sign-in replaced was still live
+(not ended, with a refresh token that works), the account is mailed "New
+sign-in to eBIRForms on <platform>": that the earlier sign-in on that
+device was ended, and to log the device out under My devices
+(`/tins#devices-h`) if it wasn't them. Fixed words only; sent after the
+registration commits, off the request; a failure is logged with ids only
+and never fails the registration. A test account with a fixed code is not
+mailed.
+
 Whenever a sign-in ends (signed out, its refresh token reused, ended by
 staff or by the person), its live device is removed with it, at the same
 time: a trigger on `oauth_grants` does it for every way a grant ends.
@@ -744,7 +808,10 @@ such as `iPhone16,1` is shown as "iPhone 15 Pro", from the table in
 identifier lists; an Apple code not in it shows as "iPhone (iPhone18,1)",
 "iPad (…)" or "Mac (…)"; other models as sent), system version and, on a
 computer, its name. The list shows those, when it was added, last signed
-in and last used, and keeps a removed device for 30 days.
+in and last used, and keeps a removed device for 30 days. A device whose
+sign-in has no refresh token that works any more (and was not ended)
+shows as "Signed out (expired)", not live. `GET /api/devices` gives each
+row a `state`: `live`, `expired` or `removed`, besides its other fields.
 
 The owner's app asks "Add this iPhone to your Buwiz account?" before it
 registers, so an app can stay signed in without a device. The list also
@@ -765,7 +832,11 @@ Reviewed and accepted for now (PR 81's review):
 - **M5.** Five requests an hour for an address, from anyone, hold that address for the hour, as on the web.
 - **L5.** Address aliases (`name+1@`, Gmail's dots) count as other addresses for the per-address limit; the new-address budgets bound them.
 - **L6.** `code_already_sent` tells someone who knows an install id that it has a live request for that address.
-- **L7.** Response times may differ for accounts with a fixed code or when nothing is mailed (the mail is awaited); to be measured.
+- **L7.** Response times may differ for accounts with a fixed code or when a code is not mailed (a mailed code's mail is awaited before the answer); to be measured. The code path is otherwise the same: an unmailed code is made, stored and checked as a mailed one is.
+- **Device replacement.** Someone who knows a device's install id and can complete a sign-in on the account replaces that device's sign-in ([Devices](#devices)); the account is mailed when the sign-in replaced was live.
+- **Fixed-code test accounts** are never held by `code_already_sent`, so a second start from one install tells them apart; only staff make them.
+- **The web form's new-address cap** stores nothing when full (unlike the apps' unmailed codes), so on the web an unknown address over that cap is not refused at its sixth start in the hour, as an address with an account is. It needs the web's 20 codes an hour for new addresses spent, through Turnstile.
+- **The network's 20 tries** are shared by everyone on one /24 or /48 (an office, a carrier): a flood from it holds the others there for the hour.
 - **L9.** Without `CF-Connecting-IP` there is no per-network count; safe while only the tunnel reaches the server.
 - **C1.** A code can be phished: the secret binds it to a request, not to the person's device, and only the mail's words protect.
 

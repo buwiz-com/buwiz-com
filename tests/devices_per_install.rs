@@ -483,3 +483,249 @@ async fn a_device_ends_with_its_sign_in(db: PgPool) {
         .unwrap();
     assert_eq!(still, ended);
 }
+
+/// [`sign_in`] with a refresh token that works: a live sign-in.
+async fn live_sign_in(db: &PgPool, account: Uuid, install: Option<&str>) -> (Uuid, String) {
+    let (grant, token) = sign_in(db, account, install, Some("ios")).await;
+    sqlx::query(
+        "INSERT INTO oauth_refresh_tokens (grant_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '30 days')",
+    )
+    .bind(grant)
+    .bind(crypto::hash(&crypto::new_token("bwr_")))
+    .execute(db)
+    .await
+    .unwrap();
+    (grant, token)
+}
+
+/// The device flow for `install`, approved by `cookie`: the new sign-in's
+/// access token.
+async fn device_flow(site: &Site, cookie: &str, install: &str) -> String {
+    let start = Request::post("/oauth/device/code")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "client_id": "buwiz-desktop", "install_id": install }).to_string()))
+        .unwrap();
+    let started: Value = serde_json::from_str(&text(site.send(start).await).await).unwrap();
+    let user_code = started["user_code"].as_str().unwrap();
+    site.post("/device/decision", cookie, &format!("user_code={user_code}&decision=approve")).await;
+    let poll = Request::post("/auth/device/poll")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "client_id": "buwiz-desktop", "device_code": started["device_code"] }).to_string()))
+        .unwrap();
+    let tokens: Value = serde_json::from_str(&text(site.send(poll).await).await).unwrap();
+    tokens["access_token"].as_str().unwrap().to_owned()
+}
+
+/// An in-app sign-in for `email` from `install`, as the app makes it on
+/// the API host: the new sign-in's access token. `code`: the code to type
+/// (a test account's fixed one), else the one mailed.
+async fn in_app(site: &Site, email: &str, install: &str, code: Option<&str>) -> String {
+    let post = |path: &str, body: Value| {
+        Request::post(path)
+            .header(header::HOST, "api.localhost:3008")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let secret = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let hash = URL_SAFE_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(secret.as_bytes()));
+    let body = json!({ "client_id": "buwiz-ebirforms", "email": email, "secret_hash": hash, "install_id": install,
+                       "platform": "android" });
+    let started: Value = serde_json::from_str(&text(site.send(post("/auth/email/start", body)).await).await).unwrap();
+    let code = match code {
+        Some(code) => code.to_owned(),
+        None => site.state.mailer.app_sign_in_mails().pop().unwrap().code,
+    };
+    let body = json!({ "request_id": started["request_id"], "secret": secret, "code": code });
+    let tokens: Value = serde_json::from_str(&text(site.send(post("/auth/email/verify", body)).await).await).unwrap();
+    tokens["access_token"].as_str().unwrap_or_else(|| panic!("{tokens}")).to_owned()
+}
+
+/// The mails about a replaced sign-in sent to `to`, once the spawned task
+/// had its moment.
+async fn replaced_mails(site: &Site, to: &str) -> Vec<buwiz_cloud::account::mail::Notice> {
+    let mails = || site.state.mailer.notices().into_iter().filter(|notice| notice.to == to).collect::<Vec<_>>();
+    for _ in 0..20 {
+        if !mails().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    mails()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_device_flow_sign_in_naming_a_live_devices_install_replaces_it_and_mails(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, cookie) = site.person(ANA).await;
+    let (old_grant, old_token) = live_sign_in(&site.db, ana, Some(PHONE)).await;
+    let (_, first, _) = register(&site, &old_token, json!({ "install_id": PHONE, "platform": "ios" })).await;
+
+    let token = device_flow(&site, &cookie, PHONE).await;
+    let (status, second, _) = register(&site, &token, json!({ "install_id": PHONE, "platform": "macos" })).await;
+    assert_eq!(status, 201, "{second}");
+    assert_eq!(second["id"], first["id"], "the install's one row");
+    assert_eq!(revoked(&site.db, old_grant).await.as_deref(), Some("device_replaced"));
+    assert_eq!(list(&site, &old_token).await.0, 401);
+    let mails = replaced_mails(&site, ANA).await;
+    assert_eq!(mails.len(), 1, "{mails:?}");
+    assert_eq!(mails[0].subject, "New sign-in to eBIRForms on Mac");
+    assert!(mails[0].text.contains("The earlier sign-in on that device was ended."), "{}", mails[0].text);
+    assert!(mails[0].text.contains(&format!("{ORIGIN}/tins#devices-h")), "{}", mails[0].text);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_in_app_sign_in_naming_a_live_devices_install_replaces_it_and_mails(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, _) = site.person(ANA).await;
+    let (old_grant, old_token) = live_sign_in(&site.db, ana, Some(PHONE)).await;
+    let (_, first, _) = register(&site, &old_token, json!({ "install_id": PHONE })).await;
+
+    let token = in_app(&site, ANA, PHONE, None).await;
+    let (status, second, _) = register(&site, &token, json!({ "install_id": PHONE, "platform": "android" })).await;
+    assert_eq!(status, 201, "{second}");
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(revoked(&site.db, old_grant).await.as_deref(), Some("device_replaced"));
+    let mails = replaced_mails(&site, ANA).await;
+    assert_eq!(mails.len(), 1, "{mails:?}");
+    assert_eq!(mails[0].subject, "New sign-in to eBIRForms on Android");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn replacing_a_sign_in_that_was_over_sends_no_mail(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, cookie) = site.person(ANA).await;
+    // Its refresh token ran out: the sign-in was over, though not ended.
+    let (old_grant, old_token) = live_sign_in(&site.db, ana, Some(PHONE)).await;
+    register(&site, &old_token, json!({ "install_id": PHONE })).await;
+    sqlx::query("UPDATE oauth_refresh_tokens SET expires_at = now() - interval '1 minute' WHERE grant_id = $1")
+        .bind(old_grant)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let token = device_flow(&site, &cookie, PHONE).await;
+    assert_eq!(register(&site, &token, json!({ "install_id": PHONE })).await.0, 201);
+    assert_eq!(revoked(&site.db, old_grant).await.as_deref(), Some("device_replaced"));
+    // And one ended before (signed out): its row is taken, no mail.
+    let (laptop_grant, laptop) = live_sign_in(&site.db, ana, Some(LAPTOP)).await;
+    register(&site, &laptop, json!({ "install_id": LAPTOP })).await;
+    sqlx::query("UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out' WHERE id = $1")
+        .bind(laptop_grant)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let token = device_flow(&site, &cookie, LAPTOP).await;
+    assert_eq!(register(&site, &token, json!({ "install_id": LAPTOP })).await.0, 201);
+    assert!(replaced_mails(&site, ANA).await.is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_test_account_is_not_mailed_when_its_device_is_replaced(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (boss, _) = site.staff_with_role("boss@example.test", "admin").await;
+    let (reviewer, _) = site.person("reviewer@example.test").await;
+    sqlx::query(
+        "UPDATE accounts SET test_account = true, fixed_code_hash = $2, fixed_code_set_by = $3, fixed_code_set_at = now()
+         WHERE id = $1",
+    )
+    .bind(reviewer)
+    .bind(crypto::hash("reviewer@example.test:481516"))
+    .bind(boss)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let (old_grant, old_token) = live_sign_in(&site.db, reviewer, Some(PHONE)).await;
+    register(&site, &old_token, json!({ "install_id": PHONE })).await;
+    let token = in_app(&site, "reviewer@example.test", PHONE, Some("481516")).await;
+    assert_eq!(register(&site, &token, json!({ "install_id": PHONE })).await.0, 201);
+    assert_eq!(revoked(&site.db, old_grant).await.as_deref(), Some("device_replaced"));
+    assert!(replaced_mails(&site, "reviewer@example.test").await.is_empty());
+}
+
+/// A device whose sign-in's tokens all ran out shows as signed out, not
+/// live, on every list.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_device_whose_sign_in_expired_shows_as_signed_out(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, cookie) = site.person(ANA).await;
+    let (_, support) = site.staff_with_role("support@example.test", "support").await;
+    let (live_grant, live) = live_sign_in(&site.db, ana, Some(PHONE)).await;
+    register(&site, &live, json!({ "install_id": PHONE, "model": "iPhone16,1" })).await;
+    let (old_grant, old) = live_sign_in(&site.db, ana, Some(LAPTOP)).await;
+    register(&site, &old, json!({ "install_id": LAPTOP, "model": "Pixel 8" })).await;
+    let (_, gone) = live_sign_in(&site.db, ana, None).await;
+    let (_, removed, _) = register(&site, &gone, json!({})).await;
+    sqlx::query("UPDATE oauth_refresh_tokens SET expires_at = now() - interval '1 minute' WHERE grant_id = $1")
+        .bind(old_grant)
+        .execute(&site.db)
+        .await
+        .unwrap();
+    let revoke = Request::post(format!("/api/devices/{}/revoke", removed["id"].as_str().unwrap()))
+        .header(header::AUTHORIZATION, format!("Bearer {live}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(site.send(revoke).await.status(), StatusCode::OK);
+
+    let (_, listed) = list(&site, &live).await;
+    let states: Vec<(&str, &str)> = listed["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|device| (device["model"].as_str().unwrap_or("none"), device["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(states.len(), 3);
+    assert!(states.contains(&("iPhone16,1", "live")), "{states:?}");
+    assert!(states.contains(&("Pixel 8", "expired")), "{states:?}");
+    assert!(states.contains(&("none", "removed")), "{states:?}");
+    assert_eq!(revoked(&site.db, live_grant).await, None);
+
+    let page = text(site.get("/tins", &cookie).await).await;
+    assert_eq!(page.matches("Signed out (expired)").count(), 1, "{page}");
+    let page = text(site.get(&format!("/staff/users/{ana}"), &support).await).await;
+    assert_eq!(page.matches("<span>Signed out (expired)</span>").count(), 1, "{page}");
+}
+
+/// A staff log-out of a device whose sign-in had already ended (a row from
+/// before the trigger kept them together) removes the device and leaves
+/// the sign-in's end as it was.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_staff_log_out_keeps_an_earlier_end_time(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person(ANA).await;
+    let (_, support) = site.staff_with_role("support@example.test", "support").await;
+    let (grant, token) = sign_in(&site.db, ana, Some(PHONE), None).await;
+    let (_, device, _) = register(&site, &token, json!({ "install_id": PHONE })).await;
+    let device = device["id"].as_str().unwrap().to_owned();
+    sqlx::query(
+        "UPDATE oauth_grants SET revoked_at = '2026-11-01T00:00:00Z', revoke_reason = 'signed_out' WHERE id = $1",
+    )
+    .bind(grant)
+    .execute(&site.db)
+    .await
+    .unwrap();
+    // The device live again, as such a row would be.
+    sqlx::query("UPDATE devices SET revoked_at = NULL WHERE id = $1::uuid")
+        .bind(&device)
+        .execute(&site.db)
+        .await
+        .unwrap();
+
+    let path = format!("/staff/users/{ana}/devices/{device}/sign-out");
+    let response = site.post(&path, &support, "reason=Lost+phone&tab=sign").await;
+    assert!(location(&response).contains("notice=app_signed_out"), "{}", location(&response));
+    let (ended, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT revoked_at::text, revoke_reason FROM oauth_grants WHERE id = $1")
+            .bind(grant)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+    assert!(ended.starts_with("2026-11-01"), "{ended}");
+    assert_eq!(reason.as_deref(), Some("signed_out"));
+    let removed: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM devices WHERE id = $1::uuid")
+        .bind(&device)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert!(removed);
+}

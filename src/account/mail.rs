@@ -34,6 +34,8 @@ pub struct Mailer {
     /// Absolute URL of the PNG wordmark in the email header (mail apps do
     /// not show WebP or SVG reliably).
     logo_url: String,
+    /// The account site's origin, for links in fixed-word mails.
+    site_origin: String,
     http: reqwest::Client,
     /// Tests only ([`Mailer::recording`]): notices are kept here, not sent.
     outbox: Option<Mutex<Vec<Notice>>>,
@@ -129,6 +131,7 @@ impl Mailer {
         Self {
             config,
             logo_url: format!("{site_origin}/assets/brand/buwiz_wordmark_email.png"),
+            site_origin: site_origin.to_owned(),
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(REQUEST_TIMEOUT)
@@ -225,6 +228,16 @@ impl Mailer {
                 Ok(())
             }
         }
+    }
+
+    /// Tells an account that a new sign-in on `device` (fixed words, as
+    /// [`crate::account::app_sign_in::Platform::device`] gives them)
+    /// replaced the sign-in that device had, which was still live. Plain
+    /// text with fixed words only; a [`Mailer::recording`] keeps it with
+    /// the notices.
+    pub async fn send_sign_in_replaced(&self, to: &str, device: &str) -> anyhow::Result<()> {
+        let (subject, text) = sign_in_replaced_message(device, &self.site_origin);
+        self.send_notice(to, &subject, &text).await
     }
 
     pub async fn send_sign_in_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
@@ -345,6 +358,20 @@ impl Mailer {
 
 /// The subject and text of the email with a code for deleting an account.
 /// As in the sign-in email, the code is the only number.
+/// The subject and text of [`Mailer::send_sign_in_replaced`].
+fn sign_in_replaced_message(device: &str, site_origin: &str) -> (String, String) {
+    let subject = format!("New sign-in to {device}");
+    let text = format!(
+        "Your Buwiz account was just signed in to {device}, on a device where it was already signed in. \
+         The earlier sign-in on that device was ended.\n\n\
+         If this was you, there is nothing to do.\n\n\
+         If it wasn't you, open My devices at {site_origin}/tins#devices-h and log that device out, \
+         then sign in again on your own devices.\n\n\
+         Buwiz"
+    );
+    (subject, text)
+}
+
 fn deletion_message(code: &str) -> (String, String) {
     (
         format!("{code} is your code to delete your Buwiz account"),
@@ -507,6 +534,14 @@ mod tests {
         for part in [&web.subject, &web.text, &web.html] {
             assert!(!part.contains("app-sign-in") && !part.contains("eBIRForms"), "{part}");
         }
+    }
+
+    #[test]
+    fn the_replaced_sign_in_mail_has_fixed_words_and_the_devices_link() {
+        let (subject, text) = sign_in_replaced_message("eBIRForms on iPhone", "https://account.buwiz.com");
+        assert_eq!(subject, "New sign-in to eBIRForms on iPhone");
+        assert!(text.contains("The earlier sign-in on that device was ended."), "{text}");
+        assert!(text.contains("https://account.buwiz.com/tins#devices-h"), "{text}");
     }
 
     #[test]

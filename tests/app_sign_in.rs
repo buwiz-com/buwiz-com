@@ -6,6 +6,10 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
@@ -35,20 +39,43 @@ const OTHER_HOST_TOKEN: &str = "elsewhere";
 /// app check on the test site's host, [`WEB_TOKEN`] as the sign-in form,
 /// [`OTHER_HOST_TOKEN`] as the app check on another host. Its URL.
 async fn turnstile() -> String {
-    let verify = |Json(asked): Json<Value>| async move {
-        let (action, hostname) = match asked["response"].as_str() {
-            Some(GOOD_TOKEN) => ("app-check", "localhost"),
-            Some(WEB_TOKEN) => ("sign-in", "localhost"),
-            Some(OTHER_HOST_TOKEN) => ("app-check", "evil.example.test"),
-            _ => return Json(json!({ "success": false })),
-        };
-        let success = asked["secret"] == TURNSTILE_SECRET_KEY;
-        Json(json!({ "success": success, "action": action, "hostname": hostname }))
+    turnstile_counted().await.0
+}
+
+/// [`turnstile`], with how many times it was asked. Its answers for tokens
+/// `web-no-hostname`, `web-no-action`, `app-no-hostname` and
+/// `app-no-action` pass, without that field.
+async fn turnstile_counted() -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let verify = move |Json(asked): Json<Value>| {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (action, hostname) = match asked["response"].as_str() {
+                Some(GOOD_TOKEN) => (Some("app-check"), Some("localhost")),
+                Some(WEB_TOKEN) => (Some("sign-in"), Some("localhost")),
+                Some(OTHER_HOST_TOKEN) => (Some("app-check"), Some("evil.example.test")),
+                Some("web-no-hostname") => (Some("sign-in"), None),
+                Some("web-no-action") => (None, Some("localhost")),
+                Some("app-no-hostname") => (Some("app-check"), None),
+                Some("app-no-action") => (None, Some("localhost")),
+                _ => return Json(json!({ "success": false })),
+            };
+            let mut answer = json!({ "success": asked["secret"] == TURNSTILE_SECRET_KEY });
+            if let Some(action) = action {
+                answer["action"] = json!(action);
+            }
+            if let Some(hostname) = hostname {
+                answer["hostname"] = json!(hostname);
+            }
+            Json(answer)
+        }
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/siteverify", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, Router::new().route("/siteverify", post(verify))).await.unwrap() });
-    url
+    (url, calls)
 }
 
 /// A secret as the app makes one, and the hash it sends at the start.
@@ -58,9 +85,16 @@ fn secret() -> (String, String) {
     (secret, hash)
 }
 
+/// The API host, where the apps post (`api.buwiz.com` in production).
+const API_HOST: &str = "api.localhost:3008";
+
 async fn post_json(site: &Site, path: &str, body: &Value) -> Response {
+    post_json_to(site, API_HOST, path, body).await
+}
+
+async fn post_json_to(site: &Site, host: &str, path: &str, body: &Value) -> Response {
     let request = Request::post(path)
-        .header(header::HOST, "api.localhost:3008")
+        .header(header::HOST, host)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -638,22 +672,32 @@ async fn refused_requests_leave_the_cap_and_write_nothing(db: PgPool) {
     // Another address still starts.
     assert_eq!(start_with(&site, "bea@example.test", json!({})).await.0, 200);
 
-    // A network over its hour: refused before anything is written.
+    // A network over its hour of tries: refused before anything is
+    // written.
     let rows = count(&site.db, "SELECT count(*) FROM app_sign_ins").await;
-    let from = |n: u32| {
-        let (_, hash) = secret();
-        let body = json!({ "client_id": CLIENT, "email": format!("net{n}@example.test"), "secret_hash": hash });
-        Request::post("/auth/email/start")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("cf-connecting-ip", format!("203.0.113.{n}"))
-            .body(Body::from(body.to_string()))
-            .unwrap()
-    };
-    for n in 0..10 {
-        assert_eq!(site.send(from(n)).await.status(), StatusCode::OK, "{n}");
+    for n in 0..20 {
+        let (status, answer) = start_from_network(&site, &format!("net{n}@example.test"), n, json!({})).await;
+        assert_eq!(status, 200, "{n}: {answer}");
     }
-    assert_eq!(site.send(from(77)).await.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, rows + 10);
+    let (status, _) = start_from_network(&site, "net77@example.test", 77, json!({})).await;
+    assert_eq!(status, 429);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, rows + 20);
+}
+
+/// A start for `email` from `203.0.113.<n>`, with `extra` in the body.
+async fn start_from_network(site: &Site, email: &str, n: u32, extra: Value) -> (u16, Value) {
+    let (_, hash) = secret();
+    let mut body = json!({ "client_id": CLIENT, "email": email, "secret_hash": hash });
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    let request = Request::post("/auth/email/start")
+        .header(header::HOST, API_HOST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("cf-connecting-ip", format!("203.0.113.{n}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    read(site.send(request).await).await
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -695,7 +739,7 @@ async fn many_starts_at_once_for_one_address_mail_five(db: PgPool) {
         let (_, hash) = secret();
         let body = json!({ "client_id": CLIENT, "email": ANA, "secret_hash": hash });
         let request = Request::post("/auth/email/start")
-            .header(header::HOST, "api.localhost:3008")
+            .header(header::HOST, API_HOST)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
@@ -724,7 +768,8 @@ async fn an_install_is_held_only_while_its_code_can_be_used(db: PgPool) {
     let (status, answer, _) = start_from(&site, ANA, PHONE).await;
     assert_eq!(status, 200, "{answer}");
 
-    // No code was mailed (the new-address budget is used up): not held.
+    // No code was mailed (the new-address budget is used up): held all the
+    // same, as for an address whose code was mailed.
     for n in 0..10 {
         sqlx::query(
             "INSERT INTO email_codes (email, code_hash, expires_at, purpose, unchecked)
@@ -737,7 +782,8 @@ async fn an_install_is_held_only_while_its_code_can_be_used(db: PgPool) {
     }
     let mails = site.state.mailer.app_sign_in_mails().len();
     assert_eq!(start_from(&site, "bea@example.test", PHONE).await.0, 200);
-    assert_eq!(start_from(&site, "bea@example.test", PHONE).await.0, 200, "not code_already_sent");
+    let (status, answer, _) = start_from(&site, "bea@example.test", PHONE).await;
+    assert_eq!((status, answer["error"].as_str()), (429, Some("code_already_sent")), "{answer}");
     assert_eq!(site.state.mailer.app_sign_in_mails().len(), mails);
 }
 
@@ -983,4 +1029,329 @@ async fn the_grant_keeps_the_install_and_platform_the_request_named(db: PgPool) 
     let (install, platform): (Option<String>, Option<String>) =
         sqlx::query_as("SELECT install_id, platform FROM oauth_grants").fetch_one(&site.db).await.unwrap();
     assert_eq!((install.as_deref(), platform.as_deref()), (Some(PHONE), Some("android")));
+}
+
+/// A code that is surely not the request's: one whose hash differs from
+/// the stored one (an unmailed code's digits are known to nobody).
+async fn wrong_code(site: &Site, started: &Started) -> String {
+    let (email, hash): (String, Vec<u8>) = sqlx::query_as(
+        "SELECT c.email, c.code_hash FROM app_sign_ins r JOIN email_codes c ON c.id = r.code_id WHERE r.id = $1::uuid",
+    )
+    .bind(&started.id)
+    .fetch_one(&site.db)
+    .await
+    .unwrap();
+    (0..).map(|n| format!("{n:06}")).find(|code| crypto::hash(&format!("{email}:{code}")) != hash).unwrap()
+}
+
+/// `answer` without what differs between two requests by nature: the
+/// request id, and the seconds a code's wait has left (about the five
+/// minutes; the clock may tick between the two). Any other wait stays.
+fn without_ids(mut answer: Value) -> Value {
+    let object = answer.as_object_mut().unwrap();
+    object.remove("request_id");
+    if object.get("retry_after").and_then(Value::as_i64).is_some_and(|wait| (295..=300).contains(&wait)) {
+        object.remove("retry_after");
+    }
+    answer
+}
+
+/// An address with an account and one without, whose budget of mail is
+/// full so its code is not mailed, are answered the same at every step:
+/// the hold on the install, the wrong codes, a start again, the sixth start
+/// in the hour.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_start_that_could_not_mail_answers_and_behaves_as_one_that_did(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let known = "known@example.test";
+    let unknown = "unknown@example.test";
+    site.person(known).await;
+    // The apps' budget for new addresses without an app check is full.
+    for n in 0..10 {
+        sqlx::query(
+            "INSERT INTO email_codes (email, code_hash, expires_at, purpose, unchecked)
+             VALUES ($1, decode('00', 'hex'), now() + interval '5 minutes', 'app_sign_in', true)",
+        )
+        .bind(format!("used{n}@example.test"))
+        .execute(&site.db)
+        .await
+        .unwrap();
+    }
+    let both = [(known, "install-known-00001"), (unknown, "install-unknown-0001")];
+
+    // The start, and a second one from the same install.
+    let mut first = Vec::new();
+    let mut answers = Vec::new();
+    for (email, install) in both {
+        let (status, answer, started) = start_from(&site, email, install).await;
+        answers.push((status, without_ids(answer)));
+        first.push(started);
+    }
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(answers[0].0, 200);
+    let mut answers = Vec::new();
+    for (email, install) in both {
+        let (status, answer, _) = start_from(&site, email, install).await;
+        answers.push((status, without_ids(answer)));
+    }
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!((answers[0].0, answers[0].1["error"].as_str()), (429, Some("code_already_sent")));
+
+    // Five wrong codes: the same tries left, then the same refusal.
+    for try_ in 0..6i64 {
+        let mut answers = Vec::new();
+        for started in &first {
+            answers.push(verify(&site, started, &wrong_code(&site, started).await).await);
+        }
+        assert_eq!(answers[0], answers[1], "try {try_}");
+        if try_ < 4 {
+            assert_eq!(answers[0].1["attempts_left"].as_i64(), Some(4 - try_), "try {try_}");
+        } else {
+            assert_eq!(answers[0], (400, refused("too_many_attempts")), "try {try_}");
+        }
+    }
+
+    // Its tries spent, the install may start again; then the sixth start in
+    // the hour (the hold aside: from other installs) is refused alike.
+    for n in 2..=6 {
+        let mut answers = Vec::new();
+        for (email, install) in both {
+            let install = if n == 2 { install.to_owned() } else { format!("{install}-{n}") };
+            let (status, answer, _) = start_from(&site, email, &install).await;
+            answers.push((status, without_ids(answer)));
+        }
+        assert_eq!(answers[0], answers[1], "start {n}");
+        let expected = if n < 6 { 200 } else { 429 };
+        assert_eq!(answers[0].0, expected, "start {n}: {:?}", answers[0]);
+    }
+
+    // The unknown address was mailed nothing; its five codes are real ones,
+    // never mailed, and took no place in any budget of mail.
+    let mails = site.state.mailer.app_sign_in_mails();
+    assert_eq!(mails.iter().filter(|mail| mail.to == unknown).count(), 0);
+    assert_eq!(mails.iter().filter(|mail| mail.to == known).count(), 5);
+    let unmailed = count(&site.db, "SELECT count(*) FROM email_codes WHERE NOT mailed").await;
+    assert_eq!(unmailed, 5);
+    let held: Vec<(i32, bool)> =
+        sqlx::query_as("SELECT length(code_hash), link_token_hash IS NOT NULL FROM app_sign_ins r JOIN email_codes c ON c.id = r.code_id WHERE r.email = $1")
+            .bind(unknown)
+            .fetch_all(&site.db)
+            .await
+            .unwrap();
+    assert_eq!(held.len(), 5);
+    assert!(held.iter().all(|row| *row == (32, true)), "{held:?}");
+    // The testing cap counts the known address's five mails only.
+    assert_eq!(
+        count(&site.db, "SELECT count(*) FROM email_codes WHERE unchecked AND mailed AND email NOT LIKE 'used%'").await,
+        5
+    );
+}
+
+/// The 21st try at start or resend from one network in an hour is refused,
+/// even when every try before it was refused, and no Turnstile call is
+/// made for it; the web form's count per network is untouched.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_network_gets_twenty_tries_an_hour_whatever_comes_of_them(db: PgPool) {
+    let (url, calls) = turnstile_counted().await;
+    let site = Site::with_turnstile_mailbox(db, &url);
+    for n in 0..10 {
+        let (status, answer) =
+            start_from_network(&site, &format!("p{n}@example.test"), n, json!({ "turnstile": "a-script" })).await;
+        assert_eq!((status, answer["error"].as_str()), (403, Some("turnstile_failed")), "{n}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    for n in 10..20 {
+        let (status, answer) = start_from_network(&site, "not an address", n, json!({})).await;
+        assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_email")), "{n}");
+    }
+    let (status, answer) = start_from_network(&site, ANA, 21, json!({ "turnstile": "a-script" })).await;
+    assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
+    let wait = answer["retry_after"].as_i64().unwrap();
+    assert!((3500..=3600).contains(&wait), "{wait}");
+    assert_eq!(calls.load(Ordering::SeqCst), 10, "no Turnstile call past the budget");
+    // A resend from the network counts the same.
+    let resend = Request::post("/auth/email/resend")
+        .header(header::HOST, API_HOST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("cf-connecting-ip", "203.0.113.99")
+        .body(Body::from(json!({ "request_id": Uuid::new_v4(), "secret": secret().0 }).to_string()))
+        .unwrap();
+    assert_eq!(site.send(resend).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Another network goes on.
+    let (_, hash) = secret();
+    let other = Request::post("/auth/email/start")
+        .header(header::HOST, API_HOST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("cf-connecting-ip", "198.51.100.7")
+        .body(Body::from(json!({ "client_id": CLIENT, "email": ANA, "secret_hash": hash }).to_string()))
+        .unwrap();
+    assert_eq!(site.send(other).await.status(), StatusCode::OK);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, 1);
+
+    // The web form from the same network still has all of its ten.
+    for n in 0..10 {
+        let request = Request::post("/auth/email/start")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("cf-connecting-ip", format!("203.0.113.{n}"))
+            .body(Body::from(format!("email=web{n}%40example.test&cf-turnstile-response={WEB_TOKEN}")))
+            .unwrap();
+        let sent = site.send(request).await;
+        assert!(location(&sent).starts_with("/login/verify"), "{n}: {}", location(&sent));
+    }
+    assert_eq!(site.state.mailer.sign_in_codes().len(), 10);
+}
+
+/// With every place for the database work taken, a start or resend is
+/// `503 busy` after about two seconds, and takes no pool connection while
+/// it waits: here every connection is held too, and it still answers.
+#[sqlx::test(migrations = "./migrations")]
+async fn with_every_place_taken_a_start_is_busy_and_holds_no_connection(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let started = start(&site, ANA).await;
+    expire(&site, &started).await;
+    let places = site.state.app_sign_in_slots.acquire_many(4).await.unwrap();
+    let mut connections = Vec::new();
+    for _ in 0..site.db.options().get_max_connections() {
+        connections.push(site.db.acquire().await.unwrap());
+    }
+    for (path, body) in [
+        ("/auth/email/start", json!({ "client_id": CLIENT, "email": ANA, "secret_hash": secret().1 })),
+        ("/auth/email/resend", json!({ "request_id": started.id, "secret": started.secret })),
+    ] {
+        let began = Instant::now();
+        let response = post_json(&site, path, &body).await;
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(1900) && took < Duration::from_secs(5), "{path}: {took:?}");
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        let (status, answer) = read(response).await;
+        assert_eq!(
+            answer,
+            json!({ "error": "busy", "message": "Buwiz is busy. Nothing was sent; try again in a few seconds.", "retry_after": 5 })
+        );
+        assert_eq!(status, 503, "{path}");
+    }
+    drop(connections);
+    drop(places);
+    assert_eq!(resend(&site, &started).await.0, 200);
+}
+
+/// The advisory lock of the testing cap ([`UNCHECKED_LOCK`] in the code).
+const UNCHECKED_LOCK: i64 = 0x6275_7769_7a02;
+
+/// A full testing cap refuses at once, without its lock: here another
+/// connection holds it. A start that must take the lock waits at most
+/// three seconds for it, then is `503 busy`.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_full_testing_cap_refuses_without_waiting_for_its_lock(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    site.person(ANA).await;
+    let mut holder = site.db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(UNCHECKED_LOCK).execute(&mut *holder).await.unwrap();
+
+    unchecked(&site.db, 20, "1 minute").await;
+    let began = Instant::now();
+    let (status, answer, _) = start_with(&site, ANA, json!({})).await;
+    assert_eq!((status, answer["error"].as_str()), (429, Some("too_many_requests")), "{answer}");
+    assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+
+    // Room in the cap: the code must be added under the lock, which is not
+    // had in time.
+    sqlx::query("DELETE FROM email_codes WHERE email = 'filler@example.test'").execute(&site.db).await.unwrap();
+    let began = Instant::now();
+    let (status, answer, _) = start_with(&site, ANA, json!({})).await;
+    assert_eq!((status, answer["error"].as_str()), (503, Some("busy")), "{answer}");
+    assert!(began.elapsed() >= Duration::from_millis(2900), "{:?}", began.elapsed());
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_ins").await, 0);
+    holder.rollback().await.unwrap();
+    assert_eq!(start_with(&site, ANA, json!({})).await.0, 200);
+}
+
+/// The apps post to the API host only (`api.buwiz.com`): start, resend and
+/// verify work there; on the account host they are not found. The web's
+/// form is the account host's only.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_app_endpoints_are_the_api_hosts_and_the_form_the_account_hosts(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (secret, hash) = secret();
+    let body = json!({ "client_id": CLIENT, "email": ANA, "secret_hash": hash });
+    let (status, answer) = read(post_json_to(&site, "api.buwiz.com", "/auth/email/start", &body).await).await;
+    assert_eq!(status, 200, "{answer}");
+    let started = Started { id: answer["request_id"].as_str().unwrap().to_owned(), secret };
+    expire(&site, &started).await;
+    let again = json!({ "request_id": started.id, "secret": started.secret });
+    assert_eq!(read(post_json_to(&site, "api.buwiz.com", "/auth/email/resend", &again).await).await.0, 200);
+    let code = json!({ "request_id": started.id, "secret": started.secret, "code": last_code(&site, ANA) });
+
+    // Not on the account host, nor on any other.
+    for host in ["account.buwiz.com", ACCOUNT_HOST, "buwiz.com", "ebirforms.buwiz.com"] {
+        for (path, body) in
+            [("/auth/email/start", &body), ("/auth/email/resend", &again), ("/auth/email/verify", &code)]
+        {
+            let response = post_json_to(&site, host, path, body).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{host}{path}");
+        }
+    }
+    let (status, tokens) = read(post_json_to(&site, "api.buwiz.com", "/auth/email/verify", &code).await).await;
+    assert_eq!((status, tokens["scope"].as_str()), (200, Some("app")), "{tokens}");
+
+    // The web's form: on the account host only.
+    for host in ["api.buwiz.com", API_HOST, "buwiz.com", "ebirforms.buwiz.com"] {
+        for (path, form) in [
+            ("/auth/email/start", "email=bea%40example.test".to_owned()),
+            ("/auth/email/verify", "email=bea%40example.test&code=123456".to_owned()),
+            ("/auth/email/resend", "email=bea%40example.test".to_owned()),
+        ] {
+            let request = Request::post(path)
+                .header(header::HOST, host)
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .unwrap();
+            assert_eq!(site.send(request).await.status(), StatusCode::NOT_FOUND, "{host}{path}");
+        }
+    }
+    assert!(site.state.mailer.sign_in_codes().is_empty());
+    let sent = site.post("/auth/email/start", "", "email=bea%40example.test").await;
+    assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
+    let (_, web_code) = site.state.mailer.sign_in_codes().pop().unwrap();
+    let signed_in = site.post("/auth/email/verify", "", &format!("email=bea%40example.test&code={web_code}")).await;
+    assert!(signed_in.headers().contains_key(header::SET_COOKIE));
+}
+
+/// Waits a moment for mail sent off the request (a spawned task).
+async fn notices_settle(site: &Site, at_least: usize) -> Vec<buwiz_cloud::account::mail::Notice> {
+    for _ in 0..40 {
+        if site.state.mailer.notices().len() >= at_least {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    site.state.mailer.notices()
+}
+
+/// A Turnstile answer without the hostname or the action: the web's form
+/// goes on as before these were checked, and staff are mailed once an
+/// hour; an app's check is refused.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_answer_without_hostname_or_action_passes_the_web_with_an_alert_and_fails_the_app(db: PgPool) {
+    let site = Site::with_turnstile_mailbox(db, &turnstile().await);
+    for (n, token) in ["web-no-hostname", "web-no-action", "web-no-hostname"].iter().enumerate() {
+        let form = format!("email=web{n}%40example.test&cf-turnstile-response={token}");
+        let sent = site.post("/auth/email/start", "", &form).await;
+        assert!(location(&sent).starts_with("/login/verify"), "{token}: {}", location(&sent));
+    }
+    assert_eq!(site.state.mailer.sign_in_codes().len(), 3);
+    let notices = notices_settle(&site, 1).await;
+    assert_eq!(notices.len(), 1, "once an hour: {notices:?}");
+    assert_eq!(notices[0].to, STAFF);
+    assert_eq!(notices[0].subject, "Sign-in: Turnstile's answers lack the hostname or action");
+
+    for token in ["app-no-hostname", "app-no-action"] {
+        let (status, answer, _) = start_with(&site, ANA, json!({ "turnstile": token })).await;
+        assert_eq!((status, answer["error"].as_str()), (403, Some("turnstile_failed")), "{token}");
+    }
+    assert!(site.state.mailer.app_sign_in_mails().is_empty());
+    assert_eq!(notices_settle(&site, 2).await.len(), 1, "the app's refusals raise nothing");
 }

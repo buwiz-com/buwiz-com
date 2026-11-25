@@ -16,7 +16,7 @@ DELETE FROM email_codes WHERE purpose = 'app_sign_in';
 ALTER TABLE email_codes DROP CONSTRAINT email_codes_purpose_check;
 ALTER TABLE email_codes ADD CONSTRAINT email_codes_purpose_check
     CHECK (purpose IN ('sign_in', 'delete'));
-ALTER TABLE email_codes DROP COLUMN unchecked;
+ALTER TABLE email_codes DROP COLUMN unchecked, DROP COLUMN mailed;
 
 -- See 0011_tin_states.down.sql.
 DELETE FROM _sqlx_migrations WHERE version = 17;

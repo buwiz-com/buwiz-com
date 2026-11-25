@@ -2384,8 +2384,10 @@ async fn staff_device(
                 <span>(what.join(" · "))</span>
                 <span>(when)</span>
             </span>
-            if live {
+            if live && device.state == "live" {
                 sx_pill(label: "Live", sym: "check", tone: "ok")
+            } else if live {
+                sx_pill(label: "Signed out (expired)", sym: "clock", tone: "")
             } else {
                 sx_pill(label: format!("Removed {}", device.revoked_at.map(short_date).unwrap_or_default()), sym: "trash", tone: "")
             }

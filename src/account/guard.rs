@@ -7,8 +7,14 @@
 //! (when `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` are set) and a
 //! limit per network. The limit on codes for addresses without an account
 //! is the last one, in `issue_code`.
+//!
+//! The apps' requests ([`crate::account::app_sign_in`]) have a budget of
+//! their own per network ([`SignInGuard::count_app_attempt`]): every try
+//! counts, whatever comes of it, and none is given back. They never touch
+//! the web form's count.
 
 use std::net::IpAddr;
+use std::sync::Mutex;
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
@@ -16,13 +22,22 @@ use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
 use crate::base::config::TurnstileConfig;
-use crate::uptime::keys::{Network, RateLimiter, client_ip};
+use crate::uptime::keys::{Bucket, Network, RateLimiter, client_ip};
 
 /// Codes one network (an IPv4 /24, an IPv6 /48) may ask for in an hour. An
 /// office or a phone carrier shares one, so it is well above what one
 /// person needs.
 const CODES_PER_NETWORK: u32 = 10;
 const NETWORK_WINDOW: Duration = Duration::hours(1);
+
+/// Tries at `POST /auth/email/start` and `/resend` (JSON, the apps') one
+/// network may make in an hour, whether they succeed or not. Counted before
+/// anything else is done for them, and never given back.
+pub const APP_ATTEMPTS_PER_NETWORK: u32 = 20;
+
+/// How often, at most, staff are mailed that Turnstile's answers lack the
+/// hostname or action ([`SignInGuard::take_unbound_alert`]).
+const UNBOUND_ALERT_EVERY: Duration = Duration::hours(1);
 
 /// How long Turnstile may take to answer before the sign-in is refused.
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -38,7 +53,48 @@ pub struct SignInGuard {
     /// The account site's host: a token is taken only from a widget there.
     hostname: String,
     http: reqwest::Client,
+    /// The web form's count: codes per network.
     networks: RateLimiter<Network>,
+    /// The apps' count: tries per network. Its own map, so filling it never
+    /// touches the web's.
+    app_attempts: RateLimiter<Network>,
+    /// Turnstile's answers without a hostname or action, for the staff alert.
+    unbound: Mutex<Unbound>,
+}
+
+#[derive(Default)]
+struct Unbound {
+    /// When it was last raised.
+    raised: Option<OffsetDateTime>,
+    /// Raised and not yet taken for the staff mail.
+    alert: bool,
+}
+
+/// Which widget a token must come from, and how a Turnstile answer without
+/// the hostname or action is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Widget {
+    /// The sign-in forms' (`sign-in`). An answer without the fields passes,
+    /// as every answer did before they were checked, and staff are told.
+    Web,
+    /// The app-check page's (`app-check`). An answer without them fails.
+    App,
+}
+
+impl Widget {
+    fn action(self) -> &'static str {
+        match self {
+            Self::Web => WEB_ACTION,
+            Self::App => APP_ACTION,
+        }
+    }
+}
+
+/// The host of the account site's origin (`ACCOUNT_ORIGIN`), as Turnstile
+/// reports it: `account.buwiz.com`, `localhost`, `[::1]`. Empty when the
+/// origin does not parse.
+pub fn account_host(origin: &str) -> String {
+    origin.parse::<http::Uri>().ok().and_then(|uri| uri.host().map(str::to_owned)).unwrap_or_default()
 }
 
 /// Why a request for a code was refused before one was made.
@@ -54,8 +110,9 @@ pub enum Refused {
 /// [`SignInGuard::forgive`] takes back.
 #[derive(Debug)]
 pub struct Counted {
-    /// `None` when the post had no address to count.
-    network: Option<Network>,
+    /// `None` when the post had no address to count; else its network and
+    /// the bucket its hit went to.
+    network: Option<(Network, Bucket)>,
     at: OffsetDateTime,
 }
 
@@ -84,6 +141,8 @@ impl SignInGuard {
             hostname: hostname.to_owned(),
             http: reqwest::Client::builder().timeout(VERIFY_TIMEOUT).build().unwrap_or_default(),
             networks: RateLimiter::new(CODES_PER_NETWORK, NETWORK_WINDOW),
+            app_attempts: RateLimiter::new(APP_ATTEMPTS_PER_NETWORK, NETWORK_WINDOW),
+            unbound: Mutex::new(Unbound::default()),
         }
     }
 
@@ -98,7 +157,7 @@ impl SignInGuard {
     pub async fn check(&self, headers: &HeaderMap, token: Option<&str>) -> Result<Counted, Refused> {
         let address = client_ip(headers);
         if let Some(turnstile) = &self.turnstile
-            && !self.is_human(turnstile, token.unwrap_or_default(), address, WEB_ACTION).await
+            && !self.is_human(turnstile, token.unwrap_or_default(), address, Widget::Web).await
         {
             return Err(Refused::NotHuman);
         }
@@ -114,13 +173,41 @@ impl SignInGuard {
     pub async fn app_check(&self, headers: &HeaderMap, token: Option<&str>) -> Option<bool> {
         let turnstile = self.turnstile.as_ref()?;
         let token = token.filter(|token| !token.is_empty())?;
-        Some(self.is_human(turnstile, token, client_ip(headers), APP_ACTION).await)
+        Some(self.is_human(turnstile, token, client_ip(headers), Widget::App).await)
     }
 
-    /// Counts an in-app request for a code against its network's hour, as
-    /// [`Self::check`] counts a form post, without asking Turnstile.
-    pub fn count_network(&self, headers: &HeaderMap) -> Result<Counted, Refused> {
-        self.count(client_ip(headers), OffsetDateTime::now_utc())
+    /// Counts an app's try at `/auth/email/start` or `/resend` against its
+    /// network's hour ([`APP_ATTEMPTS_PER_NETWORK`]): `Err` with the
+    /// seconds to wait when the hour's tries are used. Every try counts and
+    /// none is given back, so refusals cost the network as much as codes.
+    /// Without `CF-Connecting-IP` there is no network to count.
+    pub fn count_app_attempt(&self, headers: &HeaderMap) -> Result<(), i64> {
+        self.count_app_attempt_at(client_ip(headers), OffsetDateTime::now_utc())
+    }
+
+    fn count_app_attempt_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
+        let Some(address) = address else {
+            return Ok(());
+        };
+        self.app_attempts.check(Network::of(address), now).map_err(|wait| {
+            let seconds = wait.whole_seconds();
+            if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds }
+        })
+    }
+
+    /// Whether staff are to be told now that Turnstile answered without the
+    /// hostname or action: once per raise, at most once an hour.
+    pub fn take_unbound_alert(&self) -> bool {
+        std::mem::take(&mut self.unbound.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).alert)
+    }
+
+    /// Notes an answer without the hostname or action, at `now`.
+    fn raise_unbound(&self, now: OffsetDateTime) {
+        let mut unbound = self.unbound.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if unbound.raised.is_none_or(|at| now - at >= UNBOUND_ALERT_EVERY || now < at) {
+            unbound.raised = Some(now);
+            unbound.alert = true;
+        }
     }
 
     /// Counts a post from `address` at `now` against its network's hour.
@@ -128,10 +215,13 @@ impl SignInGuard {
         // Without `CF-Connecting-IP` (development, or a tunnel that lost
         // it) there is no network to count, and counting them all as one
         // would let ten posts lock everyone out.
-        let network = address.map(Network::of);
-        if let Some(network) = &network {
-            self.networks.check(network.clone(), now).map_err(|_| Refused::NetworkTooMany)?;
-        }
+        let network = match address.map(Network::of) {
+            Some(network) => {
+                let bucket = self.networks.hit(network.clone(), now).map_err(|_| Refused::NetworkTooMany)?;
+                Some((network, bucket))
+            }
+            None => None,
+        };
         Ok(Counted { network, at: now })
     }
 
@@ -140,14 +230,21 @@ impl SignInGuard {
     /// on that network are not held back by posts that sent nothing. Once
     /// the hour it was counted in has ended there is nothing to give back.
     pub fn forgive(&self, counted: &Counted) {
-        if let Some(network) = &counted.network {
-            self.networks.release(network, counted.at);
+        if let Some((network, bucket)) = &counted.network {
+            self.networks.release(network, counted.at, *bucket);
         }
     }
 
-    /// Asks Turnstile whether `token` is from a person on our form. No
-    /// answer counts as no: a code is not worth mailing on a guess.
-    async fn is_human(&self, turnstile: &TurnstileConfig, token: &str, address: Option<IpAddr>, action: &str) -> bool {
+    /// Asks Turnstile whether `token` is from a person on `widget` on the
+    /// account site. No answer counts as no: a code is not worth mailing on
+    /// a guess.
+    async fn is_human(
+        &self,
+        turnstile: &TurnstileConfig,
+        token: &str,
+        address: Option<IpAddr>,
+        widget: Widget,
+    ) -> bool {
         if token.is_empty() || token.len() > MAX_TOKEN_LEN {
             return false;
         }
@@ -164,14 +261,7 @@ impl SignInGuard {
             .and_then(reqwest::Response::error_for_status);
         match answer {
             Ok(response) => match response.json::<Verdict>().await {
-                Ok(verdict) => {
-                    let bound = verdict.action.as_deref() == Some(action)
-                        && verdict.hostname.as_deref() == Some(self.hostname.as_str());
-                    if verdict.success && !bound {
-                        tracing::warn!("a Turnstile token for another widget or host was refused");
-                    }
-                    verdict.success && bound
-                }
+                Ok(verdict) => self.passes(&verdict, widget, OffsetDateTime::now_utc()),
                 Err(error) => {
                     tracing::error!(%error, "Turnstile's answer could not be read; the sign-in is refused");
                     false
@@ -180,6 +270,38 @@ impl SignInGuard {
             Err(error) => {
                 tracing::error!(%error, "Turnstile could not be reached; the sign-in is refused");
                 false
+            }
+        }
+    }
+}
+
+impl SignInGuard {
+    /// Whether Turnstile's `verdict` lets a token of `widget` through. A
+    /// hostname or action that is there and differs fails it. One that is
+    /// missing (Cloudflare's own answer changed: no caller can drop it)
+    /// fails an app's token, and lets a web form's through as before the
+    /// fields were checked, logged and raised for staff
+    /// ([`Self::take_unbound_alert`]), so web sign-in never stops for it.
+    fn passes(&self, verdict: &Verdict, widget: Widget, now: OffsetDateTime) -> bool {
+        if !verdict.success {
+            return false;
+        }
+        let action = verdict.action.as_deref().map(|action| action == widget.action());
+        let host = verdict.hostname.as_deref().map(|host| host == self.hostname);
+        match (action, host) {
+            (Some(true), Some(true)) => true,
+            (Some(false), _) | (_, Some(false)) => {
+                tracing::warn!("a Turnstile token for another widget or host was refused");
+                false
+            }
+            _ if widget == Widget::App => {
+                tracing::warn!("Turnstile's answer has no hostname or action; an app's token was refused");
+                false
+            }
+            _ => {
+                tracing::warn!("Turnstile's answer has no hostname or action; the web form's token was let through");
+                self.raise_unbound(now);
+                true
             }
         }
     }
@@ -273,5 +395,69 @@ mod tests {
         }
         // None of them used up the network's hour.
         assert_eq!(guard.networks.len(), 0);
+    }
+
+    #[test]
+    fn the_account_host_is_parsed_from_the_origin() {
+        assert_eq!(account_host("https://account.buwiz.com"), "account.buwiz.com");
+        assert_eq!(account_host("http://localhost:3008"), "localhost");
+        assert_eq!(account_host("http://127.0.0.1:3008"), "127.0.0.1");
+        assert_eq!(account_host("http://[::1]:3008"), "[::1]");
+        assert_eq!(account_host("not an origin"), "");
+    }
+
+    #[test]
+    fn an_app_attempt_counts_whatever_comes_of_it_and_only_in_its_own_map() {
+        let guard = SignInGuard::new(None, "account.example.test");
+        let now = OffsetDateTime::now_utc();
+        for last in 0..APP_ATTEMPTS_PER_NETWORK {
+            assert_eq!(guard.count_app_attempt_at(at(&format!("203.0.113.{last}")), now), Ok(()));
+        }
+        let wait = guard.count_app_attempt_at(at("203.0.113.250"), now).unwrap_err();
+        assert!((3599..=3600).contains(&wait), "{wait}");
+        // Another network, and the next hour, go on; no address, no count.
+        assert_eq!(guard.count_app_attempt_at(at("198.51.100.7"), now), Ok(()));
+        assert_eq!(guard.count_app_attempt_at(at("203.0.113.1"), now + NETWORK_WINDOW), Ok(()));
+        assert_eq!(guard.count_app_attempt_at(None, now), Ok(()));
+        // The web form's count is untouched.
+        assert_eq!(guard.networks.len(), 0);
+        for _ in 0..CODES_PER_NETWORK {
+            assert_eq!(counted(&guard, "203.0.113.9", now), Ok(()));
+        }
+    }
+
+    fn verdict(action: Option<&str>, hostname: Option<&str>) -> Verdict {
+        Verdict { success: true, action: action.map(str::to_owned), hostname: hostname.map(str::to_owned) }
+    }
+
+    #[test]
+    fn a_missing_hostname_or_action_lets_the_web_through_once_alerted_and_refuses_the_app() {
+        let host = "account.example.test";
+        let guard = SignInGuard::new(None, host);
+        let now = OffsetDateTime::now_utc();
+        assert!(guard.passes(&verdict(Some(WEB_ACTION), Some(host)), Widget::Web, now));
+        assert!(guard.passes(&verdict(Some(APP_ACTION), Some(host)), Widget::App, now));
+        assert!(!guard.take_unbound_alert());
+        // There and different: refused for both.
+        assert!(!guard.passes(&verdict(Some(APP_ACTION), Some(host)), Widget::Web, now));
+        assert!(!guard.passes(&verdict(Some(APP_ACTION), Some("evil.example.test")), Widget::App, now));
+        assert!(!guard.passes(&verdict(None, Some("evil.example.test")), Widget::Web, now));
+        let failed = Verdict { success: false, ..verdict(Some(WEB_ACTION), Some(host)) };
+        assert!(!guard.passes(&failed, Widget::Web, now));
+        assert!(!guard.take_unbound_alert());
+        // Missing: the app is refused, with no alert.
+        for missing in [verdict(None, Some(host)), verdict(Some(APP_ACTION), None), verdict(None, None)] {
+            assert!(!guard.passes(&missing, Widget::App, now));
+        }
+        assert!(!guard.take_unbound_alert());
+        // The web goes through, and staff are told once an hour.
+        assert!(guard.passes(&verdict(None, Some(host)), Widget::Web, now));
+        assert!(guard.passes(&verdict(Some(WEB_ACTION), None), Widget::Web, now + Duration::minutes(5)));
+        assert!(guard.take_unbound_alert());
+        assert!(!guard.take_unbound_alert());
+        assert!(guard.passes(&verdict(None, None), Widget::Web, now + Duration::minutes(59)));
+        assert!(!guard.take_unbound_alert());
+        assert!(guard.passes(&verdict(None, None), Widget::Web, now + Duration::minutes(60)));
+        assert!(guard.take_unbound_alert());
     }
 }

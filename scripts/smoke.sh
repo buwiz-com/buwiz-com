@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end smoke test of the mini-app sign-in, TIN claim and review flow.
 # Start the server with MAIL_TRANSPORT=log and ADMIN_EMAILS=admin@example.test,
-# logging to $LOG, then: BASE=http://localhost:3018 LOG=server.log scripts/smoke.sh
+# logging to $LOG, then: BASE=http://account.localhost:3018 LOG=server.log scripts/smoke.sh
+# (the sign-in form is served on the account host only).
 set -u
-B=${BASE:-http://localhost:3018}; O="Origin: $B"; LOG=${LOG:-server.log}
+B=${BASE:-http://account.localhost:3018}; O="Origin: $B"; LOG=${LOG:-server.log}
 LOG=$(cd "$(dirname "$LOG")" && pwd)/$(basename "$LOG")
 work=$(mktemp -d); cd "$work"
 J1=user.jar; J2=admin.jar

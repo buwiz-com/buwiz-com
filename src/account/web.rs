@@ -748,12 +748,30 @@ struct EmailStart {
 /// host only (where Cloudflare challenges the form; docs/deploy.md,
 /// "Cloudflare rules for sign-in"). `None`: answered `404`, as if there
 /// were no such path there.
+///
+/// A loopback host (`localhost`, `127.0.0.1`, `[::1]`, any port) takes
+/// both: that is a developer's own machine, where one address serves
+/// everything. No public request has that host: the tunnel carries only
+/// the zone's own host names.
 fn sign_in_kind(headers: &HeaderMap) -> Option<bool> {
     let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
     let json = app_sign_in::is_json(headers);
+    if is_loopback_host(host) {
+        return Some(json);
+    }
     let site = crate::sites::canonical::Site::for_host(host);
     let expected = if json { crate::sites::canonical::Site::Api } else { crate::sites::canonical::Site::Account };
     (site == expected).then_some(json)
+}
+
+/// Whether a `Host` header names this machine itself, whatever the port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        // An IPv6 literal: up to its closing bracket.
+        Some(rest) => rest.split_once(']').map_or("", |(address, _)| address),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    matches!(name.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
 /// `POST /auth/email/start`: an app's JSON ([`app_sign_in::start`]) on the

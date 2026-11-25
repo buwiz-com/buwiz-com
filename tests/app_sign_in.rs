@@ -1295,6 +1295,28 @@ async fn the_app_endpoints_are_the_api_hosts_and_the_form_the_account_hosts(db: 
     let (status, tokens) = read(post_json_to(&site, "api.buwiz.com", "/auth/email/verify", &code).await).await;
     assert_eq!((status, tokens["scope"].as_str()), (200, Some("app")), "{tokens}");
 
+    // A developer's own machine (a loopback host, any port) takes both:
+    // one address serves everything there.
+    for (host, email) in [
+        ("localhost:3018", "lo1@example.test"),
+        ("127.0.0.1:3018", "lo2@example.test"),
+        ("[::1]:3018", "lo3@example.test"),
+    ] {
+        let body = json!({ "client_id": CLIENT, "email": email, "secret_hash": hash });
+        let (status, answer) = read(post_json_to(&site, host, "/auth/email/start", &body).await).await;
+        assert_eq!(status, 200, "{host}: {answer}");
+    }
+    // A name that only looks like one is not: `localhost.example` is a host
+    // of its own.
+    for host in ["localhost.example.test", "notlocalhost:3018"] {
+        let body = json!({ "client_id": CLIENT, "email": "lo4@example.test", "secret_hash": hash });
+        assert_eq!(
+            post_json_to(&site, host, "/auth/email/start", &body).await.status(),
+            StatusCode::NOT_FOUND,
+            "{host}"
+        );
+    }
+
     // The web's form: on the account host only.
     for host in ["api.buwiz.com", API_HOST, "buwiz.com", "ebirforms.buwiz.com"] {
         for (path, form) in [

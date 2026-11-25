@@ -1463,7 +1463,7 @@ async fn the_three_hundred_and_first_verify_try_from_a_network_is_refused_for_th
         assert!(back.contains(part), "{part}: {back}");
     }
     let page = site.get(&back, "").await;
-    assert!(text(page).await.contains("Too many codes were tried from your network."));
+    assert!(text(page).await.contains("Too many sign-in codes are being checked right now."));
 
     // Another network goes on; the network's starts have their own count.
     let other = Request::post("/auth/email/verify")

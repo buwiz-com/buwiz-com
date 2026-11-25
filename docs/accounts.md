@@ -614,8 +614,9 @@ together (both guess codes):
    whatever comes of them, never given back. Its own limiter, apart from
    start's and from the web's mail count. Past it the app gets `429
    too_many_requests` with `retry_after` (body and header), and the web
-   form goes back to its code page with "Too many codes were tried from
-   your network. Try again in an hour."
+   form goes back to its code page with "Too many sign-in codes are being
+   checked right now. Try again in an hour." (the network's own limit or,
+   past a full map, the shared budget: the words fit both)
 2. The body.
 3. **A place of verify's own.** At most 3 verifies use the database at
    once, so a flood of guesses never takes start's 4 (4 + 3 stay under

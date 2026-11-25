@@ -138,7 +138,7 @@ impl Refusal {
     /// `429 too_many_requests` for the network's tries at a code.
     fn too_many_tries(retry_after: i64) -> Self {
         Self {
-            message: Cow::Borrowed("Too many codes were tried from your network. Wait, then try again."),
+            message: Cow::Borrowed("Too many sign-in codes are being checked right now. Wait, then try again."),
             ..Self::too_many(retry_after)
         }
     }

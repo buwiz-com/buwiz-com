@@ -346,3 +346,31 @@ async fn the_device_flow_carries_the_install_to_its_grant(db: PgPool) {
     assert_eq!((status, answer["error"]["code"].as_str()), (400, Some("install_mismatch")));
     assert_eq!(register(&site, token, json!({ "install_id": LAPTOP })).await.0, 201);
 }
+
+/// Apps from before install ids register again on the same sign-in as they
+/// always could: another row, and the newest key signs.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_old_app_may_register_again_on_its_sign_in(db: PgPool) {
+    let site = Site::new(db);
+    let (ana, _) = site.person(ANA).await;
+    let (_, token) = sign_in(&site.db, ana, None, None).await;
+    assert_eq!(register(&site, &token, json!({})).await.0, 201);
+    let (status, answer, key) = register(&site, &token, json!({})).await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(rows(&site.db).await, 2);
+    let id: Uuid = answer["id"].as_str().unwrap().parse().unwrap();
+    // A signed route takes the newest key: past the signature, the ticket
+    // is refused for its body, not its device.
+    let request = Request::post("/api/tickets")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json");
+    let request = signed(request, &key, "POST", "/api/tickets", b"{}", Some(id));
+    let (status, code, _) = refusal(site.send(request.body(Body::from("{}")).unwrap()).await).await;
+    assert_eq!((status, code.as_str()), (400, "bad_request"), "{status} {code}");
+    let used: bool = sqlx::query_scalar("SELECT last_used_at IS NOT NULL FROM devices WHERE id = $1")
+        .bind(id)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert!(used);
+}

@@ -209,9 +209,10 @@ fn text_field(
 }
 
 /// `POST /api/devices`: registers the key in the body, signed by that key.
-/// One registration per sign-in. With an `install_id`, an install has one
-/// row per account: registering again (after a new sign-in) updates it in
-/// place, with the new key and sign-in, and ends the sign-in it had.
+/// A sign-in that carries an install id registers once, and an install
+/// has one row per account: registering again (after a new sign-in)
+/// updates it in place, with the new key and sign-in, and ends the sign-in
+/// it had. A sign-in without one may register again, each time a new row.
 pub async fn register(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
     let bearer = <Bearer as axum::extract::FromRequestParts<AppState>>::from_request_parts(&mut parts, &state).await?;
@@ -270,8 +271,11 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
         }
         _ => {}
     }
-    let registered: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM devices WHERE grant_id = $1 AND revoked_at IS NULL)")
+    // A sign-in with an install registers one device. One without (apps
+    // from before install ids) may register again, as it always could:
+    // each time is another row.
+    let registered: bool = install.is_some()
+        && sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM devices WHERE grant_id = $1 AND revoked_at IS NULL)")
             .bind(bearer.grant_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -392,7 +396,7 @@ pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<Devi
     .fetch_all(db)
     .await?;
     for device in &mut devices {
-        device.model_name = device.model.as_deref().map(|model| apple_models::name(model).to_owned());
+        device.model_name = device.model.as_deref().map(|model| apple_models::name(model).into_owned());
     }
     Ok(devices)
 }

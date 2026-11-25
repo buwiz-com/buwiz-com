@@ -277,8 +277,9 @@ buwiz-signature: <base64url Ed25519 signature, made with the new key>
 ```
 
 Answer `201 {"id","name","created_at"}`. The device belongs to this
-sign-in (OAuth grant), and one sign-in registers one device (else `409
-device_registered`). The optional fields are trimmed and refused with
+sign-in (OAuth grant). A sign-in that carries an install id registers
+one device (else `409 device_registered`); one without may register again,
+each time another row, as before. The optional fields are trimmed and refused with
 control characters: `platform` is one of `ios`, `ipados`, `android`,
 `macos`, `windows`, `linux` (anything else is kept as nothing), `model` at
 most 80 characters (`bad_model`), `os_version` 40 (`bad_os_version`),
@@ -322,17 +323,19 @@ app sign-ins that have not registered one yet (the app's "Add this iPhone
 to your Buwiz account?" was not tapped):
 
 ```json
-{"devices": [{"id": "<uuid>", "name": "Juana's phone", "client_id": "buwiz-ebirforms",
+{"devices": [{"id": "<uuid>", "name": "Juana's phone", "client_id": "buwiz-desktop",
               "current": true, "platform": "ios", "model": "iPhone16,1",
               "model_name": "iPhone 15 Pro", "os_version": "18.1", "computer_name": null,
               "created_at": "…", "signed_in_at": "…", "last_used_at": "…", "revoked_at": null}],
- "pending": [{"grant_id": "<uuid>", "client_id": "buwiz-ebirforms", "platform": "android",
+ "pending": [{"grant_id": "<uuid>", "client_id": "buwiz-desktop", "platform": "android",
               "signed_in_at": "…", "current": false}]}
 ```
 
 `current` marks the caller's own sign-in. `model_name` is the name an
-Apple model code is sold under (`src/filing/apple_models.rs`), else the
-model as sent. Devices removed more than 30 days ago are left out.
+Apple model code is sold under (`src/filing/apple_models.rs`); an Apple
+code not listed there is the platform's word with the code ("iPhone
+(iPhone18,1)", "iPad (iPad15,3)", "Mac (Mac16,12)"); any other model is as
+sent. `model` is always the raw value. Devices removed more than 30 days ago are left out.
 `POST /api/devices/{id}/revoke` revokes one device; `POST
 /api/sign-ins/{grant_id}/sign-out` ends one of the account's BIR app
 sign-ins (its device too, if it has one), this app's own included,

@@ -1,8 +1,15 @@
 //! The names Apple sells its devices under, by the model code an app reads
 //! on the device (`utsname.machine` on iPhone and iPad, `hw.model` on a
-//! Mac), for the Devices lists. Apple's codes only, from about 2019 on;
-//! Android and desktop models are shown as the app sent them, and a code
-//! not listed here shows as itself. Add a line for each new model.
+//! Mac), for the Devices lists.
+//!
+//! The table is to be filled from Apple's own published identifier lists
+//! (the "Identify your iPhone / iPad / Mac model" support pages), and an
+//! entry is added only from those lists: a wrong name is worse than none.
+//! A code not listed shows as the platform's word with the code
+//! ("iPhone (iPhone18,1)"); Android and desktop models show as the app
+//! sent them.
+
+use std::borrow::Cow;
 
 /// (model code, the name it is sold under).
 const MODELS: &[(&str, &str)] = &[
@@ -32,11 +39,6 @@ const MODELS: &[(&str, &str)] = &[
     ("iPhone17,4", "iPhone 16 Plus"),
     ("iPhone17,1", "iPhone 16 Pro"),
     ("iPhone17,2", "iPhone 16 Pro Max"),
-    ("iPhone17,5", "iPhone 16e"),
-    ("iPhone18,3", "iPhone 17"),
-    ("iPhone18,4", "iPhone Air"),
-    ("iPhone18,1", "iPhone 17 Pro"),
-    ("iPhone18,2", "iPhone 17 Pro Max"),
     // iPad
     ("iPad7,11", "iPad (7th generation)"),
     ("iPad7,12", "iPad (7th generation)"),
@@ -46,14 +48,10 @@ const MODELS: &[(&str, &str)] = &[
     ("iPad12,2", "iPad (9th generation)"),
     ("iPad13,18", "iPad (10th generation)"),
     ("iPad13,19", "iPad (10th generation)"),
-    ("iPad15,7", "iPad (A16)"),
-    ("iPad15,8", "iPad (A16)"),
     ("iPad11,1", "iPad mini (5th generation)"),
     ("iPad11,2", "iPad mini (5th generation)"),
     ("iPad14,1", "iPad mini (6th generation)"),
     ("iPad14,2", "iPad mini (6th generation)"),
-    ("iPad16,1", "iPad mini (A17 Pro)"),
-    ("iPad16,2", "iPad mini (A17 Pro)"),
     ("iPad11,3", "iPad Air (3rd generation)"),
     ("iPad11,4", "iPad Air (3rd generation)"),
     ("iPad13,1", "iPad Air (4th generation)"),
@@ -64,10 +62,6 @@ const MODELS: &[(&str, &str)] = &[
     ("iPad14,9", "iPad Air 11-inch (M2)"),
     ("iPad14,10", "iPad Air 13-inch (M2)"),
     ("iPad14,11", "iPad Air 13-inch (M2)"),
-    ("iPad15,3", "iPad Air 11-inch (M3)"),
-    ("iPad15,4", "iPad Air 11-inch (M3)"),
-    ("iPad15,5", "iPad Air 13-inch (M3)"),
-    ("iPad15,6", "iPad Air 13-inch (M3)"),
     ("iPad8,9", "iPad Pro 11-inch (2nd generation)"),
     ("iPad8,10", "iPad Pro 11-inch (2nd generation)"),
     ("iPad8,11", "iPad Pro 12.9-inch (4th generation)"),
@@ -113,35 +107,41 @@ const MODELS: &[(&str, &str)] = &[
     ("Mac14,14", "Mac Studio (2023)"),
     ("Mac14,8", "Mac Pro (2023)"),
     ("Mac15,3", "MacBook Pro 14-inch (M3, 2023)"),
-    ("Mac15,6", "MacBook Pro 14-inch (M3 Pro or Max, 2023)"),
-    ("Mac15,8", "MacBook Pro 14-inch (M3 Pro or Max, 2023)"),
-    ("Mac15,10", "MacBook Pro 14-inch (M3 Pro or Max, 2023)"),
-    ("Mac15,7", "MacBook Pro 16-inch (M3 Pro or Max, 2023)"),
-    ("Mac15,9", "MacBook Pro 16-inch (M3 Pro or Max, 2023)"),
-    ("Mac15,11", "MacBook Pro 16-inch (M3 Pro or Max, 2023)"),
     ("Mac15,4", "iMac 24-inch (M3, 2023)"),
     ("Mac15,5", "iMac 24-inch (M3, 2023)"),
     ("Mac15,12", "MacBook Air 13-inch (M3, 2024)"),
     ("Mac15,13", "MacBook Air 15-inch (M3, 2024)"),
-    ("Mac16,1", "MacBook Pro 14-inch (M4, 2024)"),
-    ("Mac16,6", "MacBook Pro 14-inch (M4 Pro or Max, 2024)"),
-    ("Mac16,8", "MacBook Pro 14-inch (M4 Pro or Max, 2024)"),
-    ("Mac16,5", "MacBook Pro 16-inch (M4 Pro or Max, 2024)"),
-    ("Mac16,7", "MacBook Pro 16-inch (M4 Pro or Max, 2024)"),
-    ("Mac16,2", "iMac 24-inch (M4, 2024)"),
-    ("Mac16,3", "iMac 24-inch (M4, 2024)"),
-    ("Mac16,10", "Mac mini (M4, 2024)"),
-    ("Mac16,11", "Mac mini (M4 Pro, 2024)"),
-    ("Mac16,12", "MacBook Air 13-inch (M4, 2025)"),
-    ("Mac16,13", "MacBook Air 15-inch (M4, 2025)"),
-    ("Mac15,14", "Mac Studio (2025)"),
-    ("Mac16,9", "Mac Studio (2025)"),
 ];
 
-/// The name `model` is sold under, or `model` itself when it is not an
-/// Apple code listed here.
-pub fn name(model: &str) -> &str {
-    MODELS.iter().find(|(code, _)| *code == model).map_or(model, |(_, name)| name)
+/// The name `model` is sold under; for an Apple code not listed, the
+/// platform's word with the code ("iPad (iPad15,3)"); anything else as it
+/// is.
+pub fn name(model: &str) -> Cow<'_, str> {
+    if let Some((_, name)) = MODELS.iter().find(|(code, _)| *code == model) {
+        return Cow::Borrowed(name);
+    }
+    match apple_word(model) {
+        Some(word) => Cow::Owned(format!("{word} ({model})")),
+        None => Cow::Borrowed(model),
+    }
+}
+
+/// The platform's word for an Apple model code (letters, then
+/// `<major>,<minor>`): iPhone, iPad, or Mac for every other one.
+fn apple_word(model: &str) -> Option<&'static str> {
+    let letters = model.find(|ch: char| ch.is_ascii_digit())?;
+    let (prefix, numbers) = model.split_at(letters);
+    let (major, minor) = numbers.split_once(',')?;
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    if !(numeric(major) && numeric(minor)) {
+        return None;
+    }
+    match prefix {
+        "iPhone" => Some("iPhone"),
+        "iPad" => Some("iPad"),
+        _ if prefix.starts_with("Mac") || prefix == "iMac" => Some("Mac"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -153,8 +153,16 @@ mod tests {
         assert_eq!(name("iPhone16,1"), "iPhone 15 Pro");
         assert_eq!(name("iPad13,18"), "iPad (10th generation)");
         assert_eq!(name("Mac14,2"), "MacBook Air 13-inch (M2, 2022)");
-        assert_eq!(name("iPhone99,9"), "iPhone99,9");
+        // Not listed (2025 models among them): the word and the code.
+        assert_eq!(name("iPhone18,1"), "iPhone (iPhone18,1)");
+        assert_eq!(name("iPad15,3"), "iPad (iPad15,3)");
+        assert_eq!(name("Mac16,12"), "Mac (Mac16,12)");
+        assert_eq!(name("MacBookPro99,1"), "Mac (MacBookPro99,1)");
+        assert_eq!(name("iMac99,1"), "Mac (iMac99,1)");
+        // Not Apple's: as sent.
         assert_eq!(name("Pixel 8"), "Pixel 8");
+        assert_eq!(name("SM-S921B"), "SM-S921B");
+        assert_eq!(name("iPhone"), "iPhone");
     }
 
     #[test]

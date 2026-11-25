@@ -632,7 +632,7 @@ posts to the same two paths are told apart by it) and answers
 `POST /auth/email/start`
 
 ```json
-{"client_id": "buwiz-ebirforms", "email": "ana@example.ph", "intent": "sign_in",
+{"client_id": "buwiz-desktop", "email": "ana@example.ph", "intent": "sign_in",
  "secret_hash": "<base64url SHA-256 of the secret>", "platform": "ios",
  "install_id": "<16 to 64 of A-Z a-z 0-9 - _>",
  "turnstile": "<optional token>", "attestation": "<optional, reserved, not read>"}
@@ -706,7 +706,9 @@ is not the sign-in's is refused (`install_mismatch`).
 
 What the app says about the device: its platform, model (an Apple code
 such as `iPhone16,1` is shown as "iPhone 15 Pro", from the table in
-`src/filing/apple_models.rs`; others as sent), system version and, on a
+`src/filing/apple_models.rs`, which is filled only from Apple's published
+identifier lists; an Apple code not in it shows as "iPhone (iPhone18,1)",
+"iPad (…)" or "Mac (…)"; other models as sent), system version and, on a
 computer, its name. The list shows those, when it was added, last signed
 in and last used, and keeps a removed device for 30 days.
 

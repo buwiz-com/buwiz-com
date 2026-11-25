@@ -22,7 +22,8 @@ use uuid::Uuid;
 use common::*;
 
 const ANA: &str = "ana@example.test";
-const CLIENT: &str = "buwiz-ebirforms";
+/// The eBIRForms app's client id on every platform.
+const CLIENT: &str = "buwiz-desktop";
 /// The one token the fake Turnstile accepts.
 const GOOD_TOKEN: &str = "a-person";
 

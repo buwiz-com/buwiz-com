@@ -198,6 +198,7 @@ async fn the_whole_flow_signs_the_app_in_with_its_install(db: PgPool) {
     assert!(page.contains("Sign in to eBIRForms on iPhone"), "{page}");
     assert!(page.contains("Continue as ana@example.test"), "{page}");
     assert!(page.contains("Use another account") && page.contains("Cancel"), "{page}");
+    assert!(page.contains("File and send returns for your TINs through Buwiz"), "{page}");
     assert!(page.contains("<title>Sign in to eBIRForms · Buwiz</title>"), "{page}");
     assert!(!page.contains("Unverified app") && !page.contains("wants to read"), "{page}");
     // Never approved on its own: nothing is stored until the tap.
@@ -330,6 +331,10 @@ async fn state_install_and_platform_are_required(db: PgPool) {
         assert_eq!((refused["error"].as_str(), refused["state"].as_str()), ("invalid_request", STATE), "{changes:?}");
     }
     let pkce = redirected_error(&site, &cookie, &[("code_challenge_method", Some("plain"))]).await;
+    assert_eq!(pkce["error"], "invalid_request");
+    // 43 characters, but not all of base64url.
+    let odd = format!("{}+", "A".repeat(42));
+    let pkce = redirected_error(&site, &cookie, &[("code_challenge", Some(odd.as_str()))]).await;
     assert_eq!(pkce["error"], "invalid_request");
     // The decision checks the same.
     let response = decide(&site, &cookie, &[("platform", None)], "approve").await;
@@ -499,6 +504,134 @@ async fn an_exchange_that_cannot_have_its_lock_in_time_is_busy(db: PgPool) {
     assert_eq!(status, 200, "{answer}");
 }
 
+/// Two exchanges of one code at the same moment: exactly one gets tokens.
+#[sqlx::test(migrations = "./migrations")]
+async fn two_exchanges_of_one_code_at_once_give_one_sign_in(db: PgPool) {
+    let site = Site::new(db);
+    let (_, cookie) = site.person(ANA).await;
+    let code = approve(&site, &cookie, &[]).await;
+    let verifier = verifier();
+    let (first, second) = tokio::join!(
+        exchange(&site, CLIENT, &code, SCHEME, &verifier),
+        exchange(&site, CLIENT, &code, SCHEME, &verifier)
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 400], "{} {}", first.1, second.1);
+    let refused = if first.0 == 400 { &first.1 } else { &second.1 };
+    assert_eq!(refused["error"], "invalid_grant");
+    assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_grants").await, 1);
+}
+
+/// A code that is not `bwc_` and 43 characters of base64url is
+/// `invalid_grant` before the database: here with every exchange place
+/// taken and the pool closed.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_code_of_the_wrong_shape_is_refused_without_the_database(db: PgPool) {
+    let site = Site::new(db);
+    let places = site.state.token_slots.acquire_many(buwiz_cloud::account::agents::TOKEN_SLOTS as u32).await.unwrap();
+    site.db.close().await;
+    let right_length = format!("bwc_{}", "A".repeat(43));
+    for bad in [
+        "bwc_short".to_owned(),
+        format!("bwc_{}", "A".repeat(44)),
+        format!("bwx_{}", "A".repeat(43)),
+        format!("bwc_{}+", "A".repeat(42)),
+        format!("bwc_{}=", "A".repeat(42)),
+        String::new(),
+    ] {
+        let started = std::time::Instant::now();
+        let (status, answer) = exchange(&site, CLIENT, &bad, SCHEME, &verifier()).await;
+        assert_eq!((status, answer["error"].as_str()), (400, Some("invalid_grant")), "{bad}: {answer}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{bad}");
+    }
+    // A code of the right shape waits for a place, then is busy.
+    let started = std::time::Instant::now();
+    let (status, answer) = exchange(&site, CLIENT, &right_length, SCHEME, &verifier()).await;
+    assert_eq!((status, answer["error"].as_str()), (503, Some("temporarily_unavailable")), "{answer}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1900));
+    drop(places);
+}
+
+/// An in-app request and its code, through the API host: (request id,
+/// secret, code).
+async fn in_app_code(site: &Site, email: &str) -> (String, String, String) {
+    let secret = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
+    let body = json!({ "client_id": CLIENT, "email": email, "intent": "sign_in", "secret_hash": hash });
+    let (status, answer) = api_json(site, "/auth/email/start", &body).await;
+    assert_eq!(status, 200, "{answer}");
+    let code = site.state.mailer.app_sign_in_mails().iter().rev().find(|mail| mail.to == email).unwrap().code.clone();
+    (answer["request_id"].as_str().unwrap().to_owned(), secret, code)
+}
+
+async fn api_json(site: &Site, path: &str, body: &Value) -> (u16, Value) {
+    let request = Request::post(path)
+        .header(header::HOST, "api.localhost:3008")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = site.send(request).await;
+    let status = response.status().as_u16();
+    (status, serde_json::from_str(&text(response).await).unwrap())
+}
+
+/// A flood of exchanges, many more at once than their places, each
+/// holding its connection as long as it can (its account's row is locked,
+/// so it waits the whole three seconds): only the exchange's own places
+/// use connections, the rest wait without one and are busy, and in-app
+/// verify meanwhile answers its tokens at once.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_flood_of_code_exchanges_leaves_in_app_verify_working(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    // Room for the holder, the exchange's places and the verify.
+    assert!(site.db.options().get_max_connections() >= 5);
+    let (request_id, secret, in_app) = in_app_code(&site, ANA).await;
+    let (bea, _) = site.person("bea@example.test").await;
+    let challenge = challenge(&verifier());
+    let mut codes = Vec::new();
+    for _ in 0..30 {
+        let code = crypto::new_token("bwc_");
+        sqlx::query(
+            "INSERT INTO oauth_codes (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at,
+                                      install_id, platform)
+             VALUES ($1, 'buwiz-desktop', $2, $3, $4, 'app', now() + interval '10 minutes', $5, 'ios')",
+        )
+        .bind(crypto::hash(&code))
+        .bind(bea)
+        .bind(SCHEME)
+        .bind(&challenge)
+        .bind(PHONE)
+        .execute(&site.db)
+        .await
+        .unwrap();
+        codes.push(code);
+    }
+    let mut holder = site.db.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(bea).execute(&mut *holder).await.unwrap();
+
+    let verifier = verifier();
+    let flood =
+        futures_util::future::join_all(codes.iter().map(|code| exchange(&site, CLIENT, code, SCHEME, &verifier)));
+    let in_app_verify = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let body = json!({ "request_id": request_id, "secret": secret, "code": in_app });
+        let answer = api_json(&site, "/auth/email/verify", &body).await;
+        (answer, started.elapsed())
+    };
+    let (flood, ((status, tokens), took)) = tokio::join!(flood, in_app_verify);
+    assert_eq!(status, 200, "{tokens}");
+    assert!(tokens["access_token"].as_str().unwrap().starts_with("bwa_"));
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    for (status, answer) in &flood {
+        assert_eq!((*status, answer["error"].as_str()), (503, Some("temporarily_unavailable")), "{answer}");
+    }
+    holder.rollback().await.unwrap();
+    // The codes were not used: each still works.
+    assert_eq!(exchange(&site, CLIENT, &codes[0], SCHEME, &verifier).await.0, 200);
+}
+
 async fn register_agent(site: &Site, name: &str, redirect: &str) -> (u16, Value) {
     let body = json!({ "client_name": name, "redirect_uris": [redirect] });
     let request = Request::post("/oauth/register")
@@ -557,6 +690,22 @@ async fn agents_keep_mcp_and_their_own_addresses(db: PgPool) {
     let grant: (Option<String>, Option<String>) =
         sqlx::query_as("SELECT install_id, platform FROM oauth_grants").fetch_one(&site.db).await.unwrap();
     assert_eq!(grant, (None, None));
+
+    // An agent registered before the rule, with the app's scheme, never
+    // has it used.
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+         VALUES ('agent_old', 'Old agent', ARRAY['ebirforms://signin-callback'])",
+    )
+    .execute(&site.db)
+    .await
+    .unwrap();
+    let page = untrusted(
+        site.get(&authorize_path(&agent_changes("agent_old", &[("redirect_uri", Some(SCHEME))])), &cookie).await,
+    )
+    .await;
+    assert!(page.contains("may not use"), "{page}");
+    untrusted(site.get(&authorize_path(&agent_changes("agent_old", &[("redirect_uri", None)])), &cookie).await).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -620,9 +769,13 @@ async fn a_new_install_is_mailed_and_a_known_device_is_not(db: PgPool) {
     let mails = site.state.mailer.new_device_mails();
     assert_eq!(mails.len(), 1);
     assert_eq!(mails[0].to, ANA);
-    assert_eq!(mails[0].subject, "New sign-in to eBIRForms on iPhone");
+    assert_eq!(mails[0].subject, "New device signed in: eBIRForms on iPhone");
     assert!(mails[0].text.contains("signed in to eBIRForms on iPhone on "), "{}", mails[0].text);
-    assert!(mails[0].text.contains(&format!("If this wasn't you, log it out at {ORIGIN}/tins")), "{}", mails[0].text);
+    assert!(
+        mails[0].text.contains(&format!("If this wasn't you, log it out at {ORIGIN}/tins#devices-h")),
+        "{}",
+        mails[0].text
+    );
     for request_word in [PHONE, STATE, "ebirforms://"] {
         assert!(!mails[0].text.contains(request_word), "{}", mails[0].text);
     }
@@ -637,7 +790,7 @@ async fn a_new_install_is_mailed_and_a_known_device_is_not(db: PgPool) {
     sign_in(&site, &cookie, LAPTOP, "macos").await;
     let mails = site.state.mailer.new_device_mails();
     assert_eq!(mails.len(), 2);
-    assert_eq!(mails[1].subject, "New sign-in to eBIRForms on Mac");
+    assert_eq!(mails[1].subject, "New device signed in: eBIRForms on Mac");
 }
 
 /// Whether the device is new is decided in the exchange, not on the mail's
@@ -658,7 +811,71 @@ async fn a_device_registered_before_the_mail_task_runs_is_still_mailed(db: PgPoo
     settled(&site, 1).await;
     let mails = site.state.mailer.new_device_mails();
     assert_eq!(mails.len(), 1);
-    assert_eq!((mails[0].to.as_str(), mails[0].subject.as_str()), (ANA, "New sign-in to eBIRForms on iPhone"));
+    assert_eq!((mails[0].to.as_str(), mails[0].subject.as_str()), (ANA, "New device signed in: eBIRForms on iPhone"));
+}
+
+/// A device the owner removed that signs in again is a new device: it is
+/// mailed again.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_removed_device_that_signs_in_again_is_mailed(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, cookie) = site.person(ANA).await;
+    let tokens = sign_in(&site, &cookie, PHONE, "ios").await;
+    let (status, device) = register(&site, tokens["access_token"].as_str().unwrap(), PHONE).await;
+    assert_eq!(status, 201, "{device}");
+    let id: Uuid = device["id"].as_str().unwrap().parse().unwrap();
+    assert!(buwiz_cloud::devices::revoke(&site.db, ana, id).await.unwrap());
+    assert_eq!(site.state.mailer.new_device_mails().len(), 1);
+
+    sign_in(&site, &cookie, PHONE, "ios").await;
+    let mails = site.state.mailer.new_device_mails();
+    assert_eq!(mails.len(), 2);
+    assert_eq!(mails[1].subject, "New device signed in: eBIRForms on iPhone");
+}
+
+async fn device_flow(site: &Site, cookie: &str, install: Option<&str>) -> Value {
+    let mut body = json!({ "client_id": CLIENT });
+    if let Some(install) = install {
+        body["install_id"] = json!(install);
+    }
+    let request = Request::post("/auth/device/start")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let started: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+    let user_code = started["user_code"].as_str().unwrap();
+    let response = site.post("/device/decision", cookie, &format!("user_code={user_code}&decision=approve")).await;
+    assert_eq!(location(&response), "/device?notice=device_approved");
+    let poll = json!({ "client_id": CLIENT, "device_code": started["device_code"] });
+    let request = Request::post("/auth/device/poll")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(poll.to_string()))
+        .unwrap();
+    let response = site.send(request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_str(&text(response).await).unwrap()
+}
+
+/// The device flow is approved in a browser too, so a sign-in from an
+/// install new to the account is mailed as Sign in with Buwiz's is. One
+/// without an install id (apps from before them) cannot be told apart and
+/// is not mailed.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_device_flow_mails_a_new_install_too(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (_, cookie) = site.person(ANA).await;
+    device_flow(&site, &cookie, None).await;
+    let tokens = device_flow(&site, &cookie, Some(LAPTOP)).await;
+    settled(&site, 1).await;
+    let mails = site.state.mailer.new_device_mails();
+    assert_eq!(mails.len(), 1, "{mails:?}");
+    assert_eq!((mails[0].to.as_str(), mails[0].subject.as_str()), (ANA, "New device signed in: eBIRForms"));
+
+    // A known device signing in again by the device flow mails nothing.
+    assert_eq!(register(&site, tokens["access_token"].as_str().unwrap(), LAPTOP).await.0, 201);
+    device_flow(&site, &cookie, Some(LAPTOP)).await;
+    settled(&site, 2).await;
+    assert_eq!(site.state.mailer.new_device_mails().len(), 1);
 }
 
 #[sqlx::test(migrations = "./migrations")]

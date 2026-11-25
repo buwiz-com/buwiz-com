@@ -8,10 +8,13 @@
 -- them, migration 18).
 --
 -- Dropping the reference scans nothing, and the new columns are nullable
--- without a default, so no row is rewritten. Postgres reads the table
--- once, under the lock, to check the new columns' checks: one short row
--- per code given out, so the lock is held for a moment only. No existing
--- row changes.
+-- without a default, so no row is rewritten and no existing row changes.
+-- Postgres does read every row of `oauth_codes` once, to check the new
+-- columns' checks, and holds its ACCESS EXCLUSIVE lock on that table (and
+-- a lock on `oauth_clients`, for the reference) until the migration
+-- commits: no code is made or exchanged meanwhile. Codes are kept 30 days
+-- only, so the table is small and the read is short. The lock_timeout
+-- below bounds the wait for the locks, not how long they are held.
 
 SET LOCAL lock_timeout = '10s';
 

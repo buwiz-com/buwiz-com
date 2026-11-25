@@ -796,6 +796,16 @@ async fn app_authorize(
                 <span class="auth-badge">icon(name: "devices")</span>
                 <h1>"Sign in to eBIRForms on " (platform)</h1>
                 <p class="auth-lead">"Continue only if you are signing in to eBIRForms yourself, on your own device."</p>
+                <div class="consent-lists">
+                    <div class="consent-can">
+                        <p class="consent-head">icon(name: "check_circle") "eBIRForms on this device can"</p>
+                        <ul>
+                            <li>"File and send returns for your TINs through Buwiz"</li>
+                            <li>"See your TINs and the returns you sent, with their receipts"</li>
+                            <li>"See your devices and sign-ins, and remove them"</li>
+                        </ul>
+                    </div>
+                </div>
                 <form class="auth-form" method="post" action="/oauth/authorize/decision">
                     for (name, value) in fields {
                         <input type="hidden" name=(name) value=(value)>

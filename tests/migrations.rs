@@ -9,7 +9,8 @@
 //! 20 (an index on devices' sign-ins) and the server's migration
 //! connection ([`buwiz_cloud::migrate`]) fail, rather than wait, behind a
 //! long transaction, and recover as docs/deploy.md says. Migration 21
-//! (Sign in with Buwiz) goes back to 20.
+//! (Sign in with Buwiz) goes back to 20, and fails behind a long
+//! transaction and recovers too.
 //! Each test gets its own empty database (`migrations = false`).
 
 use std::borrow::Cow;
@@ -1824,4 +1825,34 @@ async fn app_codes_go_back_to_20(db: PgPool) {
     assert_eq!(codes(db.clone()).await, ["agent_test"]);
     assert_eq!(rows(db.clone()).await, before);
     release_20().run(&db).await.unwrap();
+}
+
+/// Migration 21 runs in a transaction with its own lock_timeout. Behind a
+/// long transaction that read `oauth_codes`, it fails within seconds
+/// instead of waiting, records nothing and changes nothing; once that
+/// transaction ends, starting again works. The pool's connections never
+/// get the setting.
+#[sqlx::test(migrations = false)]
+async fn migration_21_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
+    release_20().run(&db).await.unwrap();
+    let schema_20 = schema(&db).await;
+    let mut stray = db.begin().await.unwrap();
+    sqlx::query("SELECT count(*) FROM oauth_codes").execute(&mut *stray).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), buwiz_cloud::migrate(&db))
+        .await
+        .expect("the migration waited for the lock without end");
+    let error = outcome.expect_err("the migration ran past an open transaction").to_string();
+    assert!(error.contains("lock timeout"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    stray.rollback().await.unwrap();
+    assert_eq!(schema(&db).await, schema_20, "nothing of migration 21 is left");
+
+    buwiz_cloud::migrate(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
+    for _ in 0..db.size() {
+        let setting: String = sqlx::query_scalar("SHOW lock_timeout").fetch_one(&db).await.unwrap();
+        assert_eq!(setting, "0", "the pool's connections keep the default");
+    }
 }

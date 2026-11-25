@@ -36,6 +36,17 @@ use crate::base::error::{OAuthError, OAuthFailure};
 use crate::base::state::AppState;
 
 const CODE_TTL: Duration = Duration::minutes(10);
+/// The prefix of a code ([`approve`]); 43 characters of base64url follow
+/// (32 random bytes, [`crypto::new_token`]).
+const CODE_PREFIX: &str = "bwc_";
+/// How many `authorization_code` exchanges may use the database at once.
+/// Their own places, so a flood of made-up codes waits here, holding no
+/// connection, and never takes in-app sign-in's: start's 4
+/// ([`app_sign_in::DATABASE_SLOTS`]), verify's 3
+/// ([`app_sign_in::VERIFY_SLOTS`]) and these 2 make 9, below the pool's 10,
+/// so the rest of the site always has one. An exchange is one short
+/// transaction, so 2 places take far more sign-ins than people make.
+pub const TOKEN_SLOTS: usize = 2;
 const MAX_REDIRECT_URIS: usize = 5;
 /// The shortest `state` an app may send: it must be the app's own random
 /// value, not a constant.
@@ -281,6 +292,11 @@ pub async fn check_authorize(
         None if registered.len() == 1 => registered[0].clone(),
         _ => return Err(AuthorizeProblem::Untrusted("The app sent a redirect address it did not register.")),
     };
+    // An address registered before the rules it breaks now (the app's own
+    // scheme) is never used.
+    if !redirect_uri_allowed(&redirect_uri) {
+        return Err(AuthorizeProblem::Untrusted("The app sent a redirect address it may not use."));
+    }
     let state = param("state").map(str::to_owned);
     let refuse = |error, description| AuthorizeProblem::Redirect {
         redirect_uri: redirect_uri.clone(),
@@ -350,7 +366,7 @@ fn check_app_authorize(
     let Some(code_challenge) = param("code_challenge") else {
         return Err(refuse("invalid_request", "PKCE is required: send code_challenge"));
     };
-    if param("code_challenge_method") != Some("S256") || code_challenge.len() != 43 {
+    if param("code_challenge_method") != Some("S256") || !is_base64url(code_challenge, 43) {
         return Err(refuse("invalid_request", "use code_challenge_method=S256"));
     }
     if state.as_ref().is_none_or(|state| state.chars().count() < MIN_APP_STATE) {
@@ -377,8 +393,8 @@ fn check_app_authorize(
 
 /// Where a redirect URI leads, for the consent page: its full origin
 /// (scheme, host and any port), or the scheme and host of an app link.
-/// Registration checks neither the client's name nor its redirect, so this
-/// is the one thing the person can judge the app by.
+/// Nothing checks the client's name, and registration takes any https
+/// address, so this is the one thing the person can judge the app by.
 pub fn redirect_origin(redirect_uri: &str) -> String {
     let Ok(url) = Url::parse(redirect_uri) else {
         return redirect_uri.to_owned();
@@ -422,11 +438,11 @@ async fn approve(
     account_id: Uuid,
     issuer: &str,
 ) -> sqlx::Result<Option<String>> {
-    let mut tx = db.begin().await?;
+    let mut tx = app_sign_in::begin_waiting(db).await?;
     if oauth::banned_now(&mut tx, account_id).await? {
         return Ok(None);
     }
-    let code = crypto::new_token("bwc_");
+    let code = crypto::new_token(CODE_PREFIX);
     sqlx::query(
         "INSERT INTO oauth_codes
              (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at, install_id, platform)
@@ -506,6 +522,50 @@ async fn decide_inner(state: &AppState, headers: &HeaderMap, form: &HashMap<Stri
     }
 }
 
+/// Whether `value` is exactly `len` characters of base64url without padding.
+fn is_base64url(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// Whether `code` has the shape [`approve`] gives a code: `bwc_` and 43
+/// characters of base64url. Anything else is refused before the database.
+pub fn is_code(code: &str) -> bool {
+    code.strip_prefix(CODE_PREFIX).is_some_and(|rest| is_base64url(rest, 43))
+}
+
+fn token_busy() -> OAuthFailure {
+    OAuthFailure::from(OAuthError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error: "temporarily_unavailable",
+        description: "Buwiz is busy; try again in a few seconds",
+    })
+}
+
+/// The `authorization_code` grant on `/oauth/token`: a code of the wrong
+/// shape is `invalid_grant` before anything else; then one of the
+/// [`TOKEN_SLOTS`] places, waited for at most
+/// [`app_sign_in::SLOT_WAIT`] (else `503 temporarily_unavailable`), for
+/// [`redeem_code`]; then an app's new-device mail, on its own task.
+pub async fn exchange(
+    state: &AppState,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<TokenResponse, OAuthFailure> {
+    if !is_code(code) {
+        return Err(OAuthFailure::from(OAuthError::new("invalid_grant", "the code is not valid")));
+    }
+    let Some(_place) = app_sign_in::slot(&state.token_slots).await else {
+        return Err(token_busy());
+    };
+    let redeemed = redeem_code(&state.db, &state.config.admin_emails, client_id, code, redirect_uri, verifier).await?;
+    if let Some(app) = redeemed.app {
+        mail_new_device(state, app);
+    }
+    Ok(redeemed.tokens)
+}
+
 /// What redeeming a code gave: the tokens and, for an app, the install
 /// it signed in, for the new-device mail.
 pub struct Redeemed {
@@ -547,11 +607,7 @@ pub async fn redeem_code(
             if error.downcast_ref::<sqlx::Error>().is_some_and(app_sign_in::is_lock_timeout) =>
         {
             tracing::warn!("code exchange: a lock or a connection was not had in time; answered busy");
-            Err(OAuthFailure::from(OAuthError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                error: "temporarily_unavailable",
-                description: "Buwiz is busy; try again in a few seconds",
-            }))
+            Err(token_busy())
         }
         redeemed => redeemed,
     }
@@ -648,11 +704,11 @@ async fn redeem_code_inner(
 }
 
 /// Whom to mail about a sign-in from `install_id`, in the exchange's
-/// transaction: the account's address when it has no device row for the
-/// install at this moment and does not sign in with a fixed code (a store
-/// reviewer's). Decided here, not on the mail's task, so an app that
+/// transaction: the account's address when it has no live device row for
+/// the install at this moment (a removed device that comes back is new)
+/// and does not sign in with a fixed code (a store reviewer's). Decided here, not on the mail's task, so an app that
 /// registers its device at once still has its new device mailed.
-async fn new_device_to(
+pub(crate) async fn new_device_to(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
     install_id: &str,
@@ -661,7 +717,8 @@ async fn new_device_to(
     sqlx::query_scalar(&format!(
         "SELECT a.email FROM accounts a
          WHERE a.id = $1 AND NOT {}
-           AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.account_id = a.id AND d.install_id = $2)",
+           AND NOT EXISTS (SELECT 1 FROM devices d
+                           WHERE d.account_id = a.id AND d.install_id = $2 AND d.revoked_at IS NULL)",
         crate::account::roles::fixed_code_sql("a", "$3")
     ))
     .bind(account_id)
@@ -691,7 +748,7 @@ async fn new_device_mail(state: &AppState, app: &SignedInApp) {
         return;
     };
     let device = Platform::device(app.platform);
-    let tins = format!("{}/tins", state.config.account_origin);
+    let tins = format!("{}/tins#devices-h", state.config.account_origin);
     if state.mailer.send_new_device(to, device, at, &tins).await.is_err() {
         tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be sent");
     }
@@ -749,7 +806,9 @@ mod tests {
 
     #[test]
     fn only_buwiz_desktop_has_app_redirects_and_they_are_strict() {
-        assert!(app_redirects("buwiz-ebirforms").is_empty() && app_redirects("buwiz-books").is_empty());
+        for (client_id, ..) in oauth::CLIENTS {
+            assert_eq!(!app_redirects(client_id).is_empty(), *client_id == "buwiz-desktop", "{client_id}");
+        }
         assert!(app_redirects("agent_x").is_empty());
         let ok = |uri: &str| app_redirects("buwiz-desktop").iter().any(|known| known.matches(uri));
         for good in ["ebirforms://signin-callback", "http://127.0.0.1:1/callback", "http://127.0.0.1:65535/callback"] {
@@ -767,6 +826,18 @@ mod tests {
             assert!(!ok(bad), "{bad}");
         }
         assert!(!redirect_uri_allowed("ebirforms://signin-callback"));
+    }
+
+    #[test]
+    fn a_code_is_bwc_and_43_characters_of_base64url() {
+        assert!(is_code(&crypto::new_token(CODE_PREFIX)));
+        assert!(is_code(&format!("bwc_{}", "-_aZ09".repeat(7) + "x")));
+        for bad in ["", "bwc_", "bwc_short", "bwd_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"] {
+            assert!(!is_code(bad), "{bad}");
+        }
+        assert!(!is_code(&format!("bwc_{}", "A".repeat(44))));
+        assert!(!is_code(&format!("bwc_{}=", "A".repeat(42))));
+        assert!(!is_code(&format!("bwc_{}é", "A".repeat(41))));
     }
 
     #[test]

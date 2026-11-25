@@ -1,6 +1,10 @@
 -- Back to migration 20. docs/deploy.md has the whole rollback; run this
 -- file before 0020's (and the older ones, to go further). It commits on
--- its own and never refuses.
+-- its own. With the service stopped, as docs/deploy.md says, it does not
+-- fail. On a running server it can: a code an app gets after its DELETE
+-- makes VALIDATE fail, and the whole file is rolled back, leaving the
+-- database at 21. A lock not had within the lock timeout fails it the
+-- same way, changing nothing.
 --
 --   psql -v ON_ERROR_STOP=1 -1 -c "SET lock_timeout = '10s'" -f 0021_app_authorize.down.sql
 --

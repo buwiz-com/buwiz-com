@@ -460,7 +460,7 @@ fn new_device_message(device: &str, at: time::OffsetDateTime, devices_page: &str
     };
     let when = format!("{} {}, {} at {hour}:{:02} {half}", at.month(), at.day(), at.year(), at.minute());
     (
-        format!("New sign-in to {device}"),
+        format!("New device signed in: {device}"),
         format!(
             "Your Buwiz account was signed in to {device} on {when}, Philippine time.\n\n\
              If this was you, there is nothing to do.\n\n\
@@ -662,7 +662,9 @@ mod tests {
     fn the_new_device_mail_says_where_and_when_in_philippine_time() {
         let at = time::OffsetDateTime::from_unix_timestamp(1_795_590_240).unwrap();
         let (subject, text) = new_device_message("eBIRForms on iPhone", at, "https://account.buwiz.com/tins");
-        assert_eq!(subject, "New sign-in to eBIRForms on iPhone");
+        assert_eq!(subject, "New device signed in: eBIRForms on iPhone");
+        let (replaced, _) = sign_in_replaced_message("eBIRForms on iPhone", "https://account.buwiz.com");
+        assert_ne!(subject, replaced, "the two mails are told apart by their subjects");
         assert!(
             text.contains("signed in to eBIRForms on iPhone on November 25, 2026 at 3:04 PM, Philippine time"),
             "{text}"

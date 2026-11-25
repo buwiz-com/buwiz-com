@@ -1103,10 +1103,15 @@ the reference from `oauth_codes.client_id` to `oauth_clients`: the app's
 client is built in and never a row there, and the code checks the client
 instead. It runs in a transaction and sets its own `lock_timeout` (10 s).
 Both columns are nullable with no default, so no row is rewritten, and
-dropping the reference scans nothing. Postgres reads `oauth_codes` once,
-under the lock, to check the new columns (one short row per code given
-out), so each lock is held a moment. No existing row changes. There is
-no setting. The release before it (at 20) refuses to start on a database
+dropping the reference scans nothing. No existing row changes. Postgres
+does read every row of `oauth_codes` once to check the new columns, and
+holds its ACCESS EXCLUSIVE lock on that table (and a lock on
+`oauth_clients`) until the migration commits, so no code is made or
+exchanged meanwhile. Codes are kept 30 days only, so the table is small
+and this is short. The lock timeout bounds the wait for the locks, not
+how long they are held: behind a long transaction on `oauth_codes` the
+migration fails within 10 s, records nothing, and the server does not
+start; end that transaction and start again. There is no setting. The release before it (at 20) refuses to start on a database
 at 21.
 
 **Before you deploy.** The database is at 20, and no code belongs to a
@@ -1118,7 +1123,11 @@ SELECT count(*) FROM oauth_codes
 ```
 Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
 
-**Rolling back to 20.** The down file never refuses. It deletes the apps'
+**Rolling back to 20.** With the service stopped (step 1), the down file
+does not fail. On a running server it can: a code an app gets after its
+`DELETE` makes the reference's check fail, and the whole file is rolled
+back, leaving the database at 21. A lock not had within the lock timeout
+fails it the same way. It deletes the apps'
 codes not yet exchanged (ten minutes old at most: the app signs in again),
 drops the two columns and puts the reference back. Agents' codes stay;
 apps already signed in keep their tokens, and their grants keep the

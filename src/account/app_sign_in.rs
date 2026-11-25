@@ -78,7 +78,8 @@ const HOUR_S: i64 = 3600;
 pub const DATABASE_SLOTS: usize = 4;
 /// How many verifies (the apps' and the web form's together) may use the
 /// database at once: their own places, so a flood of guesses cannot take
-/// start's. [`DATABASE_SLOTS`] and these stay below the pool's 10.
+/// start's. [`DATABASE_SLOTS`], these and the code exchange's
+/// ([`crate::account::agents::TOKEN_SLOTS`]) stay below the pool's 10.
 pub const VERIFY_SLOTS: usize = 3;
 /// How long a request waits for one of those places before `503 busy`.
 /// While it waits it holds no connection.
@@ -488,7 +489,9 @@ pub(crate) async fn verify_slot(state: &AppState) -> Option<tokio::sync::Semapho
     slot(&state.verify_slots).await
 }
 
-async fn slot(places: &tokio::sync::Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
+/// One of `places`, waited for at most [`SLOT_WAIT`]; `None` when none
+/// came. While it waits it holds no connection.
+pub(crate) async fn slot(places: &tokio::sync::Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
     match tokio::time::timeout(SLOT_WAIT, places.acquire()).await {
         Ok(Ok(permit)) => Some(permit),
         Ok(Err(_)) | Err(_) => {

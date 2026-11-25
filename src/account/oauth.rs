@@ -140,7 +140,7 @@ pub async fn device_poll(
     State(state): State<AppState>,
     Json(request): Json<DevicePoll>,
 ) -> Result<Json<TokenResponse>, OAuthFailure> {
-    redeem_device_code(&state.db, &request.client_id, &request.device_code).await.map(Json)
+    redeem_device_code(&state, &request.client_id, &request.device_code).await.map(Json)
 }
 
 #[derive(sqlx::FromRow)]
@@ -156,9 +156,17 @@ struct DeviceRow {
     install_id: Option<String>,
 }
 
-async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> Result<TokenResponse, OAuthFailure> {
+/// The device-code grant. An app's sign-in that named its install is
+/// mailed as a new device as Sign in with Buwiz's is
+/// ([`crate::account::agents::mail_new_device`]): the same approval in a
+/// browser, so the same risk.
+async fn redeem_device_code(
+    state: &AppState,
+    client_id: &str,
+    device_code: &str,
+) -> Result<TokenResponse, OAuthFailure> {
     known_client(client_id)?;
-    let mut tx = db.begin().await?;
+    let mut tx = state.db.begin().await?;
     // The account before the code row, in the order a ban takes them (it
     // locks the account, then ends the code rows): read who approved it
     // without a lock, lock that account, then the row.
@@ -214,8 +222,27 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
                 return Err(OAuthError::new("access_denied", "this account is banned").into());
             }
             let from = GrantFrom { install_id: row.install_id.as_deref(), platform: None };
-            let tokens = issue_grant_from(&mut tx, account_id, client_id, client_scope(client_id), from).await?;
+            let scope = client_scope(client_id);
+            let (grant_id, tokens) = issue_grant_with_id(&mut tx, account_id, client_id, scope, from).await?;
+            let app = match (scope, row.install_id.as_deref()) {
+                (SCOPE_APP, Some(install_id)) => Some(crate::account::agents::SignedInApp {
+                    account_id,
+                    grant_id,
+                    platform: None,
+                    new_device_to: crate::account::agents::new_device_to(
+                        &mut tx,
+                        account_id,
+                        install_id,
+                        &state.config.admin_emails,
+                    )
+                    .await?,
+                }),
+                _ => None,
+            };
             tx.commit().await?;
+            if let Some(app) = app {
+                crate::account::agents::mail_new_device(state, app);
+            }
             return Ok(tokens);
         }
         _ => {}
@@ -405,7 +432,7 @@ pub async fn token(
             let Some(device_code) = request.device_code else {
                 return Err(OAuthError::new("invalid_request", "device_code is required").into());
             };
-            redeem_device_code(&state.db, &request.client_id, &device_code).await.map(Json)
+            redeem_device_code(&state, &request.client_id, &device_code).await.map(Json)
         }
         "authorization_code" => {
             let (Some(code), Some(redirect_uri), Some(verifier)) =
@@ -415,19 +442,9 @@ pub async fn token(
                     OAuthError::new("invalid_request", "code, redirect_uri and code_verifier are required").into()
                 );
             };
-            let redeemed = crate::account::agents::redeem_code(
-                &state.db,
-                &state.config.admin_emails,
-                &request.client_id,
-                &code,
-                &redirect_uri,
-                &verifier,
-            )
-            .await?;
-            if let Some(app) = redeemed.app {
-                crate::account::agents::mail_new_device(&state, app);
-            }
-            Ok(Json(redeemed.tokens))
+            crate::account::agents::exchange(&state, &request.client_id, &code, &redirect_uri, &verifier)
+                .await
+                .map(Json)
         }
         _ => {
             Err(OAuthError::new("unsupported_grant_type", "use authorization_code, refresh_token or device_code")

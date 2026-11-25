@@ -836,7 +836,10 @@ the same `/oauth/authorize` and `/oauth/token` the agents use
    <email>", **Cancel**, and **Use another account**, which signs the web
    out (`POST /logout` with `next`, same-origin as every form) and comes
    back here after signing in again. It is never approved on its own: a
-   live session still needs the tap.
+   live session still needs the tap. The page says what the app can do
+   with the scope `app`: file and send returns for the account's TINs
+   through Buwiz, see its TINs and the returns it sent with their
+   receipts, and see and remove its devices and sign-ins.
 4. Continue stores a one-time code for ten minutes with scope `app`, the
    install and the platform (`oauth_codes`), and redirects to the app with
    `code`, `state` and `iss`. Cancel redirects with
@@ -889,16 +892,30 @@ why a new device is mailed.
 ### The new-device mail
 
 After the exchange (on its own task, so the token answer never waits for
-it), when the account had no `devices` row for the install at the
-exchange (a device new to this account; decided in the exchange's
-transaction, so an app that registers its device at once is still
-mailed), the account is mailed "New sign-in to
-eBIRForms on <platform>": when it happened (Philippine time), and "If
-this wasn't you, log it out at https://account.buwiz.com/tins" (My
+it), when the account had no live `devices` row for the install at the
+exchange, the account is mailed "New device signed in: eBIRForms on
+<platform>": when it happened (Philippine time), and "If this wasn't
+you, log it out at https://account.buwiz.com/tins#devices-h" (My
 devices). Fixed words only: nothing from the request but the platform's
-word. A known device signing in again, and an account signing in with a
-fixed code (a store reviewer's), are mailed nothing. A mail that fails is
-logged with the account and grant ids, and the sign-in stands.
+word.
+- New means no row, or only a removed one (`revoked_at` set): a device
+  the owner removed that signs in again is mailed again. So is one whose
+  sign-in ended (signed out, say), as ending a sign-in removes its device.
+- It is decided in the exchange's transaction, so an app that registers
+  its device at once is still mailed.
+- A known live device signing in again, and an account signing in with a
+  fixed code (a store reviewer's), are mailed nothing.
+- A mail that fails is logged with the account and grant ids, and the
+  sign-in stands.
+- The device flow sends it the same way, when its sign-in named an
+  install (`/oauth/device/code` with `install_id`): it is approved in a
+  browser too. Its device word is "eBIRForms", as the device flow names
+  no platform. Apps from before install ids are not mailed.
+- In-app sign-in does not send it: the code mailed to the address is
+  already the notice.
+- Its subject is not the replaced-sign-in mail's ("New sign-in to …",
+  [Devices](#devices)), which comes at registration when the install's
+  row already had a live sign-in.
 
 ### The authorize and token API
 
@@ -937,10 +954,19 @@ Answers `200` with the device flow's token answer, scope `app`; refresh
 as for every app (`grant_type=refresh_token`). The code works once,
 within ten minutes, for its client, address and verifier: anything else
 is `400 invalid_grant` (and uses the code up), and a banned account gets
-`400 access_denied`. The exchange waits at most 3 seconds for a
-connection and for each lock (`begin_waiting`, as in-app sign-in does);
-then it is `503 temporarily_unavailable`, the code is not used, and the
-app may try again in a few seconds.
+`400 access_denied`. What a flood of made-up codes can cost is bounded
+as for in-app sign-in:
+1. A code that is not `bwc_` and 43 characters of base64url is `400
+   invalid_grant` before any database work.
+2. **A place of the exchange's own.** At most 2 exchanges use the
+   database at once, so a flood never takes in-app sign-in's places
+   (start's 4, verify's 3, these 2: 9, under the pool's 10). One waits at
+   most 2 seconds for a place, holding no connection.
+3. Its transaction waits at most 3 seconds for a connection and for each
+   lock (`begin_waiting`).
+
+Past 2 or 3 it is `503 temporarily_unavailable`, the code is not used,
+and the app may try again in a few seconds.
 
 ## Devices
 

@@ -445,7 +445,8 @@ Runtime. For a digital PDF, it reads the text layer first.
 
 The desktop app and the mini apps use the OAuth device flow (RFC 8628):
 `/oauth/device/code` and `/oauth/token`. Refresh tokens rotate, and reusing
-an old one ends the whole sign-in.
+an old one ends the whole sign-in. The eBIRForms apps can also sign in by
+email inside the app ([below](#in-app-sign-in)).
 
 The person approves on `/device` by typing the code the app shows. No link
 fills it in: `verification_uri_complete` is the plain `/device` address, and
@@ -459,6 +460,173 @@ The clients and their scopes are in `CLIENTS` in `src/account/oauth.rs`:
 | `buwiz-desktop` | `app` |
 | `buwiz-ebirforms` | `app` |
 | `buwiz-books` | `books` |
+
+## In-app sign-in
+
+The eBIRForms apps can also sign in without a browser: the person types
+their email in the app, gets a code by email, and types it in the app.
+Code: `src/account/app_sign_in.rs`. Each request gets its own code, a row
+of `email_codes` with the purpose `app_sign_in` (`issue_code_as`,
+`try_code_row` in `src/account/accounts.rs`), and that code works only
+with its request: verify checks that one row (its expiry, its five tries,
+its hash). The same six digits typed into another device's request are a
+wrong try on that request's code; a web code typed in the app is wrong
+there, and an app code typed on the web's form is wrong there. The limits
+of [Who can be mailed a code](#who-can-be-mailed-a-code) count both
+together: five codes an hour per address, per network, and the totals
+for addresses without an account. Test accounts with a fixed code get a
+copy of its hash on each request, and nothing is mailed. A banned account
+gets no sign-in. The browser device flow above stays: it is what an app
+falls back to where its in-app check cannot run.
+
+**One wait for everything.** An in-app code works for
+`APP_SIGN_IN_MINUTES` (5 when unset, 1 to 30;
+[deploy.md](deploy.md#migration-17-in-app-sign-in)), and that is also how
+long before a new one: `expires_in` and `resend_after` are the same
+number. The web's codes keep their ten minutes. Within it:
+- a resend of the request is refused (`429 too_many_requests` with
+  `retry_after`, the seconds left on its code). Once the code has expired,
+  a resend mails a new code for the same request and restarts its time,
+  for up to an hour after the start; after that the app starts again;
+- a start for the same address from the same install (`install_id`) while
+  its code still works mails nothing and makes no request: `429
+  code_already_sent`, with `retry_after`. A start from another install is
+  a new request with its own mail, held only by the limits above; both
+  codes then work, each with its own request. A start without
+  `install_id` is never held this way. A test account with a fixed code is
+  never held: its earlier request from that install ends;
+- a start for another address (the app's "Change email") is a new mail,
+  and the old request is left to expire.
+
+**The request belongs to the device that asked.** Before it starts, the
+app makes a secret (32 random bytes, base64url without padding) and sends
+only `secret_hash`, the base64url SHA-256 of that secret string (as PKCE's
+S256). Resending and verifying need the secret itself, compared in
+constant time. So a code read from the mail is useless on any other
+device: whoever typed someone's address into their own app holds that
+app's secret, not the victim's, and the victim's code works only in the
+app that asked.
+
+**Nothing tells whether an address has an account.** Start answers the
+same whether or not it has one, whether a code was mailed or not (the
+new-address limit mails nothing, as on the web), and for a test account
+with a fixed code (nothing is mailed; the fixed code works). There is no
+"unknown email" error; an address without an account gets one when its
+code is verified. `intent` (`sign_in` or `create`) only picks the mail's
+words.
+
+**The mail.** Its own message, not the web's (which is unchanged): the
+subject is "Your Buwiz sign-in code for eBIRForms on iPhone", and the text
+says "Someone asked to sign in to eBIRForms on iPhone with this address.
+If it wasn't you, ignore this mail.", "Never give this code to anyone"
+and how long it works, in words ("five minutes"), so the code stays its
+only number. The device's name comes from fixed words only, from
+`platform`:
+
+| `platform` | Name in the mail |
+|---|---|
+| `ios` | eBIRForms on iPhone |
+| `ipados` | eBIRForms on iPad |
+| `android` | eBIRForms on Android |
+| `macos` | eBIRForms on Mac |
+| `windows` | eBIRForms on Windows |
+| `linux` | eBIRForms on Linux |
+| missing or anything else | eBIRForms |
+
+An unknown `platform` is stored as nothing and is never an error; no text
+from the request goes into a mail.
+
+**The app check and the testing cap.** A request may carry `turnstile`, a
+Cloudflare Turnstile token, checked exactly as the web form's
+(`src/account/guard.rs`). A token that fails is `403 turnstile_failed`.
+While the token is optional, requests without one (start and resend
+alike) are held to a testing cap of 20 an hour and 50 a day across every
+address, counted in the database (`app_sign_in_unchecked`, so the counts
+survive a restart and are shared by every server). Past it: `429
+too_many_requests` with `retry_after`. When a day's count reaches 25,
+Admins and Support are mailed once that (Manila) day, as BIR uptime's
+alerts are (`Mailer::send_notice` to `roles::staff_emails`). A request with
+a good token skips the cap, never the shared limits. Without Turnstile keys
+(local development) the token is ignored and the cap applies.
+
+The cap is for testing only. **A platform's 1.0.0 needs the token
+required**: from then on, a request from that platform without a token
+will be refused with `403 turnstile_required` (the code is reserved, not
+used yet). Where the app's check cannot run, it falls back to the browser
+device flow.
+
+**Records.** `app_sign_ins` holds each request (address, client, the
+secret's hash, intent, platform, install id, its code, expiry, when it
+was used). The hourly upkeep deletes a request 30 days after it
+expired, the cap's counts after two days and its alert days after 30.
+Deleting an account deletes its requests, by address, with its codes.
+
+### The API
+
+On the API host (`api.buwiz.com`), like `/oauth/token` and `/me`. Each
+takes and gives JSON (`Content-Type: application/json`: the web's form
+posts to the same two paths are told apart by it) and answers
+`Cache-Control: no-store`. Every refusal is
+`{"error": "<code>", "message": "<sentence>"}`, with `retry_after`
+(seconds, also as `Retry-After`) or `attempts_left` where they apply.
+
+`POST /auth/email/start`
+
+```json
+{"client_id": "buwiz-ebirforms", "email": "ana@example.ph", "intent": "sign_in",
+ "secret_hash": "<base64url SHA-256 of the secret>", "platform": "ios",
+ "install_id": "<16 to 64 of A-Z a-z 0-9 - _>",
+ "turnstile": "<optional token>", "attestation": "<optional, reserved, not read>"}
+```
+
+`client_id` must be a client with scope `app`; `intent`, `platform` and
+`install_id` are optional. `install_id` is the app's own id for its
+install, an identifier, not a secret. Answers `200` (with the default
+five minutes):
+
+```json
+{"request_id": "<uuid>", "expires_in": 300, "resend_after": 300, "code_length": 6}
+```
+
+`POST /auth/email/resend` with `{"request_id", "secret", "turnstile"?,
+"attestation"?}`: only once the request's code has expired (else `429
+too_many_requests` with `retry_after`), and up to an hour after the start
+(else `invalid_request`). Mails a new code for the request, which ends
+its old one, and restarts its time. The same checks, limits and answer
+as start; the request keeps its intent and platform.
+
+`POST /auth/email/verify` with `{"request_id", "secret", "code"}`. Checked
+in this order: the request exists and is not used, the secret is its
+own, it has not expired, then the code (one try of its five), then a ban.
+On success, in one transaction, the code is used up, the account made if
+it is new, the request spent, and a grant made for the request's client
+with scope `app`. Answers `200` with exactly the device flow's token
+answer:
+
+```json
+{"access_token": "bwa_…", "token_type": "Bearer", "expires_in": 900,
+ "refresh_token": "bwr_…", "scope": "app"}
+```
+
+The tokens refresh on `/oauth/token` and work on `/me` as the device
+flow's do.
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `invalid_request` | The body is not the JSON expected, `secret_hash` is not a SHA-256, or the request is unknown, used, or not this secret's |
+| 400 | `unknown_client` | `client_id` is not a client with scope `app` |
+| 400 | `invalid_email` | Not an email address (as the web form checks it) |
+| 400 | `bad_install_id` | `install_id` is not 16 to 64 of `A-Z a-z 0-9 - _` |
+| 400 | `code_expired` | The request's code has expired: resend |
+| 400 | `invalid_code` | A wrong code; `attempts_left` says how many tries are left |
+| 400 | `too_many_attempts` | The code's five tries are used up: ask for a new one |
+| 403 | `account_banned` | The account is banned (the message is `/me`'s for a banned account) |
+| 403 | `turnstile_failed` | A `turnstile` token that Turnstile refused |
+| 403 | `turnstile_required` | Reserved: not used yet (see the 1.0.0 rule above) |
+| 429 | `code_already_sent` | A start from the same install for an address whose code from it still works; `retry_after` |
+| 429 | `too_many_requests` | A resend before the request's code expired, the testing cap, or the web's limits (per address, per network); `retry_after` |
+| 502 | `mail_failed` | The mail provider failed; the request cannot be used (start again) |
+| 503 | `restarting` | The server is stopping (deploy.md, "What a deploy does at stop"); `Retry-After: 30` |
 
 ## Licence gate
 

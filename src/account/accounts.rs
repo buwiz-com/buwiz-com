@@ -21,7 +21,7 @@ const NEW_ADDRESS_CODES_PER_DAY: i64 = 60;
 /// without an account are done under, so two posts at once cannot both
 /// take the last place.
 const NEW_ADDRESS_LOCK: i64 = 0x6275_7769_7a01;
-const CODE_ATTEMPTS: i32 = 5;
+pub(crate) const CODE_ATTEMPTS: i32 = 5;
 pub const SESSION_TTL: Duration = Duration::days(30);
 /// How long sign-in records are kept: codes from when they were made,
 /// device and agent sign-ins from when they expired ([`upkeep`]).
@@ -35,6 +35,9 @@ pub(crate) enum Purpose {
     SignIn,
     /// Deleting the account ([`crate::account::deletion`]).
     Delete,
+    /// Signing in from an app ([`crate::account::app_sign_in`]): it works
+    /// only with the request it was made for ([`try_code_row`]).
+    AppSignIn,
 }
 
 impl Purpose {
@@ -42,6 +45,7 @@ impl Purpose {
         match self {
             Self::SignIn => "sign_in",
             Self::Delete => "delete",
+            Self::AppSignIn => "app_sign_in",
         }
     }
 }
@@ -120,6 +124,18 @@ impl std::fmt::Debug for IssuedCode {
 /// stored the same way after the same limits, so the ten minutes and the
 /// five wrong guesses hold for both.
 pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Result<IssuedCode, CodeError> {
+    Ok(issue_code_as(db, email, admin_emails, Purpose::SignIn, CODE_TTL).await?.1)
+}
+
+/// [`issue_code`] for `purpose` (a sign-in, from the web or an app), for
+/// `ttl`, with the id of the stored code.
+pub(crate) async fn issue_code_as(
+    db: &PgPool,
+    email: &str,
+    admin_emails: &[String],
+    purpose: Purpose,
+    ttl: Duration,
+) -> Result<(Uuid, IssuedCode), CodeError> {
     let mut tx = db.begin().await?;
     if codes_this_hour(&mut tx, email).await? >= CODES_PER_HOUR {
         return Err(CodeError::TooMany);
@@ -163,9 +179,9 @@ pub async fn issue_code(db: &PgPool, email: &str, admin_emails: &[String]) -> Re
             (code_hash(email, &code), IssuedCode::Mail(code))
         }
     };
-    add_code(&mut tx, email, hash, Purpose::SignIn).await?;
+    let id = add_code(&mut tx, email, hash, purpose, ttl).await?;
     tx.commit().await?;
-    Ok(issued)
+    Ok((id, issued))
 }
 
 /// Stores a code for deleting the account of `email` and returns it, for
@@ -185,9 +201,21 @@ pub(crate) async fn issue_deletion_code(db: &PgPool, email: &str) -> Result<Stri
         return Err(CodeError::TooMany);
     }
     let code = random_code();
-    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete).await?;
+    add_code(&mut tx, email, code_hash(email, &code), Purpose::Delete, CODE_TTL).await?;
     tx.commit().await?;
     Ok(code)
+}
+
+/// Whether the account of `email` signs in with a fixed code
+/// ([`roles::fixed_code_sql`]), so nothing is mailed to it.
+pub(crate) async fn has_fixed_code(db: &PgPool, email: &str, admin_emails: &[String]) -> sqlx::Result<bool> {
+    let fixed: Option<bool> =
+        sqlx::query_scalar(&format!("SELECT {} FROM accounts a WHERE a.email = $1", roles::fixed_code_sql("a", "$2")))
+            .bind(email)
+            .bind(admin_emails)
+            .fetch_optional(db)
+            .await?;
+    Ok(fixed.unwrap_or(false))
 }
 
 fn random_code() -> String {
@@ -207,21 +235,33 @@ async fn add_code(
     email: &str,
     hash: Vec<u8>,
     purpose: Purpose,
-) -> sqlx::Result<()> {
+    ttl: Duration,
+) -> sqlx::Result<Uuid> {
     // Dated when it is added, not when the transaction began: the code
     // added last (after waiting for the lock) must be the newest, because
     // only the newest can be redeemed.
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO email_codes (email, code_hash, expires_at, created_at, purpose)
-         VALUES ($1, $2, $3, clock_timestamp(), $4)",
+         VALUES ($1, $2, $3, clock_timestamp(), $4) RETURNING id",
     )
     .bind(email)
     .bind(hash)
-    .bind(OffsetDateTime::now_utc() + CODE_TTL)
+    .bind(OffsetDateTime::now_utc() + ttl)
     .bind(purpose.as_str())
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// What trying a code came to ([`try_code_row`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tried {
+    /// It was the code, which is now used up.
+    Taken,
+    /// It was wrong, or the code's tries were used up already: the tries
+    /// it has left (0 when none).
+    Wrong { attempts_left: i32 },
+    /// The code is not open (used, expired or gone).
+    NoCode,
 }
 
 /// Uses up the newest open code of `purpose` for `email` if `code` is it.
@@ -234,7 +274,6 @@ pub(crate) async fn take_code(
     purpose: Purpose,
     code: &str,
 ) -> sqlx::Result<bool> {
-    let code: String = code.chars().filter(char::is_ascii_digit).collect();
     let row: Option<(Uuid, Vec<u8>, i32)> = sqlx::query_as(
         "SELECT id, code_hash, attempts FROM email_codes
          WHERE email = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > now()
@@ -244,21 +283,62 @@ pub(crate) async fn take_code(
     .bind(purpose.as_str())
     .fetch_optional(&mut **tx)
     .await?;
+    Ok(try_open(tx, email, row, code).await? == Tried::Taken)
+}
+
+/// Uses up the code `code_id` (an app's, for `email`) if `code` is it and
+/// it is open: only that one code is tried, whatever else is open for the
+/// address. A wrong code counts towards its five tries, as in [`take_code`].
+pub(crate) async fn try_code_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    code_id: Uuid,
+    email: &str,
+    code: &str,
+) -> sqlx::Result<Tried> {
+    let row: Option<(Uuid, Vec<u8>, i32)> = sqlx::query_as(
+        "SELECT id, code_hash, attempts FROM email_codes
+         WHERE id = $1 AND email = $2 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE",
+    )
+    .bind(code_id)
+    .bind(email)
+    .fetch_optional(&mut **tx)
+    .await?;
+    try_open(tx, email, row, code).await
+}
+
+/// Tries `code` on an open code row (id, hash, tries so far).
+async fn try_open(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+    row: Option<(Uuid, Vec<u8>, i32)>,
+    code: &str,
+) -> sqlx::Result<Tried> {
+    let code: String = code.chars().filter(char::is_ascii_digit).collect();
     let Some((code_id, stored, attempts)) = row else {
-        return Ok(false);
+        return Ok(Tried::NoCode);
     };
     if attempts >= CODE_ATTEMPTS {
-        return Ok(false);
+        return Ok(Tried::Wrong { attempts_left: 0 });
     }
     if code.len() != 6 || stored != code_hash(email, &code) {
         sqlx::query("UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1")
             .bind(code_id)
             .execute(&mut **tx)
             .await?;
-        return Ok(false);
+        return Ok(Tried::Wrong { attempts_left: CODE_ATTEMPTS - attempts - 1 });
     }
     sqlx::query("UPDATE email_codes SET consumed_at = now() WHERE id = $1").bind(code_id).execute(&mut **tx).await?;
-    Ok(true)
+    Ok(Tried::Taken)
+}
+
+/// The account of `email`, made now if there is none: what a right
+/// sign-in code leads to.
+pub(crate) async fn account_for(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, email: &str) -> sqlx::Result<Account> {
+    sqlx::query("INSERT INTO accounts (email) VALUES ($1) ON CONFLICT (email) DO NOTHING")
+        .bind(email)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query_as("SELECT id, email FROM accounts WHERE email = $1").bind(email).fetch_one(&mut **tx).await
 }
 
 /// Checks the newest open sign-in code for `email`. A match signs the
@@ -269,12 +349,7 @@ pub async fn redeem_code(db: &PgPool, email: &str, code: &str) -> Result<Account
         tx.commit().await?;
         return Err(CodeError::Invalid);
     }
-    sqlx::query("INSERT INTO accounts (email) VALUES ($1) ON CONFLICT (email) DO NOTHING")
-        .bind(email)
-        .execute(&mut *tx)
-        .await?;
-    let account =
-        sqlx::query_as("SELECT id, email FROM accounts WHERE email = $1").bind(email).fetch_one(&mut *tx).await?;
+    let account = account_for(&mut tx, email).await?;
     tx.commit().await?;
     Ok(account)
 }
@@ -364,19 +439,25 @@ pub(crate) async fn end_sign_ins(
 
 /// The hourly upkeep: deletes sign-in records once nothing needs them.
 /// Codes go 30 days after they were made (the limits per address look back
-/// an hour and a day), and device and agent sign-ins 30 days after they
-/// expired (nothing reads one after that).
+/// an hour and a day), and device, in-app and agent sign-ins 30 days after
+/// they expired (nothing reads one after that). The in-app testing cap's
+/// counts look back a day and go after two; its alert days after 30.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM email_codes WHERE created_at < now() - make_interval(days => $1)")
         .bind(SIGN_IN_RECORDS_DAYS)
         .execute(db)
         .await?;
-    for table in ["device_authorizations", "oauth_codes"] {
+    for table in ["device_authorizations", "oauth_codes", "app_sign_ins"] {
         sqlx::query(&format!("DELETE FROM {table} WHERE expires_at < now() - make_interval(days => $1)"))
             .bind(SIGN_IN_RECORDS_DAYS)
             .execute(db)
             .await?;
     }
+    sqlx::query("DELETE FROM app_sign_in_unchecked WHERE created_at < now() - interval '2 days'").execute(db).await?;
+    sqlx::query("DELETE FROM app_sign_in_alerts WHERE sent_at < now() - make_interval(days => $1)")
+        .bind(SIGN_IN_RECORDS_DAYS)
+        .execute(db)
+        .await?;
     Ok(())
 }
 

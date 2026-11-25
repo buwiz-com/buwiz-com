@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{MethodRouter, any, get, post};
 use axum::{Form, Router};
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::account::accounts::{self, Account, CodeError, IssuedCode};
 use crate::account::admin;
 use crate::account::agents;
+use crate::account::app_sign_in;
 use crate::account::claims::{
     self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Papers, Resend, SubmitError, Upload,
 };
@@ -72,7 +73,7 @@ fn signed_public(state: &AppState, route: MethodRouter<AppState>) -> MethodRoute
 
 /// How long a client is asked to wait when the server is stopping: a
 /// restart takes a few seconds.
-const STOPPING_RETRY_S: u32 = 30;
+pub(crate) const STOPPING_RETRY_S: u32 = 30;
 
 /// A route that starts a send (a ticket, a submission, the relay): while
 /// the server is stopping it answers `503 restarting` with `Retry-After`
@@ -170,8 +171,11 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/oauth/register", post(agents::register))
         .route("/oauth/authorize/decision", post(agents::decide))
         // Account site forms.
-        .route("/auth/email/start", post(email_start))
-        .route("/auth/email/verify", post(email_verify))
+        // The same two paths take the apps' JSON (in-app sign-in,
+        // [`app_sign_in`]); `/auth/email/resend` is the apps' only.
+        .route("/auth/email/start", post(email_start_or_app))
+        .route("/auth/email/verify", post(email_verify_or_app))
+        .route("/auth/email/resend", post(app_resend))
         .route("/logout", post(logout))
         .route("/delete/code", post(deletion_code))
         .route("/delete/confirm", post(delete_account))
@@ -707,6 +711,37 @@ struct EmailStart {
     /// ([`crate::account::guard`]).
     #[serde(rename = "cf-turnstile-response")]
     human: Option<String>,
+}
+
+/// `POST /auth/email/start`: an app's JSON ([`app_sign_in::start`]), or the
+/// web's form.
+async fn email_start_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    if app_sign_in::is_json(request.headers()) {
+        return app_sign_in::start(state, request).await;
+    }
+    let headers = request.headers().clone();
+    match Form::<EmailStart>::from_request(request, &state).await {
+        Ok(form) => email_start(State(state), headers, form).await,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// `POST /auth/email/verify`: an app's JSON ([`app_sign_in::verify`]), or
+/// the web's form.
+async fn email_verify_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    if app_sign_in::is_json(request.headers()) {
+        return app_sign_in::verify(state, request).await;
+    }
+    let headers = request.headers().clone();
+    match Form::<EmailVerify>::from_request(request, &state).await {
+        Ok(form) => email_verify(State(state), headers, form).await,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// `POST /auth/email/resend`: the apps' only.
+async fn app_resend(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    app_sign_in::resend(state, request).await
 }
 
 async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailStart>) -> Response {

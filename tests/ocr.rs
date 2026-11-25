@@ -147,6 +147,7 @@ fn config() -> Config {
         forms_origin: "https://buwiz.com".into(),
         // Nothing listens there: the star count is unknown.
         github_api_url: "http://127.0.0.1:9".into(),
+        app_sign_in_minutes: 5,
     }
 }
 

@@ -891,8 +891,58 @@ deleted at 16 stay deleted. In this order:
    starts instead, it runs migration 16 again, and the rollback starts
    over at 1.
 
-Going further back runs 16's down file first, then 15's and the others as
+Going further back runs 16's down file first (after 17's,
+[below](#migration-17-in-app-sign-in)), then 15's and the others as
 [above](#migration-15-fixed-sign-in-codes); each commits on its own.
+
+## Migration 17 (in-app sign-in)
+
+The release with in-app email sign-in for the eBIRForms apps
+([accounts.md](accounts.md#in-app-sign-in)) runs migration 17 when it
+starts. It adds three tables: `app_sign_ins` (each request), and
+`app_sign_in_unchecked` and `app_sign_in_alerts` (the testing cap's counts
+and the days staff were alerted), and lets `email_codes.purpose` be
+`app_sign_in` (the check scans `email_codes`, which the upkeep keeps
+small). No existing row changes. It needs no setting: the endpoints work
+with the Turnstile keys the web already has, and without them (local
+development) every request counts towards the cap.
+
+One optional setting: `APP_SIGN_IN_MINUTES`, how long an in-app code
+works and so how long before a new one (1 to 30; 5 when unset). Any other
+value stops the server at start-up. The web's codes keep their ten
+minutes.
+
+The cap on requests without an app check (20 an hour, 50 a day, one staff
+alert at 25) is for testing only. A platform's 1.0.0 needs the Turnstile
+token required (`turnstile_required`); do not ship one without it. The
+release before it (at 16) refuses to start on a database at 17.
+
+**Before you deploy.** The database is at 16 (a read-only check):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 16
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 16.** The down file never refuses. It drops the three
+tables and deletes the in-app codes (16 knows no such purpose): sign-ins
+under way are lost (the app asks for a code again), and so are the cap's
+counts. Web codes stay; apps already signed in keep their tokens. In this
+order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0017_app_sign_ins.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 16
+   ```
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 17 again, and the rollback starts
+   over at 1.
+
+Going further back runs 17's down file first, then 16's and the others as
+[above](#migration-16-account-deletion); each commits on its own.
 
 ## OCR of claim documents
 

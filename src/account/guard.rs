@@ -92,6 +92,22 @@ impl SignInGuard {
         self.count(address, OffsetDateTime::now_utc())
     }
 
+    /// The app check of an in-app request for a code
+    /// ([`crate::account::app_sign_in`]): `None` when there is nothing to
+    /// check (Turnstile is off, or the app sent no token), else whether
+    /// Turnstile accepts `token`, asked exactly as for the web's forms.
+    pub async fn app_check(&self, headers: &HeaderMap, token: Option<&str>) -> Option<bool> {
+        let turnstile = self.turnstile.as_ref()?;
+        let token = token.filter(|token| !token.is_empty())?;
+        Some(self.is_human(turnstile, token, client_ip(headers)).await)
+    }
+
+    /// Counts an in-app request for a code against its network's hour, as
+    /// [`Self::check`] counts a form post, without asking Turnstile.
+    pub fn count_network(&self, headers: &HeaderMap) -> Result<Counted, Refused> {
+        self.count(client_ip(headers), OffsetDateTime::now_utc())
+    }
+
     /// Counts a post from `address` at `now` against its network's hour.
     fn count(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<Counted, Refused> {
         // Without `CF-Connecting-IP` (development, or a tunnel that lost

@@ -41,6 +41,10 @@ pub struct Config {
     /// The GitHub API, `https://api.github.com`, read for Buwiz Bot's star
     /// count (see [`crate::sites::github`]).
     pub github_api_url: String,
+    /// `APP_SIGN_IN_MINUTES` (1 to 30, 5 when unset): how long an in-app
+    /// sign-in code works, which is also how long before the app may ask
+    /// for a new one ([`crate::account::app_sign_in`]).
+    pub app_sign_in_minutes: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +129,7 @@ impl Config {
             downloads_url: origin(&var_or("DOWNLOADS_URL", "https://downloads.buwiz.com")).context("DOWNLOADS_URL")?,
             forms_origin: origin(&var_or("FORMS_ORIGIN", "https://ebirforms.buwiz.com")).context("FORMS_ORIGIN")?,
             github_api_url: origin(&var_or("GITHUB_API_URL", "https://api.github.com")).context("GITHUB_API_URL")?,
+            app_sign_in_minutes: app_sign_in_minutes(optional("APP_SIGN_IN_MINUTES").as_deref())?,
         })
     }
 
@@ -180,6 +185,18 @@ pub fn parse_admin_emails(raw: &str) -> (Vec<String>, Vec<String>) {
     };
     let bad = list.iter().filter(|entry| !address(entry)).cloned().collect();
     (list, bad)
+}
+
+/// `APP_SIGN_IN_MINUTES` as read: 5 when unset, else 1 to 30. Only the
+/// apps' codes: the web's last ten minutes whatever this says.
+pub fn app_sign_in_minutes(raw: Option<&str>) -> anyhow::Result<i64> {
+    let Some(raw) = raw else {
+        return Ok(5);
+    };
+    match raw.parse::<i64>() {
+        Ok(minutes) if (1..=30).contains(&minutes) => Ok(minutes),
+        _ => bail!("APP_SIGN_IN_MINUTES must be a whole number of minutes from 1 to 30, not `{raw}`"),
+    }
 }
 
 fn list(name: &str) -> Vec<String> {
@@ -354,6 +371,16 @@ pub fn sender_url(public: bool) -> anyhow::Result<Option<(String, Zeroizing<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_in_app_code_lasts_five_minutes_unless_set_from_one_to_thirty() {
+        assert_eq!(app_sign_in_minutes(None).unwrap(), 5);
+        assert_eq!(app_sign_in_minutes(Some("1")).unwrap(), 1);
+        assert_eq!(app_sign_in_minutes(Some("30")).unwrap(), 30);
+        for bad in ["0", "31", "-5", "ten", "2.5"] {
+            assert!(app_sign_in_minutes(Some(bad)).is_err(), "{bad}");
+        }
+    }
 
     #[cfg(feature = "bir")]
     #[test]

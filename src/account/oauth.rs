@@ -38,6 +38,11 @@ pub fn client_name(client_id: &str) -> Option<&'static str> {
     CLIENTS.iter().find(|(id, ..)| *id == client_id).map(|(_, name, _)| *name)
 }
 
+/// The scope of a client in [`CLIENTS`], or `None` for any other.
+pub fn client_scope_of(client_id: &str) -> Option<&'static str> {
+    CLIENTS.iter().find(|(id, ..)| *id == client_id).map(|(.., scope)| *scope)
+}
+
 fn client_scope(client_id: &str) -> &'static str {
     CLIENTS.iter().find(|(id, ..)| *id == client_id).map_or(SCOPE_MCP, |(.., scope)| *scope)
 }

@@ -1,4 +1,5 @@
-//! Sends sign-in codes, codes for deleting an account, and short
+//! Sends sign-in codes (the web's and the apps'), codes for deleting an
+//! account, and short
 //! plain-text notices to staff (BIR uptime's alerts, [`crate::uptime::alerts`]).
 
 use std::sync::Mutex;
@@ -22,6 +23,10 @@ const CODE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The HTML sign-in code email; `{{code}}` and `{{logo_url}}` are filled in.
 const SIGN_IN_CODE_HTML: &str = include_str!("email/sign_in_code.html");
 
+/// The HTML of the code an app asked for ([`crate::account::app_sign_in`]);
+/// `{{code}}`, `{{logo_url}}` and fixed words are filled in.
+const APP_SIGN_IN_CODE_HTML: &str = include_str!("email/app_sign_in_code.html");
+
 pub struct Mailer {
     config: MailConfig,
     /// Absolute URL of the PNG wordmark in the email header (mail apps do
@@ -36,8 +41,75 @@ pub struct Mailer {
     /// Tests only ([`Mailer::recording`]): codes for deleting an account as
     /// (to, code), kept here, not sent.
     deletion_codes: Option<Mutex<Vec<(String, String)>>>,
+    /// Tests only ([`Mailer::recording`]): codes the apps asked for, as
+    /// mailed, kept here, not sent.
+    app_codes: Option<Mutex<Vec<AppCodeMail>>>,
     /// Tests only: a recording mailer that fails every notice.
     failing: AtomicBool,
+    /// Tests only: a recording mailer that fails every app's code.
+    failing_app_codes: AtomicBool,
+}
+
+/// A sign-in code an app asked for, as mailed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppCodeMail {
+    pub to: String,
+    pub code: String,
+    pub subject: String,
+    pub text: String,
+    pub html: String,
+}
+
+/// What an app's code mail says besides the code. Only fixed words: no
+/// text from the request goes into a mail.
+#[derive(Clone, Copy, Debug)]
+pub struct AppCodeWords {
+    /// What asked, such as "eBIRForms on iPhone".
+    pub device: &'static str,
+    /// The person asked to create an account rather than sign in.
+    pub create: bool,
+    /// How long the code works (`APP_SIGN_IN_MINUTES`).
+    pub minutes: i64,
+}
+
+/// `minutes` in words ("five minutes"), so the code stays the mail's only
+/// number. 1 to 30, as `APP_SIGN_IN_MINUTES` allows.
+fn minutes_in_words(minutes: i64) -> String {
+    const WORDS: [&str; 31] = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+        "twenty-one",
+        "twenty-two",
+        "twenty-three",
+        "twenty-four",
+        "twenty-five",
+        "twenty-six",
+        "twenty-seven",
+        "twenty-eight",
+        "twenty-nine",
+        "thirty",
+    ];
+    let word = usize::try_from(minutes).ok().and_then(|index| WORDS.get(index)).copied().unwrap_or("a few");
+    if minutes == 1 { format!("{word} minute") } else { format!("{word} minutes") }
 }
 
 /// A staff notice as sent.
@@ -61,7 +133,9 @@ impl Mailer {
             outbox: None,
             codes: None,
             deletion_codes: None,
+            app_codes: None,
             failing: AtomicBool::new(false),
+            failing_app_codes: AtomicBool::new(false),
         }
     }
 
@@ -72,6 +146,7 @@ impl Mailer {
             outbox: Some(Mutex::new(Vec::new())),
             codes: Some(Mutex::new(Vec::new())),
             deletion_codes: Some(Mutex::new(Vec::new())),
+            app_codes: Some(Mutex::new(Vec::new())),
             ..Self::new(MailConfig::Log, site_origin)
         }
     }
@@ -90,6 +165,20 @@ impl Mailer {
         self.deletion_codes
             .as_ref()
             .map_or_else(Vec::new, |codes| codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// The codes apps asked for that a [`Mailer::recording`] kept, oldest
+    /// first.
+    pub fn app_sign_in_mails(&self) -> Vec<AppCodeMail> {
+        self.app_codes
+            .as_ref()
+            .map_or_else(Vec::new, |codes| codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// Tests only: a [`Mailer::recording`] fails every app's code while
+    /// `fail`.
+    pub fn fail_app_codes(&self, fail: bool) {
+        self.failing_app_codes.store(fail, Ordering::SeqCst);
     }
 
     /// Tests only: a [`Mailer::recording`] fails every notice while `fail`.
@@ -143,6 +232,52 @@ impl Mailer {
         match &self.config {
             MailConfig::Log => {
                 tracing::info!(to, code, "sign-in code (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .timeout(CODE_TIMEOUT)
+                    .bearer_auth(api_key)
+                    .json(&json!({
+                        "from": from,
+                        "to": [to],
+                        "subject": message.subject,
+                        "text": message.text,
+                        "html": message.html,
+                    }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
+        }
+    }
+
+    /// A sign-in code an app asked for: its own message, which names the
+    /// app and the device ([`AppCodeWords`]). The web's sign-in mail is
+    /// [`Self::send_sign_in_code`].
+    pub async fn send_app_sign_in_code(&self, to: &str, code: &str, words: AppCodeWords) -> anyhow::Result<()> {
+        let message = CodeMessage::app(code, words, &self.logo_url);
+        if let Some(codes) = &self.app_codes {
+            if self.failing_app_codes.load(Ordering::SeqCst) {
+                anyhow::bail!("made-up mail failure");
+            }
+            let mail = AppCodeMail {
+                to: to.into(),
+                code: code.into(),
+                subject: message.subject,
+                text: message.text,
+                html: message.html,
+            };
+            codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(mail);
+            return Ok(());
+        }
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(to, code, device = words.device, "app sign-in code (MAIL_TRANSPORT=log)");
                 Ok(())
             }
             MailConfig::Resend { api_key, from } => {
@@ -237,6 +372,48 @@ impl CodeMessage {
             html: SIGN_IN_CODE_HTML.replace("{{code}}", code).replace("{{logo_url}}", logo_url),
         }
     }
+
+    /// The mail of a code an app asked for. The code is still the only
+    /// number; the subject names the device instead.
+    fn app(code: &str, words: AppCodeWords, logo_url: &str) -> Self {
+        let device = words.device;
+        let minutes = minutes_in_words(words.minutes);
+        let (heading, lead, asked) = if words.create {
+            (
+                "Create your Buwiz account",
+                format!("Enter this verification code in {device} to create your Buwiz account."),
+                format!(
+                    "Someone asked to create a Buwiz account in {device} with this address. \
+                     If it wasn't you, ignore this mail."
+                ),
+            )
+        } else {
+            (
+                "Sign in to eBIRForms",
+                format!("Enter this verification code in {device} to sign in."),
+                format!("Someone asked to sign in to {device} with this address. If it wasn't you, ignore this mail."),
+            )
+        };
+        Self {
+            subject: format!("Your Buwiz sign-in code for {device}"),
+            text: format!(
+                "Your Buwiz verification code is {code}\n\n\
+                 {lead} It expires in {minutes} and works once.\n\n\
+                 Never give this code to anyone. Buwiz will never ask for it by phone, chat or email, \
+                 not even someone who says they are from Buwiz or the BIR.\n\n\
+                 {asked} Nobody can get into your account without this code.\n\n\
+                 Buwiz - https://buwiz.com"
+            ),
+            html: APP_SIGN_IN_CODE_HTML
+                .replace("{{device}}", device)
+                .replace("{{heading}}", heading)
+                .replace("{{lead}}", &lead)
+                .replace("{{asked}}", &asked)
+                .replace("{{minutes}}", &minutes)
+                .replace("{{code}}", code)
+                .replace("{{logo_url}}", logo_url),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +449,30 @@ mod tests {
         for part in [subject.as_str(), text.as_str()] {
             assert!(numbers(part).iter().all(|number| *number == "042917"), "{part}");
         }
+    }
+
+    #[test]
+    fn an_app_code_names_the_device_and_is_still_the_only_number() {
+        for create in [false, true] {
+            let words = AppCodeWords { device: "eBIRForms on iPhone", create, minutes: 5 };
+            let message = CodeMessage::app("042917", words, "https://account.buwiz.com/assets/brand/x.png");
+            assert_eq!(message.subject, "Your Buwiz sign-in code for eBIRForms on iPhone");
+            assert!(message.text.contains("Never give this code to anyone"));
+            assert!(message.text.contains("It expires in five minutes"), "{}", message.text);
+            assert!(message.html.contains("Expires in five minutes"));
+            assert!(!message.html.contains("{{"));
+            for part in [message.text.as_str(), visible(&message.html).as_str()] {
+                assert!(numbers(part).iter().all(|number| *number == "042917"), "{part}");
+                assert!(part.contains("042917"));
+            }
+        }
+    }
+
+    #[test]
+    fn minutes_are_in_words() {
+        assert_eq!(minutes_in_words(1), "one minute");
+        assert_eq!(minutes_in_words(5), "five minutes");
+        assert_eq!(minutes_in_words(30), "thirty minutes");
     }
 
     #[test]

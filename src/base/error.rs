@@ -99,6 +99,12 @@ impl IntoResponse for OAuthError {
 /// OAuth endpoints answer database failures as a plain 500.
 pub enum OAuthFailure {
     OAuth(OAuthError),
+    /// `429 too_many_requests`: the network failed too many tries at a
+    /// token this hour. The seconds until its hour ends go in `Retry-After`
+    /// and in the body's `retry_after`, as the in-app sign-in's 429s do.
+    TooMany {
+        retry_after: i64,
+    },
     Internal(anyhow::Error),
 }
 
@@ -118,6 +124,19 @@ impl IntoResponse for OAuthFailure {
     fn into_response(self) -> Response {
         match self {
             Self::OAuth(error) => error.into_response(),
+            Self::TooMany { retry_after } => {
+                let retry_after = retry_after.max(1);
+                let body = json!({
+                    "error": "too_many_requests",
+                    "error_description": "too many failed tries from this network; try again later",
+                    "retry_after": retry_after,
+                });
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                let headers = response.headers_mut();
+                headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                headers.insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+                response
+            }
             Self::Internal(error) => ApiError::Internal(error).into_response(),
         }
     }

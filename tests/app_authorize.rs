@@ -693,6 +693,39 @@ async fn device_polls_with_made_up_codes_are_limited(db: PgPool) {
     assert_eq!(poll_from(&site, NETWORK_B, pending).await.0, 400);
 }
 
+/// The refusal says when to try again, as the in-app sign-in's 429s do:
+/// `Retry-After` and `retry_after`, the seconds left in the network's
+/// hour.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_failure_limits_429_says_when_to_try_again(db: PgPool) {
+    let site = site_with_token_failures(db, 1);
+    assert_eq!(refresh_from(&site, NETWORK_A, &made_up("bwr_")).await.0, 400);
+    for path in ["/oauth/token", "/auth/device/poll"] {
+        let request = if path == "/oauth/token" {
+            let form = format!("grant_type=refresh_token&client_id={CLIENT}&refresh_token={}", made_up("bwr_"));
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("cf-connecting-ip", NETWORK_A)
+                .body(Body::from(form))
+                .unwrap()
+        } else {
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("cf-connecting-ip", NETWORK_A)
+                .body(Body::from(json!({ "client_id": CLIENT, "device_code": made_up("bwd_") }).to_string()))
+                .unwrap()
+        };
+        let response = site.send(request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+        let header: i64 = response.headers()[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
+        assert!((3500..=3600).contains(&header), "{path}: {header}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let answer: Value = serde_json::from_str(&text(response).await).unwrap();
+        assert_eq!(answer["error"], "too_many_requests", "{path}");
+        assert_eq!(answer["retry_after"].as_i64(), Some(header), "{path}");
+    }
+}
+
 /// A network over its limit is refused before the database: here with the
 /// pool closed.
 #[sqlx::test(migrations = "./migrations")]

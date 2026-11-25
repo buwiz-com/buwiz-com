@@ -423,8 +423,9 @@ pub struct TokenRequest {
 
 /// Runs a try at a token under its network's failures
 /// ([`crate::account::guard::SignInGuard::count_token_try`]): a network
-/// that failed too often this hour is `429 too_many_requests` before
-/// `attempt` runs, so before the database. The try is given back unless it
+/// that failed too often this hour is `429 too_many_requests` (with
+/// `Retry-After`, the seconds left in its hour) before `attempt` runs, so
+/// before the database. The try is given back unless it
 /// failed with `invalid_grant` (an unknown or wrong code or token).
 async fn counted<T>(
     state: &AppState,
@@ -433,13 +434,9 @@ async fn counted<T>(
 ) -> Result<T, OAuthFailure> {
     let tried = state.sign_in_guard.count_token_try(headers);
     crate::account::app_sign_in::alert_if_refused_many(state);
-    let Ok(tried) = tried else {
-        return Err(OAuthError {
-            status: http::StatusCode::TOO_MANY_REQUESTS,
-            error: "too_many_requests",
-            description: "too many failed tries from this network; try again later",
-        }
-        .into());
+    let tried = match tried {
+        Ok(tried) => tried,
+        Err(retry_after) => return Err(OAuthFailure::TooMany { retry_after }),
     };
     let outcome = attempt.await;
     let failed = matches!(&outcome, Err(OAuthFailure::OAuth(error)) if error.error == "invalid_grant");

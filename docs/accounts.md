@@ -975,7 +975,10 @@ as for in-app sign-in:
    a poll told to wait, are given back. A network with 300 failures in the
    hour (`TOKEN_FAILURES_PER_NETWORK`, deploy.md) gets `429
    too_many_requests` before any database work, for every grant, until
-   the hour ends. A working app rarely fails (a refresh token a sign-out
+   the hour ends, with `Retry-After` and `retry_after` (the seconds left
+   in the hour). A try is counted before it runs and given back after, so
+   a burst of more than 300 valid tries in flight at once from one
+   network can briefly see a 429 too. A working app rarely fails (a refresh token a sign-out
    ended, once), so 300 leaves room for hundreds of apps behind one
    carrier's address. Refusals are in the hourly log line and the staff
    alert with the other sign-in limits.

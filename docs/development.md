@@ -91,10 +91,10 @@ where a test turns it on itself (`Site::with_auto`).
 | `cargo test --features bir -- --include-ignored` | Also runs HTTPS through the pipe against example.com |
 | `--features bir` with `BIR_IAF_PASSPHRASE` | `tests/iaf_golden.rs` checks the encryption against official `Encrypt.exe` output |
 | `scripts/ocr-models.sh && cargo test --features ocr` | `tests/ocr.rs`: OCR of a synthetic TIN ID drawn in the test, alone, through a claim, and through automatic activation (a drawn card passes; see [deploy.md](deploy.md#automatic-activation)) |
-| `scripts/v6.sh` | `e2e/`, its own workspace: submission v2 with the real eBIRForms client, from a queued 1701Q to a verified receipt, plus the attacks it must refuse |
+| `scripts/v6.sh` | `e2e/`, its own workspace: submission v2 with the real Buwiz Forms client, from a queued 1701Q to a verified receipt, plus the attacks it must refuse |
 
 About `scripts/v6.sh`:
-- The eBIRForms client comes from [eBIRForms/eBIRForms](https://github.com/eBIRForms/eBIRForms), pinned by rev in `e2e/Cargo.toml`. `EBIRFORMS_PATH=<checkout>` tests a local checkout instead.
+- The client (`bir-submit`, and `bir-core` for the queue worker) comes from [hexuria/buwiz-forms](https://github.com/hexuria/buwiz-forms), pinned by rev in `e2e/Cargo.toml`. `BUWIZ_FORMS_PATH=<checkout>` tests a local checkout instead.
 - It needs Docker and the BIR files.
 
 For the Bot site, see [bot-site.md](bot-site.md).

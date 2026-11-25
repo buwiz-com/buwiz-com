@@ -1102,7 +1102,7 @@ it, and prints the public key to pin. Run it again to renew. The manual steps:
 
 ```sh
 cargo run --release --bin buwiz-trust-sign -- keygen trust.key
-# prints the public key: put it in eBIRForms crates/bir-submit/src/filing/trust.rs TRUST_KEYS
+# prints the public key: put it in buwiz-forms crates/bir-submit/src/trust.rs TRUST_KEYS
 # on the instance (through SSM), as the Sender, with its settings:
 #   sudo systemd-run --quiet --pipe --wait --uid=buwiz-sender -p EnvironmentFile=/etc/buwiz-sender/sender.env \
 #     -p MemorySwapMax=0 -p LimitCORE=0 -E RUST_LOG=off /opt/buwiz/buwiz-sender public > sender-keys.json

@@ -456,10 +456,13 @@ async fn refusal_alert(state: AppState, counts: crate::account::guard::RefusalCo
          Starts and resends (the apps'): {} by their network's limit of {} an hour, {} by the shared budget of \
          {} for new networks once 100,000 are counted.\n\
          Tries at a code (the apps' and the web form's): {} by their network's limit of {} an hour, {} by the \
-         shared budget of {}.\n\n\
+         shared budget of {}.\n\
+         Tries at a token (/oauth/token and /auth/device/poll): {} by their network's limit of {} failures an \
+         hour, {} by the shared budget of {}.\n\n\
          Refusals by a network's limit can be a flood from one network, or many people behind one carrier's or \
          office's network (near a filing deadline). Look at Cloudflare's analytics for the sign-in paths. To \
-         let more through, raise APP_SIGN_IN_STARTS_PER_NETWORK, SIGN_IN_VERIFIES_PER_NETWORK or the budgets \
+         let more through, raise APP_SIGN_IN_STARTS_PER_NETWORK, SIGN_IN_VERIFIES_PER_NETWORK, \
+         TOKEN_FAILURES_PER_NETWORK or the budgets \
          and restart (docs/deploy.md). Refusals by the shared budget mean a flood from many networks.\n\n\
          This is mailed at most once an hour (at {} refusals). The log has one line an hour with the counts.",
         counts.total(),
@@ -471,6 +474,10 @@ async fn refusal_alert(state: AppState, counts: crate::account::guard::RefusalCo
         limits.verifies_per_network,
         counts.verifies_by_budget,
         limits.verifies_past_full,
+        counts.tokens_by_network,
+        limits.token_failures_per_network,
+        counts.tokens_by_budget,
+        limits.token_failures_past_full,
         limits.refusals_alert_at,
     );
     mail_staff(&state, subject, &text).await;

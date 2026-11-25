@@ -267,7 +267,7 @@ async fn a_ban_committed_during_a_request_wins(db: PgPool) {
         "INSERT INTO device_authorizations (client_id, device_code_hash, user_code, interval_seconds, expires_at)
          VALUES ('buwiz-desktop', $1, 'BCDF-GHJK', 5, now() + interval '10 minutes')",
     )
-    .bind(buwiz_cloud::crypto::hash("bwd_test-device-code"))
+    .bind(buwiz_cloud::crypto::hash("bwd_test-device-codetest-device-codetest-device"))
     .execute(&site.db)
     .await
     .unwrap();
@@ -317,14 +317,16 @@ async fn no_token_is_issued_to_a_banned_account(db: PgPool) {
              (client_id, device_code_hash, user_code, interval_seconds, expires_at, account_id, decision)
          VALUES ('buwiz-desktop', $1, 'BCDF-GHJK', 5, now() + interval '10 minutes', $2, 'approved')",
     )
-    .bind(buwiz_cloud::crypto::hash("bwd_test-device-code"))
+    .bind(buwiz_cloud::crypto::hash("bwd_test-device-codetest-device-codetest-device"))
     .bind(ana)
     .execute(&site.db)
     .await
     .unwrap();
     let request = Request::post("/auth/device/poll")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"client_id":"buwiz-desktop","device_code":"bwd_test-device-code"}"#))
+        .body(Body::from(
+            r#"{"client_id":"buwiz-desktop","device_code":"bwd_test-device-codetest-device-codetest-device"}"#,
+        ))
         .unwrap();
     let response = site.send(request).await;
     let status = response.status();
@@ -371,7 +373,7 @@ async fn a_ban_and_a_sign_in_completing_at_once_do_not_deadlock(db: PgPool) {
              (client_id, device_code_hash, user_code, interval_seconds, expires_at, account_id, decision)
          VALUES ('buwiz-desktop', $1, 'BCDF-GHJK', 5, now() + interval '10 minutes', $2, 'approved')",
     )
-    .bind(buwiz_cloud::crypto::hash("bwd_test-device-code"))
+    .bind(buwiz_cloud::crypto::hash("bwd_test-device-codetest-device-codetest-device"))
     .bind(ana)
     .execute(&site.db)
     .await
@@ -412,7 +414,9 @@ async fn a_ban_and_a_sign_in_completing_at_once_do_not_deadlock(db: PgPool) {
     until_waiting(&site.db, 1).await;
     let poll = Request::post("/auth/device/poll")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"client_id":"buwiz-desktop","device_code":"bwd_test-device-code"}"#))
+        .body(Body::from(
+            r#"{"client_id":"buwiz-desktop","device_code":"bwd_test-device-codetest-device-codetest-device"}"#,
+        ))
         .unwrap();
     let device = site.send(poll);
     let agent = buwiz_cloud::account::agents::redeem_code(

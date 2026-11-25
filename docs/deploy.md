@@ -933,7 +933,7 @@ deployment as not public, and that lets a loopback host (`localhost`,
 https `ACCOUNT_ORIGIN`, any other value stops the server at start-up
 (`src/base/config.rs`, `secure_cookies`).
 
-Five optional settings for the sign-in limits per network
+Seven optional settings for the sign-in limits per network
 (`src/account/guard.rs`). Each is a whole number in its range; unset, it
 is today's value; any other value stops the server at start-up. Each is a
 parameter `/buwiz/<NAME>`, which `buwiz-env` writes to the Gatekeeper's
@@ -946,19 +946,24 @@ restart (`sudo systemctl restart buwiz.service`) and no release:
 | `SIGN_IN_VERIFIES_PER_NETWORK` | 300 | 1 to 1,000,000 | Tries at a code an hour, the apps' and the web form's together, per network |
 | `APP_SIGN_IN_STARTS_PAST_FULL` | 20,000 | 0 to 10,000,000 | Once 100,000 networks are counted in an hour: start and resend tries an hour for every new network together |
 | `SIGN_IN_VERIFIES_PAST_FULL` | 30,000 | 0 to 10,000,000 | The same for tries at a code |
-| `SIGN_IN_REFUSALS_ALERT_AT` | 100 | 1 to 10,000,000 | Refusals by the four limits above in an hour at which staff are mailed (at most once an hour) |
+| `TOKEN_FAILURES_PER_NETWORK` | 300 | 1 to 1,000,000 | Failed tries at a token an hour per network: an unknown or wrong code, refresh token or device code on `/oauth/token` and `/auth/device/poll`. Tries that do not fail are not counted. Over it, `429 too_many_requests` before the database |
+| `TOKEN_FAILURES_PAST_FULL` | 30,000 | 0 to 10,000,000 | The same for every new network together once 100,000 are counted |
+| `SIGN_IN_REFUSALS_ALERT_AT` | 100 | 1 to 10,000,000 | Refusals by the six limits above in an hour at which staff are mailed (at most once an hour) |
 
 Every hour with refusals, the log has one line (`tries refused in the
-last hour`) with how many starts and how many tries at a code were refused
-by a network's limit and by the shared budget. Many refusals by a
+last hour`) with how many starts, tries at a code and tries at a token
+were refused by a network's limit and by the shared budget. Many refusals by a
 network's limit near a filing deadline can be a carrier's range being
 squeezed: raise the per-network settings and restart. The line is
 written at the first try after the hour ends.
 
 The rest are constants in the code: 4 places for start's and resend's
 database work and 3 for verify's (`DATABASE_SLOTS`, `VERIFY_SLOTS`,
-`src/account/app_sign_in.rs`), under the pool's 10 connections, each
-waiting at most 3 seconds for a lock and for a connection.
+`src/account/app_sign_in.rs`), and 2 for the code exchange on
+`/oauth/token` (`TOKEN_SLOTS`, `src/account/agents.rs`): 9, under the
+pool's 10 connections, each waiting at most 3 seconds for a lock and for
+a connection. An account gets at most 3 new-device mails a day
+(`NEW_DEVICE_MAILS_PER_DAY`).
 
 The cap on requests without an app check (20 an hour, 50 a day, one staff
 alert at 25) is for testing only. A platform's 1.0.0 needs the Turnstile
@@ -988,7 +993,7 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 21's, 20's, 19's and 18's,
+Going further back runs 17's down file first (after 22's, 21's, 20's, 19's and 18's,
 [below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
@@ -1048,8 +1053,9 @@ devices removed with their sign-in stay removed). In this order:
    starts over at 1.
 
 Going further back runs 20's, 19's and 18's down files first (after
-21's, [below](#migration-21-sign-in-with-buwiz)), then 17's and the others
-as [above](#migration-17-in-app-sign-in); each commits on its own.
+22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
+17's and the others as [above](#migration-17-in-app-sign-in); each
+commits on its own.
 
 ## Migration 20 (an index on devices' sign-ins)
 
@@ -1091,34 +1097,45 @@ nothing is recorded in `_sqlx_migrations`. The next start then fails with
    ```
    (for 19, `devices_account_install`).
 3. `sudo systemctl restart buwiz.service`, then check
-   `SELECT max(version) FROM _sqlx_migrations` is 21 (20 on a release
-   without [migration 21](#migration-21-sign-in-with-buwiz)).
+   `SELECT max(version) FROM _sqlx_migrations` is 22 (20 on a release
+   without [migrations 21 and 22](#migrations-21-and-22-sign-in-with-buwiz)).
 
-## Migration 21 (Sign in with Buwiz)
+## Migrations 21 and 22 (Sign in with Buwiz)
 
 The release with Sign in with Buwiz for the eBIRForms apps
-([accounts.md](accounts.md#sign-in-with-buwiz)) runs migration 21 when it
-starts. It adds `install_id` and `platform` to `oauth_codes`, and drops
-the reference from `oauth_codes.client_id` to `oauth_clients`: the app's
-client is built in and never a row there, and the code checks the client
-instead. It also adds `removed_by` to `devices` (`owner` or `staff`, NULL
-otherwise), so the new-device mail can tell a removed device from one
-that signed out. It runs in a transaction and sets its own `lock_timeout`
-(10 s). The new columns are nullable with no default, so no row is
-rewritten, and dropping the reference scans nothing. No existing row
-changes. Postgres does read every row of `oauth_codes` once to check the
-new columns, and holds its ACCESS EXCLUSIVE lock on that table (and a
-lock on `oauth_clients`) until the migration commits, so no code is made
-or exchanged meanwhile. Codes are kept 30 days only, so the table is
-small and this is short. The same for `devices`: Postgres reads every row
-once to check `removed_by`, under its ACCESS EXCLUSIVE lock, so signed
-requests wait until the migration commits; there is one row per account
-and install, so this is short too. The lock timeout bounds the wait for
-the locks, not how long they are held: behind a long transaction on
-`oauth_codes` or `devices` the migration fails within 10 s, records
-nothing, and the server does not start; end that transaction and start
-again. There is no setting. The release before it (at 20) refuses to
-start on a database at 21.
+([accounts.md](accounts.md#sign-in-with-buwiz)) runs migrations 21 and
+22 when it starts, each in a transaction of its own with its own
+`lock_timeout` (10 s), which bounds the wait for a lock.
+- **21** adds `install_id` and `platform` to `oauth_codes`, and drops the
+  reference from `oauth_codes.client_id` to `oauth_clients`: the app's
+  client is built in and never a row there, and the code checks the
+  client instead. It adds `removed_by` to `devices` (`owner` or `staff`,
+  NULL otherwise), so the new-device mail can tell a removed device from
+  one that signed out, and the table `new_device_mails`, for the limit of
+  3 a day per account. The new columns are nullable with no default and
+  their checks are added `NOT VALID`, so no row is read or rewritten: the
+  ACCESS EXCLUSIVE locks on `oauth_codes` and `devices` are held a moment.
+  That matters for `devices`: every signed request updates its row, and
+  the table only grows (an app without an install id adds a row at each
+  registration, and nothing deletes device rows).
+- **22** validates 21's three checks (`VALIDATE CONSTRAINT`). It reads
+  every row of `oauth_codes` and `devices`, under SHARE UPDATE EXCLUSIVE
+  locks, which let reads and writes go on, signed requests included. In
+  21's own transaction the same VALIDATE would have run under 21's ACCESS
+  EXCLUSIVE locks; that is why it is a migration of its own.
+
+No existing row changes. There is no setting. The release before them (at
+20) refuses to start on a database at 21 or 22.
+
+**When one times out.** 21 waits for any transaction open on
+`oauth_codes` or `devices`, even one that only read them; 22 only for a
+schema change or another VALIDATE on them. Behind one past 10 s it fails,
+records nothing, and the server does not start (the journal says
+`migrations failed` with `canceling statement due to lock timeout`). End
+that transaction (the query in [migration
+20](#migration-20-an-index-on-devices-sign-ins)'s steps) and
+`sudo systemctl restart buwiz.service`; `SELECT max(version) FROM
+_sqlx_migrations` is then 22.
 
 **Before you deploy.** The database is at 20, and no code belongs to a
 client that is not registered (a read-only check):
@@ -1129,32 +1146,37 @@ SELECT count(*) FROM oauth_codes
 ```
 Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
 
-**Rolling back to 20.** With the service stopped (step 1), the down file
-does not fail. On a running server it can: a code an app gets after its
-`DELETE` makes the reference's check fail, and the whole file is rolled
-back, leaving the database at 21. A lock not had within the lock timeout
-fails it the same way. It deletes the apps'
-codes not yet exchanged (ten minutes old at most: the app signs in again),
-drops the two columns and puts the reference back. Agents' codes stay;
-apps already signed in keep their tokens, and their grants keep the
-install and platform. Devices lose `removed_by`: a removed device that
-signs in again later is not mailed. In this order:
+**Rolling back to 20.** Newest first: 22's down file makes 21's checks
+`NOT VALID` again (no row read, each lock a moment), then 21's.
+With the service stopped (step 1), neither fails. On a running server
+21's can: a code an app gets after its `DELETE` makes the reference's
+check fail, and the whole file is rolled back, leaving the database at
+21. A lock not had within the lock timeout fails either the same way.
+21's deletes the apps' codes not yet exchanged (ten minutes old at most:
+the app signs in again), drops the new columns and table, and puts the
+reference back. Agents' codes stay; apps already signed in keep their
+tokens, and their grants keep the install and platform. Devices lose
+`removed_by`: a removed device that signs in again later is not mailed.
+In this order:
 1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
    `systemctl is-active buwiz.service` prints `inactive`.
-2. Run the down file, with a lock timeout set first:
+2. Run the down files, newest first, each with a lock timeout set first:
    ```sh
-   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
-     -c "SET lock_timeout = '10s'" -f migrations/0021_app_authorize.down.sql
+   for down in 0022_app_authorize_validate 0021_app_authorize; do
+     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+       -c "SET lock_timeout = '10s'" -f "migrations/$down.down.sql" || break
+   done
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 20
    ```
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
-   starts instead, it runs migration 21 again, and the rollback starts
-   over at 1.
+   starts instead, it runs migrations 21 and 22 again, and the rollback
+   starts over at 1.
 
-Going further back runs 21's down file first, then 20's, 19's, 18's and
-the others as [above](#migrations-18-and-19-one-row-per-device); each
-commits on its own.
+Going further back runs 22's and 21's down files first, then 20's, 19's,
+18's and the others as
+[above](#migrations-18-and-19-one-row-per-device); each commits on its
+own.
 
 ## Cloudflare rules for sign-in
 

@@ -360,7 +360,9 @@ Apple model code is sold under (`src/filing/apple_models.rs`); an Apple
 code not listed there is the platform's word with the code ("iPhone
 (iPhone18,1)", "iPad (iPad15,3)", "Mac (Mac16,12)"); any other model is as
 sent. `model` is always the raw value. Devices removed more than 30 days ago are left out.
-`POST /api/devices/{id}/revoke` revokes one device; `POST
+`POST /api/devices/{id}/revoke` revokes one device (`{"revoked": true}`;
+one already signed out is marked removed the same way, and one already
+removed is `404`); `POST
 /api/sign-ins/{grant_id}/sign-out` ends one of the account's BIR app
 sign-ins (its device too, if it has one), this app's own included,
 answering `{"signed_out": true}` or `404` for another account's or an

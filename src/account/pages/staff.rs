@@ -2388,8 +2388,10 @@ async fn staff_device(
                 sx_pill(label: "Live", sym: "check", tone: "ok")
             } else if live {
                 sx_pill(label: "Signed out (expired)", sym: "clock", tone: "")
-            } else {
+            } else if device.removed_by.is_some() {
                 sx_pill(label: format!("Removed {}", device.revoked_at.map(short_date).unwrap_or_default()), sym: "trash", tone: "")
+            } else {
+                sx_pill(label: format!("Signed out {}", device.revoked_at.map(short_date).unwrap_or_default()), sym: "clock", tone: "")
             }
             if live && may_sign_out {
                 reason_act(

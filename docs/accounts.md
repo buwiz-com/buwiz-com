@@ -903,13 +903,21 @@ word.
   `revoked_at`): a removed device that signs in again is mailed again.
   A row that ended with its sign-in (signed out, replaced, or any grant
   ended by 0018's trigger) has no `removed_by`: the same device signing
-  in again is not mailed. Registering again clears `removed_by`.
+  in again is not mailed. Registering again clears `removed_by`. My
+  devices (and the staff page) says "Signed out" for such a row and
+  "Removed" for a removed one; the owner may still remove a signed-out
+  row, which marks it `owner`.
 - It is decided in the exchange's transaction, so an app that registers
   its device at once is still mailed.
 - A known device signing in again, and an account signing in with a
   fixed code (a store reviewer's), are mailed nothing.
 - A mail that fails is logged with the account and grant ids, and the
   sign-in stands.
+- At most 3 a day per account (`new_device_mails`, counted in the
+  exchange's transaction). A person adds a phone, a computer, maybe
+  reinstalls one; more in a day is a script with the web session, whose
+  mails would bury a real alert. Past it the sign-in stands, nothing is
+  mailed, and one log line has the account and grant ids.
 - The device flow sends it the same way, when its sign-in named an
   install (`/oauth/device/code` with `install_id`): it is approved in a
   browser too. Its device word is "eBIRForms", as the device flow names
@@ -959,16 +967,29 @@ within ten minutes, for its client, address and verifier: anything else
 is `400 invalid_grant` (and uses the code up), and a banned account gets
 `400 access_denied`. What a flood of made-up codes can cost is bounded
 as for in-app sign-in:
-1. A code that is not `bwc_` and 43 characters of base64url is `400
-   invalid_grant` before any database work.
-2. **A place of the exchange's own.** At most 2 exchanges use the
+1. **The network's failures.** Every grant on `/oauth/token`
+   (`authorization_code`, `refresh_token`, the device code) and
+   `/auth/device/poll` counts against its network's hour (IPv4 /24, IPv6
+   /48, from `CF-Connecting-IP`), and only tries that fail with
+   `invalid_grant` stay counted: a refresh or an exchange that works, and
+   a poll told to wait, are given back. A network with 300 failures in the
+   hour (`TOKEN_FAILURES_PER_NETWORK`, deploy.md) gets `429
+   too_many_requests` before any database work, for every grant, until
+   the hour ends. A working app rarely fails (a refresh token a sign-out
+   ended, once), so 300 leaves room for hundreds of apps behind one
+   carrier's address. Refusals are in the hourly log line and the staff
+   alert with the other sign-in limits.
+2. A code, refresh token or device code that is not its prefix (`bwc_`,
+   `bwr_`, `bwd_`) and 43 characters of base64url was never given out:
+   `400 invalid_grant` before any database work.
+3. **A place of the exchange's own.** At most 2 exchanges use the
    database at once, so a flood never takes in-app sign-in's places
    (start's 4, verify's 3, these 2: 9, under the pool's 10). One waits at
    most 2 seconds for a place, holding no connection.
-3. Its transaction waits at most 3 seconds for a connection and for each
+4. Its transaction waits at most 3 seconds for a connection and for each
    lock (`begin_waiting`).
 
-Past 2 or 3 it is `503 temporarily_unavailable`, the code is not used,
+Past 3 or 4 it is `503 temporarily_unavailable`, the code is not used,
 and the app may try again in a few seconds.
 
 ## Devices

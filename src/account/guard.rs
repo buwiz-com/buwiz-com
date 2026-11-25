@@ -72,6 +72,21 @@ pub const APP_ATTEMPTS_PAST_FULL: u32 = 20_000;
 /// hour).
 pub const VERIFY_TRIES_PAST_FULL: u32 = 30_000;
 
+/// Failed tries at a token one network may make in an hour: an unknown or
+/// wrong code, refresh token or device code on `/oauth/token` and
+/// `/auth/device/poll`. Only failures count (a try that did not fail is
+/// given back), and a network over the limit is refused before the
+/// database. A working app fails rarely: a refresh token that a sign-out
+/// ended, once, or a device code it polls after its sign-in was used. So
+/// 300 is room for hundreds of apps behind one carrier's or office's
+/// address failing in the same hour, and still holds a script to 300
+/// lookups an hour, under one every ten seconds.
+pub const TOKEN_FAILURES_PER_NETWORK: u32 = 300;
+
+/// The same for networks new in an hour once the map is full, as
+/// [`VERIFY_TRIES_PAST_FULL`].
+pub const TOKEN_FAILURES_PAST_FULL: u32 = 30_000;
+
 /// Refusals by those limits in an hour (start/resend's and verify's, by a
 /// network's own limit or by the shared budget) at which staff are mailed:
 /// [`SignInGuard::take_refusal_alert`]. Any refusal already means one
@@ -95,6 +110,10 @@ pub struct SignInLimits {
     pub verifies_past_full: u32,
     /// [`REFUSALS_ALERT_AT`].
     pub refusals_alert_at: u32,
+    /// [`TOKEN_FAILURES_PER_NETWORK`].
+    pub token_failures_per_network: u32,
+    /// [`TOKEN_FAILURES_PAST_FULL`].
+    pub token_failures_past_full: u32,
 }
 
 impl Default for SignInLimits {
@@ -105,6 +124,8 @@ impl Default for SignInLimits {
             starts_past_full: APP_ATTEMPTS_PAST_FULL,
             verifies_past_full: VERIFY_TRIES_PAST_FULL,
             refusals_alert_at: REFUSALS_ALERT_AT,
+            token_failures_per_network: TOKEN_FAILURES_PER_NETWORK,
+            token_failures_past_full: TOKEN_FAILURES_PAST_FULL,
         }
     }
 }
@@ -120,11 +141,20 @@ pub struct RefusalCounts {
     pub verifies_by_network: u64,
     /// Tries at a code of new networks refused by the shared budget.
     pub verifies_by_budget: u64,
+    /// Tries at a token refused by their network's own failures.
+    pub tokens_by_network: u64,
+    /// Tries at a token of new networks refused by the shared budget.
+    pub tokens_by_budget: u64,
 }
 
 impl RefusalCounts {
     pub fn total(&self) -> u64 {
-        self.starts_by_network + self.starts_by_budget + self.verifies_by_network + self.verifies_by_budget
+        self.starts_by_network
+            + self.starts_by_budget
+            + self.verifies_by_network
+            + self.verifies_by_budget
+            + self.tokens_by_network
+            + self.tokens_by_budget
     }
 }
 
@@ -133,6 +163,7 @@ impl RefusalCounts {
 enum Tries {
     Starts,
     Verifies,
+    Tokens,
 }
 
 /// The current hour's refusals.
@@ -169,6 +200,8 @@ pub struct SignInGuard {
     app_attempts: RateLimiter<Network>,
     /// Tries at a code per network, the apps' and the web form's.
     verify_tries: RateLimiter<Network>,
+    /// Failed tries at a token per network ([`TOKEN_FAILURES_PER_NETWORK`]).
+    token_failures: RateLimiter<Network>,
     /// Turnstile's answers without a hostname or action, for the staff alert.
     unbound: HourlyAlert,
     /// An in-app request that could be neither taken back nor ended after
@@ -255,6 +288,13 @@ pub struct Counted {
     at: OffsetDateTime,
 }
 
+/// A try at a token as [`SignInGuard::count_token_try`] counted it.
+#[derive(Debug)]
+pub struct TokenTry {
+    network: Option<(Network, Bucket)>,
+    at: OffsetDateTime,
+}
+
 /// The action the sign-in forms' widget sets (`data-action`).
 pub const WEB_ACTION: &str = "sign-in";
 /// The action of the app-check page's widget.
@@ -298,6 +338,11 @@ impl SignInGuard {
                 limits.verifies_per_network,
                 NETWORK_WINDOW,
                 limits.verifies_past_full,
+            ),
+            token_failures: RateLimiter::with_overflow_budget(
+                limits.token_failures_per_network,
+                NETWORK_WINDOW,
+                limits.token_failures_past_full,
             ),
             unbound: HourlyAlert::default(),
             stuck: HourlyAlert::default(),
@@ -373,6 +418,7 @@ impl SignInGuard {
         let limiter = match tries {
             Tries::Starts => &self.app_attempts,
             Tries::Verifies => &self.verify_tries,
+            Tries::Tokens => &self.token_failures,
         };
         let verdict = limiter.hit_or_refused(Network::of(address), now);
         self.note(tries, verdict.as_ref().err().map(|(bucket, _)| *bucket), now);
@@ -402,6 +448,8 @@ impl SignInGuard {
                 (Tries::Starts, Some(Bucket::Overflow)) => counts.starts_by_budget += 1,
                 (Tries::Verifies, Some(Bucket::Key)) => counts.verifies_by_network += 1,
                 (Tries::Verifies, Some(Bucket::Overflow)) => counts.verifies_by_budget += 1,
+                (Tries::Tokens, Some(Bucket::Key)) => counts.tokens_by_network += 1,
+                (Tries::Tokens, Some(Bucket::Overflow)) => counts.tokens_by_budget += 1,
             }
             (ended, counts.total())
         };
@@ -411,6 +459,8 @@ impl SignInGuard {
                 starts_by_budget = counts.starts_by_budget,
                 verifies_by_network = counts.verifies_by_network,
                 verifies_by_budget = counts.verifies_by_budget,
+                tokens_by_network = counts.tokens_by_network,
+                tokens_by_budget = counts.tokens_by_budget,
                 "sign-in: tries refused in the last hour by the per-network limits and the shared budgets"
             );
         }
@@ -461,6 +511,39 @@ impl SignInGuard {
             None => None,
         };
         Ok(Counted { network, at: now })
+    }
+
+    /// Counts a try at a token (`/oauth/token`, `/auth/device/poll`)
+    /// against its network's failures this hour, before the database:
+    /// `Err` with the seconds to wait when the network failed
+    /// [`TOKEN_FAILURES_PER_NETWORK`] times. A try that did not fail is
+    /// given back ([`Self::forgive_token_try`]), so only failures stay
+    /// counted. Without `CF-Connecting-IP` there is no network to count.
+    pub fn count_token_try(&self, headers: &HeaderMap) -> Result<TokenTry, i64> {
+        self.count_token_try_at(client_ip(headers), OffsetDateTime::now_utc())
+    }
+
+    fn count_token_try_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<TokenTry, i64> {
+        let Some(address) = address else {
+            return Ok(TokenTry { network: None, at: now });
+        };
+        let network = Network::of(address);
+        let verdict = self.token_failures.hit_or_refused(network.clone(), now);
+        self.note(Tries::Tokens, verdict.as_ref().err().map(|(bucket, _)| *bucket), now);
+        match verdict {
+            Ok(bucket) => Ok(TokenTry { network: Some((network, bucket)), at: now }),
+            Err((_, wait)) => {
+                let seconds = wait.whole_seconds();
+                Err(if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds })
+            }
+        }
+    }
+
+    /// Gives back a try at a token that did not fail.
+    pub fn forgive_token_try(&self, tried: &TokenTry) {
+        if let Some((network, bucket)) = &tried.network {
+            self.token_failures.release(network, tried.at, *bucket);
+        }
     }
 
     /// Gives a network back a post [`Self::check`] counted, when no code
@@ -735,8 +818,13 @@ mod tests {
         assert!(guard.count_verify_try_at(known, now).is_err());
         assert_eq!(guard.app_attempts.len(), max);
         // Each refusal is counted by the limit that made it.
-        let counts =
-            RefusalCounts { starts_by_network: 1, starts_by_budget: 2, verifies_by_network: 1, verifies_by_budget: 2 };
+        let counts = RefusalCounts {
+            starts_by_network: 1,
+            starts_by_budget: 2,
+            verifies_by_network: 1,
+            verifies_by_budget: 2,
+            ..RefusalCounts::default()
+        };
         assert_eq!(guard.refusals_this_hour(), counts);
         // The next hour starts again: the newcomer is counted as a network.
         let next = now + NETWORK_WINDOW;

@@ -15,6 +15,18 @@ pub fn new_token(prefix: &str) -> String {
     format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// Whether `value` has the shape [`new_token`] gives with `prefix`: the
+/// prefix and 43 characters of base64url. A token of any other shape was
+/// never given out, so it is refused before the database.
+pub fn is_token(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|rest| is_base64url(rest, 43))
+}
+
+/// Whether `value` is exactly `len` characters of base64url without padding.
+pub fn is_base64url(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 pub fn hash(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
 }

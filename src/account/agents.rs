@@ -47,6 +47,14 @@ const CODE_PREFIX: &str = "bwc_";
 /// so the rest of the site always has one. An exchange is one short
 /// transaction, so 2 places take far more sign-ins than people make.
 pub const TOKEN_SLOTS: usize = 2;
+/// New-device mails an account gets in a day. A person adds a phone, a
+/// computer, maybe reinstalls one: three new devices in a day is already
+/// rare, and a fourth mail would tell them nothing the first three did
+/// not. More is a script, and its mails would bury a real alert.
+pub const NEW_DEVICE_MAILS_PER_DAY: i64 = 3;
+/// The first key of the advisory lock the day's new-device mails are
+/// counted under; the second is the account's.
+const NEW_DEVICE_MAIL_LOCK: i32 = 0x6277_6e64;
 const MAX_REDIRECT_URIS: usize = 5;
 /// The shortest `state` an app may send: it must be the app's own random
 /// value, not a constant.
@@ -310,7 +318,7 @@ pub async fn check_authorize(
     let Some(code_challenge) = param("code_challenge") else {
         return Err(refuse("invalid_request", "PKCE is required: send code_challenge"));
     };
-    if param("code_challenge_method") != Some("S256") || code_challenge.len() != 43 {
+    if param("code_challenge_method") != Some("S256") || !crypto::is_base64url(code_challenge, 43) {
         return Err(refuse("invalid_request", "use code_challenge_method=S256"));
     }
     if let Some(scope) = param("scope")
@@ -366,7 +374,7 @@ fn check_app_authorize(
     let Some(code_challenge) = param("code_challenge") else {
         return Err(refuse("invalid_request", "PKCE is required: send code_challenge"));
     };
-    if param("code_challenge_method") != Some("S256") || !is_base64url(code_challenge, 43) {
+    if param("code_challenge_method") != Some("S256") || !crypto::is_base64url(code_challenge, 43) {
         return Err(refuse("invalid_request", "use code_challenge_method=S256"));
     }
     if state.as_ref().is_none_or(|state| state.chars().count() < MIN_APP_STATE) {
@@ -515,6 +523,15 @@ async fn decide_inner(state: &AppState, headers: &HeaderMap, form: &HashMap<Stri
             tracing::info!(client_id = %request.client_id, account = %account.id, "{what}");
             Redirect::to(&location).into_response()
         }
+        // A lock or a connection not had within three seconds: busy, and
+        // nothing was written.
+        Err(error) if app_sign_in::is_lock_timeout(&error) => {
+            tracing::warn!("consent: a lock or a connection was not had in time; answered busy");
+            let mut response =
+                (StatusCode::SERVICE_UNAVAILABLE, "Buwiz is busy. Go back and try again in a moment.").into_response();
+            response.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("5"));
+            response
+        }
         Err(error) => {
             tracing::error!(error = ?error, "consent failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -522,15 +539,10 @@ async fn decide_inner(state: &AppState, headers: &HeaderMap, form: &HashMap<Stri
     }
 }
 
-/// Whether `value` is exactly `len` characters of base64url without padding.
-fn is_base64url(value: &str, len: usize) -> bool {
-    value.len() == len && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
 /// Whether `code` has the shape [`approve`] gives a code: `bwc_` and 43
 /// characters of base64url. Anything else is refused before the database.
 pub fn is_code(code: &str) -> bool {
-    code.strip_prefix(CODE_PREFIX).is_some_and(|rest| is_base64url(rest, 43))
+    crypto::is_token(code, CODE_PREFIX)
 }
 
 fn token_busy() -> OAuthFailure {
@@ -695,7 +707,7 @@ async fn redeem_code_inner(
             account_id,
             grant_id,
             platform: platform.as_deref().and_then(Platform::from_stored),
-            new_device_to: new_device_to(&mut tx, account_id, install_id, admin_emails).await?,
+            new_device_to: new_device_to(&mut tx, account_id, grant_id, install_id, admin_emails).await?,
         }),
         _ => None,
     };
@@ -710,13 +722,20 @@ async fn redeem_code_inner(
 /// reviewer's). A row that ended with its sign-in (signed out, say) is the
 /// same device: no mail. Decided here, not on the mail's task, so an app that
 /// registers its device at once still has its new device mailed.
+///
+/// At most [`NEW_DEVICE_MAILS_PER_DAY`] an account in a day
+/// (`new_device_mails`, counted under a lock of the account's own, as the
+/// in-app code mails are counted in the database). Past that, no mail and
+/// one log line with ids only: someone with the account's web session
+/// could otherwise sign in from made-up installs and bury a real alert.
 pub(crate) async fn new_device_to(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
+    grant_id: Uuid,
     install_id: &str,
     admin_emails: &[String],
 ) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar(&format!(
+    let to: Option<String> = sqlx::query_scalar(&format!(
         "SELECT a.email FROM accounts a
          WHERE a.id = $1 AND NOT {}
            AND NOT EXISTS (SELECT 1 FROM devices d
@@ -728,7 +747,27 @@ pub(crate) async fn new_device_to(
     .bind(install_id)
     .bind(admin_emails)
     .fetch_optional(&mut **tx)
-    .await
+    .await?;
+    let Some(to) = to else {
+        return Ok(None);
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(NEW_DEVICE_MAIL_LOCK)
+        .bind(account_id)
+        .execute(&mut **tx)
+        .await?;
+    let sent: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM new_device_mails WHERE account_id = $1 AND sent_at > now() - interval '1 day'",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if sent >= NEW_DEVICE_MAILS_PER_DAY {
+        tracing::warn!(account = %account_id, grant = %grant_id, "new-device mail: the day's limit is reached; not mailed");
+        return Ok(None);
+    }
+    sqlx::query("INSERT INTO new_device_mails (account_id) VALUES ($1)").bind(account_id).execute(&mut **tx).await?;
+    Ok(Some(to))
 }
 
 /// Mails "New sign-in to eBIRForms on …", with when, and where to log it

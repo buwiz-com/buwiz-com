@@ -135,12 +135,14 @@ pub struct DevicePoll {
     device_code: String,
 }
 
-/// `POST /auth/device/poll`: the JSON form of the device-code grant.
+/// `POST /auth/device/poll`: the JSON form of the device-code grant,
+/// counted as `/oauth/token` is ([`counted`]).
 pub async fn device_poll(
     State(state): State<AppState>,
+    headers: http::HeaderMap,
     Json(request): Json<DevicePoll>,
 ) -> Result<Json<TokenResponse>, OAuthFailure> {
-    redeem_device_code(&state, &request.client_id, &request.device_code).await.map(Json)
+    counted(&state, &headers, redeem_device_code(&state, &request.client_id, &request.device_code)).await.map(Json)
 }
 
 #[derive(sqlx::FromRow)]
@@ -166,6 +168,10 @@ async fn redeem_device_code(
     device_code: &str,
 ) -> Result<TokenResponse, OAuthFailure> {
     known_client(client_id)?;
+    // A device code of another shape was never given out.
+    if !crypto::is_token(device_code, "bwd_") {
+        return Err(OAuthError::new("invalid_grant", "unknown device code").into());
+    }
     let mut tx = state.db.begin().await?;
     // The account before the code row, in the order a ban takes them (it
     // locks the account, then ends the code rows): read who approved it
@@ -232,6 +238,7 @@ async fn redeem_device_code(
                     new_device_to: crate::account::agents::new_device_to(
                         &mut tx,
                         account_id,
+                        grant_id,
                         install_id,
                         &state.config.admin_emails,
                     )
@@ -414,13 +421,46 @@ pub struct TokenRequest {
     code_verifier: Option<String>,
 }
 
+/// Runs a try at a token under its network's failures
+/// ([`crate::account::guard::SignInGuard::count_token_try`]): a network
+/// that failed too often this hour is `429 too_many_requests` before
+/// `attempt` runs, so before the database. The try is given back unless it
+/// failed with `invalid_grant` (an unknown or wrong code or token).
+async fn counted<T>(
+    state: &AppState,
+    headers: &http::HeaderMap,
+    attempt: impl Future<Output = Result<T, OAuthFailure>>,
+) -> Result<T, OAuthFailure> {
+    let tried = state.sign_in_guard.count_token_try(headers);
+    crate::account::app_sign_in::alert_if_refused_many(state);
+    let Ok(tried) = tried else {
+        return Err(OAuthError {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            error: "too_many_requests",
+            description: "too many failed tries from this network; try again later",
+        }
+        .into());
+    };
+    let outcome = attempt.await;
+    let failed = matches!(&outcome, Err(OAuthFailure::OAuth(error)) if error.error == "invalid_grant");
+    if !failed {
+        state.sign_in_guard.forgive_token_try(&tried);
+    }
+    outcome
+}
+
 /// `POST /oauth/token` (form-encoded): `refresh_token`, the RFC 8628
 /// `device_code` grant, and `authorization_code` with PKCE for agents and
-/// the eBIRForms apps.
+/// the eBIRForms apps. Every grant is counted by [`counted`].
 pub async fn token(
     State(state): State<AppState>,
+    headers: http::HeaderMap,
     Form(request): Form<TokenRequest>,
 ) -> Result<Json<TokenResponse>, OAuthFailure> {
+    counted(&state, &headers, token_grant(&state, request)).await
+}
+
+async fn token_grant(state: &AppState, request: TokenRequest) -> Result<Json<TokenResponse>, OAuthFailure> {
     match request.grant_type.as_str() {
         "refresh_token" => {
             let Some(refresh_token) = request.refresh_token else {
@@ -432,7 +472,7 @@ pub async fn token(
             let Some(device_code) = request.device_code else {
                 return Err(OAuthError::new("invalid_request", "device_code is required").into());
             };
-            redeem_device_code(&state, &request.client_id, &device_code).await.map(Json)
+            redeem_device_code(state, &request.client_id, &device_code).await.map(Json)
         }
         "authorization_code" => {
             let (Some(code), Some(redirect_uri), Some(verifier)) =
@@ -442,9 +482,7 @@ pub async fn token(
                     OAuthError::new("invalid_request", "code, redirect_uri and code_verifier are required").into()
                 );
             };
-            crate::account::agents::exchange(&state, &request.client_id, &code, &redirect_uri, &verifier)
-                .await
-                .map(Json)
+            crate::account::agents::exchange(state, &request.client_id, &code, &redirect_uri, &verifier).await.map(Json)
         }
         _ => {
             Err(OAuthError::new("unsupported_grant_type", "use authorization_code, refresh_token or device_code")
@@ -454,6 +492,10 @@ pub async fn token(
 }
 
 async fn refresh(db: &PgPool, client_id: &str, refresh_token: &str) -> Result<TokenResponse, OAuthFailure> {
+    // A refresh token of another shape was never given out.
+    if !crypto::is_token(refresh_token, "bwr_") {
+        return Err(OAuthError::new("invalid_grant", "sign in again").into());
+    }
     let mut tx = db.begin().await?;
     #[derive(sqlx::FromRow)]
     struct Stored {

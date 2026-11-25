@@ -458,6 +458,10 @@ pub struct DeviceView {
     pub last_used_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
+    /// Who removed it (`owner`, `staff`); `None` for a device that is live
+    /// or ended with its sign-in (signed out).
+    #[serde(skip)]
+    pub removed_by: Option<String>,
     /// `live` (its sign-in has a refresh token that works), `expired` (its
     /// sign-in's tokens all ran out: signed out, though nobody removed
     /// it) or `removed`.
@@ -472,7 +476,7 @@ const REMOVED_SHOWN_DAYS: i32 = 30;
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<DeviceView>> {
     let mut devices: Vec<DeviceView> = sqlx::query_as(&format!(
         "SELECT d.id, d.name, g.client_id, d.grant_id, d.platform, d.model, d.os_version, d.computer_name,
-                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at,
+                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at, d.removed_by,
                 CASE WHEN d.revoked_at IS NOT NULL THEN 'removed'
                      WHEN g.revoked_at IS NULL AND {HAS_REFRESH} THEN 'live'
                      ELSE 'expired' END AS state
@@ -520,8 +524,9 @@ pub async fn pending_for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<
 
 /// Revokes the device and ends the sign-in it was registered under: the
 /// owner removed it (`removed_by = 'owner'`), so if it signs in again it is
-/// mailed as a new device.
-/// `false` when it is not this account's or was already revoked.
+/// mailed as a new device. A device already signed out is marked removed
+/// by the owner the same way. `false` when it is not this account's or was
+/// already removed.
 pub async fn revoke(db: &PgPool, account_id: Uuid, device_id: Uuid) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
     let grant: Option<Uuid> = sqlx::query_scalar(
@@ -534,7 +539,16 @@ pub async fn revoke(db: &PgPool, account_id: Uuid, device_id: Uuid) -> sqlx::Res
     .fetch_optional(&mut *tx)
     .await?;
     let Some(grant) = grant else {
-        return Ok(false);
+        let marked = sqlx::query(
+            "UPDATE devices SET removed_by = 'owner'
+             WHERE id = $1 AND account_id = $2 AND revoked_at IS NOT NULL AND removed_by IS NULL",
+        )
+        .bind(device_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(marked.rows_affected() == 1);
     };
     sqlx::query(
         "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'device_revoked' WHERE id = $1 AND revoked_at IS NULL",

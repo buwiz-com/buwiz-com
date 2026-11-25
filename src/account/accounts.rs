@@ -440,10 +440,14 @@ pub(crate) async fn account_for(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, 
     sqlx::query_as("SELECT id, email FROM accounts WHERE email = $1").bind(email).fetch_one(&mut **tx).await
 }
 
-/// Checks the newest open sign-in code for `email`. A match signs the
-/// person in, creating the account the first time.
-pub async fn redeem_code(db: &PgPool, email: &str, code: &str) -> Result<Account, CodeError> {
-    let mut tx = db.begin().await?;
+/// Checks the newest open sign-in code for `email`, in `tx` (the caller
+/// sets its lock timeout). A match signs the person in, creating the
+/// account the first time.
+pub async fn redeem_code(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+    code: &str,
+) -> Result<Account, CodeError> {
     if !take_code(&mut tx, email, Purpose::SignIn, code).await? {
         tx.commit().await?;
         return Err(CodeError::Invalid);

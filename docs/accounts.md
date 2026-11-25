@@ -590,12 +590,14 @@ token counts against the web's caps, as the form does.
 **What a flood can cost.** Start and resend do the cheap refusals first,
 none of which uses the database, in this order:
 1. **The network's tries.** Per network (an IPv4 /24 or IPv6 /48, from
-   `CF-Connecting-IP`), 20 tries an hour at start and resend together,
+   `CF-Connecting-IP`), 40 tries an hour at start and resend together,
    counted for every request whatever comes of it (refused, bad
-   Turnstile token, bad body, mailed) and never given back. Past it: `429
-   too_many_requests` with `retry_after`. It is a limiter of its own, in
-   memory, apart from the web form's (which the apps never touch), so
-   filling it cannot hold back the web. Past it no Turnstile call is made.
+   Turnstile token, bad body, `503 busy`, mailed) and never given back:
+   giving back a `busy` would let a flood go on trying for nothing just
+   when the database is saturated. Past it: `429 too_many_requests` with
+   `retry_after`. It is a limiter of its own, in memory, apart from the
+   web form's (which the apps never touch), so filling it cannot hold
+   back the web. Past it no Turnstile call is made.
 2. The body.
 3. Turnstile, when a token came.
 4. **A place for the database work.** At most 4 starts and resends use
@@ -603,6 +605,35 @@ none of which uses the database, in this order:
    seconds for a place, holding no connection, then is `503 busy` with
    `Retry-After: 5`. In its transaction it waits at most 3 seconds for a
    lock (`lock_timeout`), else `503 busy` too.
+
+**Verify is bounded the same way**, the app's and the web form's
+together (both guess codes):
+1. **The network's tries at a code.** 60 an hour per network at
+   `POST /auth/email/verify`, the apps' JSON and the web form's counted
+   together, before the body is read and before any database work,
+   whatever comes of them, never given back. Its own limiter, apart from
+   start's and from the web's mail count. Past it the app gets `429
+   too_many_requests` with `retry_after` (body and header), and the web
+   form goes back to its code page with "Too many codes were tried from
+   your network. Try again in an hour."
+2. The body.
+3. **A place of verify's own.** At most 3 verifies use the database at
+   once, so a flood of guesses never takes start's 4 (4 + 3 stay under
+   the pool's 10). One waits at most 2 seconds, holding no connection,
+   then the app gets `503 busy` (`Retry-After: 5`) and the web form "Buwiz
+   is busy. Try again in a moment." on its code page. Its transaction
+   waits at most 3 seconds for a lock, else the same answer.
+
+**When the map of networks is full.** The two limiters above whose tries
+are never given back (start/resend's, verify's) hold at most 100,000
+networks an hour. When full, a network new that hour is let through
+uncounted rather than sharing one overflow count, so a flood of distinct
+networks locks no other network out; networks already counted still
+count. What bounds such tries is then the rest: the address's five codes
+an hour and the new-address budgets, the testing cap, a code's five
+tries, and the places for the database work. The web form's count of
+codes per network keeps one shared overflow count when full: its
+refusals are given back, so a flood's networks leave and make room.
 
 Then, in one transaction under the address's lock (`lock_address`, which
 every code of any purpose, web or app, is counted under, so requests at
@@ -612,7 +643,10 @@ full cap refuses at once; its lock is taken only to add a code that
 counts), the address's five an hour, the new-address budget. The request
 is written with its code (mailed or not) in that transaction, or not at
 all; a refusal writes nothing and spends no place in any count, and a
-code that could not be mailed is taken back with its request.
+code that could not be mailed is taken back with its request, in one
+transaction. If that fails, the request is ended (`used_at`), so it holds
+the install no more; if that fails too, only the request's and code's
+ids are logged. The app is answered `mail_failed` either way.
 
 The cap is for testing only. **A platform's 1.0.0 needs the token
 required**: from then on, a request from that platform without a token
@@ -729,9 +763,14 @@ as start; the request keeps its intent and platform.
 
 `POST /auth/email/verify` with `{"request_id", "secret", "code"}`, or
 `{"request_id", "secret", "link_token"}` with the token from the mail's
-link ([above](#the-link-in-the-mail)). Checked in this order: the request
+link ([above](#the-link-in-the-mail)). First the network's tries at a code
+(60 an hour, [above](#what-a-flood-can-cost)), then a place for the
+database work. Then checked in this order: the request
 exists and is not used, the secret is its own, it has not expired, then
-the code (one try of its five) or the link's token, then a ban.
+the code (one try of its five) or the link's token, then a ban. On the
+link's path, the right token for a code that is there but has expired
+(a moment before its request) is `code_expired`, as the code is; a wrong
+or replaced token is `link_used`.
 On success, in one transaction, the code is used up, the account made if
 it is new, the request spent, and a grant made for the request's client
 with scope `app`. Answers `200` with exactly the device flow's token
@@ -754,14 +793,14 @@ flow's do.
 | 400 | `code_expired` | The request's code has expired: resend |
 | 400 | `invalid_code` | A wrong code; `attempts_left` says how many tries are left |
 | 400 | `too_many_attempts` | The code's five tries are used up: ask for a new one |
-| 400 | `link_used` | The link's token is wrong, used, or ended by a newer code |
+| 400 | `link_used` | The link's token is wrong, used, or ended by a newer code (an expired code is `code_expired` first) |
 | 403 | `account_banned` | The account is banned (the message is `/me`'s for a banned account) |
 | 403 | `turnstile_failed` | A `turnstile` token that Turnstile refused |
 | 403 | `turnstile_required` | Reserved: not used yet (see the 1.0.0 rule above) |
 | 429 | `code_already_sent` | A start from the same install for an address whose code from it still works; `retry_after` |
-| 429 | `too_many_requests` | The network's 20 tries an hour, a resend before the request's code expired, the testing cap, or the address's five codes an hour; `retry_after` |
+| 429 | `too_many_requests` | Start and resend: the network's 40 tries an hour, a resend before the request's code expired, the testing cap, or the address's five codes an hour. Verify: the network's 60 tries at a code an hour. `retry_after` |
 | 502 | `mail_failed` | The mail provider failed; the request cannot be used (start again) |
-| 503 | `busy` | Too many requests at once: no place for the database work within 2 seconds, or a lock not had within 3. Nothing was done; `Retry-After: 5` (try again in a few seconds) |
+| 503 | `busy` | Start, resend and verify: too many requests at once, no place for the database work within 2 seconds, or a lock not had within 3. Nothing was done; `Retry-After: 5` (try again in a few seconds) |
 | 503 | `restarting` | The server is stopping (deploy.md, "What a deploy does at stop"); `Retry-After: 30` |
 
 ## Devices
@@ -836,8 +875,13 @@ Reviewed and accepted for now (PR 81's review):
 - **Device replacement.** Someone who knows a device's install id and can complete a sign-in on the account replaces that device's sign-in ([Devices](#devices)); the account is mailed when the sign-in replaced was live.
 - **Fixed-code test accounts** are never held by `code_already_sent`, so a second start from one install tells them apart; only staff make them.
 - **The web form's new-address cap** stores nothing when full (unlike the apps' unmailed codes), so on the web an unknown address over that cap is not refused at its sixth start in the hour, as an address with an account is. It needs the web's 20 codes an hour for new addresses spent, through Turnstile.
-- **The network's 20 tries** are shared by everyone on one /24 or /48 (an office, a carrier): a flood from it holds the others there for the hour.
-- **L9.** Without `CF-Connecting-IP` there is no per-network count; safe while only the tunnel reaches the server.
+- **The network's 40 tries** at start and resend, and its 60 at verify, are shared by everyone on one /24 or /48 (an office, a carrier): a flood from it holds the others there for the hour. A `503 busy` counts too, by design.
+- **A full map of networks** (100,000 in an hour) lets new networks through the two never-given-back limiters uncounted; the per-address limits, the testing cap and the database places bound them then.
+- **L9, NL9.** Without `CF-Connecting-IP` there is no per-network count, at start, resend or verify. Production always sets it (the tunnel), and a missing header raises an hourly staff alert (BIR uptime's `NetworkReader`).
+- **NC1.** Unmailed codes count toward the address's five an hour and hold installs, by design, so an address without an account looks the same as one with an account; while the budgets of mail are full an address can be held for the hour, as M5 says.
+- **NW1.** The web form lets through a Turnstile answer that lacks the hostname or action (the app's check refuses it), with a staff alert at most once an hour.
+- **NI1.** The replacement mail goes to the owner even when they replaced their own live sign-in (a reinstall that lost its tokens): rare and harmless.
+- **NU1.** The loopback-host allowance (both kinds of sign-in on `localhost`) holds only when the deployment is not public (`secure_cookies` off); on a public one a loopback host is any other unknown host.
 - **C1.** A code can be phished: the secret binds it to a request, not to the person's device, and only the mail's words protect.
 
 ## Licence gate

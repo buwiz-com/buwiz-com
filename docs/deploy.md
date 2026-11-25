@@ -915,6 +915,14 @@ works and so how long before a new one (1 to 30; 5 when unset). Any other
 value stops the server at start-up. The web's codes keep their ten
 minutes.
 
+The rest are constants in the code, with nothing to set or deploy beyond
+the release itself: per network, 40 tries an hour at start and resend
+(`APP_ATTEMPTS_PER_NETWORK`) and 60 at verify, the app's and the web
+form's together (`VERIFY_TRIES_PER_NETWORK`, `src/account/guard.rs`);
+4 places for start's and resend's database work and 3 for verify's
+(`DATABASE_SLOTS`, `VERIFY_SLOTS`, `src/account/app_sign_in.rs`), under
+the pool's 10 connections.
+
 The cap on requests without an app check (20 an hour, 50 a day, one staff
 alert at 25) is for testing only. A platform's 1.0.0 needs the Turnstile
 token required (`turnstile_required`); do not ship one without it. The

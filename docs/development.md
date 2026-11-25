@@ -30,7 +30,10 @@ and `src/base/config.rs`.
 The sign-in form posts (`/auth/email/start`, `/auth/email/verify`) are
 served on the account host only, and the apps' JSON sign-in
 (`/auth/email/start`, `/resend`, `/verify`) on the API host only; on any
-other host they are `404` ([accounts.md](accounts.md#the-api)).
+other host they are `404` ([accounts.md](accounts.md#the-api)). Off a
+public deployment only (`SECURE_COOKIES` off, which an http
+`ACCOUNT_ORIGIN` gives), a loopback host (`localhost`, `127.0.0.1`,
+`[::1]`, any port) takes both, the form and the JSON.
 
 The desktop app reaches the account site at its own setting: run it with
 `BUWIZ_ACCOUNT_URL=http://account.localhost:3008` to sign in or delete an

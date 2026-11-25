@@ -11,7 +11,12 @@
 //! The apps' requests ([`crate::account::app_sign_in`]) have a budget of
 //! their own per network ([`SignInGuard::count_app_attempt`]): every try
 //! counts, whatever comes of it, and none is given back. They never touch
-//! the web form's count.
+//! the web form's count. Tries at a code, the app's and the web form's
+//! together, have another ([`SignInGuard::count_verify_try`]), counted the
+//! same way. Both of these let a new network through uncounted when their
+//! map is full ([`RateLimiter::fail_open_when_full`]), so a flood of
+//! networks locks no other out; behind them the per-address limits, the
+//! testing cap and the database slots still hold.
 
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -32,8 +37,16 @@ const NETWORK_WINDOW: Duration = Duration::hours(1);
 
 /// Tries at `POST /auth/email/start` and `/resend` (JSON, the apps') one
 /// network may make in an hour, whether they succeed or not. Counted before
-/// anything else is done for them, and never given back.
-pub const APP_ATTEMPTS_PER_NETWORK: u32 = 20;
+/// anything else is done for them, and never given back, `503 busy`
+/// included: giving those back would let a flood go on trying for nothing
+/// just when the database is saturated. Room for the people behind one
+/// carrier's or office's network.
+pub const APP_ATTEMPTS_PER_NETWORK: u32 = 40;
+
+/// Tries at a code, `POST /auth/email/verify`, the apps' JSON and the web
+/// form's together, one network may make in an hour, whatever comes of
+/// them. Counted before the body is read, and never given back.
+pub const VERIFY_TRIES_PER_NETWORK: u32 = 60;
 
 /// How often, at most, staff are mailed that Turnstile's answers lack the
 /// hostname or action ([`SignInGuard::take_unbound_alert`]).
@@ -58,6 +71,8 @@ pub struct SignInGuard {
     /// The apps' count: tries per network. Its own map, so filling it never
     /// touches the web's.
     app_attempts: RateLimiter<Network>,
+    /// Tries at a code per network, the apps' and the web form's.
+    verify_tries: RateLimiter<Network>,
     /// Turnstile's answers without a hostname or action, for the staff alert.
     unbound: Mutex<Unbound>,
 }
@@ -141,7 +156,10 @@ impl SignInGuard {
             hostname: hostname.to_owned(),
             http: reqwest::Client::builder().timeout(VERIFY_TIMEOUT).build().unwrap_or_default(),
             networks: RateLimiter::new(CODES_PER_NETWORK, NETWORK_WINDOW),
-            app_attempts: RateLimiter::new(APP_ATTEMPTS_PER_NETWORK, NETWORK_WINDOW),
+            // Nothing is given back to these two, so a full map must not
+            // lock new networks out (it would, sharing the overflow).
+            app_attempts: RateLimiter::fail_open_when_full(APP_ATTEMPTS_PER_NETWORK, NETWORK_WINDOW),
+            verify_tries: RateLimiter::fail_open_when_full(VERIFY_TRIES_PER_NETWORK, NETWORK_WINDOW),
             unbound: Mutex::new(Unbound::default()),
         }
     }
@@ -186,13 +204,20 @@ impl SignInGuard {
     }
 
     fn count_app_attempt_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
-        let Some(address) = address else {
-            return Ok(());
-        };
-        self.app_attempts.check(Network::of(address), now).map_err(|wait| {
-            let seconds = wait.whole_seconds();
-            if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds }
-        })
+        count_try(&self.app_attempts, address, now)
+    }
+
+    /// Counts a try at a code (`POST /auth/email/verify`, an app's or the
+    /// web form's) against its network's hour ([`VERIFY_TRIES_PER_NETWORK`]):
+    /// `Err` with the seconds to wait when the hour's tries are used. Every
+    /// try counts and none is given back. Without `CF-Connecting-IP` there
+    /// is no network to count.
+    pub fn count_verify_try(&self, headers: &HeaderMap) -> Result<(), i64> {
+        self.count_verify_try_at(client_ip(headers), OffsetDateTime::now_utc())
+    }
+
+    fn count_verify_try_at(&self, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
+        count_try(&self.verify_tries, address, now)
     }
 
     /// Whether staff are to be told now that Turnstile answered without the
@@ -273,6 +298,18 @@ impl SignInGuard {
             }
         }
     }
+}
+
+/// Counts a try from `address` at `now` in `limiter`: `Err` with the whole
+/// seconds to wait. No address, no count.
+fn count_try(limiter: &RateLimiter<Network>, address: Option<IpAddr>, now: OffsetDateTime) -> Result<(), i64> {
+    let Some(address) = address else {
+        return Ok(());
+    };
+    limiter.check(Network::of(address), now).map_err(|wait| {
+        let seconds = wait.whole_seconds();
+        if wait > Duration::seconds(seconds) { seconds + 1 } else { seconds }
+    })
 }
 
 impl SignInGuard {
@@ -424,6 +461,62 @@ mod tests {
         for _ in 0..CODES_PER_NETWORK {
             assert_eq!(counted(&guard, "203.0.113.9", now), Ok(()));
         }
+    }
+
+    #[test]
+    fn verify_tries_count_per_network_in_a_map_of_their_own() {
+        let guard = SignInGuard::new(None, "account.example.test");
+        let now = OffsetDateTime::now_utc();
+        for last in 0..VERIFY_TRIES_PER_NETWORK {
+            assert_eq!(guard.count_verify_try_at(at(&format!("203.0.113.{}", last % 250)), now), Ok(()));
+        }
+        let wait = guard.count_verify_try_at(at("203.0.113.250"), now).unwrap_err();
+        assert!((3599..=3600).contains(&wait), "{wait}");
+        assert_eq!(guard.count_verify_try_at(at("198.51.100.7"), now), Ok(()));
+        assert_eq!(guard.count_verify_try_at(at("203.0.113.1"), now + NETWORK_WINDOW), Ok(()));
+        assert_eq!(guard.count_verify_try_at(None, now), Ok(()));
+        // Neither the apps' start count nor the web form's is touched.
+        assert_eq!(guard.networks.len(), 0);
+        assert_eq!(guard.app_attempts.len(), 0);
+    }
+
+    /// The `i`th IPv4 /24, for filling a map.
+    fn network(i: usize) -> Option<IpAddr> {
+        let [_, a, b, c] = u32::try_from(i).unwrap().to_be_bytes();
+        Some(IpAddr::from([10 + a, b, c, 1]))
+    }
+
+    /// A flood of one try each from as many networks as the map holds does
+    /// not lock out a network that comes after it, at start/resend or at
+    /// verify; a network already in the map is still limited. The web
+    /// form's limiter, which gives refusals back, keeps its overflow.
+    #[test]
+    fn a_full_map_of_tries_locks_no_new_network_out() {
+        let guard = SignInGuard::new(None, "account.example.test");
+        let now = OffsetDateTime::now_utc();
+        let max = crate::uptime::keys::MAX_KEYS;
+        for i in 0..max {
+            guard.count_app_attempt_at(network(i), now).unwrap();
+            guard.count_verify_try_at(network(i), now).unwrap();
+        }
+        assert_eq!(guard.app_attempts.len(), max);
+        assert_eq!(guard.verify_tries.len(), max);
+        let newcomer = network(max + 1);
+        for n in 0..VERIFY_TRIES_PER_NETWORK * 3 {
+            assert_eq!(guard.count_app_attempt_at(newcomer, now), Ok(()), "{n}");
+            assert_eq!(guard.count_verify_try_at(newcomer, now), Ok(()), "{n}");
+            assert_eq!(guard.count_app_attempt_at(network(max + 2 + n as usize), now), Ok(()), "{n}");
+        }
+        let known = network(7);
+        for _ in 1..APP_ATTEMPTS_PER_NETWORK {
+            guard.count_app_attempt_at(known, now).unwrap();
+        }
+        assert!(guard.count_app_attempt_at(known, now).is_err());
+        for _ in 1..VERIFY_TRIES_PER_NETWORK {
+            guard.count_verify_try_at(known, now).unwrap();
+        }
+        assert!(guard.count_verify_try_at(known, now).is_err());
+        assert_eq!(guard.app_attempts.len(), max);
     }
 
     fn verdict(action: Option<&str>, hostname: Option<&str>) -> Verdict {

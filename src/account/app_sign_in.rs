@@ -20,11 +20,15 @@
 //! What a flood of requests can cost is bounded before any of it is done:
 //! every try at start and resend counts against its network's hour
 //! ([`SignInGuard::count_app_attempt`](crate::account::guard::SignInGuard::count_app_attempt),
-//! 20, never given back), then the body is read, then Turnstile is asked
+//! 40, never given back), then the body is read, then Turnstile is asked
 //! (when a token came), and only then is the database used, by at most
 //! [`DATABASE_SLOTS`] requests at once, each waiting at most
 //! [`SLOT_WAIT`] for a place and [`LOCK_WAIT`] for a lock (else `503
-//! busy`).
+//! busy`). Verify, the app's and the web form's, is bounded the same way
+//! with its own count
+//! ([`SignInGuard::count_verify_try`](crate::account::guard::SignInGuard::count_verify_try),
+//! 60 an hour, before the body) and its own [`VERIFY_SLOTS`] places, so a
+//! flood of guesses cannot take start's.
 
 use std::borrow::Cow;
 
@@ -72,6 +76,10 @@ const HOUR_S: i64 = 3600;
 /// How many start and resend requests may use the database at once: below
 /// the pool's 10 connections, so the rest of the site always has some.
 pub const DATABASE_SLOTS: usize = 4;
+/// How many verifies (the apps' and the web form's together) may use the
+/// database at once: their own places, so a flood of guesses cannot take
+/// start's. [`DATABASE_SLOTS`] and these stay below the pool's 10.
+pub const VERIFY_SLOTS: usize = 3;
 /// How long a request waits for one of those places before `503 busy`.
 /// While it waits it holds no connection.
 pub const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -127,6 +135,14 @@ impl Refusal {
         }
     }
 
+    /// `429 too_many_requests` for the network's tries at a code.
+    fn too_many_tries(retry_after: i64) -> Self {
+        Self {
+            message: Cow::Borrowed("Too many codes were tried from your network. Wait, then try again."),
+            ..Self::too_many(retry_after)
+        }
+    }
+
     fn internal(error: impl Into<anyhow::Error>) -> Self {
         tracing::error!(error = ?error.into(), "in-app sign-in failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "Something went wrong. Try again.")
@@ -149,12 +165,14 @@ impl Refusal {
 const INVALID_REQUEST: Refusal =
     Refusal::bad("invalid_request", "This sign-in request is not valid any more. Start again.");
 
+/// Whether `error` is `lock_timeout` ([`LOCK_WAIT`]) running out.
+pub(crate) fn is_lock_timeout(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03"))
+}
+
 impl From<sqlx::Error> for Refusal {
     fn from(error: sqlx::Error) -> Self {
-        // `lock_timeout` ([`LOCK_WAIT`]) ran out.
-        if let sqlx::Error::Database(database) = &error
-            && database.code().as_deref() == Some("55P03")
-        {
+        if is_lock_timeout(&error) {
             tracing::warn!("in-app sign-in: a lock was not had in time; answered busy");
             return Self::busy();
         }
@@ -404,10 +422,7 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
         alert_staff(state, count).await;
     }
     if let Err(refusal) = mail(state, request_id, &email, &code, token, words).await {
-        // Nothing went out: the request and its code are taken back, and
-        // with them their place in every count.
-        sqlx::query("DELETE FROM app_sign_ins WHERE id = $1").bind(request_id).execute(&state.db).await?;
-        delete_code(state, Some(code_id)).await?;
+        take_back(state, request_id, code_id).await;
         return Err(refusal);
     }
     Ok(sent(state, request_id))
@@ -421,19 +436,35 @@ fn count_attempt(state: &AppState, headers: &HeaderMap) -> Result<(), Refusal> {
 /// One of the [`DATABASE_SLOTS`] places for the database work, waited for
 /// at most [`SLOT_WAIT`]; `503 busy` when none came.
 async fn database_slot(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, Refusal> {
-    match tokio::time::timeout(SLOT_WAIT, state.app_sign_in_slots.acquire()).await {
-        Ok(Ok(permit)) => Ok(permit),
+    slot(&state.app_sign_in_slots).await.ok_or_else(Refusal::busy)
+}
+
+/// One of the [`VERIFY_SLOTS`] places for a verify's database work (the
+/// app's or the web form's), waited for at most [`SLOT_WAIT`]; `None` when
+/// none came. While it waits it holds no connection.
+pub(crate) async fn verify_slot(state: &AppState) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    slot(&state.verify_slots).await
+}
+
+async fn slot(places: &tokio::sync::Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    match tokio::time::timeout(SLOT_WAIT, places.acquire()).await {
+        Ok(Ok(permit)) => Some(permit),
         Ok(Err(_)) | Err(_) => {
-            tracing::warn!("in-app sign-in: every place for the database work is taken; answered busy");
-            Err(Refusal::busy())
+            tracing::warn!("sign-in: every place for the database work is taken; answered busy");
+            None
         }
     }
 }
 
-/// The transaction of a start or resend, whose locks are waited for at
-/// most [`LOCK_WAIT`].
+/// The transaction of a start, resend or verify, whose locks are waited
+/// for at most [`LOCK_WAIT`].
 async fn begin(state: &AppState) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Refusal> {
-    let mut tx = state.db.begin().await?;
+    Ok(begin_waiting(&state.db).await?)
+}
+
+/// [`begin`], with the error as it came ([`is_lock_timeout`] tells it).
+pub(crate) async fn begin_waiting(db: &sqlx::PgPool) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = db.begin().await?;
     sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).execute(&mut *tx).await?;
     Ok(tx)
 }
@@ -459,11 +490,27 @@ async fn usable_code_until(
     .await
 }
 
-async fn delete_code(state: &AppState, code_id: Option<Uuid>) -> sqlx::Result<()> {
-    if let Some(code_id) = code_id {
-        sqlx::query("DELETE FROM email_codes WHERE id = $1").bind(code_id).execute(&state.db).await?;
+/// After a mail that did not go out: the request and its code are taken
+/// back, in one transaction, and with them their place in every count and
+/// their hold on the install. If that fails, the request is at least ended
+/// (`used_at`), so it holds the install no more ([`usable_code_until`]).
+/// If that fails too, only the ids are logged. The caller answers
+/// `mail_failed` whatever happens here.
+async fn take_back(state: &AppState, request_id: Uuid, code_id: Uuid) {
+    let deleted = async {
+        let mut tx = state.db.begin().await?;
+        sqlx::query("DELETE FROM app_sign_ins WHERE id = $1").bind(request_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM email_codes WHERE id = $1").bind(code_id).execute(&mut *tx).await?;
+        tx.commit().await
     }
-    Ok(())
+    .await;
+    if deleted.is_ok() {
+        return;
+    }
+    tracing::warn!(%request_id, %code_id, "in-app sign-in: an unmailed request could not be taken back; ending it");
+    if end(state, request_id).await.is_err() {
+        tracing::error!(%request_id, %code_id, "in-app sign-in: an unmailed request could be neither taken back nor ended");
+    }
 }
 
 /// `429 code_already_sent`: a code mailed to this install for this address
@@ -791,10 +838,9 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
     }
     let words = stored.words(state.config.app_sign_in_minutes);
     if let Err(refusal) = mail(state, asked.request_id, &stored.email, &code, token, words).await {
-        // Nothing went out: the code is taken back, and the request, whose
-        // old code ended, can no longer be used.
-        end(state, asked.request_id).await?;
-        delete_code(state, Some(code_id)).await?;
+        // Nothing went out: the request, whose old code ended, and its new
+        // code are taken back.
+        take_back(state, asked.request_id, code_id).await;
         return Err(refusal);
     }
     Ok(sent(state, asked.request_id))
@@ -815,7 +861,9 @@ pub struct Verify {
 
 /// The link's token, checked against the request: it uses up the
 /// request's code as the code itself would. A token that is not the
-/// request's newest (a resend replaced it) is `link_used`.
+/// request's newest (a resend replaced it) is `link_used`. The right token
+/// for a code that is there but expired (a moment before its request) is
+/// `code_expired`, as the code itself is.
 async fn take_link(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     stored: &Stored,
@@ -826,10 +874,21 @@ async fn take_link(
         return Err(Refusal::bad("link_used", "This link was used or replaced by a newer code."));
     };
     match accounts::spend_code_row(tx, code_id).await? {
-        Tried::NoCode => Err(Refusal::bad("link_used", "This link was used or replaced by a newer code.")),
+        Tried::NoCode => {
+            let expired: Option<bool> = sqlx::query_scalar("SELECT expires_at <= now() FROM email_codes WHERE id = $1")
+                .bind(code_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            if expired == Some(true) {
+                return Err(CODE_EXPIRED);
+            }
+            Err(Refusal::bad("link_used", "This link was used or replaced by a newer code."))
+        }
         tried => Ok(tried),
     }
 }
+
+const CODE_EXPIRED: Refusal = Refusal::bad("code_expired", "This code expired. Ask for a new one.");
 
 /// `POST /auth/email/verify`: the tokens, as the device flow gives them.
 pub async fn verify(state: AppState, request: Request) -> Response {
@@ -841,8 +900,13 @@ pub async fn verify(state: AppState, request: Request) -> Response {
 
 async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Refusal> {
     refuse_while_stopping(state)?;
+    // The cheap refusals first: the network's tries at a code (shared with
+    // the web form's), then the body; then one of verify's own places for
+    // the database work, held to the end.
+    state.sign_in_guard.count_verify_try(request.headers()).map_err(Refusal::too_many_tries)?;
     let asked: Verify = body(request).await?;
-    let mut tx = state.db.begin().await?;
+    let _slot = verify_slot(state).await.ok_or_else(Refusal::busy)?;
+    let mut tx = begin(state).await?;
     // The account before the request, in the order a deletion takes them
     // (it locks the account, then deletes the requests): read whose it is
     // without a lock, lock that account if there is one, then the row.
@@ -863,7 +927,7 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
         return Err(INVALID_REQUEST);
     }
     if stored.expires_at <= OffsetDateTime::now_utc() {
-        return Err(Refusal::bad("code_expired", "This code expired. Ask for a new one."));
+        return Err(CODE_EXPIRED);
     }
     // Only the request's own code: the same digits from another request,
     // or a code from the web, are wrong here. Every live request has its
@@ -878,7 +942,7 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
         Tried::Taken => None,
         Tried::Wrong { attempts_left } => Some(attempts_left),
         // The code ended a moment before its request (or was deleted).
-        Tried::NoCode => return Err(Refusal::bad("code_expired", "This code expired. Ask for a new one.")),
+        Tried::NoCode => return Err(CODE_EXPIRED),
     };
     if let Some(attempts_left) = attempts_left {
         tx.commit().await?;

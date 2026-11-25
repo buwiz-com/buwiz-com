@@ -749,14 +749,15 @@ struct EmailStart {
 /// "Cloudflare rules for sign-in"). `None`: answered `404`, as if there
 /// were no such path there.
 ///
-/// A loopback host (`localhost`, `127.0.0.1`, `[::1]`, any port) takes
-/// both: that is a developer's own machine, where one address serves
-/// everything. No public request has that host: the tunnel carries only
-/// the zone's own host names.
-fn sign_in_kind(headers: &HeaderMap) -> Option<bool> {
+/// Off a public deployment only (`secure_cookies` off: the account origin
+/// is not https), a loopback host (`localhost`, `127.0.0.1`, `[::1]`, any
+/// port) takes both: that is a developer's own machine, where one address
+/// serves everything. On a public deployment a loopback host is any other
+/// unknown host, so the allowance never rests on the `Host` header alone.
+fn sign_in_kind(state: &AppState, headers: &HeaderMap) -> Option<bool> {
     let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
     let json = app_sign_in::is_json(headers);
-    if is_loopback_host(host) {
+    if !state.config.secure_cookies && is_loopback_host(host) {
         return Some(json);
     }
     let site = crate::sites::canonical::Site::for_host(host);
@@ -777,7 +778,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// `POST /auth/email/start`: an app's JSON ([`app_sign_in::start`]) on the
 /// API host, or the web's form on the account host.
 async fn email_start_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    match sign_in_kind(request.headers()) {
+    match sign_in_kind(&state, request.headers()) {
         None => return StatusCode::NOT_FOUND.into_response(),
         Some(true) => return app_sign_in::start(state, request).await,
         Some(false) => {}
@@ -790,23 +791,44 @@ async fn email_start_or_app(State(state): State<AppState>, request: axum::extrac
 }
 
 /// `POST /auth/email/verify`: an app's JSON ([`app_sign_in::verify`]), or
-/// the web's form.
+/// the web's form. Both count against the network's tries at a code
+/// ([`crate::account::guard::SignInGuard::count_verify_try`]) before their
+/// body is read, and share verify's places for the database work.
 async fn email_verify_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    match sign_in_kind(request.headers()) {
+    match sign_in_kind(&state, request.headers()) {
         None => return StatusCode::NOT_FOUND.into_response(),
         Some(true) => return app_sign_in::verify(state, request).await,
         Some(false) => {}
     }
     let headers = request.headers().clone();
-    match Form::<EmailVerify>::from_request(request, &state).await {
-        Ok(form) => email_verify(State(state), headers, form).await,
-        Err(rejection) => rejection.into_response(),
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
     }
+    // Counted before the form is read; a refusal reads it only to send
+    // the person back to their code page, and touches no database.
+    let counted = state.sign_in_guard.count_verify_try(&headers);
+    let form = match Form::<EmailVerify>::from_request(request, &state).await {
+        Ok(Form(form)) => form,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if counted.is_err() {
+        return back_to_code_page(form, Notice::CodeTriesTooMany);
+    }
+    email_verify(&state, form).await
+}
+
+/// Back to the code page with `notice`, keeping its address, next page and
+/// countdown.
+fn back_to_code_page(form: EmailVerify, notice: Notice) -> Response {
+    let next = safe_next(form.next.as_deref());
+    let email = accounts::normalize_email(&form.email).unwrap_or_default();
+    let expires = form.expires.unwrap_or_default();
+    see_other(link("/login/verify", Some(notice), &[("email", &email), ("next", &next), ("expires", &expires)]))
 }
 
 /// `POST /auth/email/resend`: the apps' only, JSON on the API host.
 async fn app_resend(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    if sign_in_kind(request.headers()) != Some(true) {
+    if sign_in_kind(&state, request.headers()) != Some(true) {
         return StatusCode::NOT_FOUND.into_response();
     }
     app_sign_in::resend(state, request).await
@@ -895,23 +917,32 @@ struct EmailVerify {
     expires: Option<String>,
 }
 
-async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailVerify>) -> Response {
-    if let Err(refused) = same_origin(&state, &headers) {
-        return refused;
-    }
+/// The web form's verify, once [`email_verify_or_app`] counted it: in one
+/// of verify's places for the database work (waited for at most two
+/// seconds, else "try again in a moment"), held to the end, and in a
+/// transaction whose locks are waited for at most three.
+async fn email_verify(state: &AppState, form: EmailVerify) -> Response {
     let next = safe_next(form.next.as_deref());
     let Ok(email) = accounts::normalize_email(&form.email) else {
         return see_other(link("/login", Some(Notice::EmailInvalid), &[("next", &next)]));
     };
-    let account = match accounts::redeem_code(&state.db, &email, &form.code).await {
+    let Some(_slot) = app_sign_in::verify_slot(state).await else {
+        return back_to_code_page(form, Notice::SignInBusy);
+    };
+    let redeemed = match app_sign_in::begin_waiting(&state.db).await {
+        Ok(tx) => accounts::redeem_code(tx, &email, &form.code).await,
+        Err(error) => Err(error.into()),
+    };
+    let account = match redeemed {
         Ok(account) => account,
         Err(CodeError::Invalid | CodeError::TooMany | CodeError::Busy) => {
-            let expires = form.expires.unwrap_or_default();
-            return see_other(link(
-                "/login/verify",
-                Some(Notice::CodeInvalid),
-                &[("email", &email), ("next", &next), ("expires", &expires)],
-            ));
+            return back_to_code_page(form, Notice::CodeInvalid);
+        }
+        Err(CodeError::Internal(error))
+            if error.downcast_ref::<sqlx::Error>().is_some_and(app_sign_in::is_lock_timeout) =>
+        {
+            tracing::warn!("web sign-in: a lock was not had in time; sent back to try again");
+            return back_to_code_page(form, Notice::SignInBusy);
         }
         Err(CodeError::Internal(error)) => return internal(error),
     };
@@ -932,7 +963,7 @@ async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(fo
     let mut response = see_other(next);
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, session_cookie(&state, &token, accounts::SESSION_TTL.whole_seconds()));
+        .insert(header::SET_COOKIE, session_cookie(state, &token, accounts::SESSION_TTL.whole_seconds()));
     response
 }
 

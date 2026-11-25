@@ -856,9 +856,11 @@ async fn the_privacy_page_is_the_apps_policy(db: PgPool) {
     for said in [
         "<strong>The database is a standard SQLite file and the app does not encrypt it.</strong>",
         "You need a Buwiz account to use the app.",
-        "That request contains the first nine digits of the TIN and the form number.",
-        "It uses HTTPS, and falls back to plain HTTP if the BIR",
-        "contains the TIN and the taxpayer",
+        "that request contains the first nine digits of the TIN and the form number",
+        "and uses HTTPS, falling back to plain HTTP if the BIR",
+        "contains the TIN and the confirmation email address, as the BIR requires",
+        "It writes the return to no disk, no database and no log, and its memory is never swapped to disk.",
+        "are kept for 30 days",
     ] {
         assert!(page.contains(said), "{said}");
     }

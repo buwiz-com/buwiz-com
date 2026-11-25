@@ -898,12 +898,15 @@ exchange, the account is mailed "New device signed in: eBIRForms on
 you, log it out at https://account.buwiz.com/tins#devices-h" (My
 devices). Fixed words only: nothing from the request but the platform's
 word.
-- New means no row, or only a removed one (`revoked_at` set): a device
-  the owner removed that signs in again is mailed again. So is one whose
-  sign-in ended (signed out, say), as ending a sign-in removes its device.
+- New means no row, or a row the owner (My devices, or the app's own
+  remove call) or staff removed (`devices.removed_by`, set with
+  `revoked_at`): a removed device that signs in again is mailed again.
+  A row that ended with its sign-in (signed out, replaced, or any grant
+  ended by 0018's trigger) has no `removed_by`: the same device signing
+  in again is not mailed. Registering again clears `removed_by`.
 - It is decided in the exchange's transaction, so an app that registers
   its device at once is still mailed.
-- A known live device signing in again, and an account signing in with a
+- A known device signing in again, and an account signing in with a
   fixed code (a store reviewer's), are mailed nothing.
 - A mail that fails is logged with the account and grant ids, and the
   sign-in stands.

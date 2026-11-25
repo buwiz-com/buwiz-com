@@ -814,8 +814,8 @@ async fn a_device_registered_before_the_mail_task_runs_is_still_mailed(db: PgPoo
     assert_eq!((mails[0].to.as_str(), mails[0].subject.as_str()), (ANA, "New device signed in: eBIRForms on iPhone"));
 }
 
-/// A device the owner removed that signs in again is a new device: it is
-/// mailed again.
+/// A device the owner removed (My devices) that signs in again is a new
+/// device: it is mailed again.
 #[sqlx::test(migrations = "./migrations")]
 async fn a_removed_device_that_signs_in_again_is_mailed(db: PgPool) {
     let site = Site::with_mailbox(db);
@@ -825,12 +825,65 @@ async fn a_removed_device_that_signs_in_again_is_mailed(db: PgPool) {
     assert_eq!(status, 201, "{device}");
     let id: Uuid = device["id"].as_str().unwrap().parse().unwrap();
     assert!(buwiz_cloud::devices::revoke(&site.db, ana, id).await.unwrap());
+    assert_eq!(removed_by(&site.db, id).await.as_deref(), Some("owner"));
     assert_eq!(site.state.mailer.new_device_mails().len(), 1);
 
     sign_in(&site, &cookie, PHONE, "ios").await;
     let mails = site.state.mailer.new_device_mails();
     assert_eq!(mails.len(), 2);
     assert_eq!(mails[1].subject, "New device signed in: eBIRForms on iPhone");
+
+    // Registering again brings the row back: no longer removed.
+    let tokens = sign_in(&site, &cookie, PHONE, "ios").await;
+    assert_eq!(register(&site, tokens["access_token"].as_str().unwrap(), PHONE).await.0, 201);
+    assert_eq!(removed_by(&site.db, id).await, None);
+}
+
+async fn removed_by(db: &PgPool, device: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT removed_by FROM devices WHERE id = $1").bind(device).fetch_one(db).await.unwrap()
+}
+
+/// A device staff removed that signs in again is mailed as a new device.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_device_staff_removed_that_signs_in_again_is_mailed(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, cookie) = site.person(ANA).await;
+    let (_, staff) = site.staff_with_role("boss@example.test", "admin").await;
+    let tokens = sign_in(&site, &cookie, PHONE, "ios").await;
+    let (status, device) = register(&site, tokens["access_token"].as_str().unwrap(), PHONE).await;
+    assert_eq!(status, 201, "{device}");
+    let id: Uuid = device["id"].as_str().unwrap().parse().unwrap();
+    let response = site.post(&format!("/staff/users/{ana}/devices/{id}/sign-out"), &staff, "reason=Lost+phone").await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(removed_by(&site.db, id).await.as_deref(), Some("staff"));
+
+    sign_in(&site, &cookie, PHONE, "ios").await;
+    assert_eq!(site.state.mailer.new_device_mails().len(), 2);
+}
+
+/// A device whose sign-in ended (here the person signed it out) and that
+/// signs in again is the same device: no mail.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_device_that_signed_out_and_signs_in_again_is_not_mailed(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, cookie) = site.person(ANA).await;
+    let tokens = sign_in(&site, &cookie, PHONE, "ios").await;
+    let (status, device) = register(&site, tokens["access_token"].as_str().unwrap(), PHONE).await;
+    assert_eq!(status, 201, "{device}");
+    let id: Uuid = device["id"].as_str().unwrap().parse().unwrap();
+    let grant: Uuid =
+        sqlx::query_scalar("SELECT grant_id FROM devices WHERE id = $1").bind(id).fetch_one(&site.db).await.unwrap();
+    assert!(buwiz_cloud::devices::sign_out_grant(&site.db, ana, grant).await.unwrap());
+    let (revoked, by): (bool, Option<String>) =
+        sqlx::query_as("SELECT revoked_at IS NOT NULL, removed_by FROM devices WHERE id = $1")
+            .bind(id)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+    assert_eq!((revoked, by), (true, None));
+
+    sign_in(&site, &cookie, PHONE, "ios").await;
+    assert_eq!(site.state.mailer.new_device_mails().len(), 1);
 }
 
 async fn device_flow(site: &Site, cookie: &str, install: Option<&str>) -> Value {
@@ -857,13 +910,14 @@ async fn device_flow(site: &Site, cookie: &str, install: Option<&str>) -> Value 
 }
 
 /// The device flow is approved in a browser too, so a sign-in from an
-/// install new to the account is mailed as Sign in with Buwiz's is. One
+/// install new to the account is mailed as Sign in with Buwiz's is, by
+/// the same rule (a removed device is new, a signed-out one is not). One
 /// without an install id (apps from before them) cannot be told apart and
 /// is not mailed.
 #[sqlx::test(migrations = "./migrations")]
 async fn the_device_flow_mails_a_new_install_too(db: PgPool) {
     let site = Site::with_mailbox(db);
-    let (_, cookie) = site.person(ANA).await;
+    let (ana, cookie) = site.person(ANA).await;
     device_flow(&site, &cookie, None).await;
     let tokens = device_flow(&site, &cookie, Some(LAPTOP)).await;
     settled(&site, 1).await;
@@ -872,10 +926,28 @@ async fn the_device_flow_mails_a_new_install_too(db: PgPool) {
     assert_eq!((mails[0].to.as_str(), mails[0].subject.as_str()), (ANA, "New device signed in: eBIRForms"));
 
     // A known device signing in again by the device flow mails nothing.
-    assert_eq!(register(&site, tokens["access_token"].as_str().unwrap(), LAPTOP).await.0, 201);
-    device_flow(&site, &cookie, Some(LAPTOP)).await;
+    let (status, device) = register(&site, tokens["access_token"].as_str().unwrap(), LAPTOP).await;
+    assert_eq!(status, 201, "{device}");
+    let id: Uuid = device["id"].as_str().unwrap().parse().unwrap();
+    let tokens = device_flow(&site, &cookie, Some(LAPTOP)).await;
     settled(&site, 2).await;
     assert_eq!(site.state.mailer.new_device_mails().len(), 1);
+
+    // Signed out, then in again: the same device, no mail.
+    assert_eq!(register(&site, tokens["access_token"].as_str().unwrap(), LAPTOP).await.0, 201);
+    let grant: Uuid =
+        sqlx::query_scalar("SELECT grant_id FROM devices WHERE id = $1").bind(id).fetch_one(&site.db).await.unwrap();
+    assert!(buwiz_cloud::devices::sign_out_grant(&site.db, ana, grant).await.unwrap());
+    let tokens = device_flow(&site, &cookie, Some(LAPTOP)).await;
+    settled(&site, 3).await;
+    assert_eq!(site.state.mailer.new_device_mails().len(), 1);
+
+    // Removed by the owner, then in again: mailed.
+    assert_eq!(register(&site, tokens["access_token"].as_str().unwrap(), LAPTOP).await.0, 201);
+    assert!(buwiz_cloud::devices::revoke(&site.db, ana, id).await.unwrap());
+    device_flow(&site, &cookie, Some(LAPTOP)).await;
+    settled(&site, 4).await;
+    assert_eq!(site.state.mailer.new_device_mails().len(), 2);
 }
 
 #[sqlx::test(migrations = "./migrations")]

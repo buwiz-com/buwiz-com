@@ -1740,7 +1740,7 @@ fn release_20() -> Migrator {
 /// Migration 21, on a database at 20 with an agent's code, an app's
 /// sign-in and its device: a code may belong to a built-in client, which
 /// is no row of `oauth_clients`, and keeps the app's install and platform,
-/// checked. The rows there are stay as they were. Going back to 20 drops
+/// checked; a device says who removed it (`removed_by`, checked). The rows there are stay as they were. Going back to 20 drops
 /// the apps' codes only, keeps the agents' and every grant and device,
 /// and leaves 20's schema exactly; the way up works again, by sqlx and by
 /// hand.
@@ -1801,6 +1801,14 @@ async fn app_codes_go_back_to_20(db: PgPool) {
     fails_with(&db, &code("03", "buwiz-desktop", "'short', 'ios'"), "oauth_codes_install_id_check").await;
     fails_with(&db, &code("04", "buwiz-desktop", "'install-phone-0001', 'symbian'"), "oauth_codes_platform_check")
         .await;
+    // A device says who removed it: the owner or staff, or nobody.
+    let removed_by = |db: PgPool| async move {
+        sqlx::query_scalar::<_, Option<String>>("SELECT removed_by FROM devices").fetch_one(&db).await.unwrap()
+    };
+    assert_eq!(removed_by(db.clone()).await, None, "an existing device was removed by nobody");
+    fails_with(&db, "UPDATE devices SET removed_by = 'someone'", "devices_removed_by_check").await;
+    exec(&db, "UPDATE devices SET removed_by = 'staff'").await;
+    assert_eq!(removed_by(db.clone()).await.as_deref(), Some("staff"));
     let codes = |db: PgPool| async move {
         sqlx::query_scalar::<_, String>("SELECT client_id FROM oauth_codes ORDER BY 1").fetch_all(&db).await.unwrap()
     };
@@ -1828,29 +1836,39 @@ async fn app_codes_go_back_to_20(db: PgPool) {
 }
 
 /// Migration 21 runs in a transaction with its own lock_timeout. Behind a
-/// long transaction that read `oauth_codes`, it fails within seconds
-/// instead of waiting, records nothing and changes nothing; once that
-/// transaction ends, starting again works. The pool's connections never
-/// get the setting.
+/// long transaction that read either table it changes (`oauth_codes`, or
+/// `devices` for `removed_by`), it fails within seconds instead of
+/// waiting, records nothing and changes nothing; once that transaction
+/// ends, starting again works. The pool's connections never get the
+/// setting.
 #[sqlx::test(migrations = false)]
 async fn migration_21_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
     release_20().run(&db).await.unwrap();
     let schema_20 = schema(&db).await;
-    let mut stray = db.begin().await.unwrap();
-    sqlx::query("SELECT count(*) FROM oauth_codes").execute(&mut *stray).await.unwrap();
-    let started = std::time::Instant::now();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), buwiz_cloud::migrate(&db))
-        .await
-        .expect("the migration waited for the lock without end");
-    let error = outcome.expect_err("the migration ran past an open transaction").to_string();
-    assert!(error.contains("lock timeout"), "{error}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(30));
-    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
-    stray.rollback().await.unwrap();
-    assert_eq!(schema(&db).await, schema_20, "nothing of migration 21 is left");
+    for table in ["oauth_codes", "devices"] {
+        let mut stray = db.begin().await.unwrap();
+        sqlx::query(&format!("SELECT count(*) FROM {table}")).execute(&mut *stray).await.unwrap();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), buwiz_cloud::migrate(&db))
+            .await
+            .expect("the migration waited for the lock without end");
+        let error = outcome.expect_err("the migration ran past an open transaction").to_string();
+        assert!(error.contains("lock timeout"), "{table}: {error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "{table}");
+        assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>(), "{table}");
+        stray.rollback().await.unwrap();
+        assert_eq!(schema(&db).await, schema_20, "{table}: nothing of migration 21 is left");
+    }
 
     buwiz_cloud::migrate(&db).await.unwrap();
     assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
+    let removed_by: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'devices' AND column_name = 'removed_by'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(removed_by, 1);
     for _ in 0..db.size() {
         let setting: String = sqlx::query_scalar("SHOW lock_timeout").fetch_one(&db).await.unwrap();
         assert_eq!(setting, "0", "the pool's connections keep the default");

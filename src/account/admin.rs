@@ -344,7 +344,8 @@ pub async fn sign_out_device(
         return Err(DecideError::Refused(Notice::AdminOnly));
     }
     let grant: Option<Uuid> = sqlx::query_scalar(
-        "UPDATE devices SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+        "UPDATE devices SET revoked_at = now(), removed_by = 'staff'
+         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
          RETURNING grant_id",
     )
     .bind(device_id)

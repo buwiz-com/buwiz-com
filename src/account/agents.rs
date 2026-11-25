@@ -704,9 +704,11 @@ async fn redeem_code_inner(
 }
 
 /// Whom to mail about a sign-in from `install_id`, in the exchange's
-/// transaction: the account's address when it has no live device row for
-/// the install at this moment (a removed device that comes back is new)
-/// and does not sign in with a fixed code (a store reviewer's). Decided here, not on the mail's task, so an app that
+/// transaction: the account's address when it has no device row for the
+/// install at this moment, or only one the owner or staff removed
+/// (`removed_by`), and does not sign in with a fixed code (a store
+/// reviewer's). A row that ended with its sign-in (signed out, say) is the
+/// same device: no mail. Decided here, not on the mail's task, so an app that
 /// registers its device at once still has its new device mailed.
 pub(crate) async fn new_device_to(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -718,7 +720,8 @@ pub(crate) async fn new_device_to(
         "SELECT a.email FROM accounts a
          WHERE a.id = $1 AND NOT {}
            AND NOT EXISTS (SELECT 1 FROM devices d
-                           WHERE d.account_id = a.id AND d.install_id = $2 AND d.revoked_at IS NULL)",
+                           WHERE d.account_id = a.id AND d.install_id = $2
+                             AND (d.revoked_at IS NULL OR d.removed_by IS NULL))",
         crate::account::roles::fixed_code_sql("a", "$3")
     ))
     .bind(account_id)

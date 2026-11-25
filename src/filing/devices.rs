@@ -357,7 +357,8 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
             }
             sqlx::query_as(
                 "UPDATE devices SET public_key = $2, grant_id = $3, name = $4, platform = $5, model = $6,
-                     os_version = $7, computer_name = $8, signed_in_at = now(), revoked_at = NULL
+                     os_version = $7, computer_name = $8, signed_in_at = now(), revoked_at = NULL,
+                     removed_by = NULL
                  WHERE id = $1 RETURNING id, created_at",
             )
             .bind(id)
@@ -517,12 +518,15 @@ pub async fn pending_for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<
     .await
 }
 
-/// Revokes the device and ends the sign-in it was registered under.
+/// Revokes the device and ends the sign-in it was registered under: the
+/// owner removed it (`removed_by = 'owner'`), so if it signs in again it is
+/// mailed as a new device.
 /// `false` when it is not this account's or was already revoked.
 pub async fn revoke(db: &PgPool, account_id: Uuid, device_id: Uuid) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
     let grant: Option<Uuid> = sqlx::query_scalar(
-        "UPDATE devices SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+        "UPDATE devices SET revoked_at = now(), removed_by = 'owner'
+         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
          RETURNING grant_id",
     )
     .bind(device_id)

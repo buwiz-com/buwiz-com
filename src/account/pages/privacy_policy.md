@@ -14,7 +14,6 @@ Goldcoders Corp. It says what the app stores, what it sends, and to whom.
   (BIR). That service opens the return in memory to check it and to encrypt it the way the BIR requires. It does not
   keep the return's contents after the send.
 - A return is sent only when you press Queue.
-- On iPhone, iPad and Android the app prepares, checks and prints returns; in this version it only simulates sending.
 - The app has no analytics, no advertising, no crash reporting and no usage tracking.
 
 ## 1. Your Buwiz account
@@ -34,8 +33,9 @@ The app asks you to sign in to a Buwiz account before it can be used. Sign-in ha
 - The sign-in sessions and tokens needed to keep you signed in.
 
 We do not store your IP address. To measure whether the BIR's servers are reachable, we keep for 90 days a scrambled
-code of the network a request came from (not the address itself, and made with a key that changes daily and is never
-stored), together with the app's name and version. Those records are not linked to your account.
+code of the network a request came from and one of the account (not the address or the account itself, and both made
+with a key that changes daily and is never stored), together with the app's name and version. They cannot be traced
+back to your account once the day's key is gone.
 
 **The TINs on your account.** A return can be sent only for a TIN that is registered and approved on your account.
 For each TIN we hold: the TIN and branch code, the registered name and trade name, whether it is personal or
@@ -139,8 +139,7 @@ servers, and seals nothing unless the sending service's key is on a list signed 
   address was asked for, never what was typed after it.
 
 **What does not go through us.** The app's own dry run (a simulation you can switch on; development builds use it
-by default), anything done on a practice account, and every send on iPhone, iPad and Android in this version: these send
-nothing to the BIR and nothing about a return to us.
+by default) and anything done on a practice account: these send nothing to the BIR and nothing about a return to us.
 
 ## 4. Receipt tracking (optional)
 
@@ -194,7 +193,7 @@ the TINs on the account with their documents; the records of the returns you sen
 the records of sends held during a BIR outage; and the records of sign-in codes you asked for.
 
 **What stays:** lines in our staff audit logs, which name a TIN only in masked form and the account only by its id;
-the scrambled network records described in section 1, for their 90 days; server logs, which carry ids only, for
+the scrambled records described in section 1, for their 90 days; server logs, which carry ids only, for
 their 30 days; and whatever our database provider's backups and our email provider's message log still hold for
 their own limited time.
 

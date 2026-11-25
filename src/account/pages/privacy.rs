@@ -39,7 +39,6 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
                         <li>"You need a Buwiz account to use the app. Goldcoders holds the account's email address, the TINs you register with it, the documents you send to verify a TIN (until that request is decided), and a record of each return you send."</li>
                         <li>"When you send a return, it travels through Buwiz's sending service on its way to the Bureau of Internal Revenue (BIR). That service opens the return in memory to check it and to encrypt it the way the BIR requires. It does not keep the return's contents after the send."</li>
                         <li>"A return is sent only when you press Queue."</li>
-                        <li>"On iPhone, iPad and Android the app prepares, checks and prints returns; in this version it only simulates sending."</li>
                         <li>"The app has no analytics, no advertising, no crash reporting and no usage tracking."</li>
                     </ul>
 
@@ -57,7 +56,7 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
                         <li>"The sign-in sessions and tokens needed to keep you signed in."</li>
                     </ul>
                     <p>
-                        "We do not store your IP address. To measure whether the BIR's servers are reachable, we keep for 90 days a scrambled code of the network a request came from (not the address itself, and made with a key that changes daily and is never stored), together with the app's name and version. Those records are not linked to your account."
+                        "We do not store your IP address. To measure whether the BIR's servers are reachable, we keep for 90 days a scrambled code of the network a request came from and one of the account (not the address or the account itself, and both made with a key that changes daily and is never stored), together with the app's name and version. They cannot be traced back to your account once the day's key is gone."
                     </p>
                     <p>
                         <strong>"The TINs on your account."</strong>
@@ -159,7 +158,7 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
                     </ul>
                     <p>
                         <strong>"What does not go through us."</strong>
-                        " The app's own dry run (a simulation you can switch on; development builds use it by default), anything done on a practice account, and every send on iPhone, iPad and Android in this version: these send nothing to the BIR and nothing about a return to us."
+                        " The app's own dry run (a simulation you can switch on; development builds use it by default) and anything done on a practice account: these send nothing to the BIR and nothing about a return to us."
                     </p>
 
                     <h2>"4. Receipt tracking (optional)"</h2>
@@ -242,7 +241,7 @@ pub async fn privacy_page(cx: &Cx) -> Result<impl View> {
                     </p>
                     <p>
                         <strong>"What stays:"</strong>
-                        " lines in our staff audit logs, which name a TIN only in masked form and the account only by its id; the scrambled network records described in section 1, for their 90 days; server logs, which carry ids only, for their 30 days; and whatever our database provider's backups and our email provider's message log still hold for their own limited time."
+                        " lines in our staff audit logs, which name a TIN only in masked form and the account only by its id; the scrambled records described in section 1, for their 90 days; server logs, which carry ids only, for their 30 days; and whatever our database provider's backups and our email provider's message log still hold for their own limited time."
                     </p>
                     <p>
                         <strong>"When deletion is refused:"</strong>

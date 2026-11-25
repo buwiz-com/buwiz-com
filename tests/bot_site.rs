@@ -157,6 +157,7 @@ async fn the_bot_site_sends_filing_and_sign_in_pages_on(db: PgPool) {
                 .unwrap(),
         )
         .await;
-    assert_eq!(sent.status(), StatusCode::SEE_OTHER);
-    assert!(location(&sent).starts_with("/login/verify"), "{}", location(&sent));
+    // The sign-in form is the account host's only, where Cloudflare
+    // challenges it: posted here it is not found.
+    assert_eq!(sent.status(), StatusCode::NOT_FOUND);
 }

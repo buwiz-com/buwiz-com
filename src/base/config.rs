@@ -5,6 +5,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
+pub use crate::account::guard::SignInLimits;
 use crate::base::storage::{DocumentStore, ObjectStore};
 #[cfg(feature = "bir")]
 use crate::bir;
@@ -41,6 +42,14 @@ pub struct Config {
     /// The GitHub API, `https://api.github.com`, read for Buwiz Bot's star
     /// count (see [`crate::sites::github`]).
     pub github_api_url: String,
+    /// `APP_SIGN_IN_MINUTES` (1 to 30, 5 when unset): how long an in-app
+    /// sign-in code works, which is also how long before the app may ask
+    /// for a new one ([`crate::account::app_sign_in`]).
+    pub app_sign_in_minutes: i64,
+    /// The per-network limits of sign-in tries and the shared budgets past
+    /// a full map, and when staff are told of refusals
+    /// ([`sign_in_limits`]).
+    pub sign_in_limits: SignInLimits,
 }
 
 #[derive(Clone, Debug)]
@@ -70,10 +79,7 @@ pub const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnst
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let account_origin = origin(&var_or("ACCOUNT_ORIGIN", "http://localhost:3008"))?;
-        let secure_cookies = match std::env::var("SECURE_COOKIES") {
-            Ok(value) => value == "true",
-            Err(_) => account_origin.starts_with("https://"),
-        };
+        let secure_cookies = secure_cookies(&account_origin, std::env::var("SECURE_COOKIES").ok().as_deref())?;
         // Without an explicit MAIL_TRANSPORT, a Resend key means send email;
         // no key means print codes to the log.
         let has_resend_key = std::env::var("RESEND_API_KEY").is_ok_and(|key| !key.trim().is_empty());
@@ -125,6 +131,8 @@ impl Config {
             downloads_url: origin(&var_or("DOWNLOADS_URL", "https://downloads.buwiz.com")).context("DOWNLOADS_URL")?,
             forms_origin: origin(&var_or("FORMS_ORIGIN", "https://ebirforms.buwiz.com")).context("FORMS_ORIGIN")?,
             github_api_url: origin(&var_or("GITHUB_API_URL", "https://api.github.com")).context("GITHUB_API_URL")?,
+            app_sign_in_minutes: app_sign_in_minutes(optional("APP_SIGN_IN_MINUTES").as_deref())?,
+            sign_in_limits: sign_in_limits(optional)?,
         })
     }
 
@@ -180,6 +188,53 @@ pub fn parse_admin_emails(raw: &str) -> (Vec<String>, Vec<String>) {
     };
     let bad = list.iter().filter(|entry| !address(entry)).cloned().collect();
     (list, bad)
+}
+
+/// `APP_SIGN_IN_MINUTES` as read: 5 when unset, else 1 to 30. Only the
+/// apps' codes: the web's last ten minutes whatever this says.
+pub fn app_sign_in_minutes(raw: Option<&str>) -> anyhow::Result<i64> {
+    let Some(raw) = raw else {
+        return Ok(5);
+    };
+    match raw.parse::<i64>() {
+        Ok(minutes) if (1..=30).contains(&minutes) => Ok(minutes),
+        _ => bail!("APP_SIGN_IN_MINUTES must be a whole number of minutes from 1 to 30, not `{raw}`"),
+    }
+}
+
+/// `SECURE_COOKIES` as read: when unset, on for an https account origin.
+/// Off with an https origin stops the server at start-up: off means "not a
+/// public deployment", which also lets a loopback host take sign-in.
+pub fn secure_cookies(account_origin: &str, raw: Option<&str>) -> anyhow::Result<bool> {
+    let public = account_origin.starts_with("https://");
+    let on = raw.map_or(public, |value| value == "true");
+    if public && !on {
+        bail!("SECURE_COOKIES must be true with an https ACCOUNT_ORIGIN; leave it unset");
+    }
+    Ok(on)
+}
+
+/// The sign-in limits as set, each a whole number in its range, else
+/// today's value ([`SignInLimits::default`]). Any other value stops the
+/// server at start-up. `var` reads a setting (trimmed, `None` when unset).
+pub fn sign_in_limits(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<SignInLimits> {
+    let today = SignInLimits::default();
+    let read = |name: &str, default: u32, low: u32, high: u32| -> anyhow::Result<u32> {
+        let Some(raw) = var(name) else {
+            return Ok(default);
+        };
+        match raw.parse::<u32>() {
+            Ok(value) if (low..=high).contains(&value) => Ok(value),
+            _ => bail!("{name} must be a whole number from {low} to {high}, not `{raw}`"),
+        }
+    };
+    Ok(SignInLimits {
+        starts_per_network: read("APP_SIGN_IN_STARTS_PER_NETWORK", today.starts_per_network, 1, 1_000_000)?,
+        verifies_per_network: read("SIGN_IN_VERIFIES_PER_NETWORK", today.verifies_per_network, 1, 1_000_000)?,
+        starts_past_full: read("APP_SIGN_IN_STARTS_PAST_FULL", today.starts_past_full, 0, 10_000_000)?,
+        verifies_past_full: read("SIGN_IN_VERIFIES_PAST_FULL", today.verifies_past_full, 0, 10_000_000)?,
+        refusals_alert_at: read("SIGN_IN_REFUSALS_ALERT_AT", today.refusals_alert_at, 1, 10_000_000)?,
+    })
 }
 
 fn list(name: &str) -> Vec<String> {
@@ -355,6 +410,16 @@ pub fn sender_url(public: bool) -> anyhow::Result<Option<(String, Zeroizing<Stri
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_in_app_code_lasts_five_minutes_unless_set_from_one_to_thirty() {
+        assert_eq!(app_sign_in_minutes(None).unwrap(), 5);
+        assert_eq!(app_sign_in_minutes(Some("1")).unwrap(), 1);
+        assert_eq!(app_sign_in_minutes(Some("30")).unwrap(), 30);
+        for bad in ["0", "31", "-5", "ten", "2.5"] {
+            assert!(app_sign_in_minutes(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
     #[cfg(feature = "bir")]
     #[test]
     fn lab_servers_parse_with_a_colon_in_the_password() {
@@ -373,6 +438,68 @@ mod tests {
             assert_eq!(bad, list, "{raw}");
             assert_eq!(bad.len(), 1, "{raw}");
         }
+    }
+
+    #[test]
+    fn sign_in_limits_are_todays_unless_set_to_a_whole_number_in_range() {
+        let from = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            sign_in_limits(move |name| pairs.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone()))
+        };
+        assert_eq!(from(&[]).unwrap(), SignInLimits::default());
+        assert_eq!(
+            from(&[]).unwrap(),
+            SignInLimits {
+                starts_per_network: 200,
+                verifies_per_network: 300,
+                starts_past_full: 20_000,
+                verifies_past_full: 30_000,
+                refusals_alert_at: 100,
+            }
+        );
+        let set = from(&[
+            ("APP_SIGN_IN_STARTS_PER_NETWORK", "1000"),
+            ("SIGN_IN_VERIFIES_PER_NETWORK", "1500"),
+            ("APP_SIGN_IN_STARTS_PAST_FULL", "0"),
+            ("SIGN_IN_VERIFIES_PAST_FULL", "10000000"),
+            ("SIGN_IN_REFUSALS_ALERT_AT", "1"),
+        ])
+        .unwrap();
+        assert_eq!(
+            set,
+            SignInLimits {
+                starts_per_network: 1000,
+                verifies_per_network: 1500,
+                starts_past_full: 0,
+                verifies_past_full: 10_000_000,
+                refusals_alert_at: 1,
+            }
+        );
+        for (name, bad) in [
+            ("APP_SIGN_IN_STARTS_PER_NETWORK", "0"),
+            ("APP_SIGN_IN_STARTS_PER_NETWORK", "1000001"),
+            ("SIGN_IN_VERIFIES_PER_NETWORK", "-1"),
+            ("SIGN_IN_VERIFIES_PER_NETWORK", "2.5"),
+            ("APP_SIGN_IN_STARTS_PAST_FULL", "20,000"),
+            ("SIGN_IN_VERIFIES_PAST_FULL", "10000001"),
+            ("SIGN_IN_REFUSALS_ALERT_AT", "0"),
+            ("SIGN_IN_REFUSALS_ALERT_AT", "many"),
+        ] {
+            let error = from(&[(name, bad)]).unwrap_err().to_string();
+            assert!(error.starts_with(name) && error.contains(bad), "{name}={bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_https_origin_needs_secure_cookies() {
+        assert!(secure_cookies("https://account.buwiz.com", None).unwrap());
+        assert!(secure_cookies("https://account.buwiz.com", Some("true")).unwrap());
+        for off in ["false", "", "1", "TRUE"] {
+            assert!(secure_cookies("https://account.buwiz.com", Some(off)).is_err(), "{off}");
+        }
+        assert!(!secure_cookies("http://localhost:3008", None).unwrap());
+        assert!(!secure_cookies("http://localhost:3008", Some("false")).unwrap());
+        assert!(secure_cookies("http://localhost:3008", Some("true")).unwrap());
     }
 
     #[test]

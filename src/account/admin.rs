@@ -324,6 +324,58 @@ pub async fn sign_out_app(
     Ok(Notice::AppSignedOut)
 }
 
+/// Staff log one of an account's devices out: the device is removed and
+/// the sign-in it was registered under ended (`signed_out_by_staff`), with
+/// the same rule as signing one app out ([`may_sign_out`]) and an
+/// `app_signed_out` line naming the app.
+pub async fn sign_out_device(
+    db: &PgPool,
+    config: &Config,
+    actor: &Staff,
+    account_id: Uuid,
+    device_id: Uuid,
+    reason: &str,
+) -> Result<Notice, DecideError> {
+    let reason = required_reason(reason)?;
+    let mut tx = db.begin().await?;
+    let role = sign_out_role(&mut tx, config, actor).await?;
+    let target = lock_account(&mut tx, account_id).await?;
+    if !may_sign_out(config, role, &target) {
+        return Err(DecideError::Refused(Notice::AdminOnly));
+    }
+    let grant: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE devices SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+         RETURNING grant_id",
+    )
+    .bind(device_id)
+    .bind(target.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(grant) = grant else {
+        return Ok(Notice::AppAlreadySignedOut);
+    };
+    sqlx::query(
+        "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'signed_out_by_staff'
+         WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(grant)
+    .execute(&mut *tx)
+    .await?;
+    let client: String =
+        sqlx::query_scalar("SELECT client_id FROM oauth_grants WHERE id = $1").bind(grant).fetch_one(&mut *tx).await?;
+    let line = Line {
+        account_id: target.id,
+        action: "app_signed_out",
+        old_value: None,
+        new_value: Some(&client),
+        source: Source::Web,
+        reason: Some(&reason),
+    };
+    audit(&mut tx, &actor.account, line).await?;
+    tx.commit().await?;
+    Ok(Notice::AppSignedOut)
+}
+
 /// An Admin bans an account: it loses its website sessions and the
 /// sign-ins not yet picked up by an app or agent, and cannot sign in. Its
 /// app sign-ins stay, but every API call but signing out is refused

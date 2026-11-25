@@ -34,6 +34,26 @@ use crate::filing::link::SenderLink;
 /// The database migrations, for tools and tests that set up their own.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+/// How long a migration waits for a lock before it fails.
+const MIGRATION_LOCK_TIMEOUT: &str = "10s";
+
+/// Runs [`MIGRATOR`] as the server does at start: on one connection whose
+/// `lock_timeout` is [`MIGRATION_LOCK_TIMEOUT`] for the whole session, so
+/// the migrations that run outside a transaction (19 and 20, which build
+/// indexes CONCURRENTLY and cannot `SET LOCAL`) fail instead of waiting
+/// without end behind a long transaction. The others set their own. The
+/// connection is closed afterwards, so the setting never reaches the pool.
+/// docs/deploy.md says what an operator does when one fails.
+pub async fn migrate(db: &sqlx::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut connection = db.acquire().await?.detach();
+    sqlx::query(&format!("SET lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'")).execute(&mut connection).await?;
+    let ran = MIGRATOR.run(&mut connection).await;
+    if let Err(error) = sqlx::Connection::close(connection).await {
+        tracing::warn!(%error, "the migrations' connection did not close cleanly");
+    }
+    ran
+}
+
 /// How long, at shutdown, the BIR uptime records still being written get.
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -61,7 +81,7 @@ pub async fn run() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await
         .context("could not connect to DATABASE_URL")?;
-    MIGRATOR.run(&db).await.context("migrations failed")?;
+    migrate(&db).await.context("migrations failed")?;
 
     let documents = config::document_store(config.secure_cookies)?;
     let ticket_key = config::ticket_key(config.secure_cookies)?;

@@ -5,6 +5,7 @@
 pub mod accounts;
 pub mod admin;
 pub mod agents;
+pub mod app_sign_in;
 pub mod claims;
 pub mod deletion;
 pub mod guard;

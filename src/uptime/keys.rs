@@ -314,16 +314,40 @@ pub const MAX_KEYS: usize = 100_000;
 
 /// A fixed-window rate limiter held in memory: at most `limit` hits per key
 /// in each `window`. Windows are shared: when one ends, every count starts
-/// again, so nothing is ever scanned. A key new in a window that already
-/// holds `cap` keys is counted in one shared overflow bucket (with the same
-/// limit) until the window ends, so the map never grows past `cap` and a
-/// flood of new addresses cannot lock out everyone who comes after it. Keys
-/// (an IP address, an account id) are never stored anywhere else.
+/// again, so nothing is ever scanned. A key whose hits are all given back
+/// ([`RateLimiter::release`]) leaves the map, so it holds only keys with a
+/// hit that counts. The map never grows past `cap` keys; keys already in it
+/// always count normally, and a key new in a full window is counted in one
+/// shared overflow bucket until the window ends. How many hits that bucket
+/// takes depends on how the limiter was made:
+/// - [`RateLimiter::new`]: the same limit as a key. While the map is full,
+///   a flood of distinct addresses with hits that count can use up that
+///   bucket and so hold back every other new address until the window
+///   ends. Fit for a limiter whose hits are given back when they come to
+///   nothing (the web form's), so a flood's keys leave and make room.
+/// - [`RateLimiter::with_overflow_budget`]: a budget of its own, much
+///   larger than a key's limit, so a flood that fills the map does not lock
+///   new addresses out at once; once that budget is spent too, new
+///   addresses are refused until the window ends.
+///
+/// Each hit says which bucket it went to ([`Bucket`]), so giving it back
+/// takes it from that bucket and no other. Keys (an IP address, an account
+/// id) are never stored anywhere else.
 pub struct RateLimiter<K> {
     limit: u32,
     window: Duration,
     cap: usize,
+    /// How many hits the overflow bucket takes in a window.
+    overflow_limit: u32,
     hits: Mutex<Hits<K>>,
+}
+
+/// Where a hit was counted: under its own key, or in the shared overflow
+/// bucket (the map was full when its key was new).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bucket {
+    Key,
+    Overflow,
 }
 
 struct Hits<K> {
@@ -340,11 +364,40 @@ impl<K: Eq + Hash> RateLimiter<K> {
     }
 
     pub fn with_cap(limit: u32, window: Duration, cap: usize) -> Self {
-        Self { limit, window, cap, hits: Mutex::new(Hits { since: None, by_key: HashMap::new(), overflow: 0 }) }
+        Self::made(limit, window, cap, limit)
+    }
+
+    /// As [`Self::new`], except that the keys new in a full window share
+    /// `budget` hits in it, not `limit`: room for many new keys while a
+    /// flood fills the map, and a refusal once that is spent too.
+    pub fn with_overflow_budget(limit: u32, window: Duration, budget: u32) -> Self {
+        Self::made(limit, window, MAX_KEYS, budget)
+    }
+
+    fn made(limit: u32, window: Duration, cap: usize, overflow_limit: u32) -> Self {
+        Self {
+            limit,
+            window,
+            cap,
+            overflow_limit,
+            hits: Mutex::new(Hits { since: None, by_key: HashMap::new(), overflow: 0 }),
+        }
     }
 
     /// Counts a hit for `key`: `Ok`, or how long until it may go again.
     pub fn check(&self, key: K, now: OffsetDateTime) -> Result<(), Duration> {
+        self.hit(key, now).map(|_| ())
+    }
+
+    /// [`Self::check`], saying which bucket the hit went to, for
+    /// [`Self::release`].
+    pub fn hit(&self, key: K, now: OffsetDateTime) -> Result<Bucket, Duration> {
+        self.hit_or_refused(key, now).map_err(|(_, wait)| wait)
+    }
+
+    /// [`Self::hit`], saying which bucket refused it: the key's own count,
+    /// or the overflow bucket (the map was full when its key was new).
+    pub fn hit_or_refused(&self, key: K, now: OffsetDateTime) -> Result<Bucket, (Bucket, Duration)> {
         let (verdict, ended) = {
             let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             // A window that ended (or a clock that went back) starts a new
@@ -362,19 +415,19 @@ impl<K: Eq + Hash> RateLimiter<K> {
             let full = hits.by_key.len() >= self.cap;
             let Hits { by_key, overflow, .. } = &mut *hits;
             let verdict = match by_key.get_mut(&key) {
-                Some(count) if *count >= self.limit => Err(wait),
+                Some(count) if *count >= self.limit => Err((Bucket::Key, wait)),
                 Some(count) => {
                     *count += 1;
-                    Ok(())
+                    Ok(Bucket::Key)
                 }
-                None if full && *overflow >= self.limit => Err(wait),
+                None if full && *overflow >= self.overflow_limit => Err((Bucket::Overflow, wait)),
                 None if full => {
                     *overflow += 1;
-                    Ok(())
+                    Ok(Bucket::Overflow)
                 }
                 None => {
                     by_key.insert(key, 1);
-                    Ok(())
+                    Ok(Bucket::Key)
                 }
             };
             (verdict, ended)
@@ -383,19 +436,26 @@ impl<K: Eq + Hash> RateLimiter<K> {
         verdict
     }
 
-    /// Takes back the hit counted for `key` at `counted`, for a try that
-    /// came to nothing. Once that hit's window has ended nothing is taken
-    /// back: the hits of the window after it are not its own. A key that
-    /// was counted in the overflow bucket gives that one back.
-    pub fn release(&self, key: &K, counted: OffsetDateTime) {
+    /// Takes back the hit counted for `key` at `counted` in `bucket` (what
+    /// [`Self::hit`] said), for a try that came to nothing. Once that hit's
+    /// window has ended nothing is taken back: the hits of the window
+    /// after it are not its own. A hit counted in the overflow bucket is
+    /// taken from that bucket, even if its key has since got a place in
+    /// the map, and a hit counted under its key only from that key.
+    pub fn release(&self, key: &K, counted: OffsetDateTime, bucket: Bucket) {
         let mut hits = self.hits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if !hits.since.is_some_and(|since| counted >= since) {
             return;
         }
         let Hits { by_key, overflow, .. } = &mut *hits;
-        match by_key.get_mut(key) {
-            Some(count) => *count = count.saturating_sub(1),
-            None => *overflow = overflow.saturating_sub(1),
+        match (bucket, by_key.get_mut(key)) {
+            (Bucket::Overflow, _) => *overflow = overflow.saturating_sub(1),
+            // Its last hit given back: the key leaves, making room.
+            (Bucket::Key, Some(count)) if *count <= 1 => {
+                by_key.remove(key);
+            }
+            (Bucket::Key, Some(count)) => *count -= 1,
+            (Bucket::Key, None) => {}
         }
     }
 
@@ -644,6 +704,96 @@ mod tests {
         limiter.check(100, now + Duration::minutes(1)).unwrap();
         assert_eq!(limiter.len(), 1);
         assert!(!limiter.is_empty());
+    }
+
+    #[test]
+    fn keys_given_back_or_a_new_window_make_room_for_new_ones() {
+        let now = at("2026-11-11T07:12:00Z");
+        let limiter = RateLimiter::with_cap(5, Duration::minutes(1), 100);
+        // A flood of one-hit keys fills the map, and the shared bucket.
+        for key in 0..100u32 {
+            limiter.check(key, now).unwrap();
+        }
+        for key in 100..105u32 {
+            limiter.check(key, now).unwrap();
+        }
+        assert_eq!(limiter.check(200, now), Err(Duration::minutes(1)));
+        // Their hits given back, the keys leave and new ones get places.
+        for key in 0..100u32 {
+            limiter.release(&key, now, Bucket::Key);
+        }
+        assert_eq!(limiter.len(), 0);
+        for key in 200..300u32 {
+            assert_eq!(limiter.check(key, now + Duration::seconds(1)), Ok(()), "{key}");
+        }
+        assert_eq!(limiter.len(), 100);
+        // A key with hits left stays.
+        limiter.check(200, now + Duration::seconds(2)).unwrap();
+        limiter.release(&200, now + Duration::seconds(2), Bucket::Key);
+        assert_eq!(limiter.len(), 100);
+        // A new window: room for everyone.
+        assert_eq!(limiter.check(999, now + Duration::minutes(1)), Ok(()));
+        assert_eq!(limiter.len(), 1);
+    }
+
+    #[test]
+    fn a_hit_given_back_leaves_the_bucket_it_was_counted_in() {
+        let now = at("2026-11-11T07:12:00Z");
+        // One place in the map, two hits per key or bucket.
+        let limiter = RateLimiter::with_cap(2, Duration::minutes(1), 1);
+        let a = limiter.hit("a", now).unwrap();
+        assert_eq!(a, Bucket::Key);
+        // The map is full: "b" goes to the overflow bucket.
+        let b_first = limiter.hit("b", now).unwrap();
+        assert_eq!(b_first, Bucket::Overflow);
+        // "a" gives its hit back and leaves; "b" now gets the place.
+        limiter.release(&"a", now, a);
+        assert_eq!(limiter.hit("b", now), Ok(Bucket::Key));
+        // Giving back b's first hit empties the overflow bucket, not b's
+        // own count: b has one hit left, and a new key has the whole
+        // overflow bucket.
+        limiter.release(&"b", now, b_first);
+        assert_eq!(limiter.hit("b", now), Ok(Bucket::Key));
+        assert!(limiter.hit("b", now).is_err());
+        assert_eq!(limiter.hit("c", now), Ok(Bucket::Overflow));
+        assert_eq!(limiter.hit("d", now), Ok(Bucket::Overflow));
+        assert!(limiter.hit("e", now).is_err());
+    }
+
+    #[test]
+    fn with_an_overflow_budget_new_keys_share_it_when_full_then_are_refused() {
+        let now = at("2026-11-11T07:12:00Z");
+        let limiter = RateLimiter::made(3, Duration::minutes(1), 100, 50);
+        for key in 0..100u32 {
+            limiter.check(key, now).unwrap();
+        }
+        // Full: new keys share the 50 of the budget, one key or many, past
+        // their own limit of 3; the map does not grow.
+        for _ in 0..20 {
+            assert_eq!(limiter.hit(100, now + Duration::seconds(10)), Ok(Bucket::Overflow));
+        }
+        for key in 101..131u32 {
+            assert_eq!(limiter.hit(key, now + Duration::seconds(10)), Ok(Bucket::Overflow), "{key}");
+        }
+        assert_eq!(limiter.len(), 100);
+        // Spent: every new key is refused until the window ends, by the
+        // overflow bucket.
+        assert_eq!(limiter.check(100, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        assert_eq!(
+            limiter.hit_or_refused(501, now + Duration::seconds(10)),
+            Err((Bucket::Overflow, Duration::seconds(50)))
+        );
+        assert_eq!(limiter.check(500, now + Duration::seconds(10)), Err(Duration::seconds(50)));
+        // A key already in the map still counts on its own: two hits left.
+        assert_eq!(limiter.hit(7, now + Duration::seconds(10)), Ok(Bucket::Key));
+        assert_eq!(limiter.hit(7, now + Duration::seconds(10)), Ok(Bucket::Key));
+        assert_eq!(limiter.hit_or_refused(7, now + Duration::seconds(10)), Err((Bucket::Key, Duration::seconds(50))));
+        // The next window starts empty: the new key is counted again, with
+        // its own limit.
+        for _ in 0..3 {
+            limiter.check(100, now + Duration::minutes(1)).unwrap();
+        }
+        assert!(limiter.check(100, now + Duration::minutes(1)).is_err());
     }
 
     #[test]

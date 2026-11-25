@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{MethodRouter, any, get, post};
 use axum::{Form, Router};
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::account::accounts::{self, Account, CodeError, IssuedCode};
 use crate::account::admin;
 use crate::account::agents;
+use crate::account::app_sign_in;
 use crate::account::claims::{
     self, By, ClaimKind, DecideError, Decision, DocumentKind, NewClaim, Papers, Resend, SubmitError, Upload,
 };
@@ -72,7 +73,7 @@ fn signed_public(state: &AppState, route: MethodRouter<AppState>) -> MethodRoute
 
 /// How long a client is asked to wait when the server is stopping: a
 /// restart takes a few seconds.
-const STOPPING_RETRY_S: u32 = 30;
+pub(crate) const STOPPING_RETRY_S: u32 = 30;
 
 /// A route that starts a send (a ticket, a submission, the relay): while
 /// the server is stopping it answers `503 restarting` with `Retry-After`
@@ -112,6 +113,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/home.css", get(home_stylesheet))
         .route("/assets/account.css", get(account_stylesheet))
         .route("/assets/account.js", get(account_script))
+        .route("/assets/app-sign-in.js", get(app_sign_in_script))
+        .route("/assets/app-check.js", get(app_check_script))
         .route("/assets/staff.css", get(staff_stylesheet))
         .route("/assets/staff.js", get(staff_script))
         .route("/assets/screens/{name}", get(screenshot))
@@ -150,6 +153,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         // Submission v2: device keys, tickets, sealed returns.
         .route("/api/devices", post(devices::register).get(devices::list))
         .route("/api/devices/{id}/revoke", post(devices::revoke_api))
+        .route("/api/sign-ins/{grant_id}/sign-out", post(devices::sign_out_api))
         .route("/api/tickets", starts_send(&state, signed(&state, post(tickets::issue))))
         .route(
             "/api/v2/submissions",
@@ -170,8 +174,12 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/oauth/register", post(agents::register))
         .route("/oauth/authorize/decision", post(agents::decide))
         // Account site forms.
-        .route("/auth/email/start", post(email_start))
-        .route("/auth/email/verify", post(email_verify))
+        // The same two paths take the apps' JSON (in-app sign-in,
+        // [`app_sign_in`]) on the API host only; the web's form only on the
+        // account host. `/auth/email/resend` is the apps' only.
+        .route("/auth/email/start", post(email_start_or_app))
+        .route("/auth/email/verify", post(email_verify_or_app))
+        .route("/auth/email/resend", post(app_resend))
         .route("/logout", post(logout))
         .route("/delete/code", post(deletion_code))
         .route("/delete/confirm", post(delete_account))
@@ -201,6 +209,7 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/new", post(create_login))
         .route("/staff/users/{account_id}/sign-out", post(sign_out_user))
         .route("/staff/users/{account_id}/apps/{grant_id}/sign-out", post(sign_out_user_app))
+        .route("/staff/users/{account_id}/devices/{device_id}/sign-out", post(sign_out_user_device))
         .route("/staff/users/{account_id}/role", post(change_role))
         .route("/staff/users/{account_id}/ban", post(ban_user))
         .route("/staff/users/{account_id}/unban", post(unban_user))
@@ -210,7 +219,8 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/staff/users/{account_id}/fixed-code/clear", post(clear_fixed_code))
         .route("/admin", any(moved_to_staff))
         .route("/admin/{*rest}", any(moved_to_staff))
-        .route("/devices/{device_id}/revoke", post(revoke_device));
+        .route("/devices/{device_id}/revoke", post(revoke_device))
+        .route("/apps/{grant_id}/sign-out", post(sign_out_own_app));
     // BIR uptime's reads exist from `public`; below it they are not routed,
     // so they answer the site's own 404 as before.
     let router = if state.uptime.level.is_public() {
@@ -265,6 +275,14 @@ async fn bir_status_stylesheet() -> Response {
 
 async fn account_script() -> Response {
     text(include_str!("account.js"), "text/javascript; charset=utf-8")
+}
+
+async fn app_sign_in_script() -> Response {
+    text(include_str!("app-sign-in.js"), "text/javascript; charset=utf-8")
+}
+
+async fn app_check_script() -> Response {
+    text(include_str!("app-check.js"), "text/javascript; charset=utf-8")
 }
 
 async fn staff_stylesheet() -> Response {
@@ -464,6 +482,13 @@ async fn screenshot(Path(name): Path<String>) -> Response {
 const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; \
      font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
+/// The two static pages around in-app sign-in (`/app-sign-in`,
+/// `/app-check/done`): their own script and the site's styles only. The
+/// pages' style attributes (the wordmark's size) are allowed.
+const STATIC_PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; manifest-src 'self'; form-action 'self'; \
+     base-uri 'none'; frame-ancestors 'none'";
+
 /// How long a public BIR status page with nothing per viewer may be kept by
 /// any cache (the page itself changes only on 5-minute marks).
 const BIR_STATUS_CACHE: &str = "public, max-age=60";
@@ -475,6 +500,7 @@ const BIR_STATUS_CACHE: &str = "public, max-age=60";
 async fn render_page(pages: &topcoat::router::Router, state: &AppState, request: axum::extract::Request) -> Response {
     let (parts, body) = request.into_parts();
     let staff = parts.uri.path() == "/staff" || parts.uri.path().starts_with("/staff/");
+    let path = parts.uri.path().to_owned();
     let bir_status = state.uptime.level.is_public() && parts.uri.path() == crate::uptime::public::STATUS_PATH;
     if bir_status && let Err(wait) = uptime::api::check_ip(state, &parts.headers, time::OffsetDateTime::now_utc()) {
         return uptime::api::rate_limited(wait);
@@ -493,6 +519,14 @@ async fn render_page(pages: &topcoat::router::Router, state: &AppState, request:
     if staff && response.status().is_success() {
         let headers = response.headers_mut();
         headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STAFF_CSP));
+    }
+    // The app-check pages hand out a Turnstile token: no other window may
+    // keep a handle on them.
+    if path == "/app-check" || path == "/app-check/done" {
+        response.headers_mut().insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
+    }
+    if (path == "/app-sign-in" || path == "/app-check/done") && response.status().is_success() {
+        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STATIC_PAGE_CSP));
     }
     response
 }
@@ -709,6 +743,110 @@ struct EmailStart {
     human: Option<String>,
 }
 
+/// Which of the sign-in endpoints' two kinds a request to them is, by its
+/// host: an app's JSON on the API host only, the web's form on the account
+/// host only (where Cloudflare challenges the form; docs/deploy.md,
+/// "Cloudflare rules for sign-in"). `None`: answered `404`, as if there
+/// were no such path there.
+///
+/// Off a public deployment only (`secure_cookies` off: the account origin
+/// is not https), a loopback host (`localhost`, `127.0.0.1`, `[::1]`, any
+/// port) takes both: that is a developer's own machine, where one address
+/// serves everything. On a public deployment a loopback host is any other
+/// unknown host, so the allowance never rests on the `Host` header alone.
+fn sign_in_kind(state: &AppState, headers: &HeaderMap) -> Option<bool> {
+    let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let json = app_sign_in::is_json(headers);
+    if !state.config.secure_cookies && is_loopback_host(host) {
+        return Some(json);
+    }
+    let site = crate::sites::canonical::Site::for_host(host);
+    let expected = if json { crate::sites::canonical::Site::Api } else { crate::sites::canonical::Site::Account };
+    (site == expected).then_some(json)
+}
+
+/// Whether a `Host` header names this machine itself, whatever the port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        // An IPv6 literal: up to its closing bracket.
+        Some(rest) => rest.split_once(']').map_or("", |(address, _)| address),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    matches!(name.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// `POST /auth/email/start`: an app's JSON ([`app_sign_in::start`]) on the
+/// API host, or the web's form on the account host.
+async fn email_start_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    match sign_in_kind(&state, request.headers()) {
+        None => return StatusCode::NOT_FOUND.into_response(),
+        Some(true) => return app_sign_in::start(state, request).await,
+        Some(false) => {}
+    }
+    let headers = request.headers().clone();
+    match Form::<EmailStart>::from_request(request, &state).await {
+        Ok(form) => email_start(State(state), headers, form).await,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// `POST /auth/email/verify`: an app's JSON ([`app_sign_in::verify`]), or
+/// the web's form. Both count against the network's tries at a code
+/// ([`crate::account::guard::SignInGuard::count_verify_try`]) before their
+/// body is read, and share verify's places for the database work.
+async fn email_verify_or_app(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    match sign_in_kind(&state, request.headers()) {
+        None => return StatusCode::NOT_FOUND.into_response(),
+        Some(true) => return app_sign_in::verify(state, request).await,
+        Some(false) => {}
+    }
+    let headers = request.headers().clone();
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    // Counted before the form is read; a refusal reads it only to send
+    // the person back to their code page, and touches no database.
+    let counted = state.sign_in_guard.count_verify_try(&headers);
+    app_sign_in::alert_if_refused_many(&state);
+    let form = match Form::<EmailVerify>::from_request(request, &state).await {
+        Ok(Form(form)) => form,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if counted.is_err() {
+        return back_to_code_page(form, Notice::CodeTriesTooMany);
+    }
+    email_verify(&state, form).await
+}
+
+/// Back to the code page with `notice`, keeping its address, next page and
+/// countdown.
+fn back_to_code_page(form: EmailVerify, notice: Notice) -> Response {
+    let next = safe_next(form.next.as_deref());
+    let email = accounts::normalize_email(&form.email).unwrap_or_default();
+    let expires = form.expires.unwrap_or_default();
+    see_other(link("/login/verify", Some(notice), &[("email", &email), ("next", &next), ("expires", &expires)]))
+}
+
+/// `POST /auth/email/resend`: the apps' only, JSON on the API host.
+async fn app_resend(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    if sign_in_kind(&state, request.headers()) != Some(true) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    app_sign_in::resend(state, request).await
+}
+
+/// Mails staff, at most once an hour ([`crate::account::guard`]), that
+/// Turnstile answered without the hostname or action, so the web form took
+/// its tokens unbound.
+async fn unbound_alert(state: AppState) {
+    let subject = "Sign-in: Turnstile's answers lack the hostname or action";
+    let text = "Cloudflare Turnstile answered a sign-in form's check without the hostname or the action. \
+                The web form lets such answers through, as before these fields were checked, so web sign-in \
+                goes on; the apps' checks are refused until the fields are back.\n\n\
+                This is mailed at most once an hour. See docs/accounts.md, \"The app check and the testing cap\".";
+    app_sign_in::mail_staff(&state, subject, text).await;
+}
+
 async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailStart>) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
@@ -718,7 +856,11 @@ async fn email_start(State(state): State<AppState>, headers: HeaderMap, Form(for
         Ok(email) => email,
         Err(notice) => return see_other(link("/login", Some(notice), &[("next", &next)])),
     };
-    let counted = match state.sign_in_guard.check(&headers, form.human.as_deref()).await {
+    let counted = state.sign_in_guard.check(&headers, form.human.as_deref()).await;
+    if state.sign_in_guard.take_unbound_alert() {
+        tokio::spawn(unbound_alert(state.clone()));
+    }
+    let counted = match counted {
         Ok(counted) => counted,
         Err(refused) => {
             let notice = match refused {
@@ -776,26 +918,39 @@ struct EmailVerify {
     expires: Option<String>,
 }
 
-async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<EmailVerify>) -> Response {
-    if let Err(refused) = same_origin(&state, &headers) {
-        return refused;
-    }
+/// The web form's verify, once [`email_verify_or_app`] counted it: in one
+/// of verify's places for the database work (waited for at most two
+/// seconds, else "try again in a moment"), held until the code is spent,
+/// and in a transaction whose locks and connection are waited for at most
+/// three.
+async fn email_verify(state: &AppState, form: EmailVerify) -> Response {
     let next = safe_next(form.next.as_deref());
     let Ok(email) = accounts::normalize_email(&form.email) else {
         return see_other(link("/login", Some(Notice::EmailInvalid), &[("next", &next)]));
     };
-    let account = match accounts::redeem_code(&state.db, &email, &form.code).await {
+    let Some(slot) = app_sign_in::verify_slot(state).await else {
+        return back_to_code_page(form, Notice::SignInBusy);
+    };
+    let redeemed = match app_sign_in::begin_waiting(&state.db).await {
+        Ok(tx) => accounts::redeem_code(tx, &email, &form.code).await,
+        Err(error) => Err(error.into()),
+    };
+    let account = match redeemed {
         Ok(account) => account,
         Err(CodeError::Invalid | CodeError::TooMany | CodeError::Busy) => {
-            let expires = form.expires.unwrap_or_default();
-            return see_other(link(
-                "/login/verify",
-                Some(Notice::CodeInvalid),
-                &[("email", &email), ("next", &next), ("expires", &expires)],
-            ));
+            return back_to_code_page(form, Notice::CodeInvalid);
+        }
+        Err(CodeError::Internal(error))
+            if error.downcast_ref::<sqlx::Error>().is_some_and(app_sign_in::is_lock_timeout) =>
+        {
+            tracing::warn!("web sign-in: a lock or a connection was not had in time; sent back to try again");
+            return back_to_code_page(form, Notice::SignInBusy);
         }
         Err(CodeError::Internal(error)) => return internal(error),
     };
+    // The code is spent: what follows is a signed-in person's, not a guess,
+    // and needs no place.
+    drop(slot);
     // The code was right, but a banned account gets no session. Its code
     // was emailed like any other, so typing an email tells nothing. Only
     // to delete itself does it get one, which no page but `/delete` takes
@@ -813,7 +968,7 @@ async fn email_verify(State(state): State<AppState>, headers: HeaderMap, Form(fo
     let mut response = see_other(next);
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, session_cookie(&state, &token, accounts::SESSION_TTL.whole_seconds()));
+        .insert(header::SET_COOKIE, session_cookie(state, &token, accounts::SESSION_TTL.whole_seconds()));
     response
 }
 
@@ -1239,6 +1394,23 @@ async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Path(d
     }
 }
 
+/// The person logs out one of their app sign-ins that has no device yet
+/// (My TINs, "Signed in · not added as a device yet").
+async fn sign_out_own_app(State(state): State<AppState>, headers: HeaderMap, Path(grant_id): Path<Uuid>) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let account = match require_session(&state, &headers, "/tins").await {
+        Ok(account) => account,
+        Err(redirect) => return redirect,
+    };
+    match devices::sign_out_grant(&state.db, account.id, grant_id).await {
+        Ok(true) => see_other(link("/tins", Some(Notice::AppSignedOut), &[])),
+        Ok(false) => see_other(link("/tins", None, &[])),
+        Err(error) => internal(error),
+    }
+}
+
 /// A signed-in staff member with `power`, or the response to send instead:
 /// a 404 for everyone who is not staff, as if the page did not exist; for
 /// staff without the power, back to `back_to` with `admin_only` and nothing
@@ -1502,6 +1674,25 @@ async fn sign_out_user_app(
         Err(response) => return response,
     };
     let outcome = admin::sign_out_app(&state.db, &state.config, &staff, account_id, grant_id, &form.reason).await;
+    staff_outcome(&back_to, outcome)
+}
+
+/// Staff log out one of an account's devices, with a reason.
+async fn sign_out_user_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, device_id)): Path<(Uuid, Uuid)>,
+    Form(form): Form<StaffReason>,
+) -> Response {
+    if let Err(refused) = same_origin(&state, &headers) {
+        return refused;
+    }
+    let back_to = user_page(account_id, &form.tab);
+    let staff = match require_staff(&state, &headers, &back_to, Power::SignOut).await {
+        Ok(staff) => staff,
+        Err(response) => return response,
+    };
+    let outcome = admin::sign_out_device(&state.db, &state.config, &staff, account_id, device_id, &form.reason).await;
     staff_outcome(&back_to, outcome)
 }
 

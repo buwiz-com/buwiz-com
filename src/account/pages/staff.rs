@@ -1771,6 +1771,7 @@ pub mod account_id {
         let claims = claims::for_account(db, account_id).await?;
         let documents = claims::account_documents(db, account_id).await?;
         let apps = queries::apps(db, account_id).await?;
+        let devices = crate::filing::devices::for_account(db, account_id).await?;
         let sessions = queries::sessions(db, account_id).await?;
         let audit = queries::audit(db, account_id).await?;
         let account_audit = queries::account_audit(db, account_id).await?;
@@ -2114,6 +2115,21 @@ pub mod account_id {
                                     connected_app(account_id: account_id, app: app, may_sign_out: may_sign_out)
                                 }
                             </div>
+                            <section class="sx-sub">
+                                <div class="sx-subh">
+                                    <h3>"Devices"</h3>
+                                    <span class="sx-fine">"Removed ones show for 30 days"</span>
+                                </div>
+                                if devices.is_empty() {
+                                    <p class="sx-empty">"No devices."</p>
+                                } else {
+                                    <div>
+                                        for device in devices {
+                                            staff_device(account_id: account_id, device: device, may_sign_out: may_sign_out)
+                                        }
+                                    </div>
+                                }
+                            </section>
                         </section>
                         <section class="sx-card sx-tabbody" role="tabpanel" id="tab-history" aria-labelledby="tab-history-tab" hidden=(hidden[3])>
                             <ol class="sx-hist">
@@ -2327,6 +2343,70 @@ async fn connected_app(account_id: Uuid, app: AppRow, may_sign_out: bool) -> Res
         </div>
     })
 }
+/// One of the account's devices, as the person's own list shows it, with
+/// its state and, while it is live, a "Log out" with a reason.
+#[component]
+async fn staff_device(
+    account_id: Uuid,
+    device: crate::filing::devices::DeviceView,
+    may_sign_out: bool,
+) -> Result<impl View> {
+    let app = crate::account::oauth::client_name(&device.client_id).unwrap_or("Buwiz");
+    let title = device.model_name.clone().unwrap_or_else(|| device.name.clone());
+    let platform = device
+        .platform
+        .as_deref()
+        .and_then(crate::account::app_sign_in::Platform::from_stored)
+        .map(|platform| platform.label());
+    let what: Vec<String> = [
+        Some(app.to_owned()),
+        platform.map(str::to_owned),
+        device.os_version.clone(),
+        device.computer_name.clone(),
+        Some(format!("“{}”", device.name)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let used = device.last_used_at.map(short_date).unwrap_or_else(|| "never".to_owned());
+    let when = format!(
+        "Added {} · signed in {} · last used {used}",
+        short_date(device.created_at),
+        short_date(device.signed_in_at)
+    );
+    let live = device.revoked_at.is_none();
+    let action = format!("/staff/users/{account_id}/devices/{}/sign-out", device.id);
+    Ok(view! {
+        <div class="sx-app-row">
+            <span class="sx-app-ic">(ic("monitor"))</span>
+            <span class="x">
+                <b>(title.clone())</b>
+                <span>(what.join(" · "))</span>
+                <span>(when)</span>
+            </span>
+            if live && device.state == "live" {
+                sx_pill(label: "Live", sym: "check", tone: "ok")
+            } else if live {
+                sx_pill(label: "Signed out (expired)", sym: "clock", tone: "")
+            } else {
+                sx_pill(label: format!("Removed {}", device.revoked_at.map(short_date).unwrap_or_default()), sym: "trash", tone: "")
+            }
+            if live && may_sign_out {
+                reason_act(
+                    id: format!("act-device-{}", device.id),
+                    label: "Log out",
+                    small: true,
+                    action: action,
+                    question: format!("Log {title} out?"),
+                    detail: "The device is removed and its app signed out. It can't send until it signs in again.",
+                    confirm: "Log out",
+                    tab: "sign"
+                )
+            }
+        </div>
+    })
+}
+
 /// The account's story from the timestamps already kept: when it was
 /// made, its sign-ins, its claims and what happened to them, and the audit
 /// lines (deleted claims included). Newest first.

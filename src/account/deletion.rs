@@ -7,9 +7,10 @@
 //! Deleting the `accounts` row takes every row that names the account with
 //! it (`ON DELETE CASCADE`: TINs and their files and readings, returns and
 //! tickets, devices, sign-ins and their tokens, the BIR queue and outage
-//! records). This also deletes its codes, which have no foreign key, and
-//! the stored objects of files that were still kept. Audit lines stay; the
-//! account's own actions in them lose its address.
+//! records). This also deletes its codes and in-app sign-in requests,
+//! which have no foreign key, and the stored objects of files that were
+//! still kept. Audit lines stay; the account's own actions in them lose
+//! its address.
 
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
@@ -173,6 +174,7 @@ pub async fn delete(
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM email_codes WHERE email = $1").bind(&email).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM app_sign_ins WHERE email = $1").bind(&email).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM accounts WHERE id = $1").bind(account_id).execute(&mut *tx).await?;
     let me = accounts::Account { id: account_id, email: String::new() };
     let line =

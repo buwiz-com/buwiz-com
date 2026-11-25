@@ -245,6 +245,7 @@ const TABLES: &[&str] = &[
     "bir_proofs",
     "bir_queue_reports",
     "bir_turns",
+    "app_sign_ins",
 ];
 
 async fn counts(db: &PgPool) -> Vec<(&'static str, i64)> {
@@ -309,7 +310,9 @@ async fn fill(site: &Site, account: Uuid, email: &str, n: u8) {
              INSERT INTO bir_turns (id, kind, account_id, device_key, slot, not_before, expires_at)
              VALUES ('t_{n}', 'admit', '{account}', 'd:{device_id}', 's1', now(), now() + interval '5 minutes');
              INSERT INTO claim_audit (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, source)
-             VALUES (gen_random_uuid(), '{account}', '***-***-999-00000', 'deleted', 'pending', '{account}', '{email}', 'web');"
+             VALUES (gen_random_uuid(), '{account}', '***-***-999-00000', 'deleted', 'pending', '{account}', '{email}', 'web');
+             INSERT INTO app_sign_ins (email, client_id, secret_hash, intent, expires_at)
+             VALUES ('{email}', 'buwiz-ebirforms', decode(repeat('ab', 32), 'hex'), 'sign_in', now() + interval '10 minutes');"
         ),
     )
     .await;
@@ -648,7 +651,14 @@ async fn the_hourly_upkeep_deletes_sign_in_records_after_30_days(db: PgPool) {
              VALUES ('agent_test', 'Test agent', ARRAY['https://agent.example.test/cb']);
              INSERT INTO oauth_codes (code_hash, client_id, account_id, redirect_uri, code_challenge, scope, expires_at)
              VALUES (decode('b1', 'hex'), 'agent_test', '{ana}', 'https://agent.example.test/cb', 'c', 'mcp', now() - interval '31 days'),
-                    (decode('b2', 'hex'), 'agent_test', '{ana}', 'https://agent.example.test/cb', 'c', 'mcp', now() - interval '29 days');"
+                    (decode('b2', 'hex'), 'agent_test', '{ana}', 'https://agent.example.test/cb', 'c', 'mcp', now() - interval '29 days');
+             INSERT INTO app_sign_ins (email, client_id, secret_hash, intent, created_at, expires_at) VALUES
+                 ('old@example.test', 'buwiz-ebirforms', decode(repeat('ab', 32), 'hex'), 'sign_in',
+                  now() - interval '32 days', now() - interval '31 days'),
+                 ('new@example.test', 'buwiz-ebirforms', decode(repeat('ab', 32), 'hex'), 'sign_in',
+                  now() - interval '30 days', now() - interval '29 days');
+             INSERT INTO app_sign_in_alerts (day, sent_at) VALUES
+                 ('2026-01-01', now() - interval '31 days'), ('2026-01-31', now() - interval '29 days');"
         ),
     )
     .await;
@@ -661,6 +671,9 @@ async fn the_hourly_upkeep_deletes_sign_in_records_after_30_days(db: PgPool) {
         .unwrap();
     assert_eq!(left, ["BCDF-GHJ2", "BCDF-GHJ3"]);
     assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_codes").await, 1);
+    let left: Vec<String> = sqlx::query_scalar("SELECT email FROM app_sign_ins").fetch_all(&site.db).await.unwrap();
+    assert_eq!(left, ["new@example.test"]);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM app_sign_in_alerts").await, 1);
     // The account and its sessions are not sign-in records.
     assert!(exists(&site.db, ana).await);
     assert_eq!(live_sessions(&site.db, ana).await, 1);

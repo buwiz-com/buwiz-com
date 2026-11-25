@@ -109,6 +109,32 @@ impl Site {
         Self { db, router: buwiz_cloud::app(state.clone()), state }
     }
 
+    /// [`Site::with_mailbox`] with its settings changed by `change`.
+    pub fn with_config(db: PgPool, change: impl FnOnce(&mut Config)) -> Self {
+        let mut config = test_config(NO_DOWNLOADS, vec![STAFF.into()]);
+        change(&mut config);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
+        let mailer = buwiz_cloud::account::mail::Mailer::recording(ORIGIN);
+        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender).with_mailer(mailer);
+        Self { db, router: buwiz_cloud::app(state.clone()), state }
+    }
+
+    /// [`Site::with_turnstile`] whose mail is kept, as [`Site::with_mailbox`].
+    pub fn with_turnstile_mailbox(db: PgPool, verify_url: &str) -> Self {
+        let mut config = test_config(NO_DOWNLOADS, vec![STAFF.into()]);
+        config.turnstile = Some(TurnstileConfig {
+            site_key: TURNSTILE_SITE_KEY.into(),
+            secret_key: TURNSTILE_SECRET_KEY.into(),
+            verify_url: verify_url.into(),
+        });
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let sender = SenderLink::new("http://127.0.0.1:9", Zeroizing::new("unused".into()));
+        let mailer = buwiz_cloud::account::mail::Mailer::recording(ORIGIN);
+        let state = AppState::new(config, db.clone(), DocumentStore::Database, key, sender).with_mailer(mailer);
+        Self { db, router: buwiz_cloud::app(state.clone()), state }
+    }
+
     /// A site whose mail is kept, not sent: the sign-in codes it mails are
     /// `site.state.mailer.sign_in_codes()`.
     pub fn with_mailbox(db: PgPool) -> Self {
@@ -274,6 +300,8 @@ fn test_config(downloads_url: &str, admin_emails: Vec<String>) -> Config {
         forms_origin: FORMS.into(),
         // Nothing listens there: the star count is unknown.
         github_api_url: "http://127.0.0.1:9".into(),
+        app_sign_in_minutes: 5,
+        sign_in_limits: Default::default(),
     }
 }
 

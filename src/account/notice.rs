@@ -50,6 +50,8 @@ notices! {
     CodeNetworkTooMany = "code_network_too_many" => error "Too many codes were asked for from your network. Try again in an hour.",
     NotHuman = "not_human" => error "We could not confirm that you are not a robot. Wait a moment, then try again.",
     CodeInvalid = "code_invalid" => error "That code is wrong or has expired. Request a new one.",
+    CodeTriesTooMany = "code_tries_too_many" => error "Too many sign-in codes are being checked right now. Try again in an hour.",
+    SignInBusy = "sign_in_busy" => error "Buwiz is busy. Try again in a moment.",
     SignedOut = "signed_out" => info "You are signed out.",
     SignInFirst = "sign_in_first" => info "Sign in to continue.",
     DeviceInvalid = "device_invalid" => error "That code is wrong or has expired. Start the sign-in again in the app.",

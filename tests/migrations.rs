@@ -1,10 +1,14 @@
-//! Migrations 11 to 16 on a database at migration 10 with a row in every
+//! Migrations 11 to 20 on a database at migration 10 with a row in every
 //! claim status, files, readings, audit lines, tickets and returns: the
 //! rows survive and read as before, and going back down to 10 leaves a
 //! database the release before this one starts on, every return kept.
 //! Migration 13 (test TINs) goes back to 12 on its own, 14 (BIR uptime) to
 //! 13, keeping its history in the archive for the way up, 15 (fixed
-//! sign-in codes) to 14, and 16 (account deletion) to 15.
+//! sign-in codes) to 14, 16 (account deletion) to 15, 17 (in-app
+//! sign-in) to 16, and 18 (one device row per install) to 17. Migration
+//! 20 (an index on devices' sign-ins) and the server's migration
+//! connection ([`buwiz_cloud::migrate`]) fail, rather than wait, behind a
+//! long transaction, and recover as docs/deploy.md says.
 //! Each test gets its own empty database (`migrations = false`).
 
 use std::borrow::Cow;
@@ -320,7 +324,7 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     let before = rows(&db).await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
     let after = rows(&db).await;
     assert_eq!(only_columns_at_10(&after, &before), before, "no row or old column changed");
 
@@ -772,6 +776,10 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
     for (down, set) in [
+        (include_str!("../migrations/0020_devices_grant_index.down.sql"), ""),
+        (include_str!("../migrations/0019_device_install_index.down.sql"), ""),
+        (include_str!("../migrations/0018_device_installs.down.sql"), ""),
+        (include_str!("../migrations/0017_app_sign_ins.down.sql"), ""),
         (include_str!("../migrations/0016_account_deletion.down.sql"), ""),
         (include_str!("../migrations/0015_fixed_codes.down.sql"), ""),
         (include_str!("../migrations/0014_bir_uptime.down.sql"), ""),
@@ -906,7 +914,7 @@ async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgP
     assert_eq!(versions(&db).await, (1..=10).collect::<Vec<_>>());
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
 }
 
 /// Migration 13: a test TIN (root 000-000-000) is only ever one an Admin or
@@ -983,7 +991,7 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
             .unwrap();
     assert_eq!(checks, 0);
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
 }
 
 /// The migrations of the release before BIR uptime: 1 to 13.
@@ -1032,7 +1040,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     release_13().run(&db).await.unwrap();
     let schema_13 = schema(&db).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
 
     // What a try may hold: a live failure has a class and a kind, a lab
     // try neither and is never counted, times are to the minute, keys are
@@ -1184,9 +1192,13 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
         assert_eq!(rows, 0, "{table}");
     }
 
-    // By hand, as psql runs it, the down file does the same (after 16's
-    // and 15's, newest first).
+    // By hand, as psql runs it, the down file does the same (after 17's,
+    // 16's and 15's, newest first).
     for down in [
+        include_str!("../migrations/0020_devices_grant_index.down.sql"),
+        include_str!("../migrations/0019_device_install_index.down.sql"),
+        include_str!("../migrations/0018_device_installs.down.sql"),
+        include_str!("../migrations/0017_app_sign_ins.down.sql"),
         include_str!("../migrations/0016_account_deletion.down.sql"),
         include_str!("../migrations/0015_fixed_codes.down.sql"),
         include_str!("../migrations/0014_bir_uptime.down.sql"),
@@ -1278,7 +1290,7 @@ async fn a_stray_open_transaction_fails_migration_14(db: PgPool, table: &str) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>(), "{table}");
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
     let validated: bool =
         sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tickets_bir_admission_check'")
             .fetch_one(&db)
@@ -1317,7 +1329,7 @@ async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
     let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
     let boss = id(&db, "INSERT INTO accounts (email, role) VALUES ('boss@example.test', 'admin') RETURNING id").await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
 
     let hash = "decode(repeat('ab', 32), 'hex')";
     let set = |columns: &str| format!("UPDATE accounts SET {columns} WHERE id = '{ana}'");
@@ -1372,6 +1384,10 @@ async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
     exec(&db, &set(&whole)).await;
     exec(&db, &line("fixed_code_set")).await;
     for down in [
+        include_str!("../migrations/0020_devices_grant_index.down.sql"),
+        include_str!("../migrations/0019_device_install_index.down.sql"),
+        include_str!("../migrations/0018_device_installs.down.sql"),
+        include_str!("../migrations/0017_app_sign_ins.down.sql"),
         include_str!("../migrations/0016_account_deletion.down.sql"),
         include_str!("../migrations/0015_fixed_codes.down.sql"),
     ] {
@@ -1407,7 +1423,7 @@ async fn account_deletion_goes_back_to_15(db: PgPool) {
     let code = "INSERT INTO email_codes (email, code_hash, expires_at) VALUES ('ana@example.test', decode('01', 'hex'), now())";
     exec(&db, code).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
     let purposes: Vec<String> = sqlx::query_scalar("SELECT purpose FROM email_codes").fetch_all(&db).await.unwrap();
     assert_eq!(purposes, ["sign_in"]);
 
@@ -1444,11 +1460,263 @@ async fn account_deletion_goes_back_to_15(db: PgPool) {
     MIGRATOR.run(&db).await.unwrap();
     exec(&db, &with_purpose("delete")).await;
     exec(&db, &line("deleted")).await;
-    let mut tx = db.begin().await.unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0016_account_deletion.down.sql")).execute(&mut *tx).await.unwrap();
-    tx.commit().await.unwrap();
+    for down in [
+        include_str!("../migrations/0020_devices_grant_index.down.sql"),
+        include_str!("../migrations/0019_device_install_index.down.sql"),
+        include_str!("../migrations/0018_device_installs.down.sql"),
+        include_str!("../migrations/0017_app_sign_ins.down.sql"),
+        include_str!("../migrations/0016_account_deletion.down.sql"),
+    ] {
+        let mut tx = db.begin().await.unwrap();
+        sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
     assert_eq!(versions(&db).await, (1..=15).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_15);
     assert_eq!(archived(&db, "account_audit", "action").await.len(), 2);
     release_15().run(&db).await.unwrap();
+}
+
+/// The migrations of the release before in-app sign-in: 1 to 16.
+fn release_16() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 16).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// Migration 17: three new tables, whose checks hold a request to a known
+/// intent and platform, a well-formed install id and 32-byte hashes, and
+/// the `app_sign_in` purpose. Going back to 16 never refuses, leaves 16's
+/// schema exactly and keeps every web code, deleting the in-app ones; the
+/// way up works again, by sqlx and by hand.
+#[sqlx::test(migrations = false)]
+async fn in_app_sign_in_goes_back_to_16(db: PgPool) {
+    release_16().run(&db).await.unwrap();
+    let schema_16 = schema(&db).await;
+    exec(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test')").await;
+    let code = "INSERT INTO email_codes (email, code_hash, expires_at) VALUES ('ana@example.test', decode('01', 'hex'), now())";
+    exec(&db, code).await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+
+    let request = |intent: &str, platform: &str, hash_bytes: usize| {
+        format!(
+            "INSERT INTO app_sign_ins (email, client_id, secret_hash, intent, platform, expires_at)
+             VALUES ('ana@example.test', 'buwiz-ebirforms', decode(repeat('ab', {hash_bytes}), 'hex'), '{intent}',
+                     {platform}, now() + interval '10 minutes')"
+        )
+    };
+    exec(&db, &request("sign_in", "'ios'", 32)).await;
+    exec(&db, &request("create", "NULL", 32)).await;
+    fails_with(&db, &request("sign_up", "NULL", 32), "app_sign_ins_intent_check").await;
+    fails_with(&db, &request("sign_in", "'symbian'", 32), "app_sign_ins_platform_check").await;
+    fails_with(&db, &request("sign_in", "NULL", 31), "app_sign_ins_secret_hash_check").await;
+    fails_not_null(
+        &db,
+        "INSERT INTO app_sign_ins (email, client_id, secret_hash, intent)
+         VALUES ('ana@example.test', 'buwiz-ebirforms', decode(repeat('ab', 32), 'hex'), 'sign_in')",
+    )
+    .await;
+    exec(
+        &db,
+        "INSERT INTO email_codes (email, code_hash, expires_at, purpose)
+         VALUES ('ana@example.test', decode('02', 'hex'), now(), 'app_sign_in')",
+    )
+    .await;
+    fails_with(
+        &db,
+        "INSERT INTO app_sign_ins (email, client_id, secret_hash, intent, install_id, expires_at)
+         VALUES ('ana@example.test', 'buwiz-ebirforms', decode(repeat('ab', 32), 'hex'), 'sign_in', 'short', now())",
+        "app_sign_ins_install_id_check",
+    )
+    .await;
+    exec(
+        &db,
+        "INSERT INTO email_codes (email, code_hash, expires_at, purpose, unchecked)
+         VALUES ('ana@example.test', decode('03', 'hex'), now(), 'app_sign_in', true)",
+    )
+    .await;
+    exec(&db, "INSERT INTO app_sign_in_alerts (day) VALUES ('2026-11-25')").await;
+
+    // Back to 16 the way sqlx reverts.
+    MIGRATOR.undo(&db, 16).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_16, "the schema is migration 16's");
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM email_codes").fetch_one(&db).await.unwrap();
+    assert_eq!(codes, 1, "sign-in codes stay, in-app codes go");
+    release_16().run(&db).await.unwrap();
+
+    // Up again, then back by hand.
+    MIGRATOR.run(&db).await.unwrap();
+    exec(&db, &request("sign_in", "'android'", 32)).await;
+    for down in [
+        include_str!("../migrations/0020_devices_grant_index.down.sql"),
+        include_str!("../migrations/0019_device_install_index.down.sql"),
+        include_str!("../migrations/0018_device_installs.down.sql"),
+        include_str!("../migrations/0017_app_sign_ins.down.sql"),
+    ] {
+        let mut tx = db.begin().await.unwrap();
+        sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(versions(&db).await, (1..=16).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_16);
+    release_16().run(&db).await.unwrap();
+}
+
+/// The migrations of the release before one device row per install: 1 to
+/// 17.
+fn release_17() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 17).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// Migrations 18 and 19: devices get the columns an app sends, checked,
+/// and `signed_in_at` (NULL for earlier rows: nothing is rewritten); one
+/// row per account and install (19, built concurrently); grants and device
+/// sign-ins keep the install; ending a grant removes its devices. Going
+/// back to 17 never refuses,
+/// keeps every device and grant, and leaves 17's schema exactly; the way
+/// up works again, by sqlx and by hand.
+#[sqlx::test(migrations = false)]
+async fn one_device_row_per_install_goes_back_to_17(db: PgPool) {
+    release_17().run(&db).await.unwrap();
+    let schema_17 = schema(&db).await;
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let grant = id(
+        &db,
+        &format!("INSERT INTO oauth_grants (account_id, client_id) VALUES ('{ana}', 'buwiz-ebirforms') RETURNING id"),
+    )
+    .await;
+    let device = id(
+        &db,
+        &format!(
+            "INSERT INTO devices (account_id, grant_id, public_key, name, created_at)
+             VALUES ('{ana}', '{grant}', decode(repeat('01', 32), 'hex'), 'Old Mac', '2026-11-01T00:00:00Z') RETURNING id"
+        ),
+    )
+    .await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    // No row was rewritten: an earlier device reads its sign-in as its
+    // creation.
+    let (signed_in, install): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT signed_in_at::text, install_id FROM devices WHERE id = $1")
+            .bind(device)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!((signed_in, install), (None, None));
+
+    let row = |key: &str, install: &str, extra: &str| {
+        format!(
+            "INSERT INTO devices (account_id, grant_id, public_key, name, install_id{})
+             VALUES ('{ana}', '{grant}', decode(repeat('{key}', 32), 'hex'), 'Phone', '{install}'{})",
+            if extra.is_empty() { "" } else { ", model" },
+            if extra.is_empty() { String::new() } else { format!(", '{extra}'") }
+        )
+    };
+    exec(&db, &row("02", "install-phone-0001", "")).await;
+    fails_with(&db, &row("03", "install-phone-0001", ""), "devices_account_install").await;
+    fails_with(&db, &row("04", "short", ""), "devices_install_id_check").await;
+    fails_with(&db, &row("05", "install-other-0002", &"x".repeat(81)), "devices_model_check").await;
+    fails_with(
+        &db,
+        &format!("UPDATE oauth_grants SET platform = 'symbian' WHERE id = '{grant}'"),
+        "oauth_grants_platform_check",
+    )
+    .await;
+    exec(
+        &db,
+        &format!("UPDATE oauth_grants SET install_id = 'install-phone-0001', platform = 'ios' WHERE id = '{grant}'"),
+    )
+    .await;
+    // Ending the grant removes its devices, at the grant's time.
+    exec(&db, &format!("UPDATE oauth_grants SET revoked_at = '2026-11-20T00:00:00Z' WHERE id = '{grant}'")).await;
+    let removed: Vec<String> =
+        sqlx::query_scalar("SELECT revoked_at::text FROM devices ORDER BY id").fetch_all(&db).await.unwrap();
+    assert!(removed.len() == 2 && removed.iter().all(|at| at.starts_with("2026-11-20")), "{removed:?}");
+
+    // Back to 17 the way sqlx reverts.
+    MIGRATOR.undo(&db, 17).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=17).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_17, "the schema is migration 17's");
+    let devices: i64 = sqlx::query_scalar("SELECT count(*) FROM devices").fetch_one(&db).await.unwrap();
+    assert_eq!(devices, 2, "every device stays");
+    release_17().run(&db).await.unwrap();
+
+    // Up again, then back by hand.
+    MIGRATOR.run(&db).await.unwrap();
+    for down in [
+        include_str!("../migrations/0020_devices_grant_index.down.sql"),
+        include_str!("../migrations/0019_device_install_index.down.sql"),
+        include_str!("../migrations/0018_device_installs.down.sql"),
+    ] {
+        let mut tx = db.begin().await.unwrap();
+        sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(versions(&db).await, (1..=17).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_17);
+    release_17().run(&db).await.unwrap();
+}
+
+/// The migrations up to 19.
+fn release_19() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 19).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// Migration 20 builds its index CONCURRENTLY, outside a transaction, so
+/// it cannot set its own lock_timeout: the server's migrations run on a
+/// connection that has one ([`buwiz_cloud::migrate`]). Behind a long
+/// transaction that wrote to `devices`, it fails within seconds instead of
+/// waiting, leaving an invalid index and no record; as docs/deploy.md says,
+/// dropping it and starting again works. The pool's connections never get
+/// the setting.
+#[sqlx::test(migrations = false)]
+async fn migration_20_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
+    release_19().run(&db).await.unwrap();
+    let mut stray = db.begin().await.unwrap();
+    sqlx::query("UPDATE devices SET name = name").execute(&mut *stray).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(40), buwiz_cloud::migrate(&db))
+        .await
+        .expect("the migration waited for the lock without end");
+    let error = outcome.expect_err("the migration ran past an open transaction").to_string();
+    assert!(error.contains("lock timeout"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(versions(&db).await, (1..=19).collect::<Vec<_>>());
+    let valid: Option<bool> = sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'devices_grant_id'",
+    )
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert_eq!(valid, Some(false), "an invalid index is left");
+    stray.rollback().await.unwrap();
+
+    // Starting again as it is fails on the leftover index ...
+    let error = buwiz_cloud::migrate(&db).await.expect_err("the invalid index is in the way").to_string();
+    assert!(error.contains("already exists"), "{error}");
+    // ... and works once it is dropped.
+    exec(&db, "DROP INDEX CONCURRENTLY IF EXISTS devices_grant_id").await;
+    buwiz_cloud::migrate(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=20).collect::<Vec<_>>());
+    let valid: bool = sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'devices_grant_id'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(valid);
+    for _ in 0..db.size() {
+        let setting: String = sqlx::query_scalar("SHOW lock_timeout").fetch_one(&db).await.unwrap();
+        assert_eq!(setting, "0", "the pool's connections keep the default");
+    }
 }

@@ -113,7 +113,6 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/assets/home.css", get(home_stylesheet))
         .route("/assets/account.css", get(account_stylesheet))
         .route("/assets/account.js", get(account_script))
-        .route("/assets/app-sign-in.js", get(app_sign_in_script))
         .route("/assets/app-check.js", get(app_check_script))
         .route("/assets/staff.css", get(staff_stylesheet))
         .route("/assets/staff.js", get(staff_script))
@@ -275,10 +274,6 @@ async fn bir_status_stylesheet() -> Response {
 
 async fn account_script() -> Response {
     text(include_str!("account.js"), "text/javascript; charset=utf-8")
-}
-
-async fn app_sign_in_script() -> Response {
-    text(include_str!("app-sign-in.js"), "text/javascript; charset=utf-8")
 }
 
 async fn app_check_script() -> Response {
@@ -483,7 +478,7 @@ const STAFF_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'
      font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 /// The two static pages around in-app sign-in (`/app-sign-in`,
-/// `/app-check/done`): their own script and the site's styles only. The
+/// `/app-check/done`): the second's own script and the site's styles only. The
 /// pages' style attributes (the wordmark's size) are allowed.
 const STATIC_PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
      style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; manifest-src 'self'; form-action 'self'; \

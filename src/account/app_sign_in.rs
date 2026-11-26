@@ -402,11 +402,10 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
         }
     }
     let ((code_id, code), alert) = code_in(&mut tx, state, &email, checked).await?;
-    let token = code.has_link().then(|| crypto::new_token(""));
     let request_id: Uuid = sqlx::query_scalar(
         "INSERT INTO app_sign_ins
-             (email, client_id, secret_hash, intent, platform, install_id, code_id, link_token_hash, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+             (email, client_id, secret_hash, intent, platform, install_id, code_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(&email)
     .bind(&asked.client_id)
@@ -415,7 +414,6 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
     .bind(platform.map(Platform::as_str))
     .bind(install)
     .bind(code_id)
-    .bind(token.as_deref().map(crypto::hash))
     .bind(OffsetDateTime::now_utc() + ttl(state))
     .fetch_one(&mut *tx)
     .await?;
@@ -424,7 +422,7 @@ async fn start_inner(state: &AppState, headers: &HeaderMap, request: Request) ->
     if let Some(count) = alert {
         alert_staff(state, count).await;
     }
-    if let Err(refusal) = mail(state, request_id, &email, &code, token, words).await {
+    if let Err(refusal) = mail(state, &email, &code, words).await {
         take_back(state, request_id, code_id).await;
         return Err(refusal);
     }
@@ -709,7 +707,7 @@ async fn app_check(state: &AppState, headers: &HeaderMap, turnstile: Option<&str
 
 /// What a request's code is.
 enum Code {
-    /// A random code, to mail with its link.
+    /// A random code, to mail.
     Mail(String),
     /// A test account's fixed code: nothing is mailed.
     Fixed,
@@ -717,13 +715,6 @@ enum Code {
     /// ([`Planned::Busy`]). Everything else about it is as for [`Code::Mail`]:
     /// its request is answered, held and verified the same way.
     Unmailed,
-}
-
-impl Code {
-    /// Whether its request gets a link token, as a mailed code's does.
-    fn has_link(&self) -> bool {
-        matches!(self, Self::Mail(_) | Self::Unmailed)
-    }
 }
 
 /// A code [`code_in`] stored: its row, and what it is.
@@ -817,26 +808,14 @@ async fn testing_cap(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, locked: boo
     Ok(day)
 }
 
-/// Mails what [`code_in`] made, with the one-time link to the request
-/// ([`take_link`]) whose token is `token`. A fixed code (a test account)
-/// is not mailed: its holder has it. Nor is an unmailed one.
-async fn mail(
-    state: &AppState,
-    request_id: Uuid,
-    email: &str,
-    code: &Code,
-    token: Option<String>,
-    words: AppCodeWords,
-) -> Result<(), Refusal> {
+/// Mails what [`code_in`] made: the code only, no link. A fixed code (a
+/// test account) is not mailed: its holder has it. Nor is an unmailed one.
+async fn mail(state: &AppState, email: &str, code: &Code, words: AppCodeWords) -> Result<(), Refusal> {
     match code {
-        Code::Mail(code) => {
-            let link =
-                token.map(|token| format!("{}/app-sign-in#r={request_id}&t={token}", state.config.account_origin));
-            state.mailer.send_app_sign_in_code(email, code, link.as_deref(), words).await.map_err(|error| {
-                tracing::error!(error = ?error, "an app's sign-in code could not be mailed");
-                Refusal::new(StatusCode::BAD_GATEWAY, "mail_failed", "The code could not be mailed. Try again.")
-            })
-        }
+        Code::Mail(code) => state.mailer.send_app_sign_in_code(email, code, words).await.map_err(|error| {
+            tracing::error!(error = ?error, "an app's sign-in code could not be mailed");
+            Refusal::new(StatusCode::BAD_GATEWAY, "mail_failed", "The code could not be mailed. Try again.")
+        }),
         Code::Fixed => {
             tracing::info!("an app asked a code for a test account with a fixed code: nothing is mailed");
             Ok(())
@@ -886,7 +865,6 @@ struct Stored {
     platform: Option<String>,
     install_id: Option<String>,
     code_id: Option<Uuid>,
-    link_token_hash: Option<Vec<u8>>,
     created_at: OffsetDateTime,
     expires_at: OffsetDateTime,
     used_at: Option<OffsetDateTime>,
@@ -909,9 +887,8 @@ impl Stored {
 }
 
 const STORED: &str =
-    "SELECT email, client_id, secret_hash, intent, platform, install_id, code_id, link_token_hash, created_at,
-                             expires_at, used_at
-                      FROM app_sign_ins WHERE id = $1";
+    "SELECT email, client_id, secret_hash, intent, platform, install_id, code_id, created_at, expires_at, used_at
+     FROM app_sign_ins WHERE id = $1";
 
 #[derive(Deserialize)]
 pub struct Resend {
@@ -969,13 +946,11 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
         return Err(Refusal::too_many(ttl(state).whole_seconds()));
     }
     let ((code_id, code), alert) = code_in(&mut tx, state, &stored.email, checked).await?;
-    let token = code.has_link().then(|| crypto::new_token(""));
-    // A new code: the old one (and its link) ends, and the request's time
-    // starts again from now.
-    sqlx::query("UPDATE app_sign_ins SET code_id = $2, link_token_hash = $3, expires_at = $4 WHERE id = $1")
+    // A new code: the old one ends, and the request's time starts again
+    // from now.
+    sqlx::query("UPDATE app_sign_ins SET code_id = $2, expires_at = $3 WHERE id = $1")
         .bind(asked.request_id)
         .bind(code_id)
-        .bind(token.as_deref().map(crypto::hash))
         .bind(OffsetDateTime::now_utc() + ttl(state))
         .execute(&mut *tx)
         .await?;
@@ -985,7 +960,7 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
         alert_staff(state, count).await;
     }
     let words = stored.words(state.config.app_sign_in_minutes);
-    if let Err(refusal) = mail(state, asked.request_id, &stored.email, &code, token, words).await {
+    if let Err(refusal) = mail(state, &stored.email, &code, words).await {
         // Nothing went out: the request, whose old code ended, and its new
         // code are taken back.
         take_back(state, asked.request_id, code_id).await;
@@ -998,42 +973,8 @@ async fn resend_inner(state: &AppState, headers: &HeaderMap, request: Request) -
 pub struct Verify {
     request_id: Uuid,
     secret: String,
-    /// The code typed in the app, or ...
-    #[serde(default)]
-    code: Option<String>,
-    /// ... the token of the link in the mail, which the app got from
-    /// `ebirforms://signin?r=…&t=…`.
-    #[serde(default)]
-    link_token: Option<String>,
-}
-
-/// The link's token, checked against the request: it uses up the
-/// request's code as the code itself would. A token that is not the
-/// request's newest (a resend replaced it) is `link_used`. The right token
-/// for a code that is there but expired (a moment before its request) is
-/// `code_expired`, as the code itself is.
-async fn take_link(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    stored: &Stored,
-    token: &str,
-) -> Result<Tried, Refusal> {
-    let matches = stored.link_token_hash.as_deref().is_some_and(|hash| crypto::same(&crypto::hash(token), hash));
-    let (true, Some(code_id)) = (matches, stored.code_id) else {
-        return Err(Refusal::bad("link_used", "This link was used or replaced by a newer code."));
-    };
-    match accounts::spend_code_row(tx, code_id).await? {
-        Tried::NoCode => {
-            let expired: Option<bool> = sqlx::query_scalar("SELECT expires_at <= now() FROM email_codes WHERE id = $1")
-                .bind(code_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-            if expired == Some(true) {
-                return Err(CODE_EXPIRED);
-            }
-            Err(Refusal::bad("link_used", "This link was used or replaced by a newer code."))
-        }
-        tried => Ok(tried),
-    }
+    /// The code typed in the app.
+    code: String,
 }
 
 const CODE_EXPIRED: Refusal = Refusal::bad("code_expired", "This code expired. Ask for a new one.");
@@ -1082,11 +1023,9 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
     // Only the request's own code: the same digits from another request,
     // or a code from the web, are wrong here. Every live request has its
     // code, mailed or not, and both are tried the same way.
-    let tried = match (&asked.code, &asked.link_token, stored.code_id) {
-        (Some(code), None, Some(code_id)) => accounts::try_code_row(&mut tx, code_id, &email, code).await?,
-        (Some(_), None, None) => Tried::NoCode,
-        (None, Some(token), _) => take_link(&mut tx, &stored, token).await?,
-        _ => return Err(Refusal::bad("invalid_request", "Send either the code or the link's token.")),
+    let tried = match stored.code_id {
+        Some(code_id) => accounts::try_code_row(&mut tx, code_id, &email, &asked.code).await?,
+        None => Tried::NoCode,
     };
     let attempts_left = match tried {
         Tried::Taken => None,

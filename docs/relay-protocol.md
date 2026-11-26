@@ -292,8 +292,9 @@ answers it already knows: start and resend allow 200 tries an hour per
 network (`429 too_many_requests`, `retry_after` in the body and
 `Retry-After`); verify allows 300 tries at a code an hour per network
 (the same `429 too_many_requests`) and can answer `503 busy`
-(`Retry-After: 5`) as start does; and on verify's link path an expired
-code is `code_expired`, before `link_used`, as on the code path.
+(`Retry-After: 5`) as start does; and verify takes
+`{"request_id", "secret", "code"}`, so a body without `code` is `400
+invalid_request`.
 
 With `install_id` ([accounts.md](accounts.md#devices)) an install has one
 row per account: a registration from an install that has one updates it

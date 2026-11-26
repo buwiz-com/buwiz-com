@@ -865,103 +865,64 @@ async fn the_web_form_still_signs_in_on_the_same_paths(db: PgPool) {
     assert!(signed_in.headers().contains_key(header::SET_COOKIE));
 }
 
-/// The request id and link token of the newest link mailed to `email`.
-fn last_link(site: &Site, email: &str) -> (String, String) {
-    let mails = site.state.mailer.app_sign_in_mails();
-    let mail = mails.iter().rev().find(|mail| mail.to == email).unwrap();
-    let link = mail.link.clone().unwrap();
-    assert!(mail.text.contains(&link), "{}", mail.text);
-    let fragment = link.strip_prefix(&format!("{ORIGIN}/app-sign-in#")).unwrap_or_else(|| panic!("{link}"));
-    assert!(!link.contains('?'), "the values are in the fragment only: {link}");
-    let (r, t) = fragment.split_once('&').unwrap();
-    (r.strip_prefix("r=").unwrap().to_owned(), t.strip_prefix("t=").unwrap().to_owned())
-}
-
-async fn verify_link(site: &Site, started: &Started, token: &str) -> (u16, Value) {
-    let body = json!({ "request_id": started.id, "secret": started.secret, "link_token": token });
-    read(post_json(site, "/auth/email/verify", &body).await).await
-}
-
+/// The mail carries the code and no link; a body that still sends a link
+/// token instead of the code is refused like any other malformed body.
 #[sqlx::test(migrations = "./migrations")]
-async fn the_mails_link_signs_in_only_the_device_that_asked_and_once(db: PgPool) {
+async fn the_mail_has_the_code_and_no_link(db: PgPool) {
     let site = Site::with_mailbox(db);
     let started = start(&site, ANA).await;
-    let (request, token) = last_link(&site, ANA);
-    assert_eq!(request, started.id);
     let mail = site.state.mailer.app_sign_in_mails().pop().unwrap();
     assert!(mail.text.contains(&mail.code) && mail.html.contains(&mail.code));
-    assert!(mail.html.contains("Open in eBIRForms"));
+    assert!(mail.text.contains("It expires in five minutes"), "{}", mail.text);
+    for part in [&mail.text, &mail.html] {
+        assert!(!part.contains("app-sign-in") && !part.contains("Open in eBIRForms"), "{part}");
+    }
+    let stored: bool = sqlx::query_scalar("SELECT link_token_hash IS NULL FROM app_sign_ins WHERE id = $1::uuid")
+        .bind(&started.id)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert!(stored, "no link token is kept");
 
-    // Someone else's app, holding its own secret, gets nothing from it.
-    let other = Started { id: started.id.clone(), secret: secret().0 };
-    assert_eq!(verify_link(&site, &other, &token).await, (400, refused("invalid_request")));
-    let (status, answer) = verify_link(&site, &started, "a-made-up-token").await;
-    assert_eq!((status, answer["error"].as_str()), (400, Some("link_used")));
-    // Neither code nor token, or both.
-    let both = json!({ "request_id": started.id, "secret": started.secret, "code": mail.code, "link_token": token });
-    assert_eq!(read(post_json(&site, "/auth/email/verify", &both).await).await.0, 400);
-
-    let (status, tokens) = verify_link(&site, &started, &token).await;
-    assert_eq!((status, tokens["scope"].as_str()), (200, Some("app")), "{tokens}");
-    assert_eq!(verify_link(&site, &started, &token).await, (400, refused("invalid_request")));
-    // The code went with it.
-    let code = json!({ "request_id": started.id, "secret": started.secret, "code": mail.code });
-    assert_eq!(read(post_json(&site, "/auth/email/verify", &code).await).await, (400, refused("invalid_request")));
+    let token = json!({ "request_id": started.id, "secret": started.secret, "link_token": "abc_-9" });
+    let (status, answer) = read(post_json(&site, "/auth/email/verify", &token).await).await;
+    assert_eq!(
+        (status, answer["error"].as_str(), answer["message"].as_str()),
+        (400, Some("invalid_request"), Some("The request is not the JSON expected.")),
+        "{answer}"
+    );
+    assert_eq!(verify(&site, &started, &mail.code).await.0, 200);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_new_code_ends_the_old_link(db: PgPool) {
-    let site = Site::with_mailbox(db);
-    let started = start(&site, ANA).await;
-    let (_, first) = last_link(&site, ANA);
-    expire(&site, &started).await;
-    assert_eq!(resend(&site, &started).await.0, 200);
-    let (_, second) = last_link(&site, ANA);
-    assert_ne!(first, second);
-    let (status, answer) = verify_link(&site, &started, &first).await;
-    assert_eq!((status, answer["error"].as_str()), (400, Some("link_used")));
-
-    // A web code leaves it alone: the link is the request's own.
-    let sent = site.post("/auth/email/start", "", "email=ana%40example.test").await;
-    assert_eq!(sent.status(), StatusCode::SEE_OTHER);
-    assert_eq!(verify_link(&site, &started, &second).await.0, 200);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn the_link_page_only_offers_a_button(db: PgPool) {
+async fn the_link_page_says_to_type_the_code(db: PgPool) {
     let site = Site::new(db);
     let response = site.get("/app-sign-in", "").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-robots-tag"], "noindex");
-    // Its own script and the site's files only.
     let csp = response.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_owned();
     assert!(csp.contains("default-src 'none'") && csp.contains("script-src 'self'"), "{csp}");
     let page = text(response).await;
     assert!(page.contains(r#"<meta name="robots" content="noindex">"#));
-    assert!(page.contains("Open this on the device where you asked to sign in, or type the code there."));
-    assert!(page.contains(r#"id="open-app""#) && page.contains("Open eBIRForms"), "{page}");
-    // Never a dead end: the page always says the code can be typed instead.
-    assert!(page.contains("Or type the 6-digit code from this email into the app."), "{page}");
-    assert!(page.contains("hidden"), "the button is hidden until the script finds a fragment");
-    assert!(page.contains(r#"src="/assets/app-sign-in.js""#));
+    assert!(page.contains("Type the 6-digit code from the email into the app."), "{page}");
+    assert_eq!(page.matches("6-digit code").count(), 1, "one sentence: {page}");
+    assert!(!page.contains("Open eBIRForms") && !page.contains("open-app"), "{page}");
+    assert!(!page.contains("ebirforms://") && !page.contains("app-sign-in.js"), "{page}");
     assert!(!page.contains("http-equiv=\"refresh\""));
-
-    let script = text(site.get("/assets/app-sign-in.js", "").await).await;
-    assert!(script.contains("ebirforms://signin?r=") && script.contains("&t="), "{script}");
-    assert!(script.contains("window.location.hash"));
-    for redirect in [
-        "location.href =",
-        "location.replace",
-        "location.assign",
-        "window.open",
-        "fetch(",
-        "XMLHttpRequest",
-        ".click()",
-    ] {
-        assert!(!script.contains(redirect), "{redirect}");
-    }
+    assert_eq!(site.get("/assets/app-sign-in.js", "").await.status(), StatusCode::NOT_FOUND);
     // Only on the account host.
     assert_eq!(site.on_host(FORMS_HOST, "/app-sign-in").await.status(), StatusCode::NOT_FOUND);
+}
+
+/// Mails already sent link to `/app-sign-in#r=…&t=…`: the fragment never
+/// reaches the server, and the page still renders.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_old_mails_link_still_renders_the_page(db: PgPool) {
+    let site = Site::new(db);
+    let response = site.get("/app-sign-in#r=8f0e&t=abc_-9", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = text(response).await;
+    assert!(page.contains("Type the 6-digit code from the email into the app."), "{page}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1139,7 +1100,7 @@ async fn a_start_that_could_not_mail_answers_and_behaves_as_one_that_did(db: PgP
     let unmailed = count(&site.db, "SELECT count(*) FROM email_codes WHERE NOT mailed").await;
     assert_eq!(unmailed, 5);
     let held: Vec<(i32, bool)> =
-        sqlx::query_as("SELECT length(code_hash), link_token_hash IS NOT NULL FROM app_sign_ins r JOIN email_codes c ON c.id = r.code_id WHERE r.email = $1")
+        sqlx::query_as("SELECT length(code_hash), link_token_hash IS NULL FROM app_sign_ins r JOIN email_codes c ON c.id = r.code_id WHERE r.email = $1")
             .bind(unknown)
             .fetch_all(&site.db)
             .await
@@ -1587,28 +1548,6 @@ async fn a_verify_that_cannot_have_its_lock_in_time_is_busy(db: PgPool) {
     let web = site.post("/auth/email/verify", "", &format!("email=bea%40example.test&code={web_code}")).await;
     assert!(web.headers().contains_key(header::SET_COOKIE));
     assert_eq!(verify(&site, &started, &last_code(&site, ANA)).await.0, 200);
-}
-
-/// The right link token for a code that expired a moment before its
-/// request is `code_expired`, as the code is; a wrong token stays
-/// `link_used`.
-#[sqlx::test(migrations = "./migrations")]
-async fn the_link_of_an_expired_code_is_code_expired(db: PgPool) {
-    let site = Site::with_mailbox(db);
-    let started = start(&site, ANA).await;
-    let (_, token) = last_link(&site, ANA);
-    sqlx::query(
-        "UPDATE email_codes SET expires_at = now() - interval '1 second'
-         WHERE id = (SELECT code_id FROM app_sign_ins WHERE id = $1::uuid)",
-    )
-    .bind(&started.id)
-    .execute(&site.db)
-    .await
-    .unwrap();
-    assert_eq!(verify_link(&site, &started, &token).await, (400, refused("code_expired")));
-    assert_eq!(verify(&site, &started, &last_code(&site, ANA)).await, (400, refused("code_expired")));
-    let (status, answer) = verify_link(&site, &started, "a-made-up-token").await;
-    assert_eq!((status, answer["error"].as_str()), (400, Some("link_used")));
 }
 
 /// After a mail that did not go out, at start or at resend, nothing is

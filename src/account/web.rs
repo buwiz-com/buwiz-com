@@ -27,6 +27,7 @@ use crate::account::guard::Refused;
 use crate::account::mcp;
 use crate::account::notice::Notice;
 use crate::account::oauth;
+use crate::account::pin_reset;
 use crate::account::roles::{self, Power, Role, Staff};
 use crate::account::tin::Tin;
 use crate::base::state::AppState;
@@ -155,6 +156,9 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/api/devices", post(devices::register).get(devices::list))
         .route("/api/devices/{id}/revoke", post(devices::revoke_api))
         .route("/api/sign-ins/{grant_id}/sign-out", post(devices::sign_out_api))
+        // Resetting a forgotten app PIN by email code (the BIR app only).
+        .route("/api/pin-reset/start", post(pin_reset::start))
+        .route("/api/pin-reset/verify", post(pin_reset::verify))
         .route("/api/tickets", starts_send(&state, signed(&state, post(tickets::issue))))
         .route(
             "/api/v2/submissions",

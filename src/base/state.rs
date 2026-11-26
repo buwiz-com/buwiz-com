@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use crate::account::claims::ProfileLimits;
 use crate::account::guard::SignInGuard;
 use crate::account::mail::Mailer;
+use crate::account::pin_reset::PinResetLimits;
 use crate::account::verify::Verification;
 use crate::base::config::Config;
 use crate::base::storage::DocumentStore;
@@ -44,6 +45,9 @@ pub struct Inner {
     pub token_slots: tokio::sync::Semaphore,
     /// The limits on `GET` and `POST /api/tax-profiles`, per sign-in.
     pub profile_limits: ProfileLimits,
+    /// The limits on `POST /api/pin-reset/start` and `/verify` kept in
+    /// memory, per device and per account.
+    pub pin_reset_limits: PinResetLimits,
     pub documents: DocumentStore,
     /// Signs tickets.
     pub ticket_key: SigningKey,
@@ -108,6 +112,7 @@ impl AppState {
             verify_slots: tokio::sync::Semaphore::new(crate::account::app_sign_in::VERIFY_SLOTS),
             token_slots: tokio::sync::Semaphore::new(crate::account::agents::TOKEN_SLOTS),
             profile_limits: ProfileLimits::default(),
+            pin_reset_limits: PinResetLimits::default(),
             documents,
             ticket_key,
             sender,

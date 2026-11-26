@@ -374,9 +374,10 @@ pub struct Activity {
 /// written from the staff pages or the seed tool, not Buwiz's own, and
 /// not what people did to their own claims on the site (a staff member
 /// acting on their own TIN as staff still counts) or accounts (the
-/// `deleted` line of an account its owner deleted); and every TIN the BIR
-/// app added (source `app`), a JSON call any app signed in can make.
-/// Admins only read it (the Overview).
+/// `deleted` line of an account its owner deleted, a PIN reset from the
+/// app); and every TIN the BIR app added (source `app` on a claim line), a
+/// JSON call any app signed in can make. Admins only read it (the
+/// Overview).
 ///
 /// Bounded: each audit table gives its newest `limit` lines by
 /// `created_at` alone, the two are merged and cut to `limit`, and only
@@ -404,7 +405,7 @@ pub async fn recent_activity(db: &PgPool, limit: i64) -> sqlx::Result<Vec<Activi
              (SELECT 'account', l.action, NULL, l.old_value, l.new_value, l.account_id, l.actor_email, l.source,
                      l.created_at
               FROM account_audit l
-              WHERE l.action <> 'deleted'
+              WHERE l.action <> 'deleted' AND l.source IN ('web', 'seed')
               ORDER BY l.created_at DESC LIMIT $1)
              ORDER BY created_at DESC LIMIT $1
          ) feed

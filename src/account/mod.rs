@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod notice;
 pub mod oauth;
 pub mod pages;
+pub mod pin_reset;
 pub mod roles;
 pub mod seed;
 pub mod staff;

@@ -1,5 +1,6 @@
 //! Sends sign-in codes (the web's and the apps'), codes for deleting an
-//! account, and short
+//! account, codes for resetting an app's PIN and the notice that one was
+//! verified, and short
 //! plain-text notices to staff (BIR uptime's alerts, [`crate::uptime::alerts`]).
 
 use std::sync::Mutex;
@@ -49,6 +50,12 @@ pub struct Mailer {
     /// Tests only ([`Mailer::recording`]): new-device mails, kept here, not
     /// sent.
     new_devices: Option<Mutex<Vec<Notice>>>,
+    /// Tests only ([`Mailer::recording`]): PIN reset codes, as mailed, kept
+    /// here, not sent.
+    pin_reset_codes: Option<Mutex<Vec<AppCodeMail>>>,
+    /// Tests only ([`Mailer::recording`]): the notices of verified PIN
+    /// resets, kept here, not sent.
+    pin_reset_notices: Option<Mutex<Vec<Notice>>>,
     /// Tests only: a recording mailer that fails every notice.
     failing: AtomicBool,
     /// Tests only: a recording mailer that fails every new-device mail.
@@ -58,6 +65,10 @@ pub struct Mailer {
     holding_new_devices: AtomicBool,
     /// Tests only: a recording mailer that fails every app's code.
     failing_app_codes: AtomicBool,
+    /// Tests only: a recording mailer that fails every PIN reset code.
+    failing_pin_reset_codes: AtomicBool,
+    /// Tests only: a recording mailer that fails every PIN reset notice.
+    failing_pin_reset_notices: AtomicBool,
     /// How many new-device checks have finished, mail or not: tests wait
     /// on it, as the check runs on its own task.
     new_device_checks: AtomicUsize,
@@ -149,8 +160,12 @@ impl Mailer {
             deletion_codes: None,
             app_codes: None,
             new_devices: None,
+            pin_reset_codes: None,
+            pin_reset_notices: None,
             failing: AtomicBool::new(false),
             failing_app_codes: AtomicBool::new(false),
+            failing_pin_reset_codes: AtomicBool::new(false),
+            failing_pin_reset_notices: AtomicBool::new(false),
             failing_new_devices: AtomicBool::new(false),
             holding_new_devices: AtomicBool::new(false),
             new_device_checks: AtomicUsize::new(0),
@@ -166,6 +181,8 @@ impl Mailer {
             deletion_codes: Some(Mutex::new(Vec::new())),
             app_codes: Some(Mutex::new(Vec::new())),
             new_devices: Some(Mutex::new(Vec::new())),
+            pin_reset_codes: Some(Mutex::new(Vec::new())),
+            pin_reset_notices: Some(Mutex::new(Vec::new())),
             ..Self::new(MailConfig::Log, site_origin)
         }
     }
@@ -198,6 +215,33 @@ impl Mailer {
     /// `fail`.
     pub fn fail_app_codes(&self, fail: bool) {
         self.failing_app_codes.store(fail, Ordering::SeqCst);
+    }
+
+    /// The PIN reset codes a [`Mailer::recording`] kept, oldest first.
+    pub fn pin_reset_code_mails(&self) -> Vec<AppCodeMail> {
+        self.pin_reset_codes
+            .as_ref()
+            .map_or_else(Vec::new, |codes| codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// The notices of verified PIN resets a [`Mailer::recording`] kept,
+    /// oldest first.
+    pub fn pin_reset_notices(&self) -> Vec<Notice> {
+        self.pin_reset_notices
+            .as_ref()
+            .map_or_else(Vec::new, |mails| mails.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    /// Tests only: a [`Mailer::recording`] fails every PIN reset code while
+    /// `fail`.
+    pub fn fail_pin_reset_codes(&self, fail: bool) {
+        self.failing_pin_reset_codes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Tests only: a [`Mailer::recording`] fails every PIN reset notice
+    /// while `fail`.
+    pub fn fail_pin_reset_notices(&self, fail: bool) {
+        self.failing_pin_reset_notices.store(fail, Ordering::SeqCst);
     }
 
     /// The new-device mails a [`Mailer::recording`] kept, oldest first.
@@ -410,6 +454,86 @@ impl Mailer {
         }
     }
 
+    /// The code for resetting an app's PIN, mailed to the account's own
+    /// address `to`: the in-app sign-in code's message, with words for a
+    /// PIN reset and the code its only number. `minutes`: how long it
+    /// works (`APP_SIGN_IN_MINUTES`).
+    pub async fn send_pin_reset_code(&self, to: &str, code: &str, minutes: i64) -> anyhow::Result<()> {
+        let message = CodeMessage::pin_reset(code, minutes, &self.logo_url);
+        if let Some(codes) = &self.pin_reset_codes {
+            if self.failing_pin_reset_codes.load(Ordering::SeqCst) {
+                anyhow::bail!("made-up mail failure");
+            }
+            let mail = AppCodeMail {
+                to: to.into(),
+                code: code.into(),
+                subject: message.subject,
+                text: message.text,
+                html: message.html,
+            };
+            codes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(mail);
+            return Ok(());
+        }
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(to, code, "PIN reset code (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .timeout(CODE_TIMEOUT)
+                    .bearer_auth(api_key)
+                    .json(&json!({
+                        "from": from,
+                        "to": [to],
+                        "subject": message.subject,
+                        "text": message.text,
+                        "html": message.html,
+                    }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Tells the account at `to` that a PIN reset was verified on `device`
+    /// at `at` ([`pin_reset_notice_message`]): plain text, no code and no
+    /// link that acts. `Ok` only once the mail service took it.
+    pub async fn send_pin_reset_notice(&self, to: &str, device: &str, at: time::OffsetDateTime) -> anyhow::Result<()> {
+        let (subject, text) = pin_reset_notice_message(device, at, &self.site_origin);
+        if let Some(mails) = &self.pin_reset_notices {
+            if self.failing_pin_reset_notices.load(Ordering::SeqCst) {
+                anyhow::bail!("made-up mail failure");
+            }
+            let mail = Notice { to: to.into(), subject, text };
+            mails.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(mail);
+            return Ok(());
+        }
+        match &self.config {
+            MailConfig::Log => {
+                tracing::info!(to, device, "PIN reset notice (MAIL_TRANSPORT=log)");
+                Ok(())
+            }
+            MailConfig::Resend { api_key, from } => {
+                self.http
+                    .post("https://api.resend.com/emails")
+                    .bearer_auth(api_key)
+                    .json(&json!({ "from": from, "to": [to], "subject": subject, "text": text }))
+                    .send()
+                    .await
+                    .context("mail request failed")?
+                    .error_for_status()
+                    .context("mail provider refused the message")?;
+                Ok(())
+            }
+        }
+    }
+
     /// The code for deleting the account at `to`, as plain text: a short
     /// message of its own, so it is never taken for a sign-in code.
     pub async fn send_deletion_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
@@ -448,14 +572,7 @@ fn new_device_message(
     devices_page: &str,
     third_in_24_hours: bool,
 ) -> (String, String) {
-    let at = at.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"));
-    let (hour, half) = match at.hour() {
-        0 => (12, "AM"),
-        hour @ 1..=11 => (hour, "AM"),
-        12 => (12, "PM"),
-        hour => (hour - 12, "PM"),
-    };
-    let when = format!("{} {}, {} at {hour}:{:02} {half}", at.month(), at.day(), at.year(), at.minute());
+    let when = philippine_time(at);
     (
         format!("New device signed in: {device}"),
         format!(
@@ -473,6 +590,47 @@ fn new_device_message(
             } else {
                 String::new()
             }
+        ),
+    )
+}
+
+/// `at` in the Philippines (Asia/Manila, UTC+8 all year), as "November
+/// 25, 2026 at 3:04 PM".
+fn philippine_time(at: time::OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"));
+    let (hour, half) = match at.hour() {
+        0 => (12, "AM"),
+        hour @ 1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        hour => (hour - 12, "PM"),
+    };
+    format!("{} {}, {} at {hour}:{:02} {half}", at.month(), at.day(), at.year(), at.minute())
+}
+
+/// The subject and text of [`Mailer::send_pin_reset_notice`]: where and
+/// when (Manila time, and UTC), and what to do if it was not the person.
+/// The account site is named as plain text, its host only: the mail has no
+/// link that acts and no code.
+fn pin_reset_notice_message(device: &str, at: time::OffsetDateTime, site_origin: &str) -> (String, String) {
+    let when = philippine_time(at);
+    let utc = at.to_offset(time::UtcOffset::UTC);
+    let utc = format!(
+        "{}-{:02}-{:02} {:02}:{:02} UTC",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute()
+    );
+    let site = site_origin.split_once("://").map_or(site_origin, |(_, host)| host).trim_end_matches('/');
+    (
+        "A PIN reset was asked for in eBIRForms".to_owned(),
+        format!(
+            "A PIN reset was asked for on {device} on {when}, Manila time ({utc}).\n\n\
+             If this was you, there is nothing to do.\n\n\
+             If it was not you: sign in at {site}, open My devices, and remove {device}. \
+             Removing it signs it out and stops it from sending returns.\n\n\
+             Buwiz"
         ),
     )
 }
@@ -536,7 +694,6 @@ impl CodeMessage {
     /// number; the subject names the device instead.
     fn app(code: &str, words: AppCodeWords, logo_url: &str) -> Self {
         let device = words.device;
-        let minutes = minutes_in_words(words.minutes);
         let (heading, lead, asked) = if words.create {
             (
                 "Create your Buwiz account",
@@ -553,26 +710,74 @@ impl CodeMessage {
                 format!("Someone asked to sign in to {device} with this address. If it wasn't you, ignore this mail."),
             )
         };
-        Self {
+        let text = AppCodeText {
             subject: format!("Your Buwiz sign-in code for {device}"),
+            heading,
+            lead,
+            asked,
+            safe: "Nobody can get into your account without this code.",
+            why: "Sent because this address was entered in the eBIRForms app.",
+            minutes: words.minutes,
+        };
+        Self::app_words(code, text, logo_url)
+    }
+
+    /// The mail of a code for resetting an app's PIN: the app's code mail,
+    /// with words for a PIN reset. Fixed words only: nothing from the
+    /// request, not even the device's name.
+    fn pin_reset(code: &str, minutes: i64, logo_url: &str) -> Self {
+        let text = AppCodeText {
+            subject: "Your eBIRForms PIN reset code".to_owned(),
+            heading: "Reset your eBIRForms PIN",
+            lead: "Enter this verification code in eBIRForms to reset your PIN.".to_owned(),
+            asked: "Someone asked to reset the eBIRForms PIN on a device signed in to your Buwiz account. \
+                    If it wasn't you, ignore this mail."
+                .to_owned(),
+            safe: "Nobody can reset the PIN without this code.",
+            why: "Sent because a PIN reset was asked for in the eBIRForms app.",
+            minutes,
+        };
+        Self::app_words(code, text, logo_url)
+    }
+
+    /// An app's code mail in `words`. The code is its only number.
+    fn app_words(code: &str, words: AppCodeText, logo_url: &str) -> Self {
+        let AppCodeText { subject, heading, lead, asked, safe, why, minutes } = words;
+        let minutes = minutes_in_words(minutes);
+        Self {
             text: format!(
                 "Your Buwiz verification code is {code}\n\n\
                  {lead} It expires in {minutes} and works once.\n\n\
                  Never give this code to anyone. Buwiz will never ask for it by phone, chat or email, \
                  not even someone who says they are from Buwiz or the BIR.\n\n\
-                 {asked} Nobody can get into your account without this code.\n\n\
+                 {asked} {safe}\n\n\
                  Buwiz - https://buwiz.com"
             ),
             html: APP_SIGN_IN_CODE_HTML
-                .replace("{{device}}", device)
+                .replace("{{subject}}", &subject)
                 .replace("{{heading}}", heading)
                 .replace("{{lead}}", &lead)
                 .replace("{{asked}}", &asked)
                 .replace("{{minutes}}", &minutes)
+                .replace("{{why}}", why)
                 .replace("{{code}}", code)
                 .replace("{{logo_url}}", logo_url),
+            subject,
         }
     }
+}
+
+/// What an app's code mail says around the code ([`CodeMessage::app_words`]).
+struct AppCodeText {
+    subject: String,
+    heading: &'static str,
+    lead: String,
+    asked: String,
+    /// The text's last words before the sign-off.
+    safe: &'static str,
+    /// The footer's line: why the mail was sent.
+    why: &'static str,
+    minutes: i64,
 }
 
 #[cfg(test)]
@@ -693,6 +898,53 @@ mod tests {
             "{last}"
         );
         assert!(!last.contains("today"), "{last}");
+    }
+
+    #[test]
+    fn a_pin_reset_code_mail_has_the_code_only_and_its_own_words() {
+        let message = CodeMessage::pin_reset("042917", 5, "https://account.buwiz.com/x.png");
+        assert_eq!(message.subject, "Your eBIRForms PIN reset code");
+        assert!(
+            message.text.contains("Enter this verification code in eBIRForms to reset your PIN."),
+            "{}",
+            message.text
+        );
+        assert!(message.text.contains("Nobody can reset the PIN without this code."), "{}", message.text);
+        assert!(!message.text.contains("sign in") && !message.html.contains("sign-in code"), "{}", message.text);
+        let seen = visible(&message.html);
+        assert!(seen.contains("Reset your eBIRForms PIN") && seen.contains("Expires in five minutes"), "{seen}");
+        assert!(seen.contains("Sent because a PIN reset was asked for in the eBIRForms app."), "{seen}");
+        assert!(message.html.contains("<title>Your eBIRForms PIN reset code</title>"));
+        assert!(!message.html.contains("{{"));
+        for part in [message.text.as_str(), seen.as_str()] {
+            assert!(numbers(part).iter().all(|number| *number == "042917"), "{part}");
+        }
+        assert_eq!(message.html.matches("<a ").count(), 1, "{}", message.html);
+
+        // The sign-in mail keeps its own words.
+        let words = AppCodeWords { device: "eBIRForms on Mac", create: false, minutes: 5 };
+        let sign_in = CodeMessage::app("042917", words, "https://account.buwiz.com/x.png");
+        assert!(sign_in.html.contains("<title>Your Buwiz sign-in code for eBIRForms on Mac</title>"));
+        assert!(visible(&sign_in.html).contains("Sent because this address was entered in the eBIRForms app."));
+        assert!(sign_in.text.contains("Nobody can get into your account without this code."), "{}", sign_in.text);
+    }
+
+    #[test]
+    fn the_pin_reset_notice_says_where_and_when_with_no_link_or_code() {
+        let at = time::OffsetDateTime::from_unix_timestamp(1_795_590_240).unwrap();
+        let (subject, text) = pin_reset_notice_message("Ana's iPhone", at, "https://account.buwiz.com");
+        assert_eq!(subject, "A PIN reset was asked for in eBIRForms");
+        assert_eq!(
+            text,
+            "A PIN reset was asked for on Ana's iPhone on November 25, 2026 at 3:04 PM, Manila time \
+             (2026-11-25 07:04 UTC).\n\n\
+             If this was you, there is nothing to do.\n\n\
+             If it was not you: sign in at account.buwiz.com, open My devices, and remove Ana's iPhone. \
+             Removing it signs it out and stops it from sending returns.\n\n\
+             Buwiz"
+        );
+        assert!(numbers(&text).iter().all(|number| number.len() < 6), "{text}");
+        assert!(!text.contains("://"), "{text}");
     }
 
     #[test]

@@ -2591,6 +2591,7 @@ fn account_audit_icon(action: &str) -> &'static str {
         "fixed_code_set" | "fixed_code_changed" | "fixed_code_cleared" => "key",
         "signed_out" | "app_signed_out" => "logout",
         "created" => "person_add",
+        "pin_reset_verified" => "key",
         _ => "draft",
     }
 }
@@ -2617,9 +2618,16 @@ fn account_audit_text(line: &AccountAuditRow) -> String {
             None => "signed an app or agent out".to_owned(),
         },
         "created" => "created the login".to_owned(),
+        // The device's name and id, or the practice sign-in's, are the reason.
+        "pin_reset_verified" => "verified a PIN reset code in the BIR app".to_owned(),
         other => other.replace('_', " "),
     };
-    let who = actor_text(line.actor_id, &line.actor_email, &line.source, None);
+    // A line from the app is the person's own.
+    let who = if line.source == "app" {
+        "The person".to_owned()
+    } else {
+        actor_text(line.actor_id, &line.actor_email, &line.source, None)
+    };
     match &line.reason {
         Some(reason) => format!("{who} {what}: {reason}"),
         None => format!("{who} {what}"),

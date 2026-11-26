@@ -44,6 +44,9 @@ pub(crate) enum Purpose {
     /// Signing in from an app ([`crate::account::app_sign_in`]): it works
     /// only with the request it was made for ([`try_code_row`]).
     AppSignIn,
+    /// Resetting a forgotten app PIN ([`crate::account::pin_reset`]): it
+    /// works only with the request it was made for ([`try_code_row`]).
+    PinReset,
 }
 
 impl Purpose {
@@ -52,6 +55,7 @@ impl Purpose {
             Self::SignIn => "sign_in",
             Self::Delete => "delete",
             Self::AppSignIn => "app_sign_in",
+            Self::PinReset => "pin_reset",
         }
     }
 }
@@ -359,21 +363,24 @@ pub(crate) async fn take_code(
     Ok(try_open(tx, email, row, code).await? == Tried::Taken)
 }
 
-/// Uses up the code `code_id` (an app's, for `email`) if `code` is it and
-/// it is open: only that one code is tried, whatever else is open for the
-/// address. A wrong code counts towards its five tries, as in [`take_code`].
+/// Uses up the code `code_id` (an app's, for `email`, of `purpose`) if
+/// `code` is it and it is open: only that one code is tried, whatever else
+/// is open for the address, and a code of another purpose is no code here.
+/// A wrong code counts towards its five tries, as in [`take_code`].
 pub(crate) async fn try_code_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     code_id: Uuid,
     email: &str,
+    purpose: Purpose,
     code: &str,
 ) -> sqlx::Result<Tried> {
     let row: Option<(Uuid, Vec<u8>, i32)> = sqlx::query_as(
         "SELECT id, code_hash, attempts FROM email_codes
-         WHERE id = $1 AND email = $2 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE",
+         WHERE id = $1 AND email = $2 AND purpose = $3 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE",
     )
     .bind(code_id)
     .bind(email)
+    .bind(purpose.as_str())
     .fetch_optional(&mut **tx)
     .await?;
     try_open(tx, email, row, code).await
@@ -516,15 +523,16 @@ pub(crate) async fn end_sign_ins(
 
 /// The hourly upkeep: deletes sign-in records once nothing needs them.
 /// Codes go 30 days after they were made (the limits per address look back
-/// an hour and a day), and device, in-app and agent sign-ins 30 days after
-/// they expired (nothing reads one after that). The in-app testing cap's
-/// alert days and the new-device mails' record go after 30.
+/// an hour and a day), and device, in-app and agent sign-ins and PIN reset
+/// requests 30 days after they expired (nothing reads one after that). The
+/// in-app testing cap's alert days and the new-device mails' record go
+/// after 30.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM email_codes WHERE created_at < now() - make_interval(days => $1)")
         .bind(SIGN_IN_RECORDS_DAYS)
         .execute(db)
         .await?;
-    for table in ["device_authorizations", "oauth_codes", "app_sign_ins"] {
+    for table in ["device_authorizations", "oauth_codes", "app_sign_ins", "pin_resets"] {
         sqlx::query(&format!("DELETE FROM {table} WHERE expires_at < now() - make_interval(days => $1)"))
             .bind(SIGN_IN_RECORDS_DAYS)
             .execute(db)

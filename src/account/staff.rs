@@ -365,16 +365,18 @@ pub struct Activity {
     /// The account acted on; `None` once it is gone.
     pub account_email: Option<String>,
     pub actor_email: String,
-    /// `web` or `seed`.
+    /// `web`, `seed`, or `app` (a TIN the BIR app added).
     pub source: String,
     pub created_at: OffsetDateTime,
 }
 
 /// The newest staff actions on claims and accounts, newest first: lines
 /// written from the staff pages or the seed tool, not Buwiz's own, and
-/// not what people did to their own claims (a staff member acting on
-/// their own TIN as staff still counts) or accounts (the `deleted` line
-/// of an account its owner deleted). Admins only read it (the Overview).
+/// not what people did to their own claims on the site (a staff member
+/// acting on their own TIN as staff still counts) or accounts (the
+/// `deleted` line of an account its owner deleted); and every TIN the BIR
+/// app added (source `app`), a JSON call any app signed in can make.
+/// Admins only read it (the Overview).
 ///
 /// Bounded: each audit table gives its newest `limit` lines by
 /// `created_at` alone, the two are merged and cut to `limit`, and only
@@ -382,7 +384,7 @@ pub struct Activity {
 /// `created_at` each table is still read once, keeping just the top
 /// `limit` while it sorts (no migration here); if the tables grow, the
 /// index that serves it is `claim_audit (created_at DESC) WHERE source IN
-/// ('web', 'seed')` and `account_audit (created_at DESC)`, after which
+/// ('web', 'seed', 'app')` and `account_audit (created_at DESC)`, after which
 /// each part reads about `limit` rows.
 pub async fn recent_activity(db: &PgPool, limit: i64) -> sqlx::Result<Vec<Activity>> {
     sqlx::query_as(
@@ -392,10 +394,11 @@ pub async fn recent_activity(db: &PgPool, limit: i64) -> sqlx::Result<Vec<Activi
              (SELECT 'claim' AS kind, l.action, l.tin_masked, NULL::text AS old_value, NULL::text AS new_value,
                      l.account_id, l.actor_email, l.source, l.created_at
               FROM claim_audit l
-              WHERE l.source IN ('web', 'seed')
-                AND (l.actor_id <> l.account_id
-                     OR l.action IN ('approved', 'rejected', 'sent_back', 'activated', 'paused', 'resumed', 'revoked',
-                                     'auto_confirmed'))
+              WHERE (l.source IN ('web', 'seed')
+                     AND (l.actor_id <> l.account_id
+                          OR l.action IN ('approved', 'rejected', 'sent_back', 'activated', 'paused', 'resumed',
+                                          'revoked', 'auto_confirmed')))
+                 OR l.source = 'app'
               ORDER BY l.created_at DESC LIMIT $1)
              UNION ALL
              (SELECT 'account', l.action, NULL, l.old_value, l.new_value, l.account_id, l.actor_email, l.source,

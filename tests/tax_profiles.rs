@@ -629,3 +629,27 @@ async fn the_apps_add_never_tells_whether_another_account_has_the_tin(db: PgPool
     assert_eq!(theirs, [("000500001".into(), "approved".into()), ("000500002".into(), "unverified".into())]);
     assert_eq!(rows_of(&site.db, other).await, (2, 0));
 }
+
+/// A TIN the app added reads "in the app" in the staff history of its
+/// account, and shows in the Admin's Overview feed, saying so.
+#[sqlx::test(migrations = "./migrations")]
+async fn staff_see_a_tin_added_in_the_app(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (juan, _) = site.person("juan@example.test").await;
+    let app = app_token(&site.db, juan).await;
+    added(add(&site, &app, &personal("123-456-789")).await).await;
+
+    let history = text(site.get(&format!("/staff/users/{juan}"), &staff).await).await;
+    assert!(
+        history.contains("The person added ***-***-789-00000 in the app, without papers: added from the app"),
+        "{history}"
+    );
+    let lines = buwiz_cloud::account::staff::recent_activity(&site.db, 8).await.unwrap();
+    let got: Vec<(&str, &str, &str)> =
+        lines.iter().map(|line| (line.kind.as_str(), line.action.as_str(), line.source.as_str())).collect();
+    assert_eq!(got, [("claim", "created", "app")]);
+    let overview = text(site.get("/staff", &staff).await).await;
+    assert!(overview.contains("<b>juan@example.test</b>"), "{overview}");
+    assert!(overview.contains("***-***-789-00000 without papers, in the app"), "{overview}");
+}

@@ -2545,6 +2545,7 @@ fn audit_text(line: &AuditRow, account_id: Uuid) -> String {
         "removed" => format!("removed {tin}"),
         "revoked" => format!("revoked the ownership of {tin}"),
         "file_replaced" => format!("replaced the {file} on {tin}"),
+        "created" if line.source == "app" => format!("added {tin} in the app, without papers"),
         "created" => format!("added {tin} without papers"),
         "approved" => format!("approved {tin}"),
         "rejected" => format!("rejected a claim on {tin}"),

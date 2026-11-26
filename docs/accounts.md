@@ -412,13 +412,21 @@ head-office TIN waiting for its first review (never sent back, on this
 claim or an earlier one); exactly one TIN ID, a JPEG, PNG or WebP photo
 read by OCR (never a PDF, nor HEIC); TIN and name a full match with what is
 typed, each at least 90% sure, and a name of two words or more; the
-account not banned; no other account ever had a row for the TIN's root, at
-any branch; this account never had it rejected, revoked or deleted, or
-removed it after an automatic activation; sending for the TIN was never
-paused, on any account; the TIN never had a business claim, on any
-account; no other automatic activation of the account waiting for a
+account not banned; no other account ever sent papers for the TIN's root
+or had it active, at any branch; this account never had it rejected,
+revoked or deleted, or removed it after an automatic activation; sending
+for the TIN was never paused, on any account; the TIN never had a
+business claim (on this account, or on another that sent its papers or
+had it active); no other automatic activation of the account waiting for a
 person; fewer than 20 automatic activations in the last 24 hours. The
 limits are counted under one lock.
+
+Another account's claim saved without papers, live or deleted, does not
+count: anyone can save any TIN that way, on the site or from the app, so
+it is no evidence of anyone, and counting it would let anyone keep a
+stranger's TIN from ever activating by itself. The price: a real owner who
+only saved their TIN without papers does not hold off a claim with a
+drawn card.
 
 A deleted claim leaves only its audit line, which keeps the TIN masked
 (last three digits and branch) and, from this release, the claim's kind.
@@ -1137,7 +1145,21 @@ link). `approved` means it can send. Sent-back rows add `reasons`,
 `reason_codes` and the staff `note`. Only the BIR app's token gets the full
 TIN, filing permissions, links and the note. The golden example is
 `tests/fixtures/tax_profiles_all.json`; the refusal codes the same rule gives
-are in [relay-protocol.md](relay-protocol.md#refusals).
+are in [relay-protocol.md](relay-protocol.md#refusals). Each of those rows
+also says what the app does `next` (`send`, `wait` or `fix`, from the same
+rule: for the BIR app's token, `fix` exactly when it has an action;
+`send` exactly when it can send). Every mode is limited to 120 calls per sign-in in 10 minutes
+(`429 rate_limited` with `Retry-After`).
+
+`POST /api/tax-profiles` lets the BIR app add a TIN as not verified, as
+"add papers later" does on My TINs, with the same checks (this account's
+rows only, the cap of 20, names of at most 200 bytes, a trade name for
+either kind) and one audit line (source `app`, reason "added
+from the app"). The app calls it only from an explicit "Activate this TIN
+to send" button, never when a tax profile is created on the device. A test
+TIN is refused (`test_tin`); at most 10 tries per sign-in an hour. The
+request, answer and codes are in
+[relay-protocol.md](relay-protocol.md#adding-a-tin-from-the-app).
 
 ## MCP for AI agents
 

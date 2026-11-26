@@ -1467,9 +1467,12 @@ async fn a_test_tins_send_is_never_recorded(db: PgPool) {
         let result = the_result(&got).unwrap();
         assert_eq!(
             result,
-            json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run }),
+            json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run, "test_only": true }),
             "{root} v2={v2}"
         );
+        // After the result's own fields, as every added field is.
+        let Got::Text(raw) = &got[0] else { panic!("{got:?}") };
+        assert!(raw.ends_with(&format!(r#""receipt":"{dry_run}","test_only":true}}"#)), "{raw}");
         assert_eq!(status(&db, id).await, ("dry_run".to_owned(), Some("dry_run".to_owned())));
         let kept: Option<String> = sqlx::query_scalar("SELECT receipt_jws FROM submissions WHERE id = $1")
             .bind(id)
@@ -1606,7 +1609,8 @@ async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
             gatekeeper.sender.heard.lock().unwrap().clear();
             let got = gatekeeper.send(&world, id, script.clone(), &answers, HOME).await;
             let error = not_a_dry_run(v2);
-            let failed = json!({ "type": "result", "status": "failed", "error": error, "receipt": null });
+            let failed =
+                json!({ "type": "result", "status": "failed", "error": error, "receipt": null, "test_only": true });
             assert_eq!((got.len(), texts(&got)), (1, vec![failed]), "{name}, v2 {v2}");
             // Stored `failed` with that error, never `unknown`, and with
             // nothing of a send: no receipt, no time sent, no remote path.
@@ -1640,7 +1644,8 @@ async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
         let id = waiting_for(&world, claim, v2).await;
         let script = vec![hello(RelayMode::DryRun), result("dry_run", None, Some(dry_run.clone()))];
         let got = gatekeeper.send(&world, id, script, &[], HOME).await;
-        let passed = json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run });
+        let passed =
+            json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run, "test_only": true });
         assert_eq!((got.len(), texts(&got)), (1, vec![passed]), "v2 {v2}");
         assert_eq!(status(&db, id).await, ("dry_run".to_owned(), Some("dry_run".to_owned())));
     }
@@ -1649,8 +1654,9 @@ async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
         let id = waiting_for(&world, claim, v2).await;
         let script = vec![hello(RelayMode::DryRun), result("failed", Some("the ticket has expired"), None)];
         let got = gatekeeper.send(&world, id, script, &[], HOME).await;
-        let passed =
-            json!({ "type": "result", "status": "failed", "error": "the ticket has expired", "receipt": null });
+        let passed = json!({
+            "type": "result", "status": "failed", "error": "the ticket has expired", "receipt": null, "test_only": true,
+        });
         assert_eq!((got.len(), texts(&got)), (1, vec![passed]), "v2 {v2}");
         assert_eq!(status(&db, id).await.0, "failed");
     }
@@ -1678,7 +1684,7 @@ async fn a_test_tins_job_never_reaches_an_older_sender(db: PgPool) {
         let got = gatekeeper.send(&world, id, older.clone(), &answers, HOME).await;
         let unreachable = json!({
             "type": "result", "status": "failed", "error": "the sending service is not reachable; try again later",
-            "receipt": null,
+            "receipt": null, "test_only": true,
         });
         assert_eq!((got.len(), texts(&got)), (1, vec![unreachable]), "v2 {v2}");
         assert_eq!(status(&db, id).await.0, "failed", "v2 {v2}");
@@ -1687,11 +1693,14 @@ async fn a_test_tins_job_never_reaches_an_older_sender(db: PgPool) {
     assert!(gatekeeper.sender.heard.lock().unwrap().is_empty());
     assert!(tries(&db).await.is_empty(), "no row for a test TIN's send");
 
-    // A real TIN's job: the plain route, its frames as before.
+    // A real TIN's job: the plain route, its frames as before, and no
+    // `test_only` on its result.
     let (script, answers) = landed();
     let got = gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
     assert!(texts(&got).iter().any(|frame| frame["type"] == "open"));
-    assert_eq!(the_result(&got).unwrap()["status"], "sent");
+    let result = the_result(&got).unwrap();
+    assert_eq!(result["status"], "sent");
+    assert!(result.get("test_only").is_none(), "{result}");
     let routes: Vec<&str> = gatekeeper.sender.jobs.lock().unwrap().iter().map(|(route, _)| *route).collect();
     assert_eq!(routes, [sender::RELAY_ROUTE]);
 }

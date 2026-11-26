@@ -11,14 +11,19 @@
 //!   with at least 90% confidence, and a typed name of two words or more;
 //! - only a claim waiting for its first review (never sent back, on this
 //!   claim or an earlier one of the account), of an account that is not
-//!   banned, on a TIN no other account ever had a row for (at any branch),
-//!   that this account was never refused, revoked or (after an automatic
-//!   activation) removed, that was never paused, and that never had a
-//!   business claim. "Personal" is the claimant's own word: a business's
-//!   TIN claimed as personal by someone who never claimed it as a business
-//!   still passes this. Deleted claims count too: their audit lines are
-//!   matched by account and masked TIN (the last three digits; a collision
-//!   only leaves more claims for staff);
+//!   banned, on a TIN no other account ever sent papers for or had active
+//!   (at any branch), that this account was never refused, revoked or
+//!   (after an automatic activation) removed, that was never paused, and
+//!   that never had a business claim (another account's counting only if
+//!   it reached review or was active). "Personal" is the claimant's own
+//!   word: a business's TIN claimed as personal by someone who never
+//!   claimed it as a business still passes this. Deleted claims count too:
+//!   their audit lines are matched by account and masked TIN (the last
+//!   three digits; a collision only leaves more claims for staff). Another
+//!   account's claim saved without papers, live or deleted, never counts:
+//!   anyone can save any TIN that way (on the site, or from the app), so it
+//!   is no evidence of anyone, and counting it would let anyone keep a
+//!   stranger's TIN from ever activating by itself;
 //! - at most one automatic activation per account waiting for a person to
 //!   confirm it, and 20 a day across Buwiz, both counted under one lock so
 //!   readings finishing at once cannot pass them;
@@ -50,6 +55,20 @@ use crate::base::crypto;
 use crate::base::state::AppState;
 use crate::base::storage::DocumentStore;
 use crate::ocr::extract::{self, Confidence, Fields, Kind, Verdict};
+
+/// The condition on a `tin_claims` row that reached review or was active:
+/// every status but `unverified` comes only through `pending` (papers
+/// sent) or an activation, and no claim goes back to `unverified`.
+pub const REACHED_REVIEW_SQL: &str = "status <> 'unverified'";
+
+/// The same on a `claim_audit` line, for a deleted claim's history: a line
+/// written while the claim was past `unverified` (`claim_status`, the
+/// status before the action; `new` for the line of a claim's creation),
+/// or one that activated it. A claim saved without papers and deleted
+/// leaves only `created` (from the app) and `deleted` lines with
+/// `claim_status` `new` or `unverified`.
+pub const REACHED_REVIEW_LINE_SQL: &str =
+    "(claim_status NOT IN ('new', 'unverified') OR action IN ('activated', 'auto_activated', 'approved'))";
 
 /// How sure OCR must be of the TIN and of the name.
 pub const MIN_CONFIDENCE: f32 = 0.90;
@@ -117,16 +136,19 @@ pub struct Facts {
     pub tin: Tin,
     pub registered_name: String,
     pub tin_ids: Vec<TinIdFile>,
-    /// Another account has or had a row on this TIN's root, at any branch
-    /// and in any status, deleted ones included.
+    /// Another account has or had a claim on this TIN's root, at any
+    /// branch, that reached review or was active ([`REACHED_REVIEW_SQL`]),
+    /// deleted ones included. One saved without papers and never sent is
+    /// no evidence of anyone, and does not count.
     pub other_account: bool,
     /// This account had this TIN rejected, revoked or deleted, or removed
     /// it after it was activated automatically.
     pub refused_before: bool,
     /// Sending for this TIN was ever paused, on any account.
     pub paused_before: bool,
-    /// The TIN ever had another claim of kind business, on any account,
-    /// deleted ones included.
+    /// The TIN ever had another claim of kind business, deleted ones
+    /// included: on this account in any status, on another only one that
+    /// reached review or was active.
     pub business_before: bool,
     /// Another automatic activation on this account waits for a person.
     pub another_unconfirmed: bool,
@@ -525,17 +547,19 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
         i64,
     ) = sqlx::query_as(&format!(
         "SELECT
-             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND account_id <> $3)
-               OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id <> $3 AND tin_masked LIKE $5 AND {not_test}),
+             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND account_id <> $3 AND {REACHED_REVIEW_SQL})
+               OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id <> $3 AND tin_masked LIKE $5 AND {not_test}
+                            AND {REACHED_REVIEW_LINE_SQL}),
              EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND branch_code = $2 AND account_id = $3
                        AND (status IN ('rejected', 'revoked') OR (status = 'removed' AND verified_by = 'auto')))
                OR EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $3 AND claim_id <> $4 AND tin_masked = $6
                             AND action IN ('rejected', 'revoked', 'deleted')),
              EXISTS (SELECT 1 FROM claim_audit WHERE account_id = $3 AND claim_id <> $4 AND tin_masked = $6
                        AND action = 'sent_back'),
-             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND kind = 'business' AND id <> $4)
+             EXISTS (SELECT 1 FROM tin_claims WHERE tin_root = $1 AND kind = 'business' AND id <> $4
+                       AND (account_id = $3 OR {REACHED_REVIEW_SQL}))
                OR EXISTS (SELECT 1 FROM claim_audit WHERE claim_id <> $4 AND claim_kind = 'business'
-                            AND tin_masked LIKE $5 AND {not_test}),
+                            AND tin_masked LIKE $5 AND {not_test} AND (account_id = $3 OR {REACHED_REVIEW_LINE_SQL})),
              EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $3 AND id <> $4
                        AND verified_by = 'auto' AND auto_confirmed_at IS NULL),
              (SELECT count(*) FROM claim_audit WHERE action = 'auto_activated' AND created_at > now() - interval '24 hours')"

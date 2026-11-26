@@ -191,6 +191,10 @@ pub struct SubmissionView {
     sent_at: Option<OffsetDateTime>,
     #[sqlx(skip)]
     relay_path: String,
+    /// The submission's claim is a test TIN: its send is a dry run. Only
+    /// then in the JSON, so other sends read as before.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    test_only: bool,
 }
 
 impl SubmissionView {
@@ -210,12 +214,19 @@ impl SubmissionView {
     }
 }
 
-const VIEW_COLUMNS: &str =
-    "id, status, filename, form_type, period, mode, attempts, error, remote_path, receipt_jws, created_at, sent_at";
+/// The columns of a [`SubmissionView`] on `submissions`, `test_only` from
+/// its claim's TIN.
+fn view_columns() -> String {
+    format!(
+        "id, status, filename, form_type, period, mode, attempts, error, remote_path, receipt_jws, created_at, sent_at,
+         EXISTS (SELECT 1 FROM tin_claims c WHERE c.id = submissions.claim_id AND c.tin_root IN ({})) AS test_only",
+        crate::account::tin::test_roots_sql()
+    )
+}
 
 pub async fn find(db: &PgPool, account_id: Uuid, id: Uuid) -> sqlx::Result<Option<SubmissionView>> {
     let view: Option<SubmissionView> =
-        sqlx::query_as(&format!("SELECT {VIEW_COLUMNS} FROM submissions WHERE id = $1 AND account_id = $2"))
+        sqlx::query_as(&format!("SELECT {} FROM submissions WHERE id = $1 AND account_id = $2", view_columns()))
             .bind(id)
             .bind(account_id)
             .fetch_optional(db)
@@ -245,7 +256,8 @@ pub async fn list(State(state): State<AppState>, bearer: Bearer) -> Result<Json<
 
 pub async fn recent(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<SubmissionView>> {
     let views: Vec<SubmissionView> = sqlx::query_as(&format!(
-        "SELECT {VIEW_COLUMNS} FROM submissions WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50"
+        "SELECT {} FROM submissions WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50",
+        view_columns()
     ))
     .bind(account_id)
     .fetch_all(db)
@@ -621,11 +633,15 @@ struct Told {
     /// The public sign as it is when the app is told (this try's record is
     /// written after, off the send's path).
     bir: Option<Value>,
+    /// The claim is a test TIN: the result says `test_only`.
+    test_only: bool,
 }
 
 /// Records `result`; the app hears it only after that, so the submission
 /// reads the same when it asks. The text is `result` as the `Control`
-/// serializes it, byte for byte, with the added fields after its own.
+/// serializes it, byte for byte, with the added fields after its own:
+/// `class`, `bir`, then `"test_only": true` for a test TIN's send (v1 and
+/// v2 alike), absent for any other.
 async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control, told: &Told) -> anyhow::Result<String> {
     let Control::Result { status, error, receipt } = result else {
         anyhow::bail!("not a result");
@@ -639,6 +655,9 @@ async fn conclude(db: &PgPool, id: Uuid, v2: bool, result: &Control, told: &Told
     }
     if let Some(bir) = &told.bir {
         added.push(("bir", bir.clone()));
+    }
+    if told.test_only {
+        added.push(("test_only", Value::Bool(true)));
     }
     Ok(with_fields(serde_json::to_string(result)?, &added))
 }
@@ -666,13 +685,15 @@ fn with_fields(mut object: String, fields: &[(&str, Value)]) -> String {
 /// and closes its socket, then writes the try's uptime row in a task of its
 /// own ([`store::Recorder`]), which never delays or fails the send. The
 /// record's place is taken only once the app was told, so an app that
-/// stops reading holds none (and no stop waits for it).
+/// stops reading holds none (and no stop waits for it). With `test_tin`,
+/// the app is told the result is a test TIN's ([`conclude`]).
 #[allow(clippy::too_many_arguments)]
 async fn settle(
     state: &AppState,
     app_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     id: Uuid,
     v2: bool,
+    test_tin: bool,
     result: &Control,
     observer: Option<TryObserver>,
     recording: Option<RelayTry>,
@@ -694,9 +715,9 @@ async fn settle(
                 let document = public::document(&sign, &state.config.forms_origin, public::Times::Public);
                 serde_json::to_value(document).unwrap_or(Value::Null)
             });
-            Told { class, mode: Some(observed.mode), bir }
+            Told { class, mode: Some(observed.mode), bir, test_only: test_tin }
         }
-        _ => Told::default(),
+        _ => Told { test_only: test_tin, ..Told::default() },
     };
     let text = conclude(&state.db, id, v2, result, &told).await?;
     if !app_gone {
@@ -791,7 +812,7 @@ async fn bridge(
                 observer.sender_down();
             }
             let result = finish("failed", "the sending service is not reachable; try again later".into());
-            return settle(state, &mut app_tx, id, v2, &result, observer, recording, false).await;
+            return settle(state, &mut app_tx, id, v2, test_tin, &result, observer, recording, false).await;
         }
     };
     let (mut up_tx, mut up_rx) = upstream.split();
@@ -800,7 +821,7 @@ async fn bridge(
             observer.sender_down();
         }
         let result = finish("failed", "the sending service is not reachable; try again later".into());
-        return settle(state, &mut app_tx, id, v2, &result, observer, recording, false).await;
+        return settle(state, &mut app_tx, id, v2, test_tin, &result, observer, recording, false).await;
     }
     // Streams the Sender asked the app to open, so they can be ended if the
     // app goes away.
@@ -896,7 +917,7 @@ async fn bridge(
     if not_a_dry_run {
         tracing::error!(submission = %id, "the Sender did not make a test TIN's send a dry run; stopped it");
         let result = finish("failed", if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }.into());
-        return settle(state, &mut app_tx, id, v2, &result, observer, recording, app_gone).await;
+        return settle(state, &mut app_tx, id, v2, test_tin, &result, observer, recording, app_gone).await;
     }
     if result.is_none()
         && let Some(observer) = observer.as_mut()
@@ -905,13 +926,33 @@ async fn bridge(
         if deadline_passed && app_gone { observer.wait_expired() } else { observer.sender_lost() }
     }
     let result = result.unwrap_or_else(|| {
-        if streams.is_empty() {
-            finish("failed", "the sending service stopped before connecting to BIR".into())
-        } else {
-            finish("unknown", "the send ended without an outcome; BIR may have received this return".into())
+        let opened = !streams.is_empty();
+        if opened && test_tin {
+            tracing::error!(submission = %id, "a test TIN's send opened a stream and ended without an outcome");
         }
+        without_outcome(opened, test_tin, v2)
     });
-    settle(state, &mut app_tx, id, v2, &result, observer, recording, app_gone).await
+    settle(state, &mut app_tx, id, v2, test_tin, &result, observer, recording, app_gone).await
+}
+
+/// What a send that ended without an outcome stores, when it opened a
+/// stream: BIR may have the return.
+pub const ENDED_WITHOUT_OUTCOME: &str = "the send ended without an outcome; BIR may have received this return";
+
+/// The result of a try the Sender ended without one: `failed` when it
+/// opened no stream (nothing reached the BIR), else `unknown` with
+/// [`ENDED_WITHOUT_OUTCOME`]. A test TIN's send that opened a stream is
+/// not a dry run, whatever came of it: it fails as the bridge fails one
+/// ([`NOT_A_DRY_RUN`], [`NOT_A_DRY_RUN_V2`]), and never says what reached
+/// the BIR. (The bridge stops a test send at its first `open`, so this is a
+/// second guard; the caller logs it at error level.)
+fn without_outcome(opened: bool, test_tin: bool, v2: bool) -> Control {
+    let (status, error) = match (opened, test_tin) {
+        (false, _) => ("failed", "the sending service stopped before connecting to BIR"),
+        (true, true) => ("failed", if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }),
+        (true, false) => ("unknown", ENDED_WITHOUT_OUTCOME),
+    };
+    Control::Result { status: status.to_owned(), error: Some(error.to_owned()), receipt: None }
 }
 
 /// Key id of a receipt key. See [`jws::key_id`].
@@ -1020,6 +1061,26 @@ mod tests {
         // Still the same Control to every reader.
         assert_eq!(Frame::decode_text(&added), Some(Frame::Control(result)));
         assert_eq!(with_fields("{}".into(), &[("a", json!(1))]), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn a_send_without_an_outcome_never_reassures_about_a_test_send() {
+        let error = |control: Control| match control {
+            Control::Result { status, error, receipt: None } => (status, error.unwrap()),
+            other => panic!("{other:?}"),
+        };
+        for v2 in [false, true] {
+            let unknown = ("unknown".to_owned(), ENDED_WITHOUT_OUTCOME.to_owned());
+            assert_eq!(error(without_outcome(true, false, v2)), unknown);
+            // A test send that opened a stream is not a dry run: it fails as
+            // one, and says nothing about what reached the BIR.
+            let not_a_dry_run = if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN };
+            assert_eq!(error(without_outcome(true, true, v2)), ("failed".to_owned(), not_a_dry_run.to_owned()));
+            for test_tin in [false, true] {
+                let stopped = ("failed".to_owned(), "the sending service stopped before connecting to BIR".to_owned());
+                assert_eq!(error(without_outcome(false, test_tin, v2)), stopped);
+            }
+        }
     }
 
     #[test]

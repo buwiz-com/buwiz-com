@@ -195,6 +195,20 @@ impl Standing {
         }
     }
 
+    /// What the app does next with the TIN list's row (`include=all`):
+    /// `send` exactly when it can send; `fix` when the person has a step to
+    /// take (verify it, or fix it and send it again: the row's `action`,
+    /// which only the BIR app's token gets); `wait` while it is with staff
+    /// (in review, or paused). A TIN that is
+    /// not active is never listed; it reads `wait`, as it can do nothing.
+    pub fn next(&self) -> &'static str {
+        match self {
+            Self::Sendable { .. } => "send",
+            Self::Unverified | Self::NeedsFix { .. } => "fix",
+            Self::Pending | Self::Paused | Self::NotActive => "wait",
+        }
+    }
+
     /// The TIN list's line for the row: where it stands and what is next.
     pub fn list_message(&self) -> String {
         match self {
@@ -263,6 +277,24 @@ mod tests {
         assert_eq!(LIVE_SQL.matches('\'').count(), 2 * LIVE_STATUSES.len(), "{LIVE_SQL}");
         assert_eq!(Standing::Sendable { claim_id: id }.sendable().unwrap(), id);
         assert!(Standing::Paused.sendable().is_err());
+    }
+
+    #[test]
+    fn what_is_next_follows_where_the_tin_stands() {
+        let id = Uuid::new_v4();
+        let cases = [
+            (classify(id, "approved", false, &[]), "send"),
+            (classify(id, "approved", true, &[]), "wait"),
+            (classify(id, "pending", false, &[]), "wait"),
+            (classify(id, "unverified", false, &[]), "fix"),
+            (classify(id, "needs_fix", false, &codes(&["blurry"])), "fix"),
+            (classify(id, "removed", false, &[]), "wait"),
+        ];
+        for (standing, next) in cases {
+            assert_eq!(standing.next(), next, "{standing:?}");
+            // `send` exactly when it can send.
+            assert_eq!(standing.next() == "send", standing.can_send(), "{standing:?}");
+        }
     }
 
     #[test]

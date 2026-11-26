@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
+use crate::account::claims::ProfileLimits;
 use crate::account::guard::SignInGuard;
 use crate::account::mail::Mailer;
 use crate::account::verify::Verification;
@@ -41,6 +42,8 @@ pub struct Inner {
     /// `/oauth/token` ([`crate::account::agents::TOKEN_SLOTS`]): their own,
     /// so a flood of made-up codes never takes start's or verify's.
     pub token_slots: tokio::sync::Semaphore,
+    /// The limits on `GET` and `POST /api/tax-profiles`, per sign-in.
+    pub profile_limits: ProfileLimits,
     pub documents: DocumentStore,
     /// Signs tickets.
     pub ticket_key: SigningKey,
@@ -104,6 +107,7 @@ impl AppState {
             app_sign_in_slots: tokio::sync::Semaphore::new(crate::account::app_sign_in::DATABASE_SLOTS),
             verify_slots: tokio::sync::Semaphore::new(crate::account::app_sign_in::VERIFY_SLOTS),
             token_slots: tokio::sync::Semaphore::new(crate::account::agents::TOKEN_SLOTS),
+            profile_limits: ProfileLimits::default(),
             documents,
             ticket_key,
             sender,

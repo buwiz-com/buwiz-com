@@ -1,7 +1,9 @@
 //! `GET /api/tax-profiles?include=all`, the TIN list the apps read to know
-//! where each TIN stands, against the golden answer both repositories keep
-//! (`tests/fixtures/tax_profiles_all.json`); and what AI agents read about
-//! claims on `/mcp`. Each test gets its own database from `#[sqlx::test]`.
+//! where each TIN stands and what is next, against the golden answer both
+//! repositories keep (`tests/fixtures/tax_profiles_all.json`); its limit
+//! per sign-in; `POST /api/tax-profiles`, the app's add of a TIN as not
+//! verified; and what AI agents read about claims on `/mcp`. Each test
+//! gets its own database from `#[sqlx::test]`.
 
 mod common;
 
@@ -177,7 +179,8 @@ async fn other_clients_get_no_tin_no_link_and_no_note(db: PgPool) {
             assert!(row.get("tin").is_none(), "{scope}");
             assert_eq!(row["permissions"], json!(["profile.view"]), "{scope}");
             assert!(row["action"].is_null(), "{scope}");
-            for key in ["id", "tin_masked", "registered_name", "activated_at", "status", "can_send", "message"] {
+            for key in ["id", "tin_masked", "registered_name", "activated_at", "status", "can_send", "next", "message"]
+            {
                 assert_eq!(row[key], full[key], "{scope} {key}");
             }
             if row["status"] == "needs_fix" {
@@ -222,4 +225,466 @@ async fn agents_read_only_a_rejections_note(db: PgPool) {
     let fix = by_tin("***-***-457-00000");
     assert!(fix["note"].is_null());
     assert_eq!(fix["reasons"], json!(["A photo is too blurry to read."]));
+}
+
+/// A test TIN on `account`, as an Admin adds one to a test account.
+async fn test_tin(db: &PgPool, account: Uuid) {
+    sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1").bind(account).execute(db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'personal', '111111114', '00000', 'TEST TAXPAYER', 'approved', now(), 'admin')",
+    )
+    .bind(account)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// Each row says what the app does next, from the same standing as its
+/// `status`: `send` exactly when it can send, `fix` exactly when it has an
+/// action (verify, or fix and send again), `wait` otherwise (in review,
+/// paused). A test TIN reads as any TIN, with `test_only`. Ended rows and
+/// another account's are not listed. `include=all,pending`, which shipped
+/// apps ask for, answers exactly as `include=all`, `next` included.
+#[sqlx::test(migrations = "./migrations")]
+async fn each_row_says_what_is_next(db: PgPool) {
+    let site = Site::new(db);
+    let juan = golden_account(&site).await;
+    test_tin(&site.db, juan).await;
+    let app = app_token(&site.db, juan).await;
+    let all = answer(&site, &app, "/api/tax-profiles?include=all").await;
+    let rows = all["profiles"].as_array().unwrap();
+    let read: Vec<(&str, &str, bool)> = rows
+        .iter()
+        .map(|row| (row["status"].as_str().unwrap(), row["next"].as_str().unwrap(), row["test_only"] == true))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("approved", "send", false),
+            ("approved", "send", true),
+            ("paused", "wait", false),
+            ("unverified", "fix", false),
+            ("pending", "wait", false),
+            ("needs_fix", "fix", false),
+        ],
+        "{all}"
+    );
+    for row in rows {
+        assert_eq!(row["next"] == "fix", !row["action"].is_null(), "{row}");
+        assert_eq!(row["next"] == "send", row["can_send"] == true, "{row}");
+    }
+    let text = all.to_string();
+    assert!(!text.contains("ENDED") && !text.contains("SOMEONE ELSE"), "{text}");
+
+    let shipped = answer(&site, &app, "/api/tax-profiles?include=all,pending").await;
+    assert_eq!(shipped, all);
+    assert!(shipped["profiles"].as_array().unwrap().iter().all(|row| row["next"].is_string()), "{shipped}");
+    // The other modes are unchanged: no `next`.
+    for path in ["/api/tax-profiles", "/api/tax-profiles?include=pending"] {
+        let listed = answer(&site, &app, path).await;
+        assert!(listed["profiles"].as_array().unwrap().iter().all(|row| row.get("next").is_none()), "{path}");
+    }
+}
+
+fn get_profiles(token: &str, path: &str) -> Request<Body> {
+    Request::get(path).header(header::AUTHORIZATION, format!("Bearer {token}")).body(Body::empty()).unwrap()
+}
+
+/// The seconds a `429` says to wait.
+fn retry_after(response: &axum::response::Response) -> i64 {
+    response.headers().get(header::RETRY_AFTER).expect("Retry-After").to_str().unwrap().parse().unwrap()
+}
+
+/// 120 reads of the list per sign-in in 10 minutes, every mode counted
+/// together; the 121st is `429 rate_limited` with `Retry-After`, in every
+/// mode. The limit is the sign-in's, not the account's: another sign-in of
+/// the same account reads on.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_list_is_limited_per_sign_in(db: PgPool) {
+    let site = Site::new(db);
+    let juan = golden_account(&site).await;
+    let first = app_token(&site.db, juan).await;
+    let modes = ["/api/tax-profiles", "/api/tax-profiles?include=pending", "/api/tax-profiles?include=all"];
+    for call in 0..120 {
+        let response = site.send(get_profiles(&first, modes[call % modes.len()])).await;
+        assert_eq!(response.status(), 200, "call {}", call + 1);
+    }
+    for path in modes {
+        let response = site.send(get_profiles(&first, path)).await;
+        assert_eq!(response.status(), 429, "{path}");
+        let wait = retry_after(&response);
+        assert!((1..=600).contains(&wait), "{wait}");
+        let (_, code, message) = refusal(response).await;
+        assert_eq!(code, "rate_limited");
+        let minutes = (wait + 59) / 60;
+        let unit = if minutes == 1 { "minute" } else { "minutes" };
+        assert_eq!(message, format!("Too many requests. Try again in {minutes} {unit}."));
+    }
+    let second = app_token(&site.db, juan).await;
+    assert_eq!(answer(&site, &second, "/api/tax-profiles?include=all").await, golden());
+}
+
+async fn add(site: &Site, token: &str, body: &str) -> axum::response::Response {
+    let request = Request::post("/api/tax-profiles")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    site.send(request).await
+}
+
+fn personal(tin: &str) -> String {
+    json!({ "kind": "personal", "tin": tin, "registered_name": "Dela Cruz Juan" }).to_string()
+}
+
+/// The 201's row, after checking its status.
+async fn added(response: axum::response::Response) -> Value {
+    assert_eq!(response.status(), 201);
+    let body: Value = serde_json::from_str(&text(response).await).unwrap();
+    assert_eq!(body.as_object().unwrap().keys().collect::<Vec<_>>(), ["profile"], "{body}");
+    body["profile"].clone()
+}
+
+async fn rows_of(db: &PgPool, account: Uuid) -> (i64, i64) {
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1")
+        .bind(account)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let lines: i64 = sqlx::query_scalar("SELECT count(*) FROM claim_audit WHERE account_id = $1")
+        .bind(account)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    (claims, lines)
+}
+
+/// The app adds a TIN as not verified: `201` with the row as `include=all`
+/// lists it, the claim saved as the site's "add papers later" saves it, and
+/// one audit line, from the app.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_app_adds_a_tin_as_not_verified(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    let app = app_token(&site.db, juan).await;
+    let body = json!({ "kind": "personal", "tin": "123-456-789", "registered_name": "  Dela Cruz Juan " });
+    let profile = added(add(&site, &app, &body.to_string()).await).await;
+    let id: Uuid = profile["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        profile,
+        json!({
+            "id": id, "tin": "123-456-789-00000", "tin_masked": "***-***-789-00000",
+            "registered_name": "Dela Cruz Juan", "activated_at": null,
+            "permissions": ["profile.view", "filing.prepare"],
+            "status": "unverified", "can_send": false, "next": "fix",
+            "message": "Not verified. Verify it with its papers to send returns.",
+            "action": { "label": "Verify to send", "url": format!("{ORIGIN}/tins/claims/{id}/verify") },
+        })
+    );
+    let listed = answer(&site, &app, "/api/tax-profiles?include=all").await;
+    assert_eq!(listed["profiles"], json!([profile]));
+    let stored: (String, String, String, String, Option<String>, bool) = sqlx::query_as(
+        "SELECT kind, tin_root, branch_code, status, trade_name, submitted_at IS NULL FROM tin_claims WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&site.db)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("personal".into(), "123456789".into(), "00000".into(), "unverified".into(), None, true));
+    assert_eq!(
+        claim_audit_lines(&site.db, juan).await,
+        [(
+            "created".to_owned(),
+            "new".to_owned(),
+            "juan@example.test".to_owned(),
+            "app".to_owned(),
+            Some("added from the app".to_owned())
+        )]
+    );
+    let line: (Uuid, Uuid, String, Option<String>) =
+        sqlx::query_as("SELECT claim_id, actor_id, tin_masked, claim_kind FROM claim_audit WHERE account_id = $1")
+            .bind(juan)
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+    assert_eq!(line, (id, juan, "***-***-789-00000".to_owned(), Some("personal".to_owned())));
+
+    // A business TIN with its branch, in 14 digits or 12, and a trade name.
+    for (tin, branch) in [("987-654-321-00002", "00002"), ("987 654 321 003", "00003")] {
+        let body = json!({ "kind": "business", "tin": tin, "registered_name": "Juan Corp", "trade_name": " Juan's " });
+        let profile = added(add(&site, &app, &body.to_string()).await).await;
+        assert_eq!(profile["tin"], format!("987-654-321-{branch}"));
+        let trade: Option<String> = sqlx::query_scalar("SELECT trade_name FROM tin_claims WHERE id = $1")
+            .bind(profile["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&site.db)
+            .await
+            .unwrap();
+        assert_eq!(trade.as_deref(), Some("Juan's"));
+    }
+    assert_eq!(rows_of(&site.db, juan).await, (3, 3));
+}
+
+/// Each refusal, with its status and code; none writes anything.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_apps_add_refuses_with_a_code(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    for (client, scope) in [("buwiz-books", "books"), ("an-agent", "mcp")] {
+        let other = token(&site.db, juan, client, scope).await;
+        let (status, code, _) = refusal(add(&site, &other, &personal("123456789")).await).await;
+        assert_eq!((status, code.as_str()), (403, "insufficient_scope"), "{scope}");
+    }
+    let name = |name: &str| json!({ "kind": "personal", "tin": "123456789", "registered_name": name }).to_string();
+    let long = "x".repeat(201);
+    let cases = [
+        ("{", 400, "bad_request"),
+        ("[]", 400, "bad_request"),
+        (r#"{"kind":"personal","registered_name":"Juan"}"#, 400, "bad_request"),
+        (r#"{"kind":"company","tin":"123456789","registered_name":"Juan"}"#, 400, "bad_request"),
+        (r#"{"tin":"123456789","registered_name":"Juan"}"#, 400, "bad_request"),
+        (&personal("12345678"), 400, "bad_tin"),
+        (&personal("1234567890"), 400, "bad_tin"),
+        (&personal("123-456-789-0000"), 400, "bad_tin"),
+        (&personal("no digits"), 400, "bad_tin"),
+        (&name(""), 400, "name_missing"),
+        (&name("   "), 400, "name_missing"),
+        (&name(&long), 400, "name_too_long"),
+        (
+            &json!({ "kind": "business", "tin": "123456789", "registered_name": "Juan", "trade_name": long })
+                .to_string(),
+            400,
+            "name_too_long",
+        ),
+    ];
+    for (body, status, code) in cases {
+        // A sign-in of its own each, so the limit on adds never answers.
+        let app = app_token(&site.db, juan).await;
+        let (got_status, got_code, message) = refusal(add(&site, &app, body).await).await;
+        assert_eq!((got_status, got_code.as_str()), (status, code), "{body}");
+        assert!(message.ends_with('.') && !message.is_empty(), "{body}: {message}");
+    }
+    assert_eq!(rows_of(&site.db, juan).await, (0, 0));
+}
+
+/// A test TIN is refused `test_tin` in every way of writing it, before the
+/// database is asked anything: staff add test TINs. Nothing is written.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_app_cannot_add_a_test_tin(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        let dashed = format!("{}-{}-{}", &root[..3], &root[3..6], &root[6..]);
+        for tin in [dashed.clone(), format!("{dashed}-00000"), format!("{root}00001"), format!("{root}001")] {
+            for kind in ["personal", "business"] {
+                let app = app_token(&site.db, juan).await;
+                let body = json!({ "kind": kind, "tin": tin, "registered_name": "Test Taxpayer" }).to_string();
+                let (status, code, message) = refusal(add(&site, &app, &body).await).await;
+                assert_eq!((status, code.as_str()), (400, "test_tin"), "{tin}");
+                assert_eq!(
+                    message,
+                    "This TIN is reserved for testing: only Buwiz staff add test TINs. If it is yours, write to support@buwiz.com."
+                );
+            }
+        }
+    }
+    assert_eq!(rows_of(&site.db, juan).await, (0, 0));
+}
+
+/// What this account already holds is refused with `409`: active, saved
+/// without papers, in review or sent back. A TIN that ended can be added
+/// again.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_apps_add_refuses_a_tin_already_on_the_account(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    let cases = [
+        ("000123451", "approved", "tin_already_active", "This TIN is already active on your account."),
+        (
+            "000123452",
+            "unverified",
+            "tin_already_added",
+            "This TIN is already on My TINs. Verify it there to send returns.",
+        ),
+        ("000123453", "pending", "claim_already_pending", "You already have a claim for this TIN waiting for review."),
+        (
+            "000123454",
+            "needs_fix",
+            "claim_already_pending",
+            "You already have a claim for this TIN waiting for review.",
+        ),
+    ];
+    for (root, status, ..) in cases {
+        add_claim(&site.db, juan, root, status).await;
+    }
+    for (root, status, code, message) in cases {
+        let app = app_token(&site.db, juan).await;
+        let refused = refusal(add(&site, &app, &personal(root)).await).await;
+        assert_eq!(refused, (409, code.to_owned(), message.to_owned()), "{status}");
+    }
+    for ended in ["rejected", "removed"] {
+        let root = if ended == "rejected" { "000123455" } else { "000123456" };
+        add_claim(&site.db, juan, root, ended).await;
+        let app = app_token(&site.db, juan).await;
+        assert_eq!(add(&site, &app, &personal(root)).await.status(), 201, "{ended}");
+    }
+    assert_eq!(rows_of(&site.db, juan).await, (8, 2));
+}
+
+/// The cap on TINs waiting to be verified holds as on the site: the 20th
+/// is added, the 21st refused `too_many_unverified`.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_apps_add_keeps_the_cap_on_unverified_tins(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    for index in 0..19 {
+        add_claim(&site.db, juan, &format!("000200{index:03}"), "unverified").await;
+    }
+    let app = app_token(&site.db, juan).await;
+    added(add(&site, &app, &personal("000-300-001")).await).await;
+    let refused = refusal(add(&site, &app, &personal("000-300-002")).await).await;
+    assert_eq!(
+        refused,
+        (
+            409,
+            "too_many_unverified".to_owned(),
+            "You have 20 TINs waiting to be verified. Verify or remove some first.".to_owned()
+        )
+    );
+    assert_eq!(rows_of(&site.db, juan).await, (20, 1));
+}
+
+/// 10 adds per sign-in in an hour, whatever comes of them; the 11th is
+/// `429 rate_limited` with `Retry-After`. Another sign-in of the same
+/// account adds on.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_apps_add_is_limited_per_sign_in(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    let app = app_token(&site.db, juan).await;
+    for index in 0..9 {
+        added(add(&site, &app, &personal(&format!("000-400-{index:03}"))).await).await;
+    }
+    // A refusal counts too.
+    assert_eq!(refusal(add(&site, &app, &personal("000-400-000")).await).await.1, "tin_already_added");
+    let response = add(&site, &app, &personal("000-400-100")).await;
+    assert_eq!(response.status(), 429);
+    let wait = retry_after(&response);
+    assert!((3540..=3600).contains(&wait), "{wait}");
+    assert_eq!(
+        refusal(response).await,
+        (429, "rate_limited".to_owned(), "Too many requests. Try again in 60 minutes.".to_owned())
+    );
+    // The list is limited apart.
+    answer(&site, &app, "/api/tax-profiles?include=all").await;
+    let second = app_token(&site.db, juan).await;
+    added(add(&site, &second, &personal("000-400-100")).await).await;
+    assert_eq!(rows_of(&site.db, juan).await, (10, 10));
+}
+
+/// Adding a TIN another account holds, active or not verified, answers
+/// exactly as adding a free one: nothing says someone else has it. Each
+/// refusal after speaks of this account's own row only.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_apps_add_never_tells_whether_another_account_has_the_tin(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, _) = site.person("juan@example.test").await;
+    let (other, _) = site.person("other@example.test").await;
+    add_claim(&site.db, other, "000500001", "approved").await;
+    add_claim(&site.db, other, "000500002", "unverified").await;
+    let app = app_token(&site.db, juan).await;
+    let mut rows = Vec::new();
+    for root in ["000500001", "000500002", "000500003"] {
+        let mut profile = added(add(&site, &app, &personal(root)).await).await;
+        let id = profile["id"].as_str().unwrap().to_owned();
+        assert_eq!(profile["tin"], format!("{}-{}-{}-00000", &root[..3], &root[3..6], &root[6..]));
+        for key in ["id", "tin", "tin_masked"] {
+            profile.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(profile["action"]["url"], format!("{ORIGIN}/tins/claims/{id}/verify"));
+        profile["action"]["url"] = Value::Null;
+        rows.push(profile);
+    }
+    assert_eq!(rows[0], rows[2], "held active elsewhere reads as free");
+    assert_eq!(rows[1], rows[2], "held unverified elsewhere reads as free");
+    for root in ["000500001", "000500002", "000500003"] {
+        let refused = refusal(add(&site, &app, &personal(root)).await).await;
+        assert_eq!(
+            refused,
+            (
+                409,
+                "tin_already_added".to_owned(),
+                "This TIN is already on My TINs. Verify it there to send returns.".to_owned()
+            ),
+            "{root}"
+        );
+    }
+    // The other account's rows are as they were.
+    let theirs: Vec<(String, String)> =
+        sqlx::query_as("SELECT tin_root, status FROM tin_claims WHERE account_id = $1 ORDER BY tin_root")
+            .bind(other)
+            .fetch_all(&site.db)
+            .await
+            .unwrap();
+    assert_eq!(theirs, [("000500001".into(), "approved".into()), ("000500002".into(), "unverified".into())]);
+    assert_eq!(rows_of(&site.db, other).await, (2, 0));
+}
+
+const TOO_LONG: &str =
+    "That name is too long: it can have at most 200 bytes, so fewer than 200 letters when it has accents like ñ.";
+
+/// A name over 200 bytes after trimming is `name_too_long`, not
+/// `name_missing`: 101 "ñ" are 202 bytes, 100 are 200 and pass. The same
+/// for a trade name, and on the site's form.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_name_over_200_bytes_is_too_long_not_missing(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, cookie) = site.person("juan@example.test").await;
+    let app = app_token(&site.db, juan).await;
+    let (long, fits) = ("ñ".repeat(101), "ñ".repeat(100));
+    assert_eq!((long.len(), fits.len()), (202, 200));
+    let body = |name: &str, trade: &str| {
+        json!({ "kind": "business", "tin": "123456789", "registered_name": name, "trade_name": trade }).to_string()
+    };
+    for refused in [body(&long, ""), body(&format!("  {long} "), ""), body("Juan", &long)] {
+        let got = refusal(add(&site, &app, &refused).await).await;
+        assert_eq!(got, (400, "name_too_long".to_owned(), TOO_LONG.to_owned()), "{refused}");
+    }
+    let (status, code, _) = refusal(add(&site, &app, &body("  ", "")).await).await;
+    assert_eq!((status, code.as_str()), (400, "name_missing"));
+    let profile = added(add(&site, &app, &body(&format!(" {fits} "), &fits)).await).await;
+    assert_eq!(profile["registered_name"], fits);
+
+    // The site's add-a-TIN form says the same.
+    let long: &'static str = Box::leak(long.into_boxed_str());
+    let parts =
+        [("kind", Part::Text("personal")), ("tin", Part::Text("987654321")), ("registered_name", Part::Text(long))];
+    let response = site.upload("/tins/claims?skip=1", &cookie, &parts).await;
+    assert_eq!(location(&response), "/tins/new?notice=name_too_long");
+    let page = text(site.get("/tins/new?notice=name_too_long", &cookie).await).await;
+    assert!(page.contains("That name is too long"), "{page}");
+}
+
+/// A TIN the app added reads "in the app" in the staff history of its
+/// account, and shows in the Admin's Overview feed, saying so.
+#[sqlx::test(migrations = "./migrations")]
+async fn staff_see_a_tin_added_in_the_app(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (juan, _) = site.person("juan@example.test").await;
+    let app = app_token(&site.db, juan).await;
+    added(add(&site, &app, &personal("123-456-789")).await).await;
+
+    let history = text(site.get(&format!("/staff/users/{juan}"), &staff).await).await;
+    assert!(
+        history.contains("The person added ***-***-789-00000 in the app, without papers: added from the app"),
+        "{history}"
+    );
+    let lines = buwiz_cloud::account::staff::recent_activity(&site.db, 8).await.unwrap();
+    let got: Vec<(&str, &str, &str)> =
+        lines.iter().map(|line| (line.kind.as_str(), line.action.as_str(), line.source.as_str())).collect();
+    assert_eq!(got, [("claim", "created", "app")]);
+    let overview = text(site.get("/staff", &staff).await).await;
+    assert!(overview.contains("<b>juan@example.test</b>"), "{overview}");
+    assert!(overview.contains("***-***-789-00000 without papers, in the app"), "{overview}");
 }

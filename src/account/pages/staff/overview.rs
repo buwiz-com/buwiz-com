@@ -95,6 +95,10 @@ fn activity_words(line: &Activity) -> (&'static str, String, String) {
         ("claim", "revoked") => ("ban", "revoked", format!("{tin} from {email}")),
         ("claim", "deleted") => ("trash", "deleted a claim on", format!("{tin} by {email}")),
         ("claim", "removed") => ("x-circle", "removed", format!("{tin} from {email}")),
+        // The BIR app adding a TIN to its own account, without papers.
+        ("claim", "created") if line.source == "app" => {
+            ("bookmark", "added", format!("{tin} without papers, in the app"))
+        }
         // The seed tool saving a TIN without papers.
         ("claim", "created") => ("bookmark", "added", format!("{tin} to {email} without papers")),
         ("claim", _) => ("file", "changed", format!("{tin} of {email}")),

@@ -19,15 +19,20 @@
 //! keeps its row for the returns sent with it: `removed` when the owner
 //! gives the TIN up, `revoked` when staff end the ownership. Either way the
 //! TIN can be claimed again. Each of these, and each file the claimant
-//! replaces or removes on an open claim, leaves a line in `claim_audit`.
+//! replaces or removes on an open claim, leaves a line in `claim_audit`;
+//! so does a TIN the BIR app adds ([`add_tax_profile`], source `app`).
 
 use std::collections::HashMap;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
+use http::StatusCode;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::account::accounts::Account;
@@ -41,6 +46,7 @@ use crate::base::error::ApiError;
 use crate::base::state::AppState;
 use crate::base::storage::DocumentStore;
 use crate::filing::gate;
+use crate::uptime::keys::RateLimiter;
 
 // The limits are macros too, so the notices that name them (notice.rs) are
 // written from the same numbers.
@@ -256,12 +262,21 @@ pub struct NewClaim {
     pub papers_later: bool,
 }
 
-/// Trimmed registered and trade names, or why they cannot be used.
+/// The most bytes (UTF-8) a registered or trade name may have once
+/// trimmed: fewer than this many letters when it has accents like ñ.
+pub const MAX_NAME_BYTES: usize = 200;
+
+/// Trimmed registered and trade names, or why they cannot be used: no
+/// registered name ([`Notice::NameMissing`]), or one of them over
+/// [`MAX_NAME_BYTES`] ([`Notice::NameTooLong`]).
 fn check_names(registered_name: &str, trade_name: &str) -> Result<(String, Option<String>), Notice> {
     let registered_name = registered_name.trim();
     let trade_name = trade_name.trim();
-    if registered_name.is_empty() || registered_name.len() > 200 || trade_name.len() > 200 {
+    if registered_name.is_empty() {
         return Err(Notice::NameMissing);
+    }
+    if registered_name.len() > MAX_NAME_BYTES || trade_name.len() > MAX_NAME_BYTES {
+        return Err(Notice::NameTooLong);
     }
     Ok((registered_name.to_owned(), Some(trade_name.to_owned()).filter(|name| !name.is_empty())))
 }
@@ -313,6 +328,38 @@ pub async fn submit(
     key: &[u8; 32],
     account_id: Uuid,
     claim: NewClaim,
+) -> Result<Uuid, SubmitError> {
+    save(db, store, key, account_id, claim, None).await
+}
+
+/// The reason on the audit line of a TIN the BIR app added.
+pub const ADDED_FROM_APP: &str = "added from the app";
+
+/// The BIR app adds a TIN to `account` as not verified, as the site's "add
+/// papers later" does ([`submit`], the same checks under the same lock:
+/// `claim` is saved without papers, its uploads dropped), and writes its
+/// `created` audit line (source `app`, reason [`ADDED_FROM_APP`]) in the
+/// same transaction.
+pub async fn add_from_app(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    account: &Account,
+    claim: NewClaim,
+) -> Result<Uuid, SubmitError> {
+    let claim = NewClaim { uploads: Vec::new(), papers_later: true, ..claim };
+    save(db, store, key, account.id, claim, Some(account)).await
+}
+
+/// [`submit`]; with `from_app`, the account that added it in the app, for
+/// the audit line written before the commit.
+async fn save(
+    db: &PgPool,
+    store: &DocumentStore,
+    key: &[u8; 32],
+    account_id: Uuid,
+    claim: NewClaim,
+    from_app: Option<&Account>,
 ) -> Result<Uuid, SubmitError> {
     let NewClaim { kind, tin, registered_name, trade_name, uploads, papers_later } = claim;
     let (registered_name, trade_name) = check_names(&registered_name, &trade_name).map_err(SubmitError::Invalid)?;
@@ -374,6 +421,22 @@ pub async fn submit(
         }
         other => other?,
     };
+    if let Some(actor) = from_app {
+        sqlx::query(
+            "INSERT INTO claim_audit
+                 (claim_id, account_id, tin_masked, action, claim_status, actor_id, actor_email, reason, source, claim_kind)
+             VALUES ($1, $2, $3, 'created', 'new', $4, $5, $6, 'app', $7)",
+        )
+        .bind(claim_id)
+        .bind(account_id)
+        .bind(tin.masked())
+        .bind(actor.id)
+        .bind(&actor.email)
+        .bind(ADDED_FROM_APP)
+        .bind(kind.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
     let mut uploaded = Vec::new();
     let stored = store_documents(&mut tx, store, key, claim_id, checked, &mut uploaded).await;
     let committed = match stored {
@@ -1541,11 +1604,17 @@ pub async fn remove_document(
 /// `?include=pending` also lists TINs still being checked or sent back for
 /// a fix, and adds `status` to every profile. Those can prepare returns
 /// but not send them; their `id` stays the same once approved.
+///
+/// Every mode counts toward one limit per sign-in
+/// ([`PROFILE_READS_PER_SIGN_IN`] in [`PROFILE_READS_WINDOW`]): past it,
+/// `429 rate_limited` with `Retry-After`. The app reads the list at start,
+/// on foreground and before Queue, never on a timer.
 pub async fn tax_profiles(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
     bearer: Bearer,
 ) -> Result<Json<Value>, ApiError> {
+    state.profile_limits.reads.check(bearer.grant_id, OffsetDateTime::now_utc()).map_err(ApiError::rate_limited)?;
     let full = bearer.sees_full_tins();
     let include: Vec<&str> =
         query.get("include").map(|include| include.split(',').map(str::trim).collect()).unwrap_or_default();
@@ -1559,6 +1628,137 @@ pub async fn tax_profiles(
         active_profiles(&state.db, bearer.account.id, full).await?
     };
     Ok(Json(json!({ "profiles": profiles })))
+}
+
+/// Reads of `GET /api/tax-profiles` one sign-in (an app's grant: one per
+/// device sign-in) may make in [`PROFILE_READS_WINDOW`], every mode
+/// together. Start, foreground and Queue never come near it; a retry loop
+/// does.
+pub const PROFILE_READS_PER_SIGN_IN: u32 = 120;
+pub const PROFILE_READS_WINDOW: Duration = Duration::minutes(10);
+/// Tries at `POST /api/tax-profiles` one sign-in may make in
+/// [`PROFILE_ADDS_WINDOW`], whatever comes of them: the app adds a TIN
+/// only when the person presses its button.
+pub const PROFILE_ADDS_PER_SIGN_IN: u32 = 10;
+pub const PROFILE_ADDS_WINDOW: Duration = Duration::hours(1);
+/// Once a limiter's map of sign-ins is full (100,000 in one window), the
+/// sign-ins new in that window share this many times one sign-in's
+/// limit, not counted by sign-in. Each needs a signed-in token, so real
+/// use never gets there.
+const PAST_FULL_SIGN_INS: u32 = 100;
+
+/// The limits on the TIN list and the app's add, per sign-in, in memory
+/// ([`RateLimiter`]): a restart starts them again.
+pub struct ProfileLimits {
+    /// `GET /api/tax-profiles`.
+    pub reads: RateLimiter<Uuid>,
+    /// `POST /api/tax-profiles`.
+    pub adds: RateLimiter<Uuid>,
+}
+
+impl Default for ProfileLimits {
+    fn default() -> Self {
+        Self {
+            reads: RateLimiter::with_overflow_budget(
+                PROFILE_READS_PER_SIGN_IN,
+                PROFILE_READS_WINDOW,
+                PROFILE_READS_PER_SIGN_IN * PAST_FULL_SIGN_INS,
+            ),
+            adds: RateLimiter::with_overflow_budget(
+                PROFILE_ADDS_PER_SIGN_IN,
+                PROFILE_ADDS_WINDOW,
+                PROFILE_ADDS_PER_SIGN_IN * PAST_FULL_SIGN_INS,
+            ),
+        }
+    }
+}
+
+/// What the app sends to add a TIN.
+#[derive(Deserialize)]
+struct AppAdd {
+    kind: String,
+    tin: String,
+    registered_name: String,
+    #[serde(default)]
+    trade_name: Option<String>,
+}
+
+const BAD_ADD: &str = "Send a JSON object with kind, tin and registered_name.";
+/// The refusal of a test TIN on `POST /api/tax-profiles`.
+pub const TEST_TIN_REFUSED: &str =
+    "This TIN is reserved for testing: only Buwiz staff add test TINs. If it is yours, write to support@buwiz.com.";
+
+/// `POST /api/tax-profiles`: the BIR app (scope `app` only) adds a TIN to
+/// the account as not verified, without papers, as the site's "add papers
+/// later" does. The app calls it only from an explicit "Activate this TIN
+/// to send" button on a tax profile that is not on the account; never
+/// when a tax profile is created: a profile made on a device stays on the
+/// device until the person asks to activate it.
+///
+/// The TIN is read as the site's add-a-TIN form reads it without a branch
+/// field ([`Tin::parse_combined_any`]: 9 digits for head office, 12 or 14
+/// with the branch, dashes and spaces allowed). A test TIN is refused
+/// `test_tin` before the database is asked anything: staff add those.
+/// Then [`add_from_app`]: the same checks as the site, which look at this
+/// account's rows only, so adding a TIN another account holds answers as
+/// adding a free one does. `201 {"profile": …}` is the row as
+/// `include=all` lists it.
+///
+/// Names follow the site's rules ([`check_names`]): a registered name is
+/// needed, and each name has at most [`MAX_NAME_BYTES`] bytes once
+/// trimmed. A trade name is taken for either kind, as on the site.
+///
+/// Refusals: `403` as [`Bearer::require_app`]; `400` `bad_request` (not
+/// the JSON asked for, or an unknown `kind`), `bad_tin`, `name_missing`
+/// (no registered name), `name_too_long`, `test_tin`; `409` `tin_already_active`, `tin_already_added`,
+/// `claim_already_pending`, `too_many_unverified`; `429 rate_limited` past
+/// [`PROFILE_ADDS_PER_SIGN_IN`] tries in [`PROFILE_ADDS_WINDOW`].
+pub async fn add_tax_profile(State(state): State<AppState>, bearer: Bearer, body: Bytes) -> Result<Response, ApiError> {
+    bearer.require_app()?;
+    state.profile_limits.adds.check(bearer.grant_id, OffsetDateTime::now_utc()).map_err(ApiError::rate_limited)?;
+    let request: AppAdd = serde_json::from_slice(&body).map_err(|_| ApiError::bad_request("bad_request", BAD_ADD))?;
+    let kind =
+        ClaimKind::parse(&request.kind).ok_or(ApiError::bad_request("bad_request", Notice::KindMissing.message()))?;
+    let tin =
+        Tin::parse_combined_any(&request.tin).map_err(|notice| ApiError::bad_request("bad_tin", notice.message()))?;
+    // Before the database: its check refuses such a row too, as an error.
+    if tin.is_test() {
+        return Err(ApiError::bad_request("test_tin", TEST_TIN_REFUSED));
+    }
+    let claim = NewClaim {
+        kind,
+        tin,
+        registered_name: request.registered_name,
+        trade_name: request.trade_name.unwrap_or_default(),
+        uploads: Vec::new(),
+        papers_later: true,
+    };
+    let added = add_from_app(&state.db, &state.documents, &state.config.document_key, &bearer.account, claim).await;
+    let claim_id = match added {
+        Ok(claim_id) => claim_id,
+        Err(SubmitError::Invalid(notice)) => return Err(add_refusal(notice)),
+        Err(SubmitError::Internal(error)) => return Err(ApiError::Internal(error)),
+    };
+    tracing::info!(%claim_id, account = %bearer.account.id, grant = %bearer.grant_id, "tin added from the app");
+    let profile =
+        listed_profile(&state.db, bearer.account.id, claim_id, bearer.sees_full_tins(), &state.config.account_origin)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+    Ok((StatusCode::CREATED, Json(json!({ "profile": profile }))).into_response())
+}
+
+/// A refusal of [`add_from_app`], as the app reads it: what this account
+/// already holds is a `409`, the rest a `400`. Each code and message is the
+/// site's notice's.
+fn add_refusal(notice: Notice) -> ApiError {
+    let status = match notice {
+        Notice::TinAlreadyActive
+        | Notice::TinAlreadyAdded
+        | Notice::ClaimAlreadyPending
+        | Notice::TooManyUnverified => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    ApiError::Client { status, code: notice.code(), message: notice.message() }
 }
 
 /// The longest staff note the TIN list hands the apps.
@@ -1579,15 +1779,14 @@ struct ListedClaim {
 
 /// `include=all`: every TIN on the account that is not ended, each with
 /// where it stands for sending ([`gate::classify`], so the list and the
-/// gate agree), the words for it and the link to its next step. TINs that
+/// gate agree), what the app does next ([`gate::Standing::next`]), the
+/// words for it and the link to its next step. TINs that
 /// can send come first, then paused ones, both in the order they became
 /// active; then the rest, oldest first. Only the BIR app (`full`) gets the
 /// TIN, filing permissions, the links and the staff's note.
 async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -> sqlx::Result<Vec<Value>> {
     let rows: Vec<ListedClaim> = sqlx::query_as(&format!(
-        "SELECT id, tin_root, branch_code, registered_name, status, paused_at IS NOT NULL AS paused, decided_at,
-             fix_reasons, fix_note
-         FROM tin_claims
+        "SELECT {LISTED_COLUMNS} FROM tin_claims
          WHERE account_id = $1 AND {}
          ORDER BY created_at, id",
         gate::LIVE_SQL
@@ -1604,6 +1803,30 @@ async fn all_profiles(db: &PgPool, account_id: Uuid, full: bool, origin: &str) -
         _ => (2, None),
     });
     Ok(listed.into_iter().map(|(standing, row)| listed_json(&standing, &row, full, origin)).collect())
+}
+
+/// The columns of a [`ListedClaim`].
+const LISTED_COLUMNS: &str = "id, tin_root, branch_code, registered_name, status, paused_at IS NOT NULL AS paused,
+     decided_at, fix_reasons, fix_note";
+
+/// One claim of this account as `include=all` lists it.
+async fn listed_profile(
+    db: &PgPool,
+    account_id: Uuid,
+    claim_id: Uuid,
+    full: bool,
+    origin: &str,
+) -> sqlx::Result<Option<Value>> {
+    let row: Option<ListedClaim> =
+        sqlx::query_as(&format!("SELECT {LISTED_COLUMNS} FROM tin_claims WHERE id = $1 AND account_id = $2"))
+            .bind(claim_id)
+            .bind(account_id)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(|row| {
+        let standing = gate::classify(row.id, &row.status, row.paused, &row.fix_reasons);
+        listed_json(&standing, &row, full, origin)
+    }))
 }
 
 fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin: &str) -> Value {
@@ -1626,6 +1849,10 @@ fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin:
         },
         "status": standing.api_status(),
         "can_send": standing.can_send(),
+        // For the BIR app's token, `fix` exactly when the row has an
+        // `action` (other clients get no links); `send` exactly when it can
+        // send, for every token.
+        "next": standing.next(),
         "message": standing.list_message(),
         "action": match action {
             Some((label, page)) if full => json!({ "label": label, "url": format!("{origin}/tins/claims/{}/{page}", row.id) }),

@@ -544,7 +544,7 @@ pub(crate) async fn end_sign_ins(
 /// Codes go 30 days after they were made (the limits per address look back
 /// an hour and a day), and device, in-app and agent sign-ins 30 days after
 /// they expired (nothing reads one after that). The in-app testing cap's
-/// alert days go after 30.
+/// alert days and the new-device mails' record go after 30.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM email_codes WHERE created_at < now() - make_interval(days => $1)")
         .bind(SIGN_IN_RECORDS_DAYS)
@@ -556,10 +556,12 @@ pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
             .execute(db)
             .await?;
     }
-    sqlx::query("DELETE FROM app_sign_in_alerts WHERE sent_at < now() - make_interval(days => $1)")
-        .bind(SIGN_IN_RECORDS_DAYS)
-        .execute(db)
-        .await?;
+    for table in ["app_sign_in_alerts", "new_device_mails"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE sent_at < now() - make_interval(days => $1)"))
+            .bind(SIGN_IN_RECORDS_DAYS)
+            .execute(db)
+            .await?;
+    }
     Ok(())
 }
 

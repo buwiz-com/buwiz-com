@@ -107,8 +107,13 @@ async fn device_row(device: devices::DeviceView) -> Result<impl View> {
                 <span>(what.join(" · "))</span>
                 <span>(when)</span>
             </span>
-            if device.revoked_at.is_some() {
+            if device.removed_by.is_some() {
                 <span class="tagpill status-withdrawn">"Removed"</span>
+            } else if device.revoked_at.is_some() {
+                <span class="tagpill status-withdrawn">"Signed out"</span>
+                <form method="post" action=(revoke.clone())>
+                    <button class="btn btn-ghost device-remove" type="submit">"Remove"</button>
+                </form>
             } else {
                 if device.state == "expired" {
                     <span class="tagpill status-withdrawn">"Signed out (expired)"</span>

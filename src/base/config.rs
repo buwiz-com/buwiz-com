@@ -234,6 +234,8 @@ pub fn sign_in_limits(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Si
         starts_past_full: read("APP_SIGN_IN_STARTS_PAST_FULL", today.starts_past_full, 0, 10_000_000)?,
         verifies_past_full: read("SIGN_IN_VERIFIES_PAST_FULL", today.verifies_past_full, 0, 10_000_000)?,
         refusals_alert_at: read("SIGN_IN_REFUSALS_ALERT_AT", today.refusals_alert_at, 1, 10_000_000)?,
+        token_failures_per_network: read("TOKEN_FAILURES_PER_NETWORK", today.token_failures_per_network, 1, 1_000_000)?,
+        token_failures_past_full: read("TOKEN_FAILURES_PAST_FULL", today.token_failures_past_full, 0, 10_000_000)?,
     })
 }
 
@@ -455,6 +457,8 @@ mod tests {
                 starts_past_full: 20_000,
                 verifies_past_full: 30_000,
                 refusals_alert_at: 100,
+                token_failures_per_network: 300,
+                token_failures_past_full: 30_000,
             }
         );
         let set = from(&[
@@ -463,6 +467,8 @@ mod tests {
             ("APP_SIGN_IN_STARTS_PAST_FULL", "0"),
             ("SIGN_IN_VERIFIES_PAST_FULL", "10000000"),
             ("SIGN_IN_REFUSALS_ALERT_AT", "1"),
+            ("TOKEN_FAILURES_PER_NETWORK", "5000"),
+            ("TOKEN_FAILURES_PAST_FULL", "0"),
         ])
         .unwrap();
         assert_eq!(
@@ -473,6 +479,8 @@ mod tests {
                 starts_past_full: 0,
                 verifies_past_full: 10_000_000,
                 refusals_alert_at: 1,
+                token_failures_per_network: 5000,
+                token_failures_past_full: 0,
             }
         );
         for (name, bad) in [
@@ -484,6 +492,9 @@ mod tests {
             ("SIGN_IN_VERIFIES_PAST_FULL", "10000001"),
             ("SIGN_IN_REFUSALS_ALERT_AT", "0"),
             ("SIGN_IN_REFUSALS_ALERT_AT", "many"),
+            ("TOKEN_FAILURES_PER_NETWORK", "0"),
+            ("TOKEN_FAILURES_PER_NETWORK", " 300"),
+            ("TOKEN_FAILURES_PAST_FULL", "10000001"),
         ] {
             let error = from(&[(name, bad)]).unwrap_err().to_string();
             assert!(error.starts_with(name) && error.contains(bad), "{name}={bad}: {error}");

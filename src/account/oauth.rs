@@ -135,12 +135,14 @@ pub struct DevicePoll {
     device_code: String,
 }
 
-/// `POST /auth/device/poll`: the JSON form of the device-code grant.
+/// `POST /auth/device/poll`: the JSON form of the device-code grant,
+/// counted as `/oauth/token` is ([`counted`]).
 pub async fn device_poll(
     State(state): State<AppState>,
+    headers: http::HeaderMap,
     Json(request): Json<DevicePoll>,
 ) -> Result<Json<TokenResponse>, OAuthFailure> {
-    redeem_device_code(&state.db, &request.client_id, &request.device_code).await.map(Json)
+    counted(&state, &headers, redeem_device_code(&state, &request.client_id, &request.device_code)).await.map(Json)
 }
 
 #[derive(sqlx::FromRow)]
@@ -156,9 +158,21 @@ struct DeviceRow {
     install_id: Option<String>,
 }
 
-async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> Result<TokenResponse, OAuthFailure> {
+/// The device-code grant. An app's sign-in that named its install is
+/// mailed as a new device as Sign in with Buwiz's is
+/// ([`crate::account::agents::mail_new_device`]): the same approval in a
+/// browser, so the same risk.
+async fn redeem_device_code(
+    state: &AppState,
+    client_id: &str,
+    device_code: &str,
+) -> Result<TokenResponse, OAuthFailure> {
     known_client(client_id)?;
-    let mut tx = db.begin().await?;
+    // A device code of another shape was never given out.
+    if !crypto::is_token(device_code, "bwd_") {
+        return Err(OAuthError::new("invalid_grant", "unknown device code").into());
+    }
+    let mut tx = state.db.begin().await?;
     // The account before the code row, in the order a ban takes them (it
     // locks the account, then ends the code rows): read who approved it
     // without a lock, lock that account, then the row.
@@ -214,8 +228,37 @@ async fn redeem_device_code(db: &PgPool, client_id: &str, device_code: &str) -> 
                 return Err(OAuthError::new("access_denied", "this account is banned").into());
             }
             let from = GrantFrom { install_id: row.install_id.as_deref(), platform: None };
-            let tokens = issue_grant_from(&mut tx, account_id, client_id, client_scope(client_id), from).await?;
+            let scope = client_scope(client_id);
+            let (grant_id, tokens) = issue_grant_with_id(&mut tx, account_id, client_id, scope, from).await?;
+            let app = match (scope, row.install_id.as_deref()) {
+                (SCOPE_APP, Some(install_id)) => Some(crate::account::agents::SignedInApp {
+                    account_id,
+                    grant_id,
+                    platform: None,
+                    new_device_to: crate::account::agents::new_device_to(
+                        &mut tx,
+                        account_id,
+                        grant_id,
+                        install_id,
+                        &state.config.admin_emails,
+                    )
+                    .await
+                    .map_err(|error| {
+                        // Its lock not had within three seconds: busy, and
+                        // the device code stays unspent for the next poll.
+                        if crate::account::app_sign_in::is_lock_timeout(&error) {
+                            crate::account::agents::token_busy()
+                        } else {
+                            error.into()
+                        }
+                    })?,
+                }),
+                _ => None,
+            };
             tx.commit().await?;
+            if let Some(app) = app {
+                crate::account::agents::mail_new_device(state, app);
+            }
             return Ok(tokens);
         }
         _ => {}
@@ -304,15 +347,6 @@ pub struct TokenResponse {
     scope: String,
 }
 
-pub(crate) async fn issue_grant(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    account_id: Uuid,
-    client_id: &str,
-    scope: &str,
-) -> sqlx::Result<TokenResponse> {
-    issue_grant_from(tx, account_id, client_id, scope, GrantFrom::default()).await
-}
-
 /// What an app said about itself when it signed in, kept on the grant:
 /// its install (one device row per install, [`crate::filing::devices`])
 /// and, from in-app sign-in, its platform.
@@ -322,7 +356,8 @@ pub(crate) struct GrantFrom<'a> {
     pub platform: Option<&'a str>,
 }
 
-/// [`issue_grant`], keeping `from` on the grant.
+/// A new grant for `account_id` and its first tokens, keeping `from` on
+/// the grant.
 pub(crate) async fn issue_grant_from(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
@@ -330,6 +365,17 @@ pub(crate) async fn issue_grant_from(
     scope: &str,
     from: GrantFrom<'_>,
 ) -> sqlx::Result<TokenResponse> {
+    Ok(issue_grant_with_id(tx, account_id, client_id, scope, from).await?.1)
+}
+
+/// [`issue_grant_from`], with the new grant's id.
+pub(crate) async fn issue_grant_with_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    client_id: &str,
+    scope: &str,
+    from: GrantFrom<'_>,
+) -> sqlx::Result<(Uuid, TokenResponse)> {
     let grant_id: Uuid = sqlx::query_scalar(
         "INSERT INTO oauth_grants (account_id, client_id, scope, install_id, platform) VALUES ($1, $2, $3, $4, $5)
          RETURNING id",
@@ -341,7 +387,7 @@ pub(crate) async fn issue_grant_from(
     .bind(from.platform)
     .fetch_one(&mut **tx)
     .await?;
-    issue_tokens(tx, grant_id, scope).await
+    Ok((grant_id, issue_tokens(tx, grant_id, scope).await?))
 }
 
 async fn issue_tokens(
@@ -384,12 +430,39 @@ pub struct TokenRequest {
     code_verifier: Option<String>,
 }
 
+/// Runs a try at a token, counted against its network's failures
+/// ([`crate::account::guard::SignInGuard::count_token_try`]) for the
+/// hourly log line and the staff alert. Counted and alerted, never
+/// refused: a network far over the count is served as main serves it. The
+/// try is given back unless it failed with `invalid_grant` (an unknown or
+/// wrong code or token).
+async fn counted<T>(
+    state: &AppState,
+    headers: &http::HeaderMap,
+    attempt: impl Future<Output = Result<T, OAuthFailure>>,
+) -> Result<T, OAuthFailure> {
+    let tried = state.sign_in_guard.count_token_try(headers);
+    crate::account::app_sign_in::alert_if_refused_many(state);
+    let outcome = attempt.await;
+    let failed = matches!(&outcome, Err(OAuthFailure::OAuth(error)) if error.error == "invalid_grant");
+    if !failed {
+        state.sign_in_guard.forgive_token_try(&tried);
+    }
+    outcome
+}
+
 /// `POST /oauth/token` (form-encoded): `refresh_token`, the RFC 8628
-/// `device_code` grant, and `authorization_code` with PKCE for agents.
+/// `device_code` grant, and `authorization_code` with PKCE for agents and
+/// the eBIRForms apps. Every grant is counted by [`counted`].
 pub async fn token(
     State(state): State<AppState>,
+    headers: http::HeaderMap,
     Form(request): Form<TokenRequest>,
 ) -> Result<Json<TokenResponse>, OAuthFailure> {
+    counted(&state, &headers, token_grant(&state, request)).await
+}
+
+async fn token_grant(state: &AppState, request: TokenRequest) -> Result<Json<TokenResponse>, OAuthFailure> {
     match request.grant_type.as_str() {
         "refresh_token" => {
             let Some(refresh_token) = request.refresh_token else {
@@ -401,7 +474,7 @@ pub async fn token(
             let Some(device_code) = request.device_code else {
                 return Err(OAuthError::new("invalid_request", "device_code is required").into());
             };
-            redeem_device_code(&state.db, &request.client_id, &device_code).await.map(Json)
+            redeem_device_code(state, &request.client_id, &device_code).await.map(Json)
         }
         "authorization_code" => {
             let (Some(code), Some(redirect_uri), Some(verifier)) =
@@ -411,9 +484,7 @@ pub async fn token(
                     OAuthError::new("invalid_request", "code, redirect_uri and code_verifier are required").into()
                 );
             };
-            crate::account::agents::redeem_code(&state.db, &request.client_id, &code, &redirect_uri, &verifier)
-                .await
-                .map(Json)
+            crate::account::agents::exchange(state, &request.client_id, &code, &redirect_uri, &verifier).await.map(Json)
         }
         _ => {
             Err(OAuthError::new("unsupported_grant_type", "use authorization_code, refresh_token or device_code")
@@ -423,6 +494,10 @@ pub async fn token(
 }
 
 async fn refresh(db: &PgPool, client_id: &str, refresh_token: &str) -> Result<TokenResponse, OAuthFailure> {
+    // A refresh token of another shape was never given out.
+    if !crypto::is_token(refresh_token, "bwr_") {
+        return Err(OAuthError::new("invalid_grant", "sign in again").into());
+    }
     let mut tx = db.begin().await?;
     #[derive(sqlx::FromRow)]
     struct Stored {

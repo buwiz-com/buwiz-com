@@ -214,10 +214,10 @@ fn text_field(
 /// updates it in place, with the new key and sign-in, and ends the sign-in
 /// it had. A sign-in without one may register again, each time a new row.
 ///
-/// A sign-in that named its install when it began (the in-app start, or
-/// the device flow's `/oauth/device/code`) and was completed is proof of
-/// the account, so its registration replaces that install's row whatever
-/// sign-in held it: by design. Someone who knows a device's install id and
+/// A sign-in that named its install when it began (the in-app start, the
+/// device flow's `/oauth/device/code`, or `/oauth/authorize`) and was
+/// completed is proof of the account, so its registration replaces that
+/// install's row whatever sign-in held it: by design. Someone who knows a device's install id and
 /// can complete a sign-in on the account replaces that device's sign-in;
 /// when the sign-in replaced was still live, the account is mailed
 /// ([`mail_replaced`]).
@@ -357,7 +357,8 @@ pub async fn register(State(state): State<AppState>, request: Request) -> Result
             }
             sqlx::query_as(
                 "UPDATE devices SET public_key = $2, grant_id = $3, name = $4, platform = $5, model = $6,
-                     os_version = $7, computer_name = $8, signed_in_at = now(), revoked_at = NULL
+                     os_version = $7, computer_name = $8, signed_in_at = now(), revoked_at = NULL,
+                     removed_by = NULL
                  WHERE id = $1 RETURNING id, created_at",
             )
             .bind(id)
@@ -457,6 +458,10 @@ pub struct DeviceView {
     pub last_used_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
+    /// Who removed it (`owner`, `staff`); `None` for a device that is live
+    /// or ended with its sign-in (signed out).
+    #[serde(skip)]
+    pub removed_by: Option<String>,
     /// `live` (its sign-in has a refresh token that works), `expired` (its
     /// sign-in's tokens all ran out: signed out, though nobody removed
     /// it) or `removed`.
@@ -471,7 +476,7 @@ const REMOVED_SHOWN_DAYS: i32 = 30;
 pub async fn for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<DeviceView>> {
     let mut devices: Vec<DeviceView> = sqlx::query_as(&format!(
         "SELECT d.id, d.name, g.client_id, d.grant_id, d.platform, d.model, d.os_version, d.computer_name,
-                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at,
+                d.created_at, coalesce(d.signed_in_at, d.created_at) AS signed_in_at, d.last_used_at, d.revoked_at, d.removed_by,
                 CASE WHEN d.revoked_at IS NOT NULL THEN 'removed'
                      WHEN g.revoked_at IS NULL AND {HAS_REFRESH} THEN 'live'
                      ELSE 'expired' END AS state
@@ -517,12 +522,16 @@ pub async fn pending_for_account(db: &PgPool, account_id: Uuid) -> sqlx::Result<
     .await
 }
 
-/// Revokes the device and ends the sign-in it was registered under.
-/// `false` when it is not this account's or was already revoked.
+/// Revokes the device and ends the sign-in it was registered under: the
+/// owner removed it (`removed_by = 'owner'`), so if it signs in again it is
+/// mailed as a new device. A device already signed out is marked removed
+/// by the owner the same way. `false` when it is not this account's or was
+/// already removed.
 pub async fn revoke(db: &PgPool, account_id: Uuid, device_id: Uuid) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
     let grant: Option<Uuid> = sqlx::query_scalar(
-        "UPDATE devices SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+        "UPDATE devices SET revoked_at = now(), removed_by = 'owner'
+         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
          RETURNING grant_id",
     )
     .bind(device_id)
@@ -530,7 +539,16 @@ pub async fn revoke(db: &PgPool, account_id: Uuid, device_id: Uuid) -> sqlx::Res
     .fetch_optional(&mut *tx)
     .await?;
     let Some(grant) = grant else {
-        return Ok(false);
+        let marked = sqlx::query(
+            "UPDATE devices SET removed_by = 'owner'
+             WHERE id = $1 AND account_id = $2 AND revoked_at IS NOT NULL AND removed_by IS NULL",
+        )
+        .bind(device_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(marked.rows_affected() == 1);
     };
     sqlx::query(
         "UPDATE oauth_grants SET revoked_at = now(), revoke_reason = 'device_revoked' WHERE id = $1 AND revoked_at IS NULL",

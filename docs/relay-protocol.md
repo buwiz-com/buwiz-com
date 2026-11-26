@@ -300,7 +300,7 @@ row per account: a registration from an install that has one updates it
 in place (new key, new sign-in, the fields above, `signed_in_at`, not
 removed) and answers its same `id` and `created_at`; the sign-in it had
 is ended (`device_replaced`). A sign-in that carries an install id (from
-`/auth/email/start` or `/oauth/device/code`) must register with the same
+`/auth/email/start`, `/oauth/device/code` or `/oauth/authorize`) must register with the same
 one (`400 install_mismatch`, also when it is left out); one without gets
 the request's, unless that install's live device belongs to another live
 sign-in of the account (`409 install_in_use`, nothing changed).
@@ -360,7 +360,9 @@ Apple model code is sold under (`src/filing/apple_models.rs`); an Apple
 code not listed there is the platform's word with the code ("iPhone
 (iPhone18,1)", "iPad (iPad15,3)", "Mac (Mac16,12)"); any other model is as
 sent. `model` is always the raw value. Devices removed more than 30 days ago are left out.
-`POST /api/devices/{id}/revoke` revokes one device; `POST
+`POST /api/devices/{id}/revoke` revokes one device (`{"revoked": true}`;
+one already signed out is marked removed the same way, and one already
+removed is `404`); `POST
 /api/sign-ins/{grant_id}/sign-out` ends one of the account's BIR app
 sign-ins (its device too, if it has one), this app's own included,
 answering `{"signed_out": true}` or `404` for another account's or an

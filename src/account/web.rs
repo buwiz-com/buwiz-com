@@ -528,7 +528,28 @@ async fn render_page(pages: &topcoat::router::Router, state: &AppState, request:
     if (path == "/app-sign-in" || path == "/app-check/done") && response.status().is_success() {
         response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(STATIC_PAGE_CSP));
     }
+    if path == "/oauth/authorize" {
+        no_frames(response.headers_mut());
+    }
     response
+}
+
+/// `X-Frame-Options: DENY` and `frame-ancestors 'none'`, added to any
+/// Content-Security-Policy already there: the sign-in and consent pages
+/// and their answers are never shown in another site's frame, where a tap
+/// could be tricked out of someone.
+pub(crate) fn no_frames(headers: &mut HeaderMap) {
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    let policy = match headers.get(header::CONTENT_SECURITY_POLICY).and_then(|value| value.to_str().ok()) {
+        Some(policy) if policy.contains("frame-ancestors") => return,
+        Some(policy) if !policy.trim().is_empty() => {
+            format!("{}; frame-ancestors 'none'", policy.trim().trim_end_matches(';'))
+        }
+        _ => "frame-ancestors 'none'".to_owned(),
+    };
+    if let Ok(value) = HeaderValue::from_str(&policy) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
 }
 
 /// The signed-in person on the account site, from the session cookie.
@@ -972,7 +993,19 @@ async fn email_verify(state: &AppState, form: EmailVerify) -> Response {
     response
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct LogoutForm {
+    /// Where to come back to after signing in again: "Use another
+    /// account" on an app's sign-in page sends its own address.
+    #[serde(default)]
+    next: Option<String>,
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<LogoutForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
     if let Err(refused) = same_origin(&state, &headers) {
         return refused;
     }
@@ -981,7 +1014,9 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     {
         return internal(error);
     }
-    let mut response = see_other(link("/login", Some(Notice::SignedOut), &[]));
+    let next = form.ok().and_then(|Form(form)| form.next).map(|next| safe_next(Some(&next)));
+    let params: Vec<(&str, &str)> = next.iter().map(|next| ("next", next.as_str())).collect();
+    let mut response = see_other(link("/login", Some(Notice::SignedOut), &params));
     response.headers_mut().insert(header::SET_COOKIE, session_cookie(&state, "", 0));
     response
 }

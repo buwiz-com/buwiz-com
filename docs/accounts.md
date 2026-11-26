@@ -456,7 +456,9 @@ Runtime. For a digital PDF, it reads the text layer first.
 The desktop app and the mini apps use the OAuth device flow (RFC 8628):
 `/oauth/device/code` and `/oauth/token`. Refresh tokens rotate, and reusing
 an old one ends the whole sign-in. The eBIRForms apps can also sign in by
-email inside the app ([below](#in-app-sign-in)).
+email inside the app ([below](#in-app-sign-in)), or in the browser with
+the authorization code flow ([Sign in with Buwiz](#sign-in-with-buwiz)).
+The device flow stays for the apps already in the field.
 
 The person approves on `/device` by typing the code the app shows. No link
 fills it in: `verification_uri_complete` is the plain `/device` address, and
@@ -817,13 +819,209 @@ flow's do.
 | 503 | `busy` | Start, resend and verify: too many requests at once, no place for the database work within 2 seconds, or a lock not had within 3. Nothing was done; `Retry-After: 5` (try again in a few seconds) |
 | 503 | `restarting` | The server is stopping (deploy.md, "What a deploy does at stop"); `Retry-After: 30` |
 
+## Sign in with Buwiz
+
+The eBIRForms apps can sign in in the browser, as the built-in client
+`buwiz-desktop`, with the authorization code flow and PKCE (S256 only) on
+the same `/oauth/authorize` and `/oauth/token` the agents use
+(`check_app_authorize`, `redeem_code` in `src/account/agents.rs`):
+1. The app makes a PKCE verifier and a random `state`, opens
+   `https://account.buwiz.com/oauth/authorize` in the system browser (or
+   an in-app browser session) with its `install_id` and `platform`, and
+   listens on its redirect address.
+2. Without a web session the page sends the person to sign in on the web
+   and back to the same address. A banned account has no web session.
+3. The page is Buwiz's own, not the agents' consent: "Sign in to eBIRForms
+   on iPhone" (the platform's word), one button "Continue as
+   <email>", **Cancel**, and **Use another account**, which signs the web
+   out (`POST /logout` with `next`, same-origin as every form) and comes
+   back here after signing in again. It is never approved on its own: a
+   live session still needs the tap. The page says what the app can do
+   with the scope `app`: file and send returns for the account's TINs
+   through Buwiz, see its TINs and the returns it sent with their
+   receipts, and see and remove its devices and sign-ins.
+4. Continue stores a one-time code for ten minutes with scope `app`, the
+   install and the platform (`oauth_codes`), and redirects to the app with
+   `code`, `state` and `iss`. Cancel redirects with
+   `error=access_denied`.
+5. The app checks `state` and `iss`, and exchanges the code with its
+   verifier on `/oauth/token`. The grant gets the code's scope, install
+   and platform, as in-app sign-in stamps them, so `POST /api/devices` and
+   one row per install ([Devices](#devices)) work the same.
+
+The page and the decision's answer carry `X-Frame-Options: DENY` and
+`Content-Security-Policy: frame-ancestors 'none'` (`no_frames` in
+`src/account/web.rs`, added to any policy already there), so another site
+cannot frame the page and trick the tap out of someone.
+
+### Redirect addresses
+
+Fixed in the code (`app_redirects`), never registered, never in
+`oauth_clients`. Only `buwiz-desktop` has any; the other built-in clients
+(`buwiz-ebirforms`, `buwiz-books`) cannot use `/oauth/authorize`, and a
+row in `oauth_clients` under a built-in id is ignored. `redirect_uri` is
+required:
+- `ebirforms://signin-callback`, exactly: no trailing slash, path, query
+  or fragment, and the scheme in lowercase;
+- `http://127.0.0.1:<port>/callback` (RFC 8252 §7.3): the host exactly
+  `127.0.0.1` (not `localhost`, not `[::1]`), a port written out (any, 1
+  to 65535, no leading zero), the path exactly `/callback`, and no query,
+  fragment or user info.
+
+An address outside these is never redirected to: the page says the
+request cannot be used. Agents keep their own registered addresses and
+the `mcp` scope; registration refuses the `ebirforms` scheme, and a
+registered client's id is always `agent_` and a new UUID, so it never
+names a built-in client.
+
+### What PKCE and state cover
+
+PKCE: a code caught on its way to the app (another app on the phone
+claiming `ebirforms://`, or listening on the loopback port) is useless
+without the verifier, which never left the app that started. `state`
+(16 characters at least, the app's own random value) ties the answer to
+the request the app made, so the app takes no code it did not ask for (a
+link from someone else that lands on its redirect address).
+
+What neither covers: an app that pretends to be eBIRForms from the start
+makes its own verifier and state, so if the person taps Continue it is
+signed in as them. Nothing in a browser can tell the real app from such a
+one. That is why the tap is never skipped, even with a live session, and
+why a new device is mailed.
+
+### The new-device mail
+
+After the exchange (on its own task, so the token answer never waits for
+it), when the account had no live `devices` row for the install at the
+exchange, the account is mailed "New device signed in: eBIRForms on
+<platform>": when it happened (Philippine time), and "If this wasn't
+you, log it out at https://account.buwiz.com/tins#devices-h" (My
+devices). Fixed words only: nothing from the request but the platform's
+word.
+- New means no row, or a row the owner (My devices, or the app's own
+  remove call) or staff removed (`devices.removed_by`, set with
+  `revoked_at`): a removed device that signs in again is mailed again.
+  A row that ended with its sign-in (signed out, replaced, or any grant
+  ended by 0018's trigger) has no `removed_by`: the same device signing
+  in again is not mailed. Registering again clears `removed_by`. My
+  devices (and the staff page) says "Signed out" for such a row and
+  "Removed" for a removed one; the owner may still remove a signed-out
+  row, which marks it `owner`.
+- It is decided in the exchange's transaction, so an app that registers
+  its device at once is still mailed.
+- A known device signing in again, and an account signing in with a
+  fixed code (a store reviewer's), are mailed nothing.
+- A mail that fails is logged with the account and grant ids, and the
+  sign-in stands.
+- At most 3 in any 24 hours per account (`new_device_mails`, counted in
+  the exchange's transaction over the last 24 hours, not the calendar
+  day). A person adds a phone, a computer, maybe reinstalls one; more is
+  a script with the web session, whose mails would bury a real alert. The
+  third says "We send at most three new-device notices in 24 hours, and
+  this is the third" and asks the person to check My devices; no other
+  mail is sent. The next one can go once the oldest of the three is 24
+  hours old. Past it the sign-in stands, nothing is mailed, and one log line
+  has the account and grant ids.
+- Counting fails the sign-in only when the count itself cannot be made:
+  its lock not had within 3 seconds is `503 temporarily_unavailable`
+  (the device flow's poll too), any other database error is `500`. Either
+  way the sign-in is rolled back, nothing is mailed, and the code or
+  device code stays unspent, so the app may try again.
+- The device flow sends it the same way, when its sign-in named an
+  install (`/oauth/device/code` with `install_id`): it is approved in a
+  browser too. Its device word is "eBIRForms", as the device flow names
+  no platform. Apps from before install ids are not mailed.
+- In-app sign-in does not send it: the code mailed to the address is
+  already the notice.
+- Its subject is not the replaced-sign-in mail's ("New sign-in to …",
+  [Devices](#devices)), which comes at registration when the install's
+  row already had a live sign-in.
+
+### The authorize and token API
+
+`GET https://account.buwiz.com/oauth/authorize` with:
+
+| Parameter | |
+|---|---|
+| `client_id` | `buwiz-desktop` |
+| `redirect_uri` | One of the two addresses above |
+| `response_type` | `code` |
+| `code_challenge` | base64url SHA-256 of the verifier (43 characters) |
+| `code_challenge_method` | `S256` |
+| `state` | The app's random value, at least 16 characters |
+| `install_id` | 16 to 64 of `A-Z a-z 0-9 - _` |
+| `platform` | `ios`, `ipados`, `android`, `macos`, `windows` or `linux` |
+| `scope` | Optional; only `app` |
+
+`resource` is not needed (ignored). Success redirects to
+`<redirect_uri>?code=bwc_…&iss=https%3A%2F%2Faccount.buwiz.com&state=…`;
+an error to `<redirect_uri>?error=…&error_description=…&iss=…&state=…`
+(`state` when the request had one):
+
+| `error` | When |
+|---|---|
+| `invalid_request` | `state` missing or shorter than 16; `install_id` missing or malformed; `platform` missing or not one of the six; no `code_challenge`, or not S256 |
+| `unsupported_response_type` | `response_type` is not `code` |
+| `invalid_scope` | `scope` is there and is not `app` |
+| `access_denied` | The person tapped Cancel |
+
+A wrong `client_id` or `redirect_uri` redirects nowhere; the page says so.
+
+`POST https://api.buwiz.com/oauth/token` (form-encoded) with
+`grant_type=authorization_code`, `client_id=buwiz-desktop`, `code`,
+`redirect_uri` (the same string as at authorize) and `code_verifier`.
+Answers `200` with the device flow's token answer, scope `app`; refresh
+as for every app (`grant_type=refresh_token`). The code works once,
+within ten minutes, for its client, address and verifier: anything else
+is `400 invalid_grant` (and uses the code up), and a banned account gets
+`400 access_denied`.
+
+What a flood of made-up codes can cost:
+1. **Counted and alerted, never refused.** Every grant on `/oauth/token`
+   (`authorization_code`, `refresh_token`, the device code) and
+   `/auth/device/poll` is counted against its network's hour (IPv4 /24,
+   IPv6 /48, from `CF-Connecting-IP`), and only tries that fail with
+   `invalid_grant` stay counted: a refresh or an exchange that works, and
+   a poll told to wait, are given back. The tries a network makes past 300
+   failures in the hour (`TOKEN_FAILURES_PER_NETWORK`, deploy.md) are in
+   the hourly log line and the staff alert with the other sign-in limits,
+   and are served as any other: one stuck app or a neighbour behind a
+   carrier's address must never lock that address out, and main has no
+   such lockout. A slow lane for such networks is issue #84.
+2. A code, refresh token or device code that is not its prefix (`bwc_`,
+   `bwr_`, `bwd_`) and 43 characters of base64url was never given out:
+   `400 invalid_grant` before any database work.
+3. **A place of the exchange's own.** At most 2 exchanges use the
+   database at once, so a flood never takes in-app sign-in's places
+   (start's 4, verify's 3, these 2: 9, under the pool's 10). One waits at
+   most 2 seconds for a place, holding no connection.
+4. Its transaction waits at most 3 seconds for a connection and for each
+   lock (`begin_waiting`).
+
+When no place comes within 2 seconds (3), or a connection or a lock does
+not come within 3 (4), the answer is `503 temporarily_unavailable`: the
+code is not used, and the app may try again in a few seconds.
+
+What is left, plainly:
+- A stream of well-shaped made-up codes can keep Sign in with Buwiz busy
+  (`503`, its 2 places) while it lasts. In-app sign-in keeps working on
+  places of its own. Filing has no places of its own: it keeps working
+  only because the exchange holds at most two of the pool's 10
+  connections.
+- The device-code path is as on main (#84). A poll of a real device code
+  (`authorization_pending`, `slow_down`) costs a pooled connection and a
+  write, and is never counted, however fast it comes; only a poll that
+  fails with `invalid_grant` is. `/auth/device/start` (and
+  `/oauth/device/code`) is not limited at all and writes a row per call.
+
 ## Devices
 
 An app that signs in can register a device key
 ([relay-protocol.md](relay-protocol.md#51-device-key)); the account's
 devices are under **My devices** on My TINs. An app sends `install_id`,
 its own id for its install (an identifier, not a secret), when it signs
-in (`/auth/email/start`, `/oauth/device/code`) and when it registers. The
+in (`/auth/email/start`, `/oauth/device/code`, `/oauth/authorize`) and
+when it registers. The
 sign-in's grant keeps it, and an install has one device row per account
 (a unique index): signing in again on the same install and registering
 updates that row (its key, its sign-in, what the app says about the

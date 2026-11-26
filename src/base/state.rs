@@ -37,6 +37,10 @@ pub struct Inner {
     /// the web form's ([`crate::account::app_sign_in::VERIFY_SLOTS`]): their
     /// own, so a flood of guesses never takes start's.
     pub verify_slots: tokio::sync::Semaphore,
+    /// Places for the database work of an `authorization_code` exchange on
+    /// `/oauth/token` ([`crate::account::agents::TOKEN_SLOTS`]): their own,
+    /// so a flood of made-up codes never takes start's or verify's.
+    pub token_slots: tokio::sync::Semaphore,
     pub documents: DocumentStore,
     /// Signs tickets.
     pub ticket_key: SigningKey,
@@ -99,6 +103,7 @@ impl AppState {
             sign_in_guard,
             app_sign_in_slots: tokio::sync::Semaphore::new(crate::account::app_sign_in::DATABASE_SLOTS),
             verify_slots: tokio::sync::Semaphore::new(crate::account::app_sign_in::VERIFY_SLOTS),
+            token_slots: tokio::sync::Semaphore::new(crate::account::agents::TOKEN_SLOTS),
             documents,
             ticket_key,
             sender,

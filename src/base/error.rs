@@ -19,6 +19,10 @@ pub enum ApiError {
     /// `WWW-Authenticate`.
     #[error("sign in again")]
     InvalidToken,
+    /// Over a limit: `429 rate_limited`, with `Retry-After` in seconds and
+    /// the minutes to wait in the message. Never cached.
+    #[error("too many requests")]
+    RateLimited { retry_after: time::Duration },
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -34,6 +38,11 @@ impl ApiError {
 
     pub fn conflict(code: &'static str, message: &'static str) -> Self {
         Self::Client { status: StatusCode::CONFLICT, code, message }
+    }
+
+    /// [`ApiError::RateLimited`]: try again after `wait`.
+    pub fn rate_limited(wait: time::Duration) -> Self {
+        Self::RateLimited { retry_after: wait }
     }
 
     pub fn not_found() -> Self {
@@ -62,6 +71,19 @@ impl IntoResponse for ApiError {
                 response
                     .headers_mut()
                     .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(r#"Bearer error="invalid_token""#));
+                response
+            }
+            Self::RateLimited { retry_after } => {
+                // At least a second, and whole minutes rounded up in words.
+                let seconds = retry_after.whole_seconds().max(1);
+                let minutes = (seconds + 59) / 60;
+                let unit = if minutes == 1 { "minute" } else { "minutes" };
+                let message = format!("Too many requests. Try again in {minutes} {unit}.");
+                let body = json!({ "error": { "code": "rate_limited", "message": message } });
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                let headers = response.headers_mut();
+                headers.insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+                headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
                 response
             }
             Self::Internal(error) => {

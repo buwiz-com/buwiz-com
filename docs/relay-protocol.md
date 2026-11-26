@@ -142,6 +142,73 @@ except that a paused TIN is left out; a test TIN that can send is listed,
 with `"test_only": true`. `tests/fixtures/tax_profiles_all.json`
 is the golden example; [accounts.md](accounts.md#licence-gate) has more.
 
+Each `include=all` row also has `next`, what the app does with it, from
+the same rule as `status`:
+
+| `status` | `can_send` | `next` | `action` |
+|---|---|---|---|
+| `approved` | true | `send` | null |
+| `paused` | false | `wait` | null |
+| `pending` | false | `wait` | null |
+| `unverified` | false | `fix` | Verify to send (`/tins/claims/<id>/verify`) |
+| `needs_fix` | false | `fix` | Fix and send again (`/tins/claims/<id>/fix`) |
+
+`next` is `fix` exactly when the row has an `action` (for the BIR app;
+other clients get no links), and `send` exactly when `can_send`. A test
+TIN reads the same, with `test_only`. The no-include and `include=pending`
+lists have no `next`. A tax profile on the device whose TIN (root and
+branch) is not in the list is not activated.
+
+**Limit.** 120 calls per sign-in (the app's grant, one per device
+sign-in) in 10 minutes, every mode together. Past it: `429` with
+`Retry-After: <seconds>` and
+`{"error":{"code":"rate_limited","message":"Too many requests. Try again in N minutes."}}`.
+The app reads the list at start, on foreground and before Queue, never on
+a timer; on a `429` it keeps the last list and tries again after
+`Retry-After`.
+
+### Adding a TIN from the app
+
+`POST /api/tax-profiles` (BIR app only, scope `app`) adds a TIN to the
+account as not verified, without papers, the same as the account site's
+"add papers later". The app calls it **only** from an explicit button
+("Activate this TIN to send") on a tax profile that is not on the account,
+**never** when a tax profile is created: a profile made on a device stays
+on the device until the person asks to activate it.
+
+```json
+{ "kind": "personal" | "business",
+  "tin": "123-456-789-00000",
+  "registered_name": "Dela Cruz Juan",
+  "trade_name": "optional, may be omitted or empty" }
+```
+
+`tin` follows the site's rules: 9 digits for the head office (branch
+`00000`), 14 with the branch (12, with a 3-digit branch, too); dashes and
+spaces allowed. `registered_name` is 1 to 200 characters after trimming,
+`trade_name` at most 200. The answer is `201 {"profile": <row>}`, the row
+as `include=all` lists it (`status` `unverified`, `can_send` false, `next`
+`fix`, `action` Verify to send); its `id` stays the same once the claim is
+approved. Each add leaves one audit line (action `created`, source `app`,
+reason "added from the app").
+
+| HTTP | `code` | When |
+|---|---|---|
+| 403 | `insufficient_scope` | Not the BIR app's token |
+| 400 | `bad_request` | Not the JSON above, or an unknown `kind` |
+| 400 | `bad_tin` | The TIN does not read |
+| 400 | `name_missing` | The names break the length rules |
+| 400 | `test_tin` | A reserved root (`000-000-000`, `111-111-114`): staff add test TINs |
+| 409 | `tin_already_active` | This account already has it active |
+| 409 | `tin_already_added` | This account already has it as not verified |
+| 409 | `claim_already_pending` | This account already has it in review or sent back |
+| 409 | `too_many_unverified` | This account already has 20 TINs not verified |
+| 429 | `rate_limited` | Over 10 tries per sign-in in an hour (every try counts), with `Retry-After` |
+
+No answer says whether another account holds the TIN: adding one that
+another account holds, active or not, reads exactly like adding a free
+one, and a refusal speaks of this account's own row only.
+
 ## 2. Open the pipe
 
 Open a WebSocket to `relay_path` on the same server (`wss://`), with the

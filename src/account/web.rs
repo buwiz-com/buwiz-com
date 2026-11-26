@@ -135,7 +135,9 @@ pub fn router(state: AppState, pages: topcoat::router::Router) -> Router {
         .route("/oauth/token", post(oauth::token))
         .route("/me", get(oauth::me))
         .route("/api/auth/logout", post(oauth::logout))
-        .route("/api/tax-profiles", signed(&state, get(claims::tax_profiles)))
+        // The TIN list, and the BIR app's add of a TIN as not verified
+        // (only from its "Activate this TIN to send" button).
+        .route("/api/tax-profiles", signed(&state, get(claims::tax_profiles).post(claims::add_tax_profile)))
         // Submission relay.
         .route(
             "/api/submissions",

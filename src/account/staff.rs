@@ -245,8 +245,8 @@ pub async fn counts(db: &PgPool, admin_emails: &[String]) -> sqlx::Result<Counts
     .await
 }
 
-/// The Overview's numbers. Test TINs (`000-000-000`) are left out of the
-/// active TINs: they are made up and never send.
+/// The Overview's numbers. Test TINs (a reserved root, `TEST_ROOTS`) are
+/// left out of the active TINs: they are made up and never send.
 #[derive(Clone, Copy, Debug, sqlx::FromRow)]
 pub struct Overview {
     pub waiting: i64,

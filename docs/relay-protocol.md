@@ -191,6 +191,12 @@ What the server does over the pipe:
 | `failed` | Nothing reached BIR. `error` says why (`relay not built in` from a server built without the `bir` feature). | Retry later by opening the relay again (same submission, within 24 h), unless `error` ends with a refusal code in brackets (below). |
 | `unknown` | The connection broke during the upload. BIR may have the file. | Do **not** resend automatically. Ask the person to check for BIR's confirmation email. |
 
+A send the server finds stuck in `sending` for 10 minutes (it stopped
+mid-send) becomes `unknown` with the error "the server stopped while
+sending". For a test TIN's send the error is instead "the server stopped
+during this test send; it was a dry run, so nothing was sent to the BIR":
+a test TIN's send is a dry run and never reaches the BIR.
+
 Fields a `result` may carry besides these, each optional
 ([bir-uptime.md](bir-uptime.md)):
 
@@ -537,21 +543,25 @@ The Gatekeeper reaches the Sender at `SENDER_URL` and presents
   job never leaves it, and the try ends "the sending service is not
   reachable; try again later". The Sender refuses a test TIN's job on
   `/internal/relay`, and any other job here: after its `sender` frame it
-  ends with a `failed` result and sends nothing. On this route the
-  `sender` frame always says `dry_run` (nothing else is ever sent from
-  it), so a job refused here, a v2 one whose ticket does not check among
-  them, ends with its own reason.
+  ends with a `failed` result and sends nothing. On either route the
+  `sender` frame says `dry_run` only for a job that reads as a test TIN's.
+  That includes a v2 job whose ticket does not check but names a test TIN
+  (read unverified, for the frame only), so such a job ends with the
+  ticket's own reason. Any other job's frame says the Sender's mode.
 - For a test TIN's job the Gatekeeper also checks the Sender, by an
   allow-list. Its first text frame must be the `sender` frame saying
   `dry_run`; the only frame after it must be the `result`, `dry_run` or
-  `failed`, and a receipt on it must say mode `dry_run`. The app hears that
+  `failed`. A `dry_run` result must carry a receipt whose `mode` and
+  `status` both say `dry_run`; a receipt on a `failed` one must say mode
+  `dry_run`. The app hears that
   result as the Gatekeeper writes it, not as it came. Any other frame (an
   `open`, binary, any other type, a frame with two `type` keys) ends it:
   the Gatekeeper closes the Sender's socket, forwards nothing of it to the
   app, and ends the try `failed`
   with "the sending service would not make this test send a dry run; try
-  again later". An older Sender that knows fewer reserved roots is stopped
-  this way too.
+  again later" (v1), or "...; ask for a new ticket and send again later"
+  (v2, whose ticket is spent). An older Sender that knows fewer reserved
+  roots is stopped this way too.
 
 Without `SENDER_URL`, a development server runs a Sender in its own
 process. A public deployment (`https://` `ACCOUNT_ORIGIN`) refuses to start

@@ -68,7 +68,8 @@ email = "juan@example.test"
   state = "active"
   reason = "Login only"
 
-# A made-up test TIN (000-000-000, at any branch) for trying the apps goes
+# A test TIN (a reserved root, 000-000-000 or 111-111-114, at any branch)
+# for trying the apps goes
 # on a login with the test label, active, and only when its entry says so.
 # It never sends to the BIR. The label stays on while the login holds one.
 #

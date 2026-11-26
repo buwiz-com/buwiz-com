@@ -39,10 +39,12 @@
 //! [`RESERVED_RELAY_ROUTE`], which an older Sender does not have: the
 //! connection fails and the job never leaves the Gatekeeper. This Sender
 //! refuses a test TIN's job on [`RELAY_ROUTE`] and any other job on the
-//! reserved one; on that route its `sender` frame always says `dry_run`.
+//! reserved one. On either route its `sender` frame says `dry_run` only
+//! for a job that reads as a test TIN's.
 //! And for a test TIN's job the Gatekeeper wants the Sender's first frame
 //! to be the `sender` frame saying `dry_run`, and after it only a `result`
-//! that is `dry_run` or `failed`, with any receipt saying `dry_run`.
+//! that is `dry_run` (with a receipt whose mode and status say `dry_run`)
+//! or `failed`.
 //! Anything else ends the try `failed`, with nothing of it sent on to the
 //! app, so no stream to the BIR is opened.
 
@@ -455,6 +457,18 @@ impl Sender {
         }
     }
 
+    /// Whether `job` reads as a test TIN's, for its `sender` frame on the
+    /// reserved route: [`Sender::is_test_job`], or a v2 job whose ticket
+    /// does not check but names a test TIN (read unverified). Only the
+    /// frame rests on the second: such a job is then refused with the
+    /// ticket's reason and sends nothing.
+    fn reads_as_test_job(&self, job: &Job) -> bool {
+        self.is_test_job(job)
+            || matches!(job, Job::V2 { ticket, .. } if jws::claims_unverified(ticket)
+                .and_then(|claims| claims["tin"].as_str().and_then(ticket_tin))
+                .is_some_and(|tin| tin.is_test()))
+    }
+
     async fn send(&self, pipe: &Pipe, send: Send) -> Control {
         let mode = send.plan.mode;
         if send.plan.given == Given::Blanked {
@@ -631,11 +645,12 @@ async fn run_job(sender: Arc<Sender>, mut socket: WebSocket, reserved: bool) {
         Some(Ok(Message::Text(text))) => serde_json::from_str::<Job>(&text).ok(),
         _ => None,
     };
-    // On the reserved route nothing but a test TIN's dry run is ever sent,
-    // so its `sender` frame says `dry_run` whatever the job: a job refused
-    // there then ends with its own reason, not the Gatekeeper's.
+    // On the reserved route the `sender` frame says `dry_run` only for a
+    // job that reads as a test TIN's, so a test job refused there (a v2 one
+    // whose ticket does not check) ends with its own reason, not the
+    // Gatekeeper's. Any other job gets the mode `plan` gives it.
     let mode = match &job {
-        _ if reserved => Mode::DryRun,
+        Some(job) if reserved && sender.reads_as_test_job(job) => Mode::DryRun,
         Some(job) => sender.job_mode(job),
         None => sender.config.relay.mode,
     };
@@ -1074,11 +1089,11 @@ mod tests {
         for (tin, test) in [("11111111400000", true), ("00000000000000", true), ("12345678900000", false)] {
             let (v1, v2) = jobs_for(tin);
             for job in [v1, v2] {
-                // The reserved route's `sender` frame always says `dry_run`.
-                let plain = if test { Mode::DryRun } else { Mode::Live };
-                let on = |reserved: bool| if reserved { Mode::DryRun } else { plain };
-                cases.push((tin, job.clone(), !test, on(!test), wrong_route(!test)));
-                cases.push((tin, job, test, on(test), unsent.clone()));
+                // The `sender` frame says `dry_run` for a test job only, on
+                // either route.
+                let mode = if test { Mode::DryRun } else { Mode::Live };
+                cases.push((tin, job.clone(), !test, mode, wrong_route(!test)));
+                cases.push((tin, job, test, mode, unsent.clone()));
             }
         }
         for (tin, job, reserved, mode, answer) in cases {
@@ -1103,8 +1118,10 @@ mod tests {
 
     /// A test TIN's v2 job whose ticket does not check, on the reserved
     /// route: its `sender` frame says `dry_run` (so the Gatekeeper passes
-    /// it on) and its result gives the ticket's reason. So does a job the
-    /// Sender cannot read.
+    /// it on) and its result gives the ticket's reason. A real TIN's job
+    /// with a bad ticket there, and a job the Sender cannot read, are not
+    /// test jobs: their `sender` frame says the Sender's own mode (`live`),
+    /// which the Gatekeeper refuses for a test TIN's try.
     #[tokio::test]
     async fn a_test_jobs_bad_ticket_says_why_on_the_reserved_route() {
         use futures_util::{SinkExt, StreamExt};
@@ -1116,17 +1133,32 @@ mod tests {
         let keys = sender.config.ticket_keys.clone();
         tokio::spawn(serve(listener, sender));
         let link = crate::filing::link::SenderLink::new(&format!("http://{address}"), Zeroizing::new("x".repeat(32)));
-        let (_, mut forged) = jobs_for("11111111400000");
-        if let Job::V2 { ticket, .. } = &mut forged {
-            let claims = tickets::verify(&keys, ticket, 0).unwrap();
-            *ticket = tickets::sign(&SigningKey::from_bytes(&[1; 32]), &claims);
+        let forged = |tin: &str| {
+            let (_, mut forged) = jobs_for(tin);
+            if let Job::V2 { ticket, .. } = &mut forged {
+                let claims = tickets::verify(&keys, ticket, 0).unwrap();
+                *ticket = tickets::sign(&SigningKey::from_bytes(&[1; 32]), &claims);
+            }
+            let Job::V2 { ticket, .. } = &forged else { unreachable!() };
+            let reason =
+                tickets::verify(&keys, ticket, OffsetDateTime::now_utc().unix_timestamp()).unwrap_err().to_string();
+            (serde_json::to_string(&forged).unwrap(), failed(reason))
+        };
+        let (test, test_answer) = forged("11111111400000");
+        let (real, real_answer) = forged("12345678900000");
+        // A test TIN's ticket that ran out, signed by the right key.
+        let (_, mut expired) = jobs_for("11111111400000");
+        if let Job::V2 { ticket, .. } = &mut expired {
+            let mut claims = tickets::verify(&keys, ticket, 0).unwrap();
+            claims.exp = OffsetDateTime::now_utc().unix_timestamp() - 1;
+            *ticket = tickets::sign(&SigningKey::from_bytes(&[9; 32]), &claims);
         }
-        let Job::V2 { ticket, .. } = &forged else { unreachable!() };
-        let reason =
-            tickets::verify(&keys, ticket, OffsetDateTime::now_utc().unix_timestamp()).unwrap_err().to_string();
-        for (job, answer) in [
-            (serde_json::to_string(&forged).unwrap(), failed(reason)),
-            ("not a job".to_owned(), failed("the Sender did not understand the job".into())),
+        let expired = serde_json::to_string(&expired).unwrap();
+        for (job, mode, answer) in [
+            (test, Mode::DryRun, test_answer),
+            (expired, Mode::DryRun, failed(tickets::TicketError::Expired.to_string())),
+            (real, Mode::Live, real_answer),
+            ("not a job".to_owned(), Mode::Live, failed("the Sender did not understand the job".into())),
         ] {
             let mut socket = link.open(true).await.unwrap();
             socket.send(Up::Text(job.into())).await.unwrap();
@@ -1137,7 +1169,7 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(frames, [sender_frame(Mode::DryRun), serde_json::to_string(&answer).unwrap()]);
+            assert_eq!(frames, [sender_frame(mode), serde_json::to_string(&answer).unwrap()]);
         }
     }
 

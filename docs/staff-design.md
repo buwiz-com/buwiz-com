@@ -115,7 +115,8 @@ is since midnight in Manila (UTC+8); "this week" is the last 7 days, today
 included, or for returns from midnight six days ago. Queries are in
 `src/account/staff.rs`; no index or migration is involved.
 
-- **Active TINs**: approved, not paused, not a test TIN (`000-000-000`). The
+- **Active TINs**: approved, not paused, not a test TIN (a reserved root,
+  `000-000-000` or `111-111-114`). The
   small line under it names `N paused` (approved real TINs whose sending is
   paused, whether a staff member paused them or Buwiz did itself: an
   automatic activation nobody confirmed in time) and `N test` (approved test

@@ -167,7 +167,9 @@ set `decided_at` and `verified_by`.
      and start them.
    - **11:** first take 11 back, from the release's checkout:
      `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql`
-     (the app never ran on it, so none of its refusals apply), check
+     (on the instance, through the helper in
+     [Running psql on the instance](#running-psql-on-the-instance); the app
+     never ran on it, so none of its refusals apply), check
      `max(version)` is `10`, then put the previous binaries back and start
      them.
    - **12:** both went in and the failure is something else: read the
@@ -201,14 +203,84 @@ systemctl is-active buwiz-sender.service buwiz.service   # active, active
 
 (Or `deploy/ec2/deploy.sh <previous sha>` once the database is at 10.)
 
-**The instance has no `psql`.** Every hand-run down step on this page
-uses it. First install the client on the instance (Ubuntu 24.04): `sudo
-apt-get install -y postgresql-client-16`. Copy the release's down files
-to the instance through the deploy bucket (`aws s3 cp`), and run the steps
-from the folder that holds `migrations/`. Read `DATABASE_URL` from
-`/etc/buwiz/env`, which only root can read, without printing it: in a
-root shell, `u=$(sed -n 's/^DATABASE_URL=//p' /etc/buwiz/env)`, then use
-`"$u"` where a step says `"$DATABASE_URL"`.
+#### Running psql on the instance
+
+**The instance has no `psql` of its own.** Every hand-run step on this
+page that says `psql "$DATABASE_URL"` uses it. Install the client once
+(Ubuntu 24.04): `sudo apt-get install -y postgresql-client-16`. Copy the
+release's down files to the instance through the deploy bucket
+(`aws s3 cp`).
+
+Never put `DATABASE_URL`, or anything with its password, on a command
+line: every user on the instance can read a command line (`ps`,
+`/proc/<pid>/cmdline`). Run psql through this helper instead, in a root
+shell. It reads the first `DATABASE_URL=` line of `/etc/buwiz/env` (only
+root can read the file), strips spaces and quotes around the value, and
+parses it with Python's `urlsplit`. It hands psql the parts in libpq's
+variables: `PGHOST`, `PGPORT` (5432 if none), `PGUSER`, `PGPASSWORD`,
+`PGDATABASE`, and `PGSSLMODE` and `PGCHANNELBINDING` from `sslmode` and
+`channel_binding`. Then it becomes psql (`os.execvpe`), so the password is
+never in a command line, never printed, and gone when psql ends. It is the
+method of the read-only `/root/pgro.py` already on the instance; if
+`/root/buwiz-psql.py` is missing, write it again from here:
+
+```sh
+sudo -i                # a root shell: run the steps in it
+umask 077
+cat > /root/buwiz-psql.py <<'PY'
+import os, sys
+from urllib.parse import parse_qsl, unquote, urlsplit
+# The connection goes to psql in its environment only: never in argv, never printed.
+lines = [line for line in open("/etc/buwiz/env") if line.startswith("DATABASE_URL=")]
+url = lines[0].removeprefix("DATABASE_URL=").strip() if lines else ""
+if len(url) > 1 and url[0] == url[-1] and url[0] in "\"'":
+    url = url[1:-1]
+try:
+    u = urlsplit(url)
+    if u.scheme not in ("postgres", "postgresql") or not u.hostname or not u.username:
+        raise ValueError
+    env = dict(os.environ, PGHOST=u.hostname, PGPORT=str(u.port or 5432), PGUSER=unquote(u.username),
+               PGPASSWORD=unquote(u.password or ""), PGDATABASE=unquote(u.path.lstrip("/")))
+    query = dict(parse_qsl(u.query))
+except ValueError:
+    sys.exit("DATABASE_URL in /etc/buwiz/env is missing or not a postgres:// URL; nothing was run")
+for key, name in (("sslmode", "PGSSLMODE"), ("channel_binding", "PGCHANNELBINDING")):
+    if key in query:
+        env[name] = query[key]
+env.pop("DATABASE_URL", None)
+form, args = sys.argv[1] if len(sys.argv) > 1 else "", sys.argv[2:]
+if form == "ro" and len(args) == 1:
+    psql = ["-q", "-tA", "-v", "ON_ERROR_STOP=1", "-c", f"BEGIN TRANSACTION READ ONLY; {args[0]}; COMMIT"]
+elif form == "down" and len(args) == 1:
+    psql = ["-1", "-v", "ON_ERROR_STOP=1", "-c", "SET lock_timeout = '10s'", "-f", args[0]]
+elif form == "psql":
+    psql = args
+else:
+    sys.exit("use: buwiz-psql.py ro 'SQL' | down FILE | psql ARGUMENTS...")
+os.execvpe("psql", ["psql", "-X", *psql], env)
+PY
+cd <the folder that holds migrations/>
+python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"
+```
+
+Its three forms:
+- `python3 /root/buwiz-psql.py ro "<query>"`: read-only, inside
+  `BEGIN TRANSACTION READ ONLY; …; COMMIT`; for the checks.
+- `python3 /root/buwiz-psql.py down migrations/<file>.down.sql`: a down
+  file in one transaction, `psql -1 -v ON_ERROR_STOP=1 -c "SET
+  lock_timeout = '10s'" -f <file>`.
+- `python3 /root/buwiz-psql.py psql <arguments>`: psql with the step's own
+  arguments, for anything else (the override of 12's down file, `DROP INDEX
+  CONCURRENTLY`). Where a step says `psql "$DATABASE_URL" <arguments>`, this
+  form with the same arguments runs it as written.
+
+The password goes in psql's environment, not in a `PGPASSFILE`. Linux
+shows a process's environment (`/proc/<pid>/environ`) only to its own user
+and root, and root can read `/etc/buwiz/env` anyway. A password file would
+need `:` and `\` escaped in the password, and a file to delete afterwards,
+also when the shell dies. If the helper says the URL is missing or not one
+it reads, nothing was run: look at the file's `DATABASE_URL` line yourself
+(it must be `postgres://user:password@host:port/database`).
 
 ### Rolling back
 
@@ -271,6 +343,7 @@ The order:
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0011_tin_states.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 10
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
    **Only if** the first refuses because accounts have a stored staff role,
    and you have checked that `ADMIN_EMAILS` names your admins, run it again
    with the override, then the second file:
@@ -278,6 +351,7 @@ The order:
    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
      -c "SET LOCAL buwiz.rollback_drop_roles = 'yes'" -f migrations/0012_staff_roles.down.sql
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
    If the first file refuses for anything else, it changed nothing and the
    database is at 12: start the app, resolve it on the staff pages, and go
    back to step 2 (from 13, the app that runs at 12 is the previous
@@ -378,7 +452,8 @@ Session Manager preferences, and treat that log as holding taxpayer TINs.
 
 Reasons in the file stop at 500 characters, as on the website.
 
-A test TIN (000-000-000, at any branch) goes in only with `test_tin = true`
+A test TIN (a reserved root, 000-000-000 or 111-111-114, at any branch)
+goes in only with `test_tin = true`
 on its entry, active, on a login with the test label
 (`docs/seed.example.toml`); without that key it is refused on its own like
 any TIN that is not valid. A file that takes the label off a login holding
@@ -490,7 +565,8 @@ checking the tab daily.
 
 The release with test TINs ([accounts.md](accounts.md#bans-and-test-accounts))
 runs migration 13 when it starts. It adds one check to `tin_claims`: a row
-whose TIN root is `000000000` (a test TIN) is one an Admin or the seed tool
+whose TIN root is `000000000` (a test TIN; migration 23 adds the root
+`111111114`) is one an Admin or the seed tool
 made active (`verified_by` `admin` or `seed`), and it is active or ended
 from there (`approved`, `removed` or `revoked`). No column changes. The
 release before it (at 12) refuses to start on a database at 13, as with
@@ -510,7 +586,9 @@ refuses while any row holds one, ended ones too, and then changes nothing.
 Revoke each test TIN on the staff pages first (the history keeps who and
 why), stop the app, delete the rows (since the
 [test-TIN dry run](#deploying-the-test-tin-dry-run) they may have tickets
-and returns; the file's comment has the statements for those), then:
+and returns; the file's comment has the statements for those), then, on
+the instance through the helper in
+[Running psql on the instance](#running-psql-on-the-instance):
 ```sh
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/0013_test_tins.down.sql
 psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 12
@@ -524,7 +602,8 @@ before 12's checks run, and a refusal by 12's leaves the database at 12
 ## Deploying the test-TIN dry run
 
 The release with the test-TIN dry run lets an active test TIN (root
-`000-000-000`, on a test account, added by staff) send through the whole
+`000-000-000`, and since migration 23 also `111-111-114`, on a test account,
+added by staff) send through the whole
 production route, and makes the Sender turn every such send into a dry
 run, whatever `BIR_RELAY_MODE` says. The first filings from each platform's
 release app (Mac, Windows, iPhone, iPad, Android) can then end in a signed
@@ -732,6 +811,7 @@ turns, held requests and recorded host keys. In this order:
      -c "SET lock_timeout = '10s'" -f migrations/0014_bir_uptime.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 13
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 4. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead (systemd restarted it, or the binaries were not swapped
@@ -856,6 +936,7 @@ In this order:
      -c "SET lock_timeout = '10s'" -f migrations/0015_fixed_codes.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 14
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migration 15 again (with no codes), and the
@@ -895,6 +976,7 @@ deleted at 16 stay deleted. In this order:
      -c "SET lock_timeout = '10s'" -f migrations/0016_account_deletion.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 15
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migration 16 again, and the rollback starts
@@ -972,8 +1054,8 @@ database work and 3 for verify's (`DATABASE_SLOTS`, `VERIFY_SLOTS`,
 `src/account/app_sign_in.rs`), and 2 for the code exchange on
 `/oauth/token` (`TOKEN_SLOTS`, `src/account/agents.rs`): 9, under the
 pool's 10 connections, each waiting at most 3 seconds for a lock and for
-a connection. An account gets at most 3 new-device mails a day
-(`NEW_DEVICE_MAILS_PER_DAY`).
+a connection. An account gets at most 3 new-device mails in any 24
+hours (`NEW_DEVICE_MAILS_PER_DAY`).
 
 The cap on requests without an app check (20 an hour, 50 a day, one staff
 alert at 25) is for testing only. A platform's 1.0.0 needs the Turnstile
@@ -998,6 +1080,7 @@ order:
      -c "SET lock_timeout = '10s'" -f migrations/0017_app_sign_ins.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 16
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migration 17 again, and the rollback starts
@@ -1057,6 +1140,7 @@ devices removed with their sign-in stay removed). In this order:
    done
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 17
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migrations 18 to 20 again, and the rollback
@@ -1106,6 +1190,7 @@ nothing is recorded in `_sqlx_migrations`. The next start then fails with
    psql "$DATABASE_URL" -c "DROP INDEX CONCURRENTLY IF EXISTS devices_grant_id"
    ```
    (for 19, `devices_account_install`).
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. `sudo systemctl restart buwiz.service`, then check
    `SELECT max(version) FROM _sqlx_migrations` is 23 (22 on a release
    without [migration 23](#migration-23-reserved-test-roots), 20 on one
@@ -1182,6 +1267,7 @@ In this order:
    done
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 20
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migrations 21 and 22 again, and the rollback
@@ -1309,9 +1395,9 @@ release or a newer one is back. That check covers the Gatekeeper only:
   older Sender does not have, so the job never leaves it and the try ends
   "the sending service is not reachable; try again later". And for a test
   TIN's job it wants the Sender's `sender` frame to say `dry_run`, and
-  after it only a `result` that is `dry_run` or `failed` (a receipt on it
-  saying `dry_run`); anything else ends the try `failed` and nothing of the
-  Sender's reaches the app.
+  after it only a `result` that is `dry_run` (with a receipt whose mode and
+  status say `dry_run`) or `failed`; anything else ends the try `failed`
+  and nothing of the Sender's reaches the app.
 - Always restore, start and stop the two services together, never one
   alone ([above](#putting-the-previous-binaries-back)). An older Gatekeeper
   that is already running (the version check is at its start only) beside
@@ -1344,6 +1430,7 @@ order:
      -c "SET lock_timeout = '10s'" -f migrations/0023_test_roots.down.sql
    psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 22
    ```
+   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
    It puts back 13's check exactly; test TINs on `000-000-000` stay. If it
    refuses (a row came in since the query), stop as above.
 3. Put the previous binaries back and start them, as

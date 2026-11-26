@@ -1482,8 +1482,21 @@ async fn a_test_tins_send_is_never_recorded(db: PgPool) {
 }
 
 /// What a test TIN's try ends with when its Sender would not make it a dry
-/// run.
+/// run: a v1 one can be tried again, a v2 one needs a new ticket.
 const NOT_A_DRY_RUN: &str = "the sending service would not make this test send a dry run; try again later";
+const NOT_A_DRY_RUN_V2: &str =
+    "the sending service would not make this test send a dry run; ask for a new ticket and send again later";
+
+fn not_a_dry_run(v2: bool) -> &'static str {
+    if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }
+}
+
+/// A receipt as the Sender signs it, with these `mode` and `status`.
+fn receipt_saying(mode: &str, status: &str) -> String {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let claims = json!({ "mode": mode, "status": status, "remote_path": "/1601C/made-up.xml", "payload_sha256": "ab" });
+    buwiz_cloud::filing::jws::sign(&key, sender::RECEIPT_TYP, &claims)
+}
 
 /// A staff-made test TIN on root 111-111-114, as migrations 13 and 23
 /// allow it, on a test account.
@@ -1524,10 +1537,12 @@ async fn waiting_for(world: &World, claim: Uuid, v2: bool) -> Uuid {
 /// The Gatekeeper's own guard for a test TIN: an older Sender knows fewer
 /// reserved roots and says `live` for a 111-111-114 job. Its first frame
 /// must be the `sender` frame saying `dry_run`, and the only frame after it
-/// a `result` that is `dry_run` or `failed`, any receipt on it saying
-/// `dry_run`. Anything else (an `open`, binary, another frame, two `type`
-/// keys, a `sent` result, a live receipt) ends the try `failed` (to be
-/// tried again), the app hears only that, and the app's answer for the
+/// a `result` that is `dry_run` (with a receipt whose mode and status say
+/// `dry_run`) or `failed`. Anything else (an `open`, binary, another frame,
+/// two `type` keys, a `sent` result, a live receipt, a dry run with no
+/// receipt or with one whose status is not `dry_run`) ends the try
+/// `failed` (a v1 one to be tried again, a v2 one with a new ticket), never
+/// `unknown`; the app hears only that, and the app's answer for the
 /// port is never used. A Sender that says `dry_run` and then a dry run's
 /// or a failed result passes as before
 /// ([`a_test_tins_send_is_never_recorded`]). A real TIN's live send is
@@ -1573,6 +1588,15 @@ async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
             vec![hello(RelayMode::DryRun), result("dry_run", None, Some("x.y.z".into()))],
         ),
         ("dry_run, then unknown", vec![hello(RelayMode::DryRun), result("unknown", Some("lost"), None)]),
+        ("dry_run, then a dry run with no receipt", vec![hello(RelayMode::DryRun), result("dry_run", None, None)]),
+        (
+            "dry_run, then a dry run whose receipt says status sent",
+            vec![hello(RelayMode::DryRun), result("dry_run", None, Some(receipt_saying("dry_run", "sent")))],
+        ),
+        (
+            "dry_run, then a dry run whose receipt's status is empty",
+            vec![hello(RelayMode::DryRun), result("dry_run", None, Some(receipt_saying("dry_run", "")))],
+        ),
     ];
     let jobs = 2 * scripts.len();
     let answers = [(22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec()))];
@@ -1581,15 +1605,27 @@ async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
             let id = waiting_for(&world, claim, v2).await;
             gatekeeper.sender.heard.lock().unwrap().clear();
             let got = gatekeeper.send(&world, id, script.clone(), &answers, HOME).await;
-            let failed = json!({ "type": "result", "status": "failed", "error": NOT_A_DRY_RUN, "receipt": null });
+            let error = not_a_dry_run(v2);
+            let failed = json!({ "type": "result", "status": "failed", "error": error, "receipt": null });
             assert_eq!((got.len(), texts(&got)), (1, vec![failed]), "{name}, v2 {v2}");
-            let (status, error): (String, Option<String>) =
-                sqlx::query_as("SELECT status, error FROM submissions WHERE id = $1")
-                    .bind(id)
-                    .fetch_one(&db)
-                    .await
-                    .unwrap();
-            assert_eq!((status.as_str(), error.as_deref()), ("failed", Some(NOT_A_DRY_RUN)), "{name}, v2 {v2}");
+            // Stored `failed` with that error, never `unknown`, and with
+            // nothing of a send: no receipt, no time sent, no remote path.
+            // A v1 return keeps its XML (it can be tried again); a v2 one
+            // loses its sealed return.
+            let stored: (String, Option<String>, bool, bool, bool, bool, bool) = sqlx::query_as(
+                "SELECT status, error, receipt_jws IS NULL, sent_at IS NULL, remote_path IS NULL,
+                        xml_ciphertext IS NOT NULL, envelope IS NULL
+                 FROM submissions WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                stored,
+                ("failed".to_owned(), Some(error.to_owned()), true, true, true, !v2, true),
+                "{name}, v2 {v2}"
+            );
             let heard = gatekeeper.sender.heard.lock().unwrap().clone();
             assert!(heard.iter().all(|frame| !frame.contains("opened")), "{name}, v2 {v2}: {heard:?}");
         }
@@ -1597,11 +1633,9 @@ async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
     let routes: Vec<&str> = gatekeeper.sender.jobs.lock().unwrap().iter().map(|(route, _)| *route).collect();
     assert_eq!(routes, vec![sender::RESERVED_RELAY_ROUTE; jobs], "a test TIN's job goes to the reserved route");
 
-    // A Sender that makes it a dry run passes as it is.
-    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
-    let claims =
-        json!({ "mode": "dry_run", "status": "dry_run", "remote_path": "/1601C/made-up.xml", "payload_sha256": "ab" });
-    let dry_run = buwiz_cloud::filing::jws::sign(&key, sender::RECEIPT_TYP, &claims);
+    // A Sender that makes it a dry run, with a receipt whose mode and
+    // status say `dry_run`, passes as it is.
+    let dry_run = receipt_saying("dry_run", "dry_run");
     for v2 in [false, true] {
         let id = waiting_for(&world, claim, v2).await;
         let script = vec![hello(RelayMode::DryRun), result("dry_run", None, Some(dry_run.clone()))];
@@ -1660,6 +1694,66 @@ async fn a_test_tins_job_never_reaches_an_older_sender(db: PgPool) {
     assert_eq!(the_result(&got).unwrap()["status"], "sent");
     let routes: Vec<&str> = gatekeeper.sender.jobs.lock().unwrap().iter().map(|(route, _)| *route).collect();
     assert_eq!(routes, [sender::RELAY_ROUTE]);
+}
+
+/// The upkeep ends a send stuck in `sending` for 10 minutes as `unknown`.
+/// A test TIN's, v1 or v2, on every reserved root, gets words that say it
+/// was a dry run and nothing reached the BIR; a real TIN's keeps "the
+/// server stopped while sending". A send under 10 minutes old is left.
+#[sqlx::test]
+async fn a_stuck_test_send_is_not_called_a_possible_filing(db: PgPool) {
+    const TEST_WORDS: &str =
+        "the server stopped during this test send; it was a dry run, so nothing was sent to the BIR";
+    let world = World::new(db.clone()).await;
+    let mut cases = Vec::new();
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        let claim = test_claim_on(&world, root).await;
+        for v2 in [false, true] {
+            cases.push((waiting_for(&world, claim, v2).await, TEST_WORDS, format!("{root} v2 {v2}")));
+        }
+    }
+    for v2 in [false, true] {
+        let id = if v2 { world.v2(None).await } else { world.v1().await };
+        cases.push((id, "the server stopped while sending", format!("real v2 {v2}")));
+    }
+    let ids: Vec<Uuid> = cases.iter().map(|(id, ..)| *id).collect();
+    sqlx::query(
+        "UPDATE submissions SET status = 'sending', sending_since = now() - interval '11 minutes' WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .execute(&db)
+    .await
+    .unwrap();
+    let recent = waiting_for(&world, test_root_claim_at(&world, "00001").await, false).await;
+    sqlx::query("UPDATE submissions SET status = 'sending', sending_since = now() WHERE id = $1")
+        .bind(recent)
+        .execute(&db)
+        .await
+        .unwrap();
+    buwiz_cloud::submissions::upkeep(&db).await.unwrap();
+    for (id, words, name) in cases {
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM submissions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), error.as_deref()), ("unknown", Some(words)), "{name}");
+    }
+    assert_eq!(status(&db, recent).await.0, "sending");
+}
+
+/// A staff-made test TIN on root 111-111-114 at `branch`.
+async fn test_root_claim_at(world: &World, branch: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'personal', '111111114', $2, 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
+    )
+    .bind(world.account)
+    .bind(branch)
+    .fetch_one(&world.db)
+    .await
+    .unwrap()
 }
 
 /// A 1601C return for `tin` (14 digits) in 2025, as the Sender reads it.

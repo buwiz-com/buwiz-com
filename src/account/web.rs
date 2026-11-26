@@ -1865,7 +1865,8 @@ struct TestTinForm {
     tab: String,
 }
 
-/// An Admin adds a made-up test TIN to a test account, active at once.
+/// An Admin adds a test TIN (a reserved root, at any branch) to a test
+/// account, active at once.
 async fn add_test_tin(
     State(state): State<AppState>,
     headers: HeaderMap,

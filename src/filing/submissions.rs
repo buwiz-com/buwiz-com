@@ -711,19 +711,27 @@ async fn settle(
     Ok(())
 }
 
-/// What a test TIN's try ends with when its Sender would not make it a dry
-/// run ([`dry_run_frame_passes`]).
+/// What a test TIN's v1 try ends with when its Sender would not make it a
+/// dry run ([`dry_run_frame_passes`]). Its XML is kept, so it can be tried
+/// again.
 const NOT_A_DRY_RUN: &str = "the sending service would not make this test send a dry run; try again later";
+
+/// The same for a v2 try. Its ticket is spent and its sealed return is
+/// deleted, so it needs a new ticket.
+const NOT_A_DRY_RUN_V2: &str =
+    "the sending service would not make this test send a dry run; ask for a new ticket and send again later";
 
 /// For a test TIN's send, whether the Sender's text frame may pass. An
 /// allow-list: the first must be its `sender` frame, saying `dry_run`;
 /// every later one must be the `result`, and nothing else (a dry run opens
-/// no stream). That result must be `dry_run` or `failed`, and a receipt on
-/// it must say mode `dry_run`, read as [`record`] reads it. Neither frame
-/// is forwarded as it came: the `sender` frame stops here, and the app
-/// hears the result as [`conclude`] writes it. An older Sender, which knows
-/// fewer reserved roots, says `live` for the others: this is the
-/// Gatekeeper's guard against it.
+/// no stream). That result must be `dry_run` or `failed`. A `dry_run`
+/// result must carry a receipt whose `mode` and `status` both say
+/// `dry_run`; a receipt on a `failed` one must say mode `dry_run`. Each is
+/// read unverified, as [`record`] reads it. Neither frame is forwarded as
+/// it came: the `sender` frame stops here, and the app hears the result as
+/// [`conclude`] writes it. An older Sender, which knows fewer reserved
+/// roots, says `live` for the others: this is the Gatekeeper's guard
+/// against it.
 fn dry_run_frame_passes(text: &str, first: bool) -> bool {
     let Ok(frame) = serde_json::from_str::<Value>(text) else {
         return false;
@@ -739,14 +747,15 @@ fn dry_run_frame_passes(text: &str, first: bool) -> bool {
     let Some(Frame::Control(Control::Result { status, receipt, .. })) = Frame::decode_text(text) else {
         return false;
     };
-    let receipt_is_a_dry_run = match &receipt {
-        None => true,
-        Some(receipt) => receipt
-            .as_str()
-            .and_then(jws::claims_unverified)
-            .is_some_and(|claims| claims["mode"] == Mode::DryRun.as_str()),
-    };
-    matches!(status.as_str(), "dry_run" | "failed") && receipt_is_a_dry_run
+    let claims = receipt.as_ref().map(|receipt| receipt.as_str().and_then(jws::claims_unverified));
+    let dry_run = Mode::DryRun.as_str();
+    match (status.as_str(), claims) {
+        // A dry run with no receipt would be stored `unknown` by `record`.
+        ("dry_run", Some(Some(claims))) => claims["mode"] == dry_run && claims["status"] == dry_run,
+        ("failed", None) => true,
+        ("failed", Some(Some(claims))) => claims["mode"] == dry_run,
+        _ => false,
+    }
 }
 
 /// Hands `job` to the Sender and forwards frames between it and the app
@@ -886,7 +895,7 @@ async fn bridge(
     let _ = up_tx.send(Up::Close(None)).await;
     if not_a_dry_run {
         tracing::error!(submission = %id, "the Sender did not make a test TIN's send a dry run; stopped it");
-        let result = finish("failed", NOT_A_DRY_RUN.into());
+        let result = finish("failed", if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }.into());
         return settle(state, &mut app_tx, id, v2, &result, observer, recording, app_gone).await;
     }
     if result.is_none()
@@ -927,16 +936,28 @@ pub async fn hpke_key(State(state): State<AppState>) -> Result<Json<Value>, ApiE
     Ok(Json(public["hpke"].clone()))
 }
 
+/// What the upkeep stores for a test TIN's send stuck in `sending`. A test
+/// TIN's send is a dry run and opens no stream, so nothing of it reached
+/// the BIR.
+pub const STOPPED_TEST_SEND: &str =
+    "the server stopped during this test send; it was a dry run, so nothing was sent to the BIR";
+
 /// Startup and hourly upkeep: a send stuck in `sending` for 10 minutes
 /// ended with its server, so its outcome is unknown; XML older than 24 hours
 /// is deleted, and so is a sealed return whose ticket ran out unsent. (BIR
-/// uptime's retention runs beside it, [`crate::uptime::hourly`].)
+/// uptime's retention runs beside it, [`crate::uptime::hourly`].) A test
+/// TIN's send stuck in `sending` gets [`STOPPED_TEST_SEND`], not the words
+/// of a send that may have reached the BIR.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE submissions SET status = 'unknown', error = 'the server stopped while sending',
+    sqlx::query(&format!(
+        "UPDATE submissions s SET status = 'unknown',
+             error = CASE WHEN EXISTS (SELECT 1 FROM tin_claims c WHERE c.id = s.claim_id AND c.tin_root IN ({}))
+                          THEN $1 ELSE 'the server stopped while sending' END,
              xml_nonce = NULL, xml_ciphertext = NULL, envelope = NULL, purged_at = now()
          WHERE status = 'sending' AND sending_since < now() - interval '10 minutes'",
-    )
+        crate::account::tin::test_roots_sql()
+    ))
+    .bind(STOPPED_TEST_SEND)
     .execute(db)
     .await?;
     sqlx::query(

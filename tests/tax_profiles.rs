@@ -449,12 +449,12 @@ async fn the_apps_add_refuses_with_a_code(db: PgPool) {
         (&personal("no digits"), 400, "bad_tin"),
         (&name(""), 400, "name_missing"),
         (&name("   "), 400, "name_missing"),
-        (&name(&long), 400, "name_missing"),
+        (&name(&long), 400, "name_too_long"),
         (
             &json!({ "kind": "business", "tin": "123456789", "registered_name": "Juan", "trade_name": long })
                 .to_string(),
             400,
-            "name_missing",
+            "name_too_long",
         ),
     ];
     for (body, status, code) in cases {
@@ -628,6 +628,41 @@ async fn the_apps_add_never_tells_whether_another_account_has_the_tin(db: PgPool
             .unwrap();
     assert_eq!(theirs, [("000500001".into(), "approved".into()), ("000500002".into(), "unverified".into())]);
     assert_eq!(rows_of(&site.db, other).await, (2, 0));
+}
+
+const TOO_LONG: &str =
+    "That name is too long: it can have at most 200 bytes, so fewer than 200 letters when it has accents like ñ.";
+
+/// A name over 200 bytes after trimming is `name_too_long`, not
+/// `name_missing`: 101 "ñ" are 202 bytes, 100 are 200 and pass. The same
+/// for a trade name, and on the site's form.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_name_over_200_bytes_is_too_long_not_missing(db: PgPool) {
+    let site = Site::new(db);
+    let (juan, cookie) = site.person("juan@example.test").await;
+    let app = app_token(&site.db, juan).await;
+    let (long, fits) = ("ñ".repeat(101), "ñ".repeat(100));
+    assert_eq!((long.len(), fits.len()), (202, 200));
+    let body = |name: &str, trade: &str| {
+        json!({ "kind": "business", "tin": "123456789", "registered_name": name, "trade_name": trade }).to_string()
+    };
+    for refused in [body(&long, ""), body(&format!("  {long} "), ""), body("Juan", &long)] {
+        let got = refusal(add(&site, &app, &refused).await).await;
+        assert_eq!(got, (400, "name_too_long".to_owned(), TOO_LONG.to_owned()), "{refused}");
+    }
+    let (status, code, _) = refusal(add(&site, &app, &body("  ", "")).await).await;
+    assert_eq!((status, code.as_str()), (400, "name_missing"));
+    let profile = added(add(&site, &app, &body(&format!(" {fits} "), &fits)).await).await;
+    assert_eq!(profile["registered_name"], fits);
+
+    // The site's add-a-TIN form says the same.
+    let long: &'static str = Box::leak(long.into_boxed_str());
+    let parts =
+        [("kind", Part::Text("personal")), ("tin", Part::Text("987654321")), ("registered_name", Part::Text(long))];
+    let response = site.upload("/tins/claims?skip=1", &cookie, &parts).await;
+    assert_eq!(location(&response), "/tins/new?notice=name_too_long");
+    let page = text(site.get("/tins/new?notice=name_too_long", &cookie).await).await;
+    assert!(page.contains("That name is too long"), "{page}");
 }
 
 /// A TIN the app added reads "in the app" in the staff history of its

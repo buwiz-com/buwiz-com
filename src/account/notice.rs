@@ -64,6 +64,7 @@ notices! {
     TinBranch = "tin_branch" => error "The branch code must have 3 or 5 digits (head office is 00000).",
     KindMissing = "kind_missing" => error "Choose whether this is a personal or a business TIN.",
     NameMissing = "name_missing" => error "Enter the registered name exactly as it appears on your document.",
+    NameTooLong = "name_too_long" => error "That name is too long: it can have at most 200 bytes, so fewer than 200 letters when it has accents like ñ.",
     Need2303 = "need_2303" => error "Attach a scan or photo of your BIR Form 2303.",
     NeedId = "need_id" => error "Attach a scan or photo of a government ID.",
     NeedTinId = "need_tin_id" => error "Attach a photo of your TIN ID, or the digital TIN ID file from ORUS.",
@@ -186,5 +187,7 @@ mod tests {
         assert!(Notice::ReasonTooLong.message().contains(&format!(" {reason} ")));
         let file_mb = MAX_FILE_BYTES / 1024 / 1024;
         assert!(Notice::FileTooBig.message().contains(&format!(" {file_mb} MB")));
+        let name = crate::account::claims::MAX_NAME_BYTES;
+        assert!(Notice::NameTooLong.message().contains(&format!(" {name} bytes")));
     }
 }

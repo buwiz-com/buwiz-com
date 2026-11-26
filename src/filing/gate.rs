@@ -197,8 +197,9 @@ impl Standing {
 
     /// What the app does next with the TIN list's row (`include=all`):
     /// `send` exactly when it can send; `fix` when the person has a step to
-    /// take (verify it, or fix it and send it again: the row's `action`);
-    /// `wait` while it is with staff (in review, or paused). A TIN that is
+    /// take (verify it, or fix it and send it again: the row's `action`,
+    /// which only the BIR app's token gets); `wait` while it is with staff
+    /// (in review, or paused). A TIN that is
     /// not active is never listed; it reads `wait`, as it can do nothing.
     pub fn next(&self) -> &'static str {
         match self {

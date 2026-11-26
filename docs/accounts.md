@@ -1147,13 +1147,14 @@ TIN, filing permissions, links and the note. The golden example is
 `tests/fixtures/tax_profiles_all.json`; the refusal codes the same rule gives
 are in [relay-protocol.md](relay-protocol.md#refusals). Each of those rows
 also says what the app does `next` (`send`, `wait` or `fix`, from the same
-rule: `fix` exactly when it has an action, `send` exactly when it can
-send). Every mode is limited to 120 calls per sign-in in 10 minutes
+rule: for the BIR app's token, `fix` exactly when it has an action;
+`send` exactly when it can send). Every mode is limited to 120 calls per sign-in in 10 minutes
 (`429 rate_limited` with `Retry-After`).
 
 `POST /api/tax-profiles` lets the BIR app add a TIN as not verified, as
 "add papers later" does on My TINs, with the same checks (this account's
-rows only, the cap of 20) and one audit line (source `app`, reason "added
+rows only, the cap of 20, names of at most 200 bytes, a trade name for
+either kind) and one audit line (source `app`, reason "added
 from the app"). The app calls it only from an explicit "Activate this TIN
 to send" button, never when a tax profile is created on the device. A test
 TIN is refused (`test_tin`); at most 10 tries per sign-in an hour. The

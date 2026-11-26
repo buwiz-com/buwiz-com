@@ -158,8 +158,9 @@ the same rule as `status`:
 | `unverified` | false | `fix` | Verify to send (`/tins/claims/<id>/verify`) |
 | `needs_fix` | false | `fix` | Fix and send again (`/tins/claims/<id>/fix`) |
 
-`next` is `fix` exactly when the row has an `action` (for the BIR app;
-other clients get no links), and `send` exactly when `can_send`. A test
+For the BIR app's token, `next` is `fix` exactly when the row has an
+`action`; other clients get no links, so their `fix` rows have none.
+`send` is exactly when `can_send`, for every token. A test
 TIN reads the same, with `test_only`. The no-include and `include=pending`
 lists have no `next`. A tax profile on the device whose TIN (root and
 branch) is not in the list is not activated.
@@ -185,13 +186,15 @@ on the device until the person asks to activate it.
 { "kind": "personal" | "business",
   "tin": "123-456-789-00000",
   "registered_name": "Dela Cruz Juan",
-  "trade_name": "optional, may be omitted or empty" }
+  "trade_name": "optional, for either kind, may be omitted or empty" }
 ```
 
 `tin` follows the site's rules: 9 digits for the head office (branch
 `00000`), 14 with the branch (12, with a 3-digit branch, too); dashes and
-spaces allowed. `registered_name` is 1 to 200 characters after trimming,
-`trade_name` at most 200. The answer is `201 {"profile": <row>}`, the row
+spaces allowed. After trimming, `registered_name` must not be empty, and
+each name has at most 200 bytes (UTF-8, as on the site: fewer than 200
+letters when it has accents like ñ). `trade_name` is taken for a personal
+TIN too, as the site takes it. The answer is `201 {"profile": <row>}`, the row
 as `include=all` lists it (`status` `unverified`, `can_send` false, `next`
 `fix`, `action` Verify to send); its `id` stays the same once the claim is
 approved. Each add leaves one audit line (action `created`, source `app`,
@@ -202,7 +205,8 @@ reason "added from the app").
 | 403 | `insufficient_scope` | Not the BIR app's token |
 | 400 | `bad_request` | Not the JSON above, or an unknown `kind` |
 | 400 | `bad_tin` | The TIN does not read |
-| 400 | `name_missing` | The names break the length rules |
+| 400 | `name_missing` | No `registered_name` (empty after trimming) |
+| 400 | `name_too_long` | `registered_name` or `trade_name` over 200 bytes after trimming |
 | 400 | `test_tin` | A reserved root (`000-000-000`, `111-111-114`): staff add test TINs |
 | 409 | `tin_already_active` | This account already has it active |
 | 409 | `tin_already_added` | This account already has it as not verified |

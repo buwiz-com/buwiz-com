@@ -262,12 +262,21 @@ pub struct NewClaim {
     pub papers_later: bool,
 }
 
-/// Trimmed registered and trade names, or why they cannot be used.
+/// The most bytes (UTF-8) a registered or trade name may have once
+/// trimmed: fewer than this many letters when it has accents like ñ.
+pub const MAX_NAME_BYTES: usize = 200;
+
+/// Trimmed registered and trade names, or why they cannot be used: no
+/// registered name ([`Notice::NameMissing`]), or one of them over
+/// [`MAX_NAME_BYTES`] ([`Notice::NameTooLong`]).
 fn check_names(registered_name: &str, trade_name: &str) -> Result<(String, Option<String>), Notice> {
     let registered_name = registered_name.trim();
     let trade_name = trade_name.trim();
-    if registered_name.is_empty() || registered_name.len() > 200 || trade_name.len() > 200 {
+    if registered_name.is_empty() {
         return Err(Notice::NameMissing);
+    }
+    if registered_name.len() > MAX_NAME_BYTES || trade_name.len() > MAX_NAME_BYTES {
+        return Err(Notice::NameTooLong);
     }
     Ok((registered_name.to_owned(), Some(trade_name.to_owned()).filter(|name| !name.is_empty())))
 }
@@ -1695,9 +1704,13 @@ pub const TEST_TIN_REFUSED: &str =
 /// adding a free one does. `201 {"profile": …}` is the row as
 /// `include=all` lists it.
 ///
+/// Names follow the site's rules ([`check_names`]): a registered name is
+/// needed, and each name has at most [`MAX_NAME_BYTES`] bytes once
+/// trimmed. A trade name is taken for either kind, as on the site.
+///
 /// Refusals: `403` as [`Bearer::require_app`]; `400` `bad_request` (not
-/// the JSON asked for, or an unknown `kind`), `bad_tin`, `name_missing`,
-/// `test_tin`; `409` `tin_already_active`, `tin_already_added`,
+/// the JSON asked for, or an unknown `kind`), `bad_tin`, `name_missing`
+/// (no registered name), `name_too_long`, `test_tin`; `409` `tin_already_active`, `tin_already_added`,
 /// `claim_already_pending`, `too_many_unverified`; `429 rate_limited` past
 /// [`PROFILE_ADDS_PER_SIGN_IN`] tries in [`PROFILE_ADDS_WINDOW`].
 pub async fn add_tax_profile(State(state): State<AppState>, bearer: Bearer, body: Bytes) -> Result<Response, ApiError> {
@@ -1836,8 +1849,9 @@ fn listed_json(standing: &gate::Standing, row: &ListedClaim, full: bool, origin:
         },
         "status": standing.api_status(),
         "can_send": standing.can_send(),
-        // `fix` exactly when the row has an `action` (for the BIR app), and
-        // `send` exactly when it can send.
+        // For the BIR app's token, `fix` exactly when the row has an
+        // `action` (other clients get no links); `send` exactly when it can
+        // send, for every token.
         "next": standing.next(),
         "message": standing.list_message(),
         "action": match action {

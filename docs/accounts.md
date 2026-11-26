@@ -698,38 +698,25 @@ fails, errors, expires or times out, the same two ways carry
 `expired`, `timeout`, `error_<Turnstile's code>`, and `not_configured`
 when the server has no Turnstile keys (local development; the page says
 so and sends it at once). `/app-check/done` and `/app-sign-in` send a
-strict Content-Security-Policy (their own script, the site's files);
+strict Content-Security-Policy (`/app-check/done`'s own script, the site's files);
 `/app-check` loads Turnstile and has none of its own.
 
 Where the web view cannot run (Linux under Wayland, a view that fails to
 load) the app falls back to the browser device flow, which stays.
 
-### The link in the mail
+### The mail
 
-The mail also carries a one-time link,
-`https://account.buwiz.com/app-sign-in#r=<request_id>&t=<link_token>`, for
-a person who reads it on the device that asked. The values are in the
-fragment, never the query, so they reach no server log. The page
-(`src/account/pages/app_sign_in.rs`, on the account host, no sign-in,
-noindex) only shows an "Open eBIRForms" button for
-`ebirforms://signin?r=…&t=…`: it opens nothing on load, approves nothing
-and calls no endpoint. The app then verifies with the token instead of the
-code.
+The mail says to enter the code in eBIRForms on the device that asked,
+gives the code and how long it lasts, and says what to do if the person
+did not ask. It has no link: the person types the code into the app.
 
-Why it is safe:
-- **The click approves nothing.** Verifying needs the secret of the app
-  that asked as well as the token. Someone who types a victim's address
-  into their own app and gets the victim to click the link signs nobody
-  in: their app has the token's request but not the victim's mail, and
-  the victim's device has the mail but not the attacker's secret. The page
-  says to open it on the device that asked, or to type the code there.
-- **A hijacked scheme gets nothing usable.** Another app that registers
-  `ebirforms://` receives a token it cannot spend without the secret.
-- **A leaked token is worth no more than the code.** Only its hash is
-  stored, on its request, and it spends the request's own code, so it
-  works only while that code does: a resend replaces it, using the code
-  or the link spends both, and the code's five tries or its expiry end
-  it too. It dies with its request.
+Mails sent before this carried a link to
+`https://account.buwiz.com/app-sign-in#r=…&t=…`. That page stays, so
+those links still open (`src/account/pages/app_sign_in.rs`, on the
+account host, no sign-in, noindex). It has no button and no script: it
+says to type the 6-digit code from the email into the app, approves
+nothing and calls no endpoint. No link token is made or stored any more;
+`app_sign_ins.link_token_hash` (migration 17) stays empty.
 
 **Records.** `app_sign_ins` holds each request (address, client, the
 secret's hash, intent, platform, install id, its code, expiry, when it
@@ -777,16 +764,13 @@ too_many_requests` with `retry_after`), and up to an hour after the start
 its old one, and restarts its time. The same checks, limits and answer
 as start; the request keeps its intent and platform.
 
-`POST /auth/email/verify` with `{"request_id", "secret", "code"}`, or
-`{"request_id", "secret", "link_token"}` with the token from the mail's
-link ([above](#the-link-in-the-mail)). First the network's tries at a code
+`POST /auth/email/verify` with `{"request_id", "secret", "code"}`. A body
+without `code` (one with a `link_token` instead, among them) is
+`invalid_request`, as any body that is not the JSON expected. First the network's tries at a code
 (300 an hour, [above](#what-a-flood-can-cost)), then a place for the
 database work. Then checked in this order: the request
 exists and is not used, the secret is its own, it has not expired, then
-the code (one try of its five) or the link's token, then a ban. On the
-link's path, the right token for a code that is there but has expired
-(a moment before its request) is `code_expired`, as the code is; a wrong
-or replaced token is `link_used`.
+the code (one try of its five), then a ban.
 On success, in one transaction, the code is used up, the account made if
 it is new, the request spent, and a grant made for the request's client
 with scope `app`. Answers `200` with exactly the device flow's token
@@ -809,7 +793,6 @@ flow's do.
 | 400 | `code_expired` | The request's code has expired: resend |
 | 400 | `invalid_code` | A wrong code; `attempts_left` says how many tries are left |
 | 400 | `too_many_attempts` | The code's five tries are used up: ask for a new one |
-| 400 | `link_used` | The link's token is wrong, used, or ended by a newer code (an expired code is `code_expired` first) |
 | 403 | `account_banned` | The account is banned (the message is `/me`'s for a banned account) |
 | 403 | `turnstile_failed` | A `turnstile` token that Turnstile refused |
 | 403 | `turnstile_required` | Reserved: not used yet (see the 1.0.0 rule above) |

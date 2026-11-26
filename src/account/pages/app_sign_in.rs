@@ -1,10 +1,8 @@
-//! `/app-sign-in`, where the link in an app's sign-in mail goes
-//! (docs/accounts.md, "The link in the mail"). The request and its link
-//! token are in the fragment (`#r=…&t=…`), which never reaches the server.
-//! The page's script (`/assets/app-sign-in.js`) turns them into an "Open
-//! eBIRForms" button for `ebirforms://signin?r=…&t=…`. It opens nothing on
-//! its own, approves nothing and calls no endpoint: only the app that
-//! asked holds the secret that makes the token work.
+//! `/app-sign-in`, where the link in older app sign-in mails goes. Mails
+//! no longer carry a link (docs/accounts.md, "In-app sign-in"), but those
+//! already sent still point here, so the page stays: it says to type the
+//! code from the email into the app. It has no button and no script,
+//! approves nothing and calls no endpoint.
 
 use http::header;
 
@@ -25,16 +23,9 @@ pub async fn app_sign_in_page(cx: &Cx) -> Result<impl View> {
                 auth_brand()
                 <span class="auth-badge">icon(name: "devices")</span>
                 <h1>"Sign in to eBIRForms"</h1>
-                <p class="auth-lead">"Open this on the device where you asked to sign in, or type the code there."</p>
-                // Never a dead end: an app that cannot open the button yet,
-                // or a mail read on another device, still has the code.
-                <p class="auth-hint">"Or type the 6-digit code from this email into the app."</p>
-                <div class="auth-actions">
-                    <a id="open-app" class="btn btn-solid" href="#" hidden=(true)>"Open eBIRForms"</a>
-                </div>
+                <p class="auth-lead">"Type the 6-digit code from the email into the app."</p>
             </section>
             <p class="auth-foot"><a href="/">"Buwiz"</a> " · Philippine tax filing, made modern"</p>
-            <script src="/assets/app-sign-in.js" defer=(true)></script>
         </main>
     })
 }

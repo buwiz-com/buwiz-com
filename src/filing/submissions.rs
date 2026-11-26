@@ -534,7 +534,7 @@ async fn run_relay(
     // A test TIN's send is a dry run (the Sender forces it) and never
     // touches the BIR: it gets no uptime record, so it is never counted and
     // never moves the sign or the host-key sightings.
-    let test_tin = locked.tin_root == crate::account::tin::TEST_ROOT;
+    let test_tin = crate::account::tin::is_test_root(&locked.tin_root);
     let recording = context.filter(|_| !test_tin).map(|context| RelayTry {
         account_id,
         network: context.network,
@@ -542,7 +542,7 @@ async fn run_relay(
         admission: locked.admission.clone().unwrap_or_else(|| "open".to_owned()),
         started_at: OffsetDateTime::now_utc(),
     });
-    bridge(&state, socket, &job, id, v2, recording).await?;
+    bridge(&state, socket, &job, id, v2, test_tin, recording).await?;
     Ok(())
 }
 
@@ -711,16 +711,59 @@ async fn settle(
     Ok(())
 }
 
+/// What a test TIN's try ends with when its Sender would not make it a dry
+/// run ([`dry_run_frame_passes`]).
+const NOT_A_DRY_RUN: &str = "the sending service would not make this test send a dry run; try again later";
+
+/// For a test TIN's send, whether the Sender's text frame may pass. An
+/// allow-list: the first must be its `sender` frame, saying `dry_run`;
+/// every later one must be the `result`, and nothing else (a dry run opens
+/// no stream). That result must be `dry_run` or `failed`, and a receipt on
+/// it must say mode `dry_run`, read as [`record`] reads it. Neither frame
+/// is forwarded as it came: the `sender` frame stops here, and the app
+/// hears the result as [`conclude`] writes it. An older Sender, which knows
+/// fewer reserved roots, says `live` for the others: this is the
+/// Gatekeeper's guard against it.
+fn dry_run_frame_passes(text: &str, first: bool) -> bool {
+    let Ok(frame) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if first {
+        return frame["type"] == "sender" && frame["mode"] == Mode::DryRun.as_str();
+    }
+    // Both readings must say `result`: serde_json keeps the last of two
+    // `type` keys, so a frame that names another type too is refused.
+    if frame["type"] != "result" {
+        return false;
+    }
+    let Some(Frame::Control(Control::Result { status, receipt, .. })) = Frame::decode_text(text) else {
+        return false;
+    };
+    let receipt_is_a_dry_run = match &receipt {
+        None => true,
+        Some(receipt) => receipt
+            .as_str()
+            .and_then(jws::claims_unverified)
+            .is_some_and(|claims| claims["mode"] == Mode::DryRun.as_str()),
+    };
+    matches!(status.as_str(), "dry_run" | "failed") && receipt_is_a_dry_run
+}
+
 /// Hands `job` to the Sender and forwards frames between it and the app
 /// until the Sender's `result`, which it records, then passes on. The
 /// Sender's `sender` frame stops here. With `recording`, the try's frames
-/// are watched for its uptime record ([`crate::uptime::observe`]).
+/// are watched for its uptime record ([`crate::uptime::observe`]). With
+/// `test_tin`, the job goes to the Sender's reserved route
+/// ([`crate::sender::RESERVED_RELAY_ROUTE`]), no frame of the Sender's is
+/// forwarded as it came, and the try ends `failed` at the first frame that
+/// is not a dry run's ([`dry_run_frame_passes`]), or at any binary frame.
 async fn bridge(
     state: &AppState,
     socket: WebSocket,
     job: &Job,
     id: Uuid,
     v2: bool,
+    test_tin: bool,
     recording: Option<RelayTry>,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message as Up;
@@ -729,7 +772,9 @@ async fn bridge(
     let mut observer = recording.as_ref().map(|_| TryObserver::new(&state.uptime.upload_ports));
     let finish =
         |status: &str, error: String| Control::Result { status: status.to_owned(), error: Some(error), receipt: None };
-    let upstream = match state.sender.open().await {
+    // A test TIN's job goes only to the Sender's reserved route, which an
+    // older Sender does not have: the open fails and the job never leaves.
+    let upstream = match state.sender.open(test_tin).await {
         Ok(upstream) => upstream,
         Err(error) => {
             tracing::error!(error = ?error, "the Sender is not reachable");
@@ -754,6 +799,8 @@ async fn bridge(
     let mut app_gone = false;
     let mut result = None;
     let mut deadline_passed = false;
+    let mut first_text = true;
+    let mut not_a_dry_run = false;
     let deadline = tokio::time::sleep(Duration::from_secs(24 * 3600));
     tokio::pin!(deadline);
     loop {
@@ -796,6 +843,11 @@ async fn bridge(
             }
             message = up_rx.next() => match message {
                 Some(Ok(Up::Text(text))) => {
+                    if test_tin && !dry_run_frame_passes(&text, first_text) {
+                        not_a_dry_run = true;
+                        break;
+                    }
+                    first_text = false;
                     // The `sender` frame (its mode) is for this side only.
                     let forward = match observer.as_mut() {
                         Some(observer) => observer.sender_text(&text),
@@ -814,6 +866,10 @@ async fn bridge(
                     }
                 }
                 Some(Ok(Up::Binary(bytes))) => {
+                    if test_tin {
+                        not_a_dry_run = true;
+                        break;
+                    }
                     if !app_gone {
                         let _ = app_tx.send(Message::Binary(bytes)).await;
                     }
@@ -828,6 +884,11 @@ async fn bridge(
         }
     }
     let _ = up_tx.send(Up::Close(None)).await;
+    if not_a_dry_run {
+        tracing::error!(submission = %id, "the Sender did not make a test TIN's send a dry run; stopped it");
+        let result = finish("failed", NOT_A_DRY_RUN.into());
+        return settle(state, &mut app_tx, id, v2, &result, observer, recording, app_gone).await;
+    }
     if result.is_none()
         && let Some(observer) = observer.as_mut()
     {

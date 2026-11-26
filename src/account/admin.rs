@@ -467,11 +467,11 @@ pub async fn unban(
 /// Whether the account holds a test TIN that has not ended.
 pub(crate) async fn holds_test_tins(tx: &mut Transaction<'_, Postgres>, account_id: Uuid) -> sqlx::Result<bool> {
     sqlx::query_scalar(&format!(
-        "SELECT EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND {})",
+        "SELECT EXISTS (SELECT 1 FROM tin_claims WHERE account_id = $1 AND tin_root = ANY($2) AND {})",
         crate::filing::gate::LIVE_SQL
     ))
     .bind(account_id)
-    .bind(crate::account::tin::TEST_ROOT)
+    .bind(crate::account::tin::TEST_ROOTS)
     .fetch_one(&mut **tx)
     .await
 }

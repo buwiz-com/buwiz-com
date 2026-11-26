@@ -100,7 +100,8 @@ The account's codes come before any TIN's, in this order: `account_banned`,
 then `account_practice`, then the TIN's own. A practice account holding a
 test TIN is refused `account_practice`.
 
-A **test TIN** (root `000-000-000`, any branch, which staff add to
+A **test TIN** (a reserved root, `000-000-000` or `111-111-114`, any
+branch, which staff add to
 test-labelled accounts only) answers as any TIN does: an active one is
 sendable (a paused one answers `tin_paused`), and its send ends as a dry
 run (section 3, [Test TINs](#test-tins)). Servers before the dry run
@@ -210,22 +211,30 @@ as a `403` with that code (section 1, Refusals): back to a draft, no retry.
 A v2 return's envelope is dropped with its ticket; a v1 return may be sent
 again once the TIN can send.
 
-The Sender checks the return itself again, against its file name (v1) or
-its ticket (v2), before it opens anything, with the same rules as
-`POST /api/submissions`. A return that does not match ends `failed` with
+The Sender checks the return itself again, against the job (v1) or its
+ticket (v2), before it opens anything, with the same rules as
+`POST /api/submissions`. For v1 the stored file name must name exactly
+the job's TIN, and the XML the job's TIN, form and period. A return that
+does not match ends `failed` with
 `"The return does not match its ticket: … (return_mismatch)"` (or "its
-file name"). Nothing reached BIR, and it is final: back to a draft, no
+job", for example "the file name's TIN is not the job's TIN"). Nothing
+reached BIR, it is never a dry run, and it is final: back to a draft, no
 retry. What the message repeats from the return is cut at 40
 characters. A send already under way on another
 connection keeps its own outcome.
 
 ### Test TINs
 
-A return for a test TIN (root `000-000-000`) goes the whole production
-route, ticket or v1 return, relay and Sender, with no new request field.
+A test TIN is a TIN whose root is one of the reserved roots, at any
+branch: today `000-000-000` and `111-111-114` (`TEST_ROOTS` in
+`src/account/tin.rs`, [accounts.md](accounts.md#bans-and-test-accounts)).
+People cannot register one; staff add one to a test account. A return
+for one goes the whole production route, ticket or v1 return, relay and Sender, with no new request field.
 The Sender makes its send a dry run whatever its `BIR_RELAY_MODE`, deciding
-from the TIN in the verified ticket (v2) or in the job, once the return was
-checked against it (v1): it encrypts the return and stops, with no
+from the TIN in the verified ticket (v2) or in the job, once the file name
+and the return were checked against it (v1): it hands the BIR code
+settings with no dispatcher, upload host, pinned key or lab server, in
+every relay mode, so it encrypts the return and stops, with no
 dispatcher login and no upload stream. The `result` is `dry_run` with a
 receipt whose `mode` and `status` are both `dry_run`, signed with the usual
 receipt key (the one in `/.well-known/jwks.json` and the trust list). The
@@ -521,6 +530,28 @@ The Gatekeeper reaches the Sender at `SENDER_URL` and presents
   hold. The two processes ship from one build and restart together; a try
   without the frame is recorded with mode `unknown`, like a lab try: no
   class, never counted, nothing told to the app.
+- `GET /internal/relay/reserved` (WebSocket): the same, for a test TIN's
+  job (its root is reserved, `TEST_ROOTS`) and only for that. The
+  Gatekeeper sends a test TIN's job only here. A Sender from before
+  reserved roots has no such route, so the Gatekeeper cannot connect, the
+  job never leaves it, and the try ends "the sending service is not
+  reachable; try again later". The Sender refuses a test TIN's job on
+  `/internal/relay`, and any other job here: after its `sender` frame it
+  ends with a `failed` result and sends nothing. On this route the
+  `sender` frame always says `dry_run` (nothing else is ever sent from
+  it), so a job refused here, a v2 one whose ticket does not check among
+  them, ends with its own reason.
+- For a test TIN's job the Gatekeeper also checks the Sender, by an
+  allow-list. Its first text frame must be the `sender` frame saying
+  `dry_run`; the only frame after it must be the `result`, `dry_run` or
+  `failed`, and a receipt on it must say mode `dry_run`. The app hears that
+  result as the Gatekeeper writes it, not as it came. Any other frame (an
+  `open`, binary, any other type, a frame with two `type` keys) ends it:
+  the Gatekeeper closes the Sender's socket, forwards nothing of it to the
+  app, and ends the try `failed`
+  with "the sending service would not make this test send a dry run; try
+  again later". An older Sender that knows fewer reserved roots is stopped
+  this way too.
 
 Without `SENDER_URL`, a development server runs a Sender in its own
 process. A public deployment (`https://` `ACCOUNT_ORIGIN`) refuses to start

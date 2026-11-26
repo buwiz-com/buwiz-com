@@ -1,8 +1,8 @@
-//! Test TINs: a made-up TIN (root 000-000-000) an Admin adds to a test
-//! account, active at once. It is marked as a test TIN wherever it is
+//! Test TINs: a TIN with a reserved root (`TEST_ROOTS`) an Admin adds to a
+//! test account, active at once. It is marked as a test TIN wherever it is
 //! listed, and the send gate treats it as any TIN: an active one sends on
 //! every path, and the Sender makes each send a dry run, whatever the relay
-//! mode (see `src/sender`).
+//! mode (see `src/sender`). A person can never register one.
 
 mod common;
 
@@ -364,4 +364,153 @@ async fn an_admin_emails_address_gets_no_test_tin(db: PgPool) {
     let response = site.post(&format!("{user}/test-tin"), &staff, FORM).await;
     assert_eq!(location(&response), format!("{user}?notice=test_label_from_server"));
     assert!(test_tins(&site.db, boss).await.is_empty());
+}
+
+/// A reserved root (`TEST_ROOTS`) as written on a form: `111-111-114`.
+fn dashed(root: &str) -> String {
+    format!("{}-{}-{}", &root[..3], &root[3..6], &root[6..])
+}
+
+/// What the people's forms answer a reserved root: all zeros keeps its old
+/// words, any other reserved root says it is reserved.
+fn reserved_notice(root: &str) -> &'static str {
+    if root.bytes().all(|byte| byte == b'0') { "tin_zero" } else { "tin_reserved" }
+}
+
+/// Every reserved root is a test TIN staff add: an Admin adds it to a test
+/// account at head office (never to one without the label), the apps' TIN
+/// lists and an AI agent's list mark it `test_only`, and the gate lets it
+/// send, so its send reaches the Sender, which makes it a dry run.
+#[sqlx::test(migrations = "./migrations")]
+async fn every_reserved_root_is_a_test_tin_an_admin_adds(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = test_account(&site, "ana@example.test").await;
+    let (plain, _) = site.person("plain@example.test").await;
+    let token = app_token(&site.db, ana).await;
+    let device = TestDevice::new(&site.db, ana).await;
+    let path = |id: Uuid| format!("/staff/users/{id}/test-tin");
+    let back = |id: Uuid, notice: &str| format!("/staff/users/{id}?notice={notice}");
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        let shown = format!("{}-00000", dashed(root));
+        let form = FORM.replace("000-000-000-00000", &shown);
+        assert_eq!(location(&site.post(&path(plain), &staff, &form).await), back(plain, "not_test_account"), "{root}");
+        assert_eq!(location(&site.post(&path(ana), &staff, &form).await), back(ana, "test_tin_added"), "{root}");
+        let (status, verified_by): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, verified_by FROM tin_claims WHERE account_id = $1 AND tin_root = $2 AND branch_code = '00000'",
+        )
+        .bind(ana)
+        .bind(root)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), verified_by.as_deref()), ("approved", Some("admin")), "{root}");
+
+        let all = profiles(&site, &token, "/api/tax-profiles?include=all").await;
+        let row = all.as_array().unwrap().iter().find(|row| row["tin"] == json!(shown)).expect("listed");
+        assert_eq!(
+            (&row["test_only"], &row["status"], &row["can_send"], &row["message"]),
+            (&json!(true), &json!("approved"), &json!(true), &json!(TEST_TIN)),
+            "{row}"
+        );
+        let listed = profiles(&site, &token, "/api/tax-profiles").await;
+        let row = listed.as_array().unwrap().iter().find(|row| row["tin"] == json!(shown)).expect("listed");
+        assert_eq!(row["test_only"], json!(true), "{row}");
+
+        let mut body = ticket_body(&format!("ticket-{root}"));
+        body["tin"] = json!(format!("{root}00000"));
+        assert_eq!(device.post(&site, "/api/tickets", &body).await.status(), StatusCode::CREATED, "{root}");
+        let tin = buwiz_cloud::tin::Tin::parse_any(root, "").unwrap();
+        assert!(matches!(gate::own(&site.db, ana, &tin).await.unwrap(), gate::Standing::Sendable { .. }), "{root}");
+    }
+    let held: i64 = sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1")
+        .bind(plain)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(held, 0);
+
+    let agent = common::token(&site.db, ana, "an-agent", "mcp").await;
+    let request = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {agent}"))
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tin_claims"}}"#))
+        .unwrap();
+    let listed: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+    let content: Value = serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let claims = content["claims"].as_array().unwrap();
+    assert_eq!(claims.len(), buwiz_cloud::tin::TEST_ROOTS.len(), "{content}");
+    assert!(claims.iter().all(|row| row["test_only"] == json!(true)), "{content}");
+}
+
+/// A person can never register a reserved root: the add-a-TIN form, with
+/// papers or without, in every way of writing it, refuses it (all zeros
+/// with its old words, another reserved root with "reserved for testing"),
+/// and the apps' "Add it" link never fills one in. No row is made.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_person_cannot_register_a_reserved_root(db: PgPool) {
+    use common::Part::{File, Text};
+    let site = Site::new(db);
+    // A test account too: the label gives a person no way in.
+    let (ana, cookie) = test_account(&site, "ana@example.test").await;
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        let notice = reserved_notice(root);
+        let back = format!("/tins/new?notice={notice}");
+        for (tin, branch) in [
+            (dashed(root), "00000"),
+            (root.to_string(), "00001"),
+            (format!("{}-00000", dashed(root)), ""),
+            (format!("{root}00002"), "00000"),
+            // A bad branch: the root is still what is named.
+            (dashed(root), "12"),
+        ] {
+            for papers in [false, true] {
+                let mut parts = vec![
+                    ("kind", Text("personal")),
+                    ("tin", Text(leak(tin.clone()))),
+                    ("branch", Text(branch)),
+                    ("registered_name", Text("SYNTHETIC TAXPAYER")),
+                    ("tin_id", File("id.png", PNG)),
+                ];
+                if !papers {
+                    parts.push(("skip", Text("1")));
+                }
+                let response = site.upload("/tins/claims", &cookie, &parts).await;
+                assert_eq!(location(&response), back, "{tin} {branch} papers={papers}");
+            }
+        }
+        let page = text(site.get(&format!("/tins/new?tin={root}&branch=00000"), &cookie).await).await;
+        assert!(!page.contains(&format!("value=\"{}\"", dashed(root))), "{root}");
+    }
+    let page = text(site.get("/tins/new?notice=tin_reserved", &cookie).await).await;
+    assert!(page.contains("This TIN is reserved for testing. If it is yours, write to support@buwiz.com."), "{page}");
+    let page = text(site.get("/tins/new?notice=tin_zero", &cookie).await).await;
+    assert!(page.contains("That TIN is not valid."), "{page}");
+    let held: i64 = sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE account_id = $1")
+        .bind(ana)
+        .fetch_one(&site.db)
+        .await
+        .unwrap();
+    assert_eq!(held, 0);
+    // Nor can any row a person's path makes hold one: the database refuses
+    // a claim waiting with papers, one saved without them, one the
+    // automatic check activated, for every reserved root.
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        for (status, extra, values) in
+            [("pending", "", ""), ("unverified", "", ""), ("approved", ", decided_at, verified_by", ", now(), 'auto'")]
+        {
+            let error = sqlx::query(&format!(
+                "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status{extra})
+                 VALUES ($1, 'personal', $2, '00000', 'SYNTHETIC TAXPAYER', '{status}'{values})"
+            ))
+            .bind(ana)
+            .bind(root)
+            .execute(&site.db)
+            .await
+            .unwrap_err();
+            let constraint = error.as_database_error().and_then(|error| error.constraint().map(str::to_owned));
+            assert_eq!(constraint.as_deref(), Some("tin_claims_test_tin_check"), "{root} {status}");
+        }
+    }
 }

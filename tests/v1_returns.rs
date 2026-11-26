@@ -111,3 +111,49 @@ async fn a_v1_return_with_two_tins_or_hidden_fields_is_refused(db: PgPool) {
     }
     assert_eq!(stored(&site.db).await, 0);
 }
+
+/// The Gatekeeper's half of the v1 TIN check, test TINs included: a file
+/// name whose TIN is not the one in the return is refused on arrival,
+/// whichever side names a test TIN, and nothing is stored. So a stored v1
+/// return's file name names the TIN it was stored for (the Sender refuses
+/// a job where it does not).
+#[sqlx::test(migrations = "./migrations")]
+async fn a_v1_file_name_must_name_the_returns_tin_test_tins_too(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = site.person("ana@example.test").await;
+    sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1").bind(ana).execute(&site.db).await.unwrap();
+    add_claim(&site.db, ana, "000123453", "approved").await;
+    let form = "tin=111-111-114-00000&kind=personal&registered_name=Test+Taxpayer&reason=Trying+the+app";
+    let response = site.post(&format!("/staff/users/{ana}/test-tin"), &staff, form).await;
+    assert_eq!(location(&response), format!("/staff/users/{ana}?notice=test_tin_added"));
+    let token = app_token(&site.db, ana).await;
+    let name = |tin: &str| format!("{tin}-1701Qv2018-2026Q1#ana@example.test#.xml");
+    let (real, test) = ("00012345300000", "11111111400000");
+    for (named, inside) in [
+        (real, test),
+        (test, real),
+        (test, "00000000000000"),
+        ("00000000000000", test),
+        (test, "11111111400001"),
+        (test, "11111111300000"),
+    ] {
+        let xml = iaf_return("frm1701q", inside, "2026");
+        let (status, code, message) = refusal(post_v1(&site, &token, &name(named), &xml).await).await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (
+                400,
+                "return_mismatch",
+                "The return does not match its file name: the TIN in the return is not the file name's TIN."
+            ),
+            "{named} with {inside} inside"
+        );
+    }
+    assert_eq!(stored(&site.db).await, 0);
+    for tin in [real, test] {
+        let response = post_v1(&site, &token, &name(tin), &iaf_return("frm1701q", tin, "2026")).await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{tin}");
+    }
+    assert_eq!(stored(&site.db).await, 2);
+}

@@ -131,7 +131,8 @@ pub struct Expected<'a> {
     pub tin: &'a str,
     pub form: &'a str,
     pub period: &'a str,
-    /// `ticket` or `file name`.
+    /// `ticket`, `file name` (the Gatekeeper's v1 check) or `job` (the
+    /// Sender's v1 check, against the job's TIN, form and period).
     pub named_by: &'a str,
 }
 

@@ -201,6 +201,15 @@ systemctl is-active buwiz-sender.service buwiz.service   # active, active
 
 (Or `deploy/ec2/deploy.sh <previous sha>` once the database is at 10.)
 
+**The instance has no `psql`.** Every hand-run down step on this page
+uses it. First install the client on the instance (Ubuntu 24.04): `sudo
+apt-get install -y postgresql-client-16`. Copy the release's down files
+to the instance through the deploy bucket (`aws s3 cp`), and run the steps
+from the folder that holds `migrations/`. Read `DATABASE_URL` from
+`/etc/buwiz/env`, which only root can read, without printing it: in a
+root shell, `u=$(sed -n 's/^DATABASE_URL=//p' /etc/buwiz/env)`, then use
+`"$u"` where a step says `"$DATABASE_URL"`.
+
 ### Rolling back
 
 Use this when the new release runs (the database is at 12) and you need
@@ -891,8 +900,8 @@ deleted at 16 stay deleted. In this order:
    starts instead, it runs migration 16 again, and the rollback starts
    over at 1.
 
-Going further back runs 16's down file first (after 17's,
-[below](#migration-17-in-app-sign-in)), then 15's and the others as
+Going further back runs 16's down file first (after 23's to 17's, newest
+first, [below](#migration-17-in-app-sign-in)), then 15's and the others as
 [above](#migration-15-fixed-sign-in-codes); each commits on its own.
 
 ## Migration 17 (in-app sign-in)
@@ -994,7 +1003,7 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 22's, 21's, 20's, 19's and 18's,
+Going further back runs 17's down file first (after 23's, 22's, 21's, 20's, 19's and 18's,
 [below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
@@ -1054,7 +1063,7 @@ devices removed with their sign-in stay removed). In this order:
    starts over at 1.
 
 Going further back runs 20's, 19's and 18's down files first (after
-22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
+23's, 22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
 17's and the others as [above](#migration-17-in-app-sign-in); each
 commits on its own.
 
@@ -1098,7 +1107,8 @@ nothing is recorded in `_sqlx_migrations`. The next start then fails with
    ```
    (for 19, `devices_account_install`).
 3. `sudo systemctl restart buwiz.service`, then check
-   `SELECT max(version) FROM _sqlx_migrations` is 22 (20 on a release
+   `SELECT max(version) FROM _sqlx_migrations` is 23 (22 on a release
+   without [migration 23](#migration-23-reserved-test-roots), 20 on one
    without [migrations 21 and 22](#migrations-21-and-22-sign-in-with-buwiz)).
 
 ## Migrations 21 and 22 (Sign in with Buwiz)
@@ -1113,9 +1123,10 @@ The release with Sign in with Buwiz for the eBIRForms apps
   client instead. It adds `removed_by` to `devices` (`owner` or `staff`,
   NULL otherwise), so the new-device mail can tell a removed device from
   one that signed out, and the table `new_device_mails`, for the limit of
-  3 a day per account. The new columns are nullable with no default and
-  their checks are added `NOT VALID`, so no row is read or rewritten: the
-  ACCESS EXCLUSIVE locks on `oauth_codes` and `devices` are held a moment.
+  3 in any 24 hours per account. The new columns are nullable with no
+  default and their checks are added `NOT VALID`, so no row is read or
+  rewritten: the ACCESS EXCLUSIVE locks on `oauth_codes` and `devices`
+  are held a moment.
   That matters for `devices`: every signed request updates its row, and
   the table only grows (an app without an install id adds a row at each
   registration, and nothing deletes device rows).
@@ -1137,7 +1148,8 @@ records nothing, and the server does not start (the journal says
 that transaction (the query in [migration
 20](#migration-20-an-index-on-devices-sign-ins)'s steps) and
 `sudo systemctl restart buwiz.service`; `SELECT max(version) FROM
-_sqlx_migrations` is then 22.
+_sqlx_migrations` is then 23 (22 on a release without [migration
+23](#migration-23-reserved-test-roots)).
 
 **Before you deploy.** The database is at 20, and no code belongs to a
 client that is not registered (a read-only check):
@@ -1175,10 +1187,173 @@ In this order:
    starts instead, it runs migrations 21 and 22 again, and the rollback
    starts over at 1.
 
-Going further back runs 22's and 21's down files first, then 20's, 19's,
+Going further back runs 22's and 21's down files first (after 23's,
+[below](#migration-23-reserved-test-roots)), then 20's, 19's,
 18's and the others as
 [above](#migrations-18-and-19-one-row-per-device); each commits on its
 own.
+
+## Migration 23 (reserved test roots)
+
+The release with reserved test roots
+([accounts.md](accounts.md#bans-and-test-accounts)) runs migration 23
+when it starts. It puts migration 13's check
+`tin_claims_test_tin_check` back over the list of reserved roots
+(`000000000`, `111111114`) instead of all zeros alone, under a 10-second
+lock timeout. No column changes. The check is added `NOT VALID` and then
+validated, but in the same transaction that gains nothing: dropping the
+old check already takes the ACCESS EXCLUSIVE lock on `tin_claims`, and the
+validation scan runs under it. Reads on `tin_claims` queue behind that
+lock for at most the 10-second lock timeout, and the table is small.
+
+Before that it refuses to run while any row holds a reserved root and is
+not a test TIN: for all zeros, one that is not an Admin's or the seed
+tool's active or ended row (13's check already rules those out), and for
+`111111114` any row at all, whatever its status, since before 23 no one
+could add a test TIN with that root, so any such row is a real person's
+claim. The release before it (at 22) refuses to start on a database at
+23.
+
+The reservation assumes 111-111-114 is nobody's real TIN; if it is someone's, that person cannot register it and is sent to support, and a claim already holding it stops the deploy.
+
+**The install window.** The installer restarts the Sender before the
+Gatekeeper ([above](#migration-14-bir-uptime)). When this release goes in
+over the one before, for that moment the old Gatekeeper sends every job to
+the new Sender's plain route, and the new Sender refuses there any job
+whose TIN has a reserved root ("the Sender takes a test TIN's job only on
+its reserved route"), before it runs: nothing is sent to the BIR. That
+covers the test TINs on `000-000-000`, and also a real person's claim on
+`111-111-114` made by the release before (the query in "Before you deploy"
+should have found one, and stopped the deploy). Such a claim's send fails
+in the window with that message: a v1 return can be tried again later, a
+v2 one needs a new ticket. Then the new Gatekeeper starts, migration 23
+refuses that row, and you do as "If it refuses" says. A real TIN on any
+other root is unchanged.
+
+**Before every deploy of this change, run the BIR tests (required).** CI
+builds without the `bir` feature, so it never runs the code that hands a
+test send its blanked settings. On a machine with the private files
+([relay.md](relay.md#restoring-the-private-files)), run the whole suite
+with `--features bir`, as [development.md](development.md#running-them-safely)
+says. Every test must pass; do not deploy if one fails. These run only
+with `bir` (21, and 1 ignored that reaches the internet):
+- `tests/bir_uptime.rs` (1): `a_test_tins_send_to_the_real_sender_is_a_dry_run`
+  (a test TIN's send, 111-111-114 and 000-000-000, v1 and v2, through the
+  Gatekeeper's bridge to the real Sender in `live` ends `dry_run`, never
+  with the guard's refusal: so a dry run opens no stream);
+- `src/sender/mod.rs`, `bir_tests` (3): `a_test_tin_is_a_dry_run_in_live_mode`
+  (every reserved root, v1 and v2, ends `dry_run` and the dispatcher is
+  never contacted), `blanked_settings_have_nothing_to_contact`,
+  `a_real_tin_in_live_mode_is_unaffected`;
+- the library's other `bir` tests (10): `bir::dispatcher` (3), `bir::iaf`
+  (3), `bir::sftp` (2), `sender::identity::tests::the_fixture_returns_match`,
+  `base::config::tests::lab_servers_parse_with_a_colon_in_the_password`;
+- `tests/relay.rs` (6, and `https_dispatcher_requests_travel_through_the_pipe`
+  ignored): `a_dry_run_touches_no_network` among them;
+- `tests/iaf_golden.rs` (1): `matches_encrypt_exe_output`.
+
+**No step here deletes or changes a submission or a ticket.** A return
+already stored for a claim is a record of what was filed, and the release
+before this one took `111-111-114` for a real TIN, so a return for it may
+be a real filing at the BIR.
+
+**Before you deploy.** The database is at 22, and no row would be
+refused; both read-only, expected `22` and no rows:
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 22
+SELECT id, account_id, tin_root, branch_code, status, verified_by
+  FROM tin_claims
+ WHERE tin_root IN ('000000000', '111111114')
+   AND (tin_root <> '000000000'
+        OR NOT (status IN ('approved', 'removed', 'revoked') AND coalesce(verified_by, '') IN ('admin', 'seed')));
+                                                                     -- (0 rows)
+```
+If the second query lists a row, do not deploy: do as "If it refuses"
+says, from step 2. Otherwise deploy as above (keep the previous binaries,
+check 6, `deploy.sh`).
+
+**If it refuses.** The app does not start; its log names each row (`id`,
+`account_id`, root, branch, status, `verified_by`) after "refusing to
+reserve the test roots". The database is untouched at 22. A row on
+`111111114` from before this release is a real person's claim, and the
+release before treated it as a real TIN, so returns for it may already be
+real filings.
+1. Stop the deploy. Put the previous binaries back and start them
+   ([above](#putting-the-previous-binaries-back)) so the site is up, and do
+   not try this release again until the owner has decided.
+2. Keep that account's submissions and tickets exactly as they are: do
+   not delete or change them, nor the claim's row.
+3. End the claim the normal staff way, with a reason, on the staff pages:
+   revoke it if it is active (it then reads `revoked`; its owner can
+   remove it, `removed`), reject it if it is still waiting. Do not use a
+   delete action on it. Ending it does not let migration 23 run (it
+   refuses such a row in every status); it stops new sends for it.
+4. Write to the owner, with each row the log named. The owner decides
+   what happens with that person (they are sent to support), and whether
+   the root stays reserved (taking it out is `TEST_ROOTS` and the
+   migration, in a new release).
+
+**Rolling back to 22.** Once a test TIN on `111-111-114` exists, the
+previous binaries are never started again: the way is forward only. The
+previous Gatekeeper cannot start on a database at 23 in any case, with
+such a row or without: it runs its migrations first and sqlx refuses an
+applied migration it does not know
+(`the_release_before_never_starts_on_reserved_roots` in tests/migrations.rs).
+If it is put back, the site stays down, and nothing is sent, until this
+release or a newer one is back. That check covers the Gatekeeper only:
+- Never put back only the older Sender beside this Gatekeeper: it would
+  take a test TIN's job for a real one. The Gatekeeper now also refuses
+  such a send, as a second guard, in two ways
+  ([relay-protocol.md](relay-protocol.md#6-the-sender)). It sends a test
+  TIN's job only to the Sender's route `/internal/relay/reserved`, which the
+  older Sender does not have, so the job never leaves it and the try ends
+  "the sending service is not reachable; try again later". And for a test
+  TIN's job it wants the Sender's `sender` frame to say `dry_run`, and
+  after it only a `result` that is `dry_run` or `failed` (a receipt on it
+  saying `dry_run`); anything else ends the try `failed` and nothing of the
+  Sender's reaches the app.
+- Always restore, start and stop the two services together, never one
+  alone ([above](#putting-the-previous-binaries-back)). An older Gatekeeper
+  that is already running (the version check is at its start only) beside
+  an older Sender would send a `111-111-114` test TIN's job live; only
+  stopping both closes that.
+- Never run an older binary's `seed` or `bir` subcommand against the
+  migrated database: they skip the migrations, so nothing refuses them, and
+  only the database check limits what they write to `tin_claims`.
+
+The release before this one takes `111-111-114` for a real TIN, so a test
+TIN on it would be sent to the BIR. So while any row holds that root, ended
+ones too, the down file refuses, and it deletes and changes nothing. With
+no such row, it puts back 13's check and deletes only its own line in
+`_sqlx_migrations`. First, read-only:
+```sql
+SELECT id, account_id, branch_code, status FROM tin_claims WHERE tin_root = '111111114';
+                                                                     -- (0 rows)
+```
+If it lists a row, the rollback to 22 is not available: do not delete
+the rows, their tickets or their submissions to get past the refusal.
+Stop; keep them as they are; end each such claim the normal staff way
+with a reason (revoke it on the staff pages); and write to the owner, who
+decides (a fix goes forward, in a new release). With no row, in this
+order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
+     -c "SET lock_timeout = '10s'" -f migrations/0023_test_roots.down.sql
+   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 22
+   ```
+   It puts back 13's check exactly; test TINs on `000-000-000` stay. If it
+   refuses (a row came in since the query), stop as above.
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 23 again, and the rollback starts
+   over at 1.
+
+Going further back runs 23's down file first, then 22's, 21's and the
+others as [above](#migrations-21-and-22-sign-in-with-buwiz); each commits
+on its own.
 
 ## Cloudflare rules for sign-in
 

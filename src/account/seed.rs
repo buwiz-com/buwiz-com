@@ -305,8 +305,9 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
             let shown = shown(&tin, full);
             if entry.test_tin && !tin.is_test() {
                 problems.push(format!(
-                    "TIN {shown} for {email}: test_tin = true is only for a made-up TIN (000-000-000); a real TIN \
-                     is added without it"
+                    "TIN {shown} for {email}: test_tin = true is only for a made-up TIN (a reserved root: {}); a \
+                     real TIN is added without it",
+                    crate::account::tin::test_roots_shown()
                 ));
                 continue;
             }

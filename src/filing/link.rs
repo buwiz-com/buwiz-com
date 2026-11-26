@@ -50,9 +50,12 @@ impl SenderLink {
             .await
     }
 
-    /// Opens a job socket to the Sender.
-    pub async fn open(&self) -> anyhow::Result<Upstream> {
-        let url = format!("{}/internal/relay", self.base.replacen("http", "ws", 1));
+    /// Opens a job socket to the Sender: on its reserved route for a test
+    /// TIN's job (`reserved`), else on its plain one. A Sender from before
+    /// reserved roots has no reserved route, so that open fails.
+    pub async fn open(&self, reserved: bool) -> anyhow::Result<Upstream> {
+        let route = if reserved { crate::sender::RESERVED_RELAY_ROUTE } else { crate::sender::RELAY_ROUTE };
+        let url = format!("{}{route}", self.base.replacen("http", "ws", 1));
         let mut request = url.into_client_request().context("bad SENDER_URL")?;
         request.headers_mut().insert(
             http::header::AUTHORIZATION,

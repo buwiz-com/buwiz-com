@@ -990,7 +990,7 @@ deleted at 16 stay deleted. In this order:
    starts instead, it runs migration 16 again, and the rollback starts
    over at 1.
 
-Going further back runs 16's down file first (after 24's to 17's, newest
+Going further back runs 16's down file first (after 25's to 17's, newest
 first, [below](#migration-17-in-app-sign-in)), then 15's and the others as
 [above](#migration-15-fixed-sign-in-codes); each commits on its own.
 
@@ -1094,7 +1094,7 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 24's, 23's, 22's, 21's, 20's, 19's and 18's,
+Going further back runs 17's down file first (after 25's, 24's, 23's, 22's, 21's, 20's, 19's and 18's,
 [below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
@@ -1154,7 +1154,7 @@ devices removed with their sign-in stay removed). In this order:
    starts over at 1.
 
 Going further back runs 20's, 19's and 18's down files first (after
-24's, 23's, 22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
+25's, 24's, 23's, 22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
 17's and the others as [above](#migration-17-in-app-sign-in); each
 commits on its own.
 
@@ -1199,7 +1199,8 @@ nothing is recorded in `_sqlx_migrations`. The next start then fails with
    (for 19, `devices_account_install`).
    (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. `sudo systemctl restart buwiz.service`, then check
-   `SELECT max(version) FROM _sqlx_migrations` is 24 (23 on a release
+   `SELECT max(version) FROM _sqlx_migrations` is 25 (24 on a release
+   without [migration 25](#migration-25-pin-resets), 23 on one
    without [migration 24](#migration-24-audit-lines-from-the-app), 22 on
    one without [migration 23](#migration-23-reserved-test-roots), 20 on one
    without [migrations 21 and 22](#migrations-21-and-22-sign-in-with-buwiz)).
@@ -1241,7 +1242,8 @@ records nothing, and the server does not start (the journal says
 that transaction (the query in [migration
 20](#migration-20-an-index-on-devices-sign-ins)'s steps) and
 `sudo systemctl restart buwiz.service`; `SELECT max(version) FROM
-_sqlx_migrations` is then 24 (23 on a release without [migration
+_sqlx_migrations` is then 25 (24 on a release without [migration
+25](#migration-25-pin-resets), 23 on one without [migration
 24](#migration-24-audit-lines-from-the-app), 22 on one without [migration
 23](#migration-23-reserved-test-roots)).
 
@@ -1281,8 +1283,8 @@ In this order:
    starts instead, it runs migrations 21 and 22 again, and the rollback
    starts over at 1.
 
-Going further back runs 22's and 21's down files first (after 24's and
-23's, [below](#migration-23-reserved-test-roots)), then 20's, 19's,
+Going further back runs 22's and 21's down files first (after 25's, 24's
+and 23's, [below](#migration-23-reserved-test-roots)), then 20's, 19's,
 18's and the others as
 [above](#migrations-18-and-19-one-row-per-device); each commits on its
 own.
@@ -1432,7 +1434,9 @@ decides (a fix goes forward, in a new release). With no row, in this
 order:
 1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
    `systemctl is-active buwiz.service` prints `inactive`.
-2. On a database at 24, run 24's down file first, as
+2. On a database at 25, run 25's down file first, as
+   [below](#migration-25-pin-resets) says (it refuses once a PIN reset was
+   asked for); on one at 24, run 24's down file next, as
    [below](#migration-24-audit-lines-from-the-app) says (it refuses once
    the app has added a TIN). Then run this down file, with a lock timeout
    set first:
@@ -1448,7 +1452,7 @@ order:
    starts instead, it runs migration 23 again, and the rollback starts
    over at 1.
 
-Going further back runs 23's down file first (after 24's,
+Going further back runs 23's down file first (after 25's and 24's,
 [below](#migration-24-audit-lines-from-the-app)), then 22's, 21's and the
 others as [above](#migrations-21-and-22-sign-in-with-buwiz); each commits
 on its own.
@@ -1491,7 +1495,9 @@ If it is not 0, the rollback to 23 is not available: stop. With 0, in this
 order:
 1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
    `systemctl is-active buwiz.service` prints `inactive`.
-2. Run the down file, with a lock timeout set first:
+2. On a database at 25, run 25's down file first, as
+   [below](#migration-25-pin-resets) says (it refuses once a PIN reset was
+   asked for). Then run this down file, with a lock timeout set first:
    ```sh
    python3 /root/buwiz-psql.py down migrations/0024_app_audit_source.down.sql
    python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 23
@@ -1504,8 +1510,80 @@ order:
    starts instead, it runs migration 24 again, and the rollback starts
    over at 1.
 
-Going further back runs 24's down file first, then 23's and the others as
+Going further back runs 24's down file first (after 25's,
+[below](#migration-25-pin-resets)), then 23's and the others as
 [above](#migration-23-reserved-test-roots); each commits on its own.
+
+## Migration 25 (PIN resets)
+
+The release with resetting a forgotten app PIN by email code
+(`POST /api/pin-reset/start` and `/verify`,
+[accounts.md](accounts.md#resetting-a-forgotten-app-pin)) runs migration 25
+when it starts. It widens three checks, each the same way (the wider check
+added `NOT VALID`, validated, the old one dropped and the new one given its
+name, so no column is ever without a check):
+- `email_codes_purpose_check` (from migration 17) also takes `pin_reset`;
+- `account_audit_action_check` (from migration 16) also takes
+  `pin_reset_verified`;
+- `account_audit_source_check` (from migration 12: `web`, `seed`) also
+  takes `app`. Migration 24 changed only `claim_audit`'s.
+
+It adds the table `pin_resets` (one row per request: the account, its
+device, NULL for a practice account, its sign-in, the device's name, its
+code, `created_at`, `expires_at`, `used_at`), deleted with its account,
+device or sign-in, with an index on `(account_id, created_at)` for the
+day's count. No existing row changes. In one transaction that saves no
+lock: the ACCESS EXCLUSIVE locks on `email_codes` and `account_audit` are
+held while each small table is read once (every row passes), and the new
+table's references then hold back writes to `accounts`, `devices`,
+`oauth_grants` and `email_codes` until the short transaction commits; each
+wait is bounded by the 10-second lock timeout. Behind a transaction open on
+one of them (any that read `email_codes` or `account_audit`, or wrote to
+`accounts`, `devices`, `oauth_grants` or `email_codes`; signed requests'
+updates of their device are short) past 10 s it fails, records nothing,
+and the server does not start (`canceling statement due to lock
+timeout`); end that transaction and restart, as for [migration
+20](#migration-20-an-index-on-devices-sign-ins).
+The release before it (at 24) refuses to start on a database at 25
+(`pin_resets_block_going_back_to_24` in tests/migrations.rs).
+
+**Before you deploy.** The database is at 24 (read-only, expected `24`):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 24
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 24.** The release before this one cannot hold a PIN reset
+request, its code, or its audit line, and the line is the only record that
+a reset was verified, on which device, and that the account was told. So
+once any exists (once a PIN reset was asked for), rolling back below 25 is
+refused, and the way is forward only: the down file refuses, and deletes
+and changes nothing. Do not delete or change those rows to get past it; a
+fix goes forward, in a new release. First, read-only:
+```sql
+SELECT (SELECT count(*) FROM pin_resets)
+     + (SELECT count(*) FROM account_audit WHERE action = 'pin_reset_verified' OR source = 'app')
+     + (SELECT count(*) FROM email_codes WHERE purpose = 'pin_reset');  -- 0
+```
+If it is not 0, the rollback to 24 is not available: stop. With 0, in this
+order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   python3 /root/buwiz-psql.py down migrations/0025_pin_resets.down.sql
+   python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 24
+   ```
+   (In the root shell, from the folder that holds `migrations/`: see [Running psql on the instance](#running-psql-on-the-instance).)
+   It drops `pin_resets` and puts back 17's, 16's and 12's checks exactly.
+   If it refuses (a reset was asked for since the query), stop as above.
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 25 again, and the rollback starts
+   over at 1.
+
+Going further back runs 25's down file first, then 24's and the others as
+[above](#migration-24-audit-lines-from-the-app); each commits on its own.
 
 ## Cloudflare rules for sign-in
 

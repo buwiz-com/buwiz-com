@@ -279,8 +279,15 @@ shows a process's environment (`/proc/<pid>/environ`) only to its own user
 and root, and root can read `/etc/buwiz/env` anyway. A password file would
 need `:` and `\` escaped in the password, and a file to delete afterwards,
 also when the shell dies. If the helper says the URL is missing or not one
-it reads, nothing was run: look at the file's `DATABASE_URL` line yourself
-(it must be `postgres://user:password@host:port/database`).
+it reads, nothing was run. Check the line's shape without printing its
+value (the session may be logged):
+```sh
+grep -c '^DATABASE_URL=' /etc/buwiz/env                                  # 1
+grep -cE '^DATABASE_URL=["'"'"']?postgres(ql)?://[^:@/]+:[^@]+@[^/]+/' /etc/buwiz/env   # 1
+```
+Neither prints the value. A 0 in the second means the line is not
+`postgres://user:password@host[:port]/database`: fix it with `buwiz-env`
+(the parameter in SSM), never by hand in the file.
 
 ### Rolling back
 
@@ -1135,12 +1142,11 @@ devices removed with their sign-in stay removed). In this order:
 2. Run the down files, newest first, each with a lock timeout set first:
    ```sh
    for down in 0020_devices_grant_index 0019_device_install_index 0018_device_installs; do
-     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
-       -c "SET lock_timeout = '10s'" -f "migrations/$down.down.sql" || break
+     python3 /root/buwiz-psql.py down "migrations/$down.down.sql" || break
    done
-   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 17
+   python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 17
    ```
-   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
+   (In the root shell, from the folder that holds `migrations/`: see [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migrations 18 to 20 again, and the rollback
@@ -1262,12 +1268,11 @@ In this order:
 2. Run the down files, newest first, each with a lock timeout set first:
    ```sh
    for down in 0022_app_authorize_validate 0021_app_authorize; do
-     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
-       -c "SET lock_timeout = '10s'" -f "migrations/$down.down.sql" || break
+     python3 /root/buwiz-psql.py down "migrations/$down.down.sql" || break
    done
-   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 20
+   python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 20
    ```
-   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
+   (In the root shell, from the folder that holds `migrations/`: see [Running psql on the instance](#running-psql-on-the-instance).)
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migrations 21 and 22 again, and the rollback
@@ -1426,11 +1431,10 @@ order:
    `systemctl is-active buwiz.service` prints `inactive`.
 2. Run the down file, with a lock timeout set first:
    ```sh
-   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 \
-     -c "SET lock_timeout = '10s'" -f migrations/0023_test_roots.down.sql
-   psql "$DATABASE_URL" -c "SELECT max(version) FROM _sqlx_migrations"   # must be 22
+   python3 /root/buwiz-psql.py down migrations/0023_test_roots.down.sql
+   python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 22
    ```
-   (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
+   (In the root shell, from the folder that holds `migrations/`: see [Running psql on the instance](#running-psql-on-the-instance).)
    It puts back 13's check exactly; test TINs on `000-000-000` stay. If it
    refuses (a row came in since the query), stop as above.
 3. Put the previous binaries back and start them, as

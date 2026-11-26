@@ -449,37 +449,67 @@ pub(crate) fn alert_if_refused_many(state: &AppState) {
 }
 
 async fn refusal_alert(state: AppState, counts: crate::account::guard::RefusalCounts) {
-    let subject = "Sign-in: many tries refused by the network limits this hour";
-    let limits = state.config.sign_in_limits;
-    let text = format!(
-        "{} sign-in tries were refused this hour.\n\n\
-         Starts and resends (the apps'): {} by their network's limit of {} an hour, {} by the shared budget of \
-         {} for new networks once 100,000 are counted.\n\
-         Tries at a code (the apps' and the web form's): {} by their network's limit of {} an hour, {} by the \
-         shared budget of {}.\n\
-         Tries at a token (/oauth/token and /auth/device/poll), served and never refused, counted here only: \
-         {} past their network's count of {} failures an hour, {} past the shared budget of {}.\n\n\
-         Refusals by a network's limit can be a flood from one network, or many people behind one carrier's or \
-         office's network (near a filing deadline). Look at Cloudflare's analytics for the sign-in paths. To \
-         let more through, raise APP_SIGN_IN_STARTS_PER_NETWORK, SIGN_IN_VERIFIES_PER_NETWORK or the budgets \
-         and restart (docs/deploy.md). Refusals by the shared budget mean a flood from many networks.\n\n\
-         This is mailed at most once an hour (at {} refusals). The log has one line an hour with the counts.",
-        counts.total(),
-        counts.starts_by_network,
-        limits.starts_per_network,
-        counts.starts_by_budget,
-        limits.starts_past_full,
-        counts.verifies_by_network,
-        limits.verifies_per_network,
-        counts.verifies_by_budget,
-        limits.verifies_past_full,
-        counts.tokens_by_network,
-        limits.token_failures_per_network,
-        counts.tokens_by_budget,
-        limits.token_failures_past_full,
-        limits.refusals_alert_at,
-    );
-    mail_staff(&state, subject, &text).await;
+    let (subject, text) = refusal_alert_words(&counts, &state.config.sign_in_limits);
+    mail_staff(&state, &subject, &text).await;
+}
+
+/// The staff alert's subject and text. Sign-in tries past a limit were
+/// refused; tries at a token past their count were not (they are counted
+/// only), so each part says which, and the subject names what the hour
+/// had: refusals, counted failures, or both.
+fn refusal_alert_words(
+    counts: &crate::account::guard::RefusalCounts,
+    limits: &crate::account::guard::SignInLimits,
+) -> (String, String) {
+    let refused =
+        counts.starts_by_network + counts.starts_by_budget + counts.verifies_by_network + counts.verifies_by_budget;
+    let failed = counts.tokens_by_network + counts.tokens_by_budget;
+    let subject = match (refused > 0, failed > 0) {
+        (true, true) => "Sign-in: many tries refused, and many failed tries at a token counted, this hour",
+        (false, true) => "Sign-in: many failed tries at a token counted this hour (none refused)",
+        _ => "Sign-in: many tries refused by the network limits this hour",
+    };
+    let mut parts = Vec::new();
+    if refused > 0 {
+        parts.push(format!(
+            "{refused} sign-in tries were refused this hour.\n\n\
+             Starts and resends (the apps'): {} by their network's limit of {} an hour, {} by the shared budget of \
+             {} for new networks once 100,000 are counted.\n\
+             Tries at a code (the apps' and the web form's): {} by their network's limit of {} an hour, {} by the \
+             shared budget of {}.\n\n\
+             Refusals by a network's limit can be a flood from one network, or many people behind one carrier's \
+             or office's network (near a filing deadline). Look at Cloudflare's analytics for the sign-in paths. \
+             To let more through, raise APP_SIGN_IN_STARTS_PER_NETWORK, SIGN_IN_VERIFIES_PER_NETWORK or the \
+             budgets and restart (docs/deploy.md). Refusals by the shared budget mean a flood from many networks.",
+            counts.starts_by_network,
+            limits.starts_per_network,
+            counts.starts_by_budget,
+            limits.starts_past_full,
+            counts.verifies_by_network,
+            limits.verifies_per_network,
+            counts.verifies_by_budget,
+            limits.verifies_past_full,
+        ));
+    }
+    if failed > 0 {
+        parts.push(format!(
+            "{failed} failed tries at a token (/oauth/token and /auth/device/poll) were counted this hour past the \
+             counts. None was refused: each was answered as any other.\n\
+             {} past their network's count of {} failures an hour, {} past the shared budget of {} for new \
+             networks.\n\n\
+             Many can be a stuck app retrying, or someone trying made-up codes or tokens. Look at Cloudflare's \
+             analytics for /oauth/token and /auth/device/poll.",
+            counts.tokens_by_network,
+            limits.token_failures_per_network,
+            counts.tokens_by_budget,
+            limits.token_failures_past_full,
+        ));
+    }
+    parts.push(format!(
+        "This is mailed at most once an hour (at {} in the hour). The log has one line an hour with the counts.",
+        limits.refusals_alert_at
+    ));
+    (subject.to_owned(), parts.join("\n\n"))
 }
 
 /// One of the [`DATABASE_SLOTS`] places for the database work, waited for
@@ -1093,6 +1123,32 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_staff_alert_says_refused_or_counted_as_each_was() {
+        use crate::account::guard::{RefusalCounts, SignInLimits};
+        let limits = SignInLimits::default();
+        let tokens = RefusalCounts { tokens_by_network: 120, ..RefusalCounts::default() };
+        let (subject, text) = refusal_alert_words(&tokens, &limits);
+        assert_eq!(subject, "Sign-in: many failed tries at a token counted this hour (none refused)");
+        assert!(text.starts_with("120 failed tries at a token"), "{text}");
+        assert!(text.contains("None was refused"), "{text}");
+        assert!(!text.contains("were refused") && !text.contains("refused by"), "{text}");
+
+        let sign_ins = RefusalCounts { verifies_by_network: 100, ..RefusalCounts::default() };
+        let (subject, text) = refusal_alert_words(&sign_ins, &limits);
+        assert_eq!(subject, "Sign-in: many tries refused by the network limits this hour");
+        assert!(text.starts_with("100 sign-in tries were refused this hour."), "{text}");
+        assert!(!text.contains("at a token"), "{text}");
+
+        let both = RefusalCounts { verifies_by_network: 60, tokens_by_budget: 40, ..RefusalCounts::default() };
+        let (subject, text) = refusal_alert_words(&both, &limits);
+        assert_eq!(subject, "Sign-in: many tries refused, and many failed tries at a token counted, this hour");
+        assert!(
+            text.contains("60 sign-in tries were refused") && text.contains("40 failed tries at a token"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn a_request_left_open_says_why_without_an_address() {

@@ -381,17 +381,18 @@ impl Mailer {
 
     /// Tells `to` that `device` (fixed words, such as "eBIRForms on
     /// iPhone") signed in to the account at `at`, and where its devices
-    /// are listed (`devices_page`), as plain text. The day's last
-    /// (`last_today`) says so and asks the person to check their devices.
+    /// are listed (`devices_page`), as plain text. The third in 24 hours
+    /// (`third_in_24_hours`), the most there are, says so and asks the
+    /// person to check their devices.
     pub async fn send_new_device(
         &self,
         to: &str,
         device: &'static str,
         at: time::OffsetDateTime,
         devices_page: &str,
-        last_today: bool,
+        third_in_24_hours: bool,
     ) -> anyhow::Result<()> {
-        let (subject, text) = new_device_message(device, at, devices_page, last_today);
+        let (subject, text) = new_device_message(device, at, devices_page, third_in_24_hours);
         if let Some(mails) = &self.new_devices {
             if self.failing_new_devices.load(Ordering::SeqCst) {
                 anyhow::bail!("made-up mail failure");
@@ -456,7 +457,7 @@ fn new_device_message(
     device: &str,
     at: time::OffsetDateTime,
     devices_page: &str,
-    last_today: bool,
+    third_in_24_hours: bool,
 ) -> (String, String) {
     let at = at.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"));
     let (hour, half) = match at.hour() {
@@ -474,9 +475,10 @@ fn new_device_message(
              If this wasn't you, log it out at {devices_page}\n\n\
              {last}\
              Buwiz - https://buwiz.com",
-            last = if last_today {
+            last = if third_in_24_hours {
                 format!(
-                    "This is the last new-device notice we send you today. Check My devices at {devices_page} \
+                    "We send at most three new-device notices in 24 hours, and this is the third. Check My \
+                     devices at {devices_page} \
                      for any other device signed in to your account.\n\n"
                 )
             } else {
@@ -693,12 +695,17 @@ mod tests {
             false,
         );
         assert!(midnight.contains("November 26, 2026 at 12:30 AM"), "{midnight}");
-        assert!(!text.contains("last new-device notice"), "{text}");
+        assert!(!text.contains("this is the third"), "{text}");
+        assert!(!text.contains("today"), "{text}");
         let (_, last) = new_device_message("eBIRForms on iPhone", at, "https://account.buwiz.com/tins", true);
         assert!(
-            last.contains("This is the last new-device notice we send you today. Check My devices at https://account.buwiz.com/tins "),
+            last.contains(
+                "We send at most three new-device notices in 24 hours, and this is the third. Check My devices \
+                 at https://account.buwiz.com/tins "
+            ),
             "{last}"
         );
+        assert!(!last.contains("today"), "{last}");
     }
 
     #[test]

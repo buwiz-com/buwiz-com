@@ -751,9 +751,11 @@ pub(crate) async fn new_device_to(
     let Some(to) = to else {
         return Ok(None);
     };
-    // Waited for at most three seconds, on the device flow's transaction
-    // too (the exchange's already waits no longer): then the sign-in fails,
-    // rolled back, its code or device code unspent.
+    // This advisory lock is waited for at most three seconds, on the device
+    // flow's transaction too (the exchange's already waits no longer): then
+    // the sign-in fails, rolled back, its code or device code unspent. The
+    // device flow's earlier row locks are waited for as on main, without a
+    // bound (#84).
     sqlx::query("SET LOCAL lock_timeout = '3s'").execute(&mut **tx).await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
         .bind(NEW_DEVICE_MAIL_LOCK)
@@ -771,15 +773,16 @@ pub(crate) async fn new_device_to(
         return Ok(None);
     }
     sqlx::query("INSERT INTO new_device_mails (account_id) VALUES ($1)").bind(account_id).execute(&mut **tx).await?;
-    Ok(Some(NewDeviceNotice { to, last_today: sent + 1 == NEW_DEVICE_MAILS_PER_DAY }))
+    Ok(Some(NewDeviceNotice { to, third_in_24_hours: sent + 1 == NEW_DEVICE_MAILS_PER_DAY }))
 }
 
 /// A new-device mail the exchange decided on ([`new_device_to`]).
 pub struct NewDeviceNotice {
     pub to: String,
-    /// The day's last ([`NEW_DEVICE_MAILS_PER_DAY`]): it says so, and asks
-    /// the person to check My devices for others.
-    pub last_today: bool,
+    /// The third in 24 hours, the most there are
+    /// ([`NEW_DEVICE_MAILS_PER_DAY`]): it says so, and asks the person to
+    /// check My devices for others.
+    pub third_in_24_hours: bool,
 }
 
 /// Mails "New sign-in to eBIRForms on …", with when, and where to log it
@@ -803,7 +806,7 @@ async fn new_device_mail(state: &AppState, app: &SignedInApp) {
     };
     let device = Platform::device(app.platform);
     let tins = format!("{}/tins#devices-h", state.config.account_origin);
-    if state.mailer.send_new_device(&notice.to, device, at, &tins, notice.last_today).await.is_err() {
+    if state.mailer.send_new_device(&notice.to, device, at, &tins, notice.third_in_24_hours).await.is_err() {
         tracing::error!(account = %app.account_id, grant = %app.grant_id, "the new-device mail could not be sent");
     }
 }

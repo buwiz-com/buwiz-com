@@ -639,7 +639,32 @@ async fn a_network_far_over_its_failures_is_still_served(db: PgPool) {
     }
     let notices = site.state.mailer.notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(notices[0].text.contains("served and never refused"), "{}", notices[0].text);
+    assert_eq!(notices[0].subject, "Sign-in: many failed tries at a token counted this hour (none refused)");
+    assert!(notices[0].text.contains("None was refused"), "{}", notices[0].text);
+    assert!(!notices[0].text.contains("were refused"), "{}", notices[0].text);
+}
+
+/// Polls of a real device code that is still waiting are never counted,
+/// however many: only a poll that fails with `invalid_grant` is.
+#[sqlx::test(migrations = "./migrations")]
+async fn polls_of_a_pending_device_code_are_never_counted(db: PgPool) {
+    let site = site_with_token_failures(db, 2);
+    let request = Request::post("/auth/device/start")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "client_id": CLIENT }).to_string()))
+        .unwrap();
+    let started: Value = serde_json::from_str(&text(site.send(request).await).await).unwrap();
+    let pending = started["device_code"].as_str().unwrap();
+    for _ in 0..20 {
+        let (status, answer) = poll_from(&site, NETWORK_A, pending).await;
+        assert_eq!(status, 400);
+        assert!(matches!(answer["error"].as_str(), Some("authorization_pending" | "slow_down")), "{answer}");
+    }
+    for _ in 0..3 {
+        assert_eq!(poll_from(&site, NETWORK_A, &made_up("bwd_")).await.0, 400);
+    }
+    // Two made-up codes fill the count; only the third is past it.
+    assert_eq!(site.state.sign_in_guard.refusals_this_hour().tokens_by_network, 1);
 }
 
 /// A try that does not fail is given back: many valid refreshes from one
@@ -1076,11 +1101,17 @@ async fn the_new_device_mail_is_limited_to_three_a_day(db: PgPool) {
     }
     let mails = site.state.mailer.new_device_mails();
     assert_eq!(mails.len(), 3);
-    // The third says it is the day's last, and asks them to check.
+    // The third says it is the third of at most three in 24 hours, and asks
+    // them to check.
     for mail in &mails[..2] {
-        assert!(!mail.text.contains("last new-device notice"), "{}", mail.text);
+        assert!(!mail.text.contains("this is the third"), "{}", mail.text);
     }
-    assert!(mails[2].text.contains("This is the last new-device notice we send you today."), "{}", mails[2].text);
+    assert!(
+        mails[2].text.contains("We send at most three new-device notices in 24 hours, and this is the third."),
+        "{}",
+        mails[2].text
+    );
+    assert!(!mails[2].text.contains("today"), "{}", mails[2].text);
     assert!(mails[2].text.contains(&format!("Check My devices at {ORIGIN}/tins#devices-h")), "{}", mails[2].text);
     assert_eq!(count(&site.db, "SELECT count(*) FROM new_device_mails").await, 3);
     assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_grants WHERE revoked_at IS NULL").await, 5);
@@ -1165,7 +1196,11 @@ async fn the_device_flows_mail_lock_is_waited_for_three_seconds_at_most(db: PgPo
     let started_at = std::time::Instant::now();
     let (status, answer) = poll_from(&site, NETWORK_A, device_code).await;
     assert_eq!((status, answer["error"].as_str()), (503, Some("temporarily_unavailable")), "{answer}");
-    assert!(started_at.elapsed() < std::time::Duration::from_secs(10));
+    let waited = started_at.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(2900) && waited < std::time::Duration::from_secs(6),
+        "{waited:?}: three seconds for the lock, and a little more for the rest"
+    );
     assert_eq!(count(&site.db, "SELECT count(*) FROM oauth_grants").await, 0);
     sqlx::query("SELECT pg_advisory_unlock_all()").execute(&mut *holder).await.unwrap();
     drop(holder);

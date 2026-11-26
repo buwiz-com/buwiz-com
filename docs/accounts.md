@@ -913,12 +913,14 @@ word.
   fixed code (a store reviewer's), are mailed nothing.
 - A mail that fails is logged with the account and grant ids, and the
   sign-in stands.
-- At most 3 a day per account (`new_device_mails`, counted in the
-  exchange's transaction). A person adds a phone, a computer, maybe
-  reinstalls one; more in a day is a script with the web session, whose
-  mails would bury a real alert. The third says it is the last notice
-  that day and asks the person to check My devices; no other mail is
-  sent. Past it the sign-in stands, nothing is mailed, and one log line
+- At most 3 in any 24 hours per account (`new_device_mails`, counted in
+  the exchange's transaction over the last 24 hours, not the calendar
+  day). A person adds a phone, a computer, maybe reinstalls one; more is
+  a script with the web session, whose mails would bury a real alert. The
+  third says "We send at most three new-device notices in 24 hours, and
+  this is the third" and asks the person to check My devices; no other
+  mail is sent. The next one can go once the oldest of the three is 24
+  hours old. Past it the sign-in stands, nothing is mailed, and one log line
   has the account and grant ids.
 - Counting fails the sign-in only when the count itself cannot be made:
   its lock not had within 3 seconds is `503 temporarily_unavailable`
@@ -1002,11 +1004,15 @@ code is not used, and the app may try again in a few seconds.
 
 What is left, plainly:
 - A stream of well-shaped made-up codes can keep Sign in with Buwiz busy
-  (`503`, its 2 places) while it lasts. In-app sign-in and filing keep
-  working: they have their own places.
-- The device-code path (`/auth/device/poll`, and the device code on
-  `/oauth/token`) costs a pooled connection per poll, as on main, and is
-  not changed here (#84).
+  (`503`, its 2 places) while it lasts. In-app sign-in keeps working on
+  places of its own. Filing has no places of its own: it keeps working
+  only because the exchange holds at most two of the pool's 10
+  connections.
+- The device-code path is as on main (#84). A poll of a real device code
+  (`authorization_pending`, `slow_down`) costs a pooled connection and a
+  write, and is never counted, however fast it comes; only a poll that
+  fails with `invalid_grant` is. `/auth/device/start` (and
+  `/oauth/device/code`) is not limited at all and writes a row per call.
 
 ## Devices
 

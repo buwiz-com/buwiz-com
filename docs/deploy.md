@@ -989,7 +989,7 @@ deleted at 16 stay deleted. In this order:
    starts instead, it runs migration 16 again, and the rollback starts
    over at 1.
 
-Going further back runs 16's down file first (after 23's to 17's, newest
+Going further back runs 16's down file first (after 24's to 17's, newest
 first, [below](#migration-17-in-app-sign-in)), then 15's and the others as
 [above](#migration-15-fixed-sign-in-codes); each commits on its own.
 
@@ -1093,7 +1093,7 @@ order:
    starts instead, it runs migration 17 again, and the rollback starts
    over at 1.
 
-Going further back runs 17's down file first (after 23's, 22's, 21's, 20's, 19's and 18's,
+Going further back runs 17's down file first (after 24's, 23's, 22's, 21's, 20's, 19's and 18's,
 [below](#migrations-18-and-19-one-row-per-device)), then 16's and the others as
 [above](#migration-16-account-deletion); each commits on its own.
 
@@ -1153,7 +1153,7 @@ devices removed with their sign-in stay removed). In this order:
    starts over at 1.
 
 Going further back runs 20's, 19's and 18's down files first (after
-23's, 22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
+24's, 23's, 22's and 21's, [below](#migrations-21-and-22-sign-in-with-buwiz)), then
 17's and the others as [above](#migration-17-in-app-sign-in); each
 commits on its own.
 
@@ -1198,8 +1198,9 @@ nothing is recorded in `_sqlx_migrations`. The next start then fails with
    (for 19, `devices_account_install`).
    (On the instance, run each line through the helper in [Running psql on the instance](#running-psql-on-the-instance).)
 3. `sudo systemctl restart buwiz.service`, then check
-   `SELECT max(version) FROM _sqlx_migrations` is 23 (22 on a release
-   without [migration 23](#migration-23-reserved-test-roots), 20 on one
+   `SELECT max(version) FROM _sqlx_migrations` is 24 (23 on a release
+   without [migration 24](#migration-24-audit-lines-from-the-app), 22 on
+   one without [migration 23](#migration-23-reserved-test-roots), 20 on one
    without [migrations 21 and 22](#migrations-21-and-22-sign-in-with-buwiz)).
 
 ## Migrations 21 and 22 (Sign in with Buwiz)
@@ -1239,7 +1240,8 @@ records nothing, and the server does not start (the journal says
 that transaction (the query in [migration
 20](#migration-20-an-index-on-devices-sign-ins)'s steps) and
 `sudo systemctl restart buwiz.service`; `SELECT max(version) FROM
-_sqlx_migrations` is then 23 (22 on a release without [migration
+_sqlx_migrations` is then 24 (23 on a release without [migration
+24](#migration-24-audit-lines-from-the-app), 22 on one without [migration
 23](#migration-23-reserved-test-roots)).
 
 **Before you deploy.** The database is at 20, and no code belongs to a
@@ -1278,8 +1280,8 @@ In this order:
    starts instead, it runs migrations 21 and 22 again, and the rollback
    starts over at 1.
 
-Going further back runs 22's and 21's down files first (after 23's,
-[below](#migration-23-reserved-test-roots)), then 20's, 19's,
+Going further back runs 22's and 21's down files first (after 24's and
+23's, [below](#migration-23-reserved-test-roots)), then 20's, 19's,
 18's and the others as
 [above](#migrations-18-and-19-one-row-per-device); each commits on its
 own.
@@ -1429,7 +1431,10 @@ decides (a fix goes forward, in a new release). With no row, in this
 order:
 1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
    `systemctl is-active buwiz.service` prints `inactive`.
-2. Run the down file, with a lock timeout set first:
+2. On a database at 24, run 24's down file first, as
+   [below](#migration-24-audit-lines-from-the-app) says (it refuses once
+   the app has added a TIN). Then run this down file, with a lock timeout
+   set first:
    ```sh
    python3 /root/buwiz-psql.py down migrations/0023_test_roots.down.sql
    python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 22
@@ -1442,9 +1447,64 @@ order:
    starts instead, it runs migration 23 again, and the rollback starts
    over at 1.
 
-Going further back runs 23's down file first, then 22's, 21's and the
+Going further back runs 23's down file first (after 24's,
+[below](#migration-24-audit-lines-from-the-app)), then 22's, 21's and the
 others as [above](#migrations-21-and-22-sign-in-with-buwiz); each commits
 on its own.
+
+## Migration 24 (audit lines from the app)
+
+The release with the BIR app's add of a TIN (`POST /api/tax-profiles`,
+[relay-protocol.md](relay-protocol.md#adding-a-tin-from-the-app)) runs
+migration 24 when it starts. It widens the check on `claim_audit.source`
+(`claim_audit_source_check`, from migration 11: `web`, `auto`, `seed`) to
+take `app` too, the source of the line each add from the app writes. No
+row or column changes. The wider check is added `NOT VALID`, validated,
+then the old one dropped and the new one given its name, so the column is
+never without a check; in one transaction that saves no lock: the ACCESS
+EXCLUSIVE lock on `claim_audit` is held while the small table is read once
+(every row passes), and writes of audit lines queue behind it for at most
+the 10-second lock timeout. Behind a transaction open on `claim_audit` it
+fails, records nothing, and the server does not start (`canceling
+statement due to lock timeout`); end that transaction and restart, as for
+[migration 20](#migration-20-an-index-on-devices-sign-ins). The release
+before it (at 23) refuses to start on a database at 24
+(`audit_lines_from_the_app_block_going_back_to_23` in tests/migrations.rs).
+
+**Before you deploy.** The database is at 23 (read-only, expected `23`):
+```sql
+SELECT max(version) FROM _sqlx_migrations;                           -- 23
+```
+Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
+
+**Rolling back to 23.** The release before this one cannot hold an audit
+line from the app, and the line is the only record of who added that TIN
+and how. So once one exists (once the app has added a TIN), rolling back
+below 24 is refused, and the way is forward only: the down file refuses,
+and deletes and changes nothing. Do not delete or change those lines to
+get past it; a fix goes forward, in a new release. First, read-only:
+```sql
+SELECT count(*) FROM claim_audit WHERE source = 'app';               -- 0
+```
+If it is not 0, the rollback to 23 is not available: stop. With 0, in this
+order:
+1. `sudo systemctl stop buwiz.service`, then confirm it is stopped:
+   `systemctl is-active buwiz.service` prints `inactive`.
+2. Run the down file, with a lock timeout set first:
+   ```sh
+   python3 /root/buwiz-psql.py down migrations/0024_app_audit_source.down.sql
+   python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 23
+   ```
+   (In the root shell, from the folder that holds `migrations/`: see [Running psql on the instance](#running-psql-on-the-instance).)
+   It puts back 11's check exactly. If it refuses (an app's add came in
+   since the query), stop as above.
+3. Put the previous binaries back and start them, as
+   [above](#putting-the-previous-binaries-back). If this release's binary
+   starts instead, it runs migration 24 again, and the rollback starts
+   over at 1.
+
+Going further back runs 24's down file first, then 23's and the others as
+[above](#migration-23-reserved-test-roots); each commits on its own.
 
 ## Cloudflare rules for sign-in
 

@@ -1,4 +1,4 @@
-//! Migrations 11 to 22 on a database at migration 10 with a row in every
+//! Migrations 11 to 23 on a database at migration 10 with a row in every
 //! claim status, files, readings, audit lines, tickets and returns: the
 //! rows survive and read as before, and going back down to 10 leaves a
 //! database the release before this one starts on, every return kept.
@@ -12,7 +12,7 @@
 //! (Sign in with Buwiz) goes back to 20, and fails behind a long
 //! transaction and recovers too; 22 (validating 21's checks) goes back to
 //! 21, runs beside open writes, and fails behind a SHARE lock and
-//! recovers.
+//! recovers. Migration 23 (reserved test roots) goes back to 22.
 //! Each test gets its own empty database (`migrations = false`).
 
 use std::borrow::Cow;
@@ -328,7 +328,7 @@ async fn rows_from_migration_10_survive(db: PgPool) {
     let before = rows(&db).await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     let after = rows(&db).await;
     assert_eq!(only_columns_at_10(&after, &before), before, "no row or old column changed");
 
@@ -780,6 +780,7 @@ async fn going_back_to_migration_10_keeps_every_return(db: PgPool) {
     )
     .await;
     for (down, set) in [
+        (include_str!("../migrations/0023_test_roots.down.sql"), ""),
         (include_str!("../migrations/0022_app_authorize_validate.down.sql"), ""),
         (include_str!("../migrations/0021_app_authorize.down.sql"), ""),
         (include_str!("../migrations/0020_devices_grant_index.down.sql"), ""),
@@ -920,7 +921,7 @@ async fn a_stray_open_transaction_fails_the_migration_instead_of_hanging(db: PgP
     assert_eq!(versions(&db).await, (1..=10).collect::<Vec<_>>());
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
 }
 
 /// Migration 13: a test TIN (root 000-000-000) is only ever one an Admin or
@@ -997,7 +998,7 @@ async fn test_tins_are_admin_rows_and_block_a_rollback(db: PgPool) {
             .unwrap();
     assert_eq!(checks, 0);
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
 }
 
 /// The migrations of the release before BIR uptime: 1 to 13.
@@ -1046,7 +1047,7 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
     release_13().run(&db).await.unwrap();
     let schema_13 = schema(&db).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
 
     // What a try may hold: a live failure has a class and a kind, a lab
     // try neither and is never counted, times are to the minute, keys are
@@ -1198,9 +1199,10 @@ async fn bir_uptime_goes_back_to_13_and_its_history_comes_back(db: PgPool) {
         assert_eq!(rows, 0, "{table}");
     }
 
-    // By hand, as psql runs it, the down file does the same (after 17's,
-    // 16's and 15's, newest first).
+    // By hand, as psql runs it, the down file does the same (after 23's
+    // to 15's, newest first).
     for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
         include_str!("../migrations/0022_app_authorize_validate.down.sql"),
         include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
@@ -1298,7 +1300,7 @@ async fn a_stray_open_transaction_fails_migration_14(db: PgPool, table: &str) {
     assert_eq!(versions(&db).await, (1..=13).collect::<Vec<_>>(), "{table}");
     stray.rollback().await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     let validated: bool =
         sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tickets_bir_admission_check'")
             .fetch_one(&db)
@@ -1337,7 +1339,7 @@ async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
     let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
     let boss = id(&db, "INSERT INTO accounts (email, role) VALUES ('boss@example.test', 'admin') RETURNING id").await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
 
     let hash = "decode(repeat('ab', 32), 'hex')";
     let set = |columns: &str| format!("UPDATE accounts SET {columns} WHERE id = '{ana}'");
@@ -1392,6 +1394,7 @@ async fn fixed_codes_live_on_test_accounts_and_go_back_to_14(db: PgPool) {
     exec(&db, &set(&whole)).await;
     exec(&db, &line("fixed_code_set")).await;
     for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
         include_str!("../migrations/0022_app_authorize_validate.down.sql"),
         include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
@@ -1433,7 +1436,7 @@ async fn account_deletion_goes_back_to_15(db: PgPool) {
     let code = "INSERT INTO email_codes (email, code_hash, expires_at) VALUES ('ana@example.test', decode('01', 'hex'), now())";
     exec(&db, code).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     let purposes: Vec<String> = sqlx::query_scalar("SELECT purpose FROM email_codes").fetch_all(&db).await.unwrap();
     assert_eq!(purposes, ["sign_in"]);
 
@@ -1471,6 +1474,7 @@ async fn account_deletion_goes_back_to_15(db: PgPool) {
     exec(&db, &with_purpose("delete")).await;
     exec(&db, &line("deleted")).await;
     for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
         include_str!("../migrations/0022_app_authorize_validate.down.sql"),
         include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
@@ -1510,7 +1514,7 @@ async fn in_app_sign_in_goes_back_to_16(db: PgPool) {
     let code = "INSERT INTO email_codes (email, code_hash, expires_at) VALUES ('ana@example.test', decode('01', 'hex'), now())";
     exec(&db, code).await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
 
     let request = |intent: &str, platform: &str, hash_bytes: usize| {
         format!(
@@ -1563,6 +1567,7 @@ async fn in_app_sign_in_goes_back_to_16(db: PgPool) {
     MIGRATOR.run(&db).await.unwrap();
     exec(&db, &request("sign_in", "'android'", 32)).await;
     for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
         include_str!("../migrations/0022_app_authorize_validate.down.sql"),
         include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
@@ -1614,7 +1619,7 @@ async fn one_device_row_per_install_goes_back_to_17(db: PgPool) {
     )
     .await;
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     // No row was rewritten: an earlier device reads its sign-in as its
     // creation.
     let (signed_in, install): (Option<String>, Option<String>) =
@@ -1665,6 +1670,7 @@ async fn one_device_row_per_install_goes_back_to_17(db: PgPool) {
     // Up again, then back by hand.
     MIGRATOR.run(&db).await.unwrap();
     for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
         include_str!("../migrations/0022_app_authorize_validate.down.sql"),
         include_str!("../migrations/0021_app_authorize.down.sql"),
         include_str!("../migrations/0020_devices_grant_index.down.sql"),
@@ -1723,7 +1729,7 @@ async fn migration_20_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
     // ... and works once it is dropped.
     exec(&db, "DROP INDEX CONCURRENTLY IF EXISTS devices_grant_id").await;
     buwiz_cloud::migrate(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     let valid: bool = sqlx::query_scalar(
         "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'devices_grant_id'",
     )
@@ -1804,7 +1810,7 @@ async fn app_codes_go_back_to_20(db: PgPool) {
     let before = rows(db.clone()).await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     assert_eq!(rows(db.clone()).await, before, "no grant or device changed");
     exec(&db, &code("02", "buwiz-desktop", "'install-phone-0001', 'ios'")).await;
     fails_with(&db, &code("03", "buwiz-desktop", "'short', 'ios'"), "oauth_codes_install_id_check").await;
@@ -1836,6 +1842,7 @@ async fn app_codes_go_back_to_20(db: PgPool) {
     exec(&db, &code("05", "buwiz-desktop", "'install-phone-0001', 'android'")).await;
     exec(&db, &format!("INSERT INTO new_device_mails (account_id) VALUES ('{ana}')")).await;
     for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
         include_str!("../migrations/0022_app_authorize_validate.down.sql"),
         include_str!("../migrations/0021_app_authorize.down.sql"),
     ] {
@@ -1903,7 +1910,7 @@ async fn migration_22_validates_21s_checks_and_goes_back_to_21(db: PgPool) {
     fails_with(&db, "UPDATE devices SET removed_by = 'someone'", "devices_removed_by_check").await;
 
     MIGRATOR.run(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     assert_eq!(checks_validated(&db).await, valid);
 
     MIGRATOR.undo(&db, 21).await.unwrap();
@@ -1912,9 +1919,14 @@ async fn migration_22_validates_21s_checks_and_goes_back_to_21(db: PgPool) {
     release_21().run(&db).await.unwrap();
 
     MIGRATOR.run(&db).await.unwrap();
-    let mut tx = db.begin().await.unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0022_app_authorize_validate.down.sql")).execute(&mut *tx).await.unwrap();
-    tx.commit().await.unwrap();
+    for down in [
+        include_str!("../migrations/0023_test_roots.down.sql"),
+        include_str!("../migrations/0022_app_authorize_validate.down.sql"),
+    ] {
+        let mut tx = db.begin().await.unwrap();
+        sqlx::raw_sql(down).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
     assert_eq!(versions(&db).await, (1..=21).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_21);
     let devices: i64 = sqlx::query_scalar("SELECT count(*) FROM devices").fetch_one(&db).await.unwrap();
@@ -1972,7 +1984,7 @@ async fn migration_21_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
         .await
         .expect("migration 22 waited for the writes")
         .unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     writing.rollback().await.unwrap();
 
     // Behind a SHARE lock, 22 fails and records nothing.
@@ -1986,9 +1998,302 @@ async fn migration_21_fails_behind_a_long_transaction_and_recovers(db: PgPool) {
     }
 
     buwiz_cloud::migrate(&db).await.unwrap();
-    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
     for _ in 0..db.size() {
         let setting: String = sqlx::query_scalar("SHOW lock_timeout").fetch_one(&db).await.unwrap();
         assert_eq!(setting, "0", "the pool's connections keep the default");
     }
+}
+
+/// The migrations of the release before reserved test roots: 1 to 22.
+fn release_22() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(MIGRATOR.iter().filter(|migration| migration.version <= 22).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// A test TIN's row an Admin made, at `root` and `branch`.
+fn admin_test_row(account: Uuid, root: &str, branch: &str, status: &str, by: &str) -> String {
+    format!(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ('{account}', 'personal', '{root}', '{branch}', 'TEST TAXPAYER', '{status}', now(), '{by}') RETURNING id"
+    )
+}
+
+/// Migration 23: migration 13's check holds for every reserved root, and
+/// only for those; going back to 22 refuses while a row holds a root 13
+/// did not reserve, then puts 13's check back exactly; the way up works
+/// again, by sqlx and by hand.
+#[sqlx::test(migrations = false)]
+async fn reserved_test_roots_go_back_to_22(db: PgPool) {
+    release_22().run(&db).await.unwrap();
+    let schema_22 = schema(&db).await;
+    let check = "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'tin_claims_test_tin_check'";
+    let check_22: String = sqlx::query_scalar(check).fetch_one(&db).await.unwrap();
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    // A zero-root test TIN from 13 stays as it is.
+    let zeros = id(&db, &admin_test_row(ana, "000000000", "00000", "approved", "admin")).await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
+    let validated: bool =
+        sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'tin_claims_test_tin_check'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(validated);
+
+    let insert = |root: &str, status: &str, extra: &str, values: &str| {
+        format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status{extra})
+             VALUES ('{ana}', 'personal', '{root}', '00009', 'TEST TAXPAYER', '{status}'{values}) RETURNING id"
+        )
+    };
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        for (status, extra, values) in [
+            ("unverified", "", ""),
+            ("pending", "", ""),
+            ("approved", ", decided_at, verified_by", ", now(), 'staff'"),
+            ("approved", ", decided_at, verified_by", ", now(), 'auto'"),
+            ("pending", ", verified_by", ", 'admin'"),
+            ("rejected", ", verified_by", ", 'admin'"),
+        ] {
+            fails_with(&db, &insert(root, status, extra, values), "tin_claims_test_tin_check").await;
+        }
+        let mut branch = 0;
+        for (status, by) in [("approved", "seed"), ("removed", "admin"), ("revoked", "seed")] {
+            branch += 1;
+            id(&db, &admin_test_row(ana, root, &format!("{branch:05}"), status, by)).await;
+        }
+    }
+    // A real TIN is as before, and so is a near miss of a reserved root.
+    for root in ["000123453", "111111113"] {
+        exec(&db, &insert(root, "unverified", "", "")).await;
+    }
+
+    // A dry-run return on one of them.
+    let test_claim =
+        id(&db, "SELECT id FROM tin_claims WHERE tin_root = '111111114' ORDER BY branch_code LIMIT 1").await;
+    exec(&db, &stored_return(ana, test_claim)).await;
+
+    // Back to 22: refused while 111-111-114 has a row, ended ones too, and
+    // it says to keep the rows and their returns; nothing is deleted.
+    let refused = MIGRATOR.undo(&db, 22).await.unwrap_err().to_string();
+    assert!(refused.contains("3 row(s) hold the test root 111-111-114"), "{refused}");
+    for words in [
+        "Stop the rollback",
+        "Do not delete these rows or their submissions and tickets",
+        "end each claim on the staff pages with a reason (removed or revoked)",
+        "write to the owner, who decides",
+    ] {
+        assert!(refused.contains(words), "{words}: {refused}");
+    }
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
+    assert_eq!(returns_of(&db, test_claim).await, 1);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE tin_root = '111111114'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(left, 3);
+    // (The test's own clean-up; the runbook never deletes them.)
+    exec(&db, &format!("DELETE FROM submissions WHERE claim_id = '{test_claim}'")).await;
+    exec(&db, "DELETE FROM tin_claims WHERE tin_root = '111111114'").await;
+    MIGRATOR.undo(&db, 22).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_22, "the schema is migration 22's");
+    assert_eq!(sqlx::query_scalar::<_, String>(check).fetch_one(&db).await.unwrap(), check_22);
+    // At 22, 111-111-114 is an ordinary TIN again, and zeros still checked.
+    exec(&db, &insert("111111114", "unverified", "", "")).await;
+    fails_with(&db, &insert("000000000", "unverified", "", ""), "tin_claims_test_tin_check").await;
+    release_22().run(&db).await.unwrap();
+    exec(&db, "DELETE FROM tin_claims WHERE tin_root = '111111114'").await;
+
+    // Up again, then back by hand.
+    MIGRATOR.run(&db).await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0023_test_roots.down.sql")).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    assert_eq!(schema(&db).await, schema_22);
+    assert_eq!(sqlx::query_scalar::<_, String>(check).fetch_one(&db).await.unwrap(), check_22);
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tin_claims WHERE id = $1").bind(zeros).fetch_one(&db).await.unwrap();
+    assert_eq!(kept, 1);
+}
+
+/// Migration 23 refuses to run while a row holds a reserved root and is not
+/// a test TIN, and names each such row: at 22 a person's claim on
+/// 111-111-114, in any status (even one an Admin made active), is a real
+/// TIN. Nothing changes; once the rows are handled it goes in.
+#[sqlx::test(migrations = false)]
+async fn migration_23_refuses_a_real_claim_on_a_reserved_root(db: PgPool) {
+    release_22().run(&db).await.unwrap();
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    let pending = id(
+        &db,
+        &format!(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status)
+             VALUES ('{ana}', 'personal', '111111114', '00000', 'JUAN REAL', 'pending') RETURNING id"
+        ),
+    )
+    .await;
+    // Activated by an Admin without papers: still a real person's TIN.
+    let activated = id(&db, &admin_test_row(ana, "111111114", "00001", "approved", "admin")).await;
+    // A return the release before sent for it as a real TIN.
+    exec(&db, &stored_return(ana, activated)).await;
+    let refused = MIGRATOR.run(&db).await.unwrap_err().to_string();
+    assert!(refused.contains("refusing to reserve the test roots"), "{refused}");
+    for words in [
+        "Stop the deploy",
+        "Do not delete these rows or their submissions and tickets",
+        "end each claim on the staff pages with a reason (removed or revoked)",
+        "write to the owner, who decides",
+    ] {
+        assert!(refused.contains(words), "{words}: {refused}");
+    }
+    assert_eq!(returns_of(&db, activated).await, 1, "the return is kept");
+    for (claim, branch, status, by) in
+        [(pending, "00000", "pending", "(none)"), (activated, "00001", "approved", "admin")]
+    {
+        let named =
+            format!("id={claim} account_id={ana} root=111111114 branch={branch} status={status} verified_by={by}");
+        assert!(refused.contains(&named), "{named}: {refused}");
+    }
+    assert_eq!(versions(&db).await, (1..=22).collect::<Vec<_>>());
+    let check: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'tin_claims_test_tin_check'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(!check.contains("111111114"), "{check}");
+
+    // (The test's own clean-up, to see it go in; the runbook never deletes
+    // a claim, a ticket or a return.)
+    exec(&db, &format!("DELETE FROM submissions WHERE claim_id = '{activated}'")).await;
+    exec(&db, "DELETE FROM tin_claims WHERE tin_root = '111111114'").await;
+    MIGRATOR.run(&db).await.unwrap();
+    assert_eq!(versions(&db).await, (1..=23).collect::<Vec<_>>());
+}
+
+/// A sent return on `claim`.
+fn stored_return(account: Uuid, claim: Uuid) -> String {
+    format!(
+        "INSERT INTO submissions (account_id, claim_id, form_type, period, filename, xml_sha256, status, sent_at)
+         VALUES ('{account}', '{claim}', '1601Cv2018', '062025', '11111111400000-1601Cv2018-062025#a@example.test#.xml',
+             decode('dd', 'hex'), 'sent', now())"
+    )
+}
+
+async fn returns_of(db: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM submissions WHERE claim_id = $1").bind(claim).fetch_one(db).await.unwrap()
+}
+
+/// What in `text` deletes or rewrites a return, a ticket or a claim:
+/// any case, any spacing, a schema-qualified name (`public.submissions`,
+/// `public . submissions`) or a quoted one (`"submissions"`), `ONLY` and
+/// `IF EXISTS`, any `TRUNCATE` at all, `DROP TABLE`, and an `ALTER TABLE`
+/// that drops something from `submissions` or `tickets`.
+fn rewrites_returns(text: &str) -> Option<String> {
+    let flat = text.to_ascii_lowercase().replace('"', "");
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flat.replace(" .", ".").replace(". ", ".").replace("public.", "");
+    let flat = flat.replace(" only ", " ").replace(" if exists ", " ");
+    if flat.contains("truncate") {
+        return Some("truncate".into());
+    }
+    for table in ["submissions", "tickets", "tin_claims"] {
+        for verb in ["delete from", "update", "drop table"] {
+            if table == "tin_claims" && verb == "update" {
+                continue;
+            }
+            let statement = format!("{verb} {table}");
+            if flat.contains(&statement) {
+                return Some(statement);
+            }
+        }
+    }
+    for statement in flat.split(';') {
+        for table in ["submissions", "tickets"] {
+            if statement.contains(&format!("alter table {table}")) && statement.contains(" drop ") {
+                return Some(format!("alter table {table} ... drop"));
+            }
+        }
+    }
+    flat.contains("deleted with its tickets").then(|| "deleted with its tickets".into())
+}
+
+/// Migration 23's files and runbook never delete or rewrite a return or a
+/// ticket: a claim on 111-111-114 from before it may hold real filings.
+/// The runbook stops, keeps them, ends the claim with a reason and writes
+/// to the owner, and states the reservation's limit.
+#[test]
+fn migration_23_never_deletes_returns_or_tickets() {
+    for caught in [
+        "DELETE FROM public.\"submissions\" WHERE true",
+        "Update\n  \"Tickets\" SET jws = ''",
+        "truncate table tin_claims, submissions",
+        "TRUNCATE ONLY tickets",
+        "delete from only public.tickets",
+        "DELETE FROM Tin_Claims",
+        "delete from public . submissions",
+        "UPDATE public .\n tickets SET jws = ''",
+        "DROP TABLE submissions",
+        "drop table if exists public.\"tickets\" cascade",
+        "ALTER TABLE submissions DROP COLUMN receipt_jws",
+        "alter table only public . tickets\n  drop column jws",
+        "ALTER TABLE IF EXISTS \"submissions\" DROP CONSTRAINT submissions_status_check",
+    ] {
+        assert!(rewrites_returns(caught).is_some(), "{caught}");
+    }
+    assert_eq!(rewrites_returns("DELETE FROM _sqlx_migrations WHERE version = 23"), None);
+    assert_eq!(rewrites_returns("ALTER TABLE tin_claims DROP CONSTRAINT tin_claims_test_tin_check;"), None);
+    let deploy = include_str!("../docs/deploy.md");
+    let section = deploy.split("## Migration 23 (reserved test roots)").nth(1).expect("the section");
+    let section = &section[..section.find("\n## ").unwrap()];
+    for (name, text) in [
+        ("up", include_str!("../migrations/0023_test_roots.up.sql")),
+        ("down", include_str!("../migrations/0023_test_roots.down.sql")),
+        ("docs/deploy.md", section),
+    ] {
+        assert_eq!(rewrites_returns(text), None, "{name}");
+    }
+    let flat = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    for words in [
+        "The reservation assumes 111-111-114 is nobody's real TIN; if it is someone's, that person cannot register it and is sent to support, and a claim already holding it stops the deploy.",
+        "Stop the deploy.",
+        "Keep that account's submissions and tickets exactly as they are",
+        "End the claim the normal staff way, with a reason",
+        "Write to the owner",
+        "No step here deletes or changes a submission or a ticket.",
+    ] {
+        assert!(flat.contains(words), "{words}");
+    }
+}
+
+/// The release before reserved test roots never starts on a database at
+/// 23: its Gatekeeper runs its migrations first thing (src/lib.rs), and
+/// sqlx refuses any applied migration the binary does not embed, whatever
+/// the rows hold (a 111-111-114 test TIN is stored here only to show the
+/// case that matters). Nothing turns the check off. It covers the
+/// Gatekeeper's start only: not the Sender, which has no database, nor the
+/// `seed` and `bir` subcommands, which do not run the migrations. The
+/// Gatekeeper's guards on a test TIN's job (the reserved route, and the
+/// `dry_run` frame) and the runbook's lines in docs/deploy.md cover those.
+#[sqlx::test(migrations = false)]
+async fn the_release_before_never_starts_on_reserved_roots(db: PgPool) {
+    assert!(!MIGRATOR.ignore_missing, "the Gatekeeper must refuse a database newer than itself");
+    release_22().run(&db).await.unwrap();
+    MIGRATOR.run(&db).await.unwrap();
+    let ana = id(&db, "INSERT INTO accounts (email) VALUES ('ana@example.test') RETURNING id").await;
+    id(&db, &admin_test_row(ana, "111111114", "00000", "approved", "admin")).await;
+    let latest = *versions(&db).await.last().unwrap();
+
+    let refused = release_22().run(&db).await.unwrap_err();
+    assert!(
+        matches!(refused, sqlx::migrate::MigrateError::VersionMissing(version) if version > 22 && version <= latest),
+        "{refused}"
+    );
+    // The refusal changed nothing.
+    assert_eq!(*versions(&db).await.last().unwrap(), latest);
 }

@@ -4,7 +4,8 @@
 //! Gatekeeper on a private network.
 //!
 //! For each send the Gatekeeper opens `GET /internal/relay` (WebSocket,
-//! `Authorization: Bearer $SENDER_SECRET`), sends one [`Job`] as a text
+//! `Authorization: Bearer $SENDER_SECRET`; `/internal/relay/reserved` for a
+//! test TIN's job, below), sends one [`Job`] as a text
 //! frame, then bridges the app's relay pipe to it frame for frame. The
 //! Sender runs the send through the pipe (see `crate::bir`) and ends with
 //! the pipe's `result`, carrying a receipt it signed.
@@ -14,19 +15,38 @@
 //! `failed` and [`NOT_BUILT_IN`]: nothing reaches BIR.
 //!
 //! A v2 job carries the app's ticket and sealed envelope. The Sender checks
-//! the ticket (signature, expiry, single use), opens the envelope, and
-//! sends only when the XML's SHA-256, TIN, form and period are the
-//! ticket's. The file name comes from the ticket. A v1 job's XML must name
-//! the job's TIN, form and period too (the Gatekeeper checked it against
-//! the file name when the return came; this covers one stored before).
+//! the ticket (signature, expiry, single use), reads its TIN (14 digits),
+//! opens the envelope, and sends only when the XML's SHA-256, TIN, form and
+//! period are the ticket's. The file name comes from the ticket. A v1 job's
+//! file name must name exactly the job's TIN, and its XML the job's TIN,
+//! form and period (the Gatekeeper checked the XML against the file name
+//! when the return came; this covers one stored before, or a stored job
+//! that disagrees with its file name). A job that fails either is refused
+//! as a mismatch, and nothing is sent.
 //!
-//! A send for a test TIN (root `000-000-000`, [`Tin::is_test`]) is always a
-//! dry run, whatever `BIR_RELAY_MODE` says: once the return is tied to its
-//! ticket's TIN (v2) or to the job's (v1), the Sender hands the BIR code
-//! settings in `dry_run` for that one send, so no dispatcher login and no
-//! upload stream can happen. Its receipt says `dry_run`, signed with the
-//! usual receipt key, and so does the job's `sender` frame. This is the
-//! guard: the Gatekeeper lets a test TIN through its gate like any other.
+//! A send for a test TIN (a reserved root, [`Tin::is_test`]) is always a
+//! dry run, whatever `BIR_RELAY_MODE` says, `dry_run` included: once the
+//! return is tied to its ticket's TIN (v2) or to the job's (v1), [`plan`]
+//! decides from that TIN alone, and the BIR code gets blanked settings
+//! ([`Given::Blanked`]: no dispatcher, upload host, pinned key or lab
+//! server) for that one send, so no dispatcher login and no upload stream
+//! can happen. Its receipt says `dry_run`, signed with the usual receipt
+//! key, and so does the job's `sender` frame. This is the guard: the
+//! Gatekeeper lets a test TIN through its gate like any other.
+//!
+//! The Gatekeeper has two more guards, for a Sender older than it that
+//! knows fewer reserved roots. It sends a test TIN's job only to
+//! [`RESERVED_RELAY_ROUTE`], which an older Sender does not have: the
+//! connection fails and the job never leaves the Gatekeeper. This Sender
+//! refuses a test TIN's job on [`RELAY_ROUTE`] and any other job on the
+//! reserved one. On either route its `sender` frame says `dry_run` only
+//! for a job that reads as a test TIN's.
+//! And for a test TIN's job the Gatekeeper wants the Sender's first frame
+//! to be the `sender` frame saying `dry_run`, and after it only a `result`
+//! that is `dry_run` (with a receipt whose mode and status say `dry_run`)
+//! or `failed`.
+//! Anything else ends the try `failed`, with nothing of it sent on to the
+//! app, so no stream to the BIR is opened.
 
 pub mod identity;
 mod outcome;
@@ -46,6 +66,7 @@ use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures_util::future::BoxFuture;
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -175,16 +196,138 @@ fn public_key(raw: &str) -> anyhow::Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).context("not an Ed25519 key")
 }
 
+/// How one send is made: its mode, and the settings the BIR code gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub mode: Mode,
+    pub given: Given,
+}
+
+/// The settings the BIR code gets for one send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Given {
+    /// The relay's own (`BIR_*`), in its own mode.
+    Relay,
+    /// `dry_run` with no dispatcher, no upload host, no pinned key and no
+    /// lab server: nothing to contact.
+    Blanked,
+}
+
+/// The plan of one send: for a test TIN's, a dry run with blanked settings
+/// whatever the relay's own mode (`dry_run` too); for every other, the
+/// relay's own mode and settings.
+pub fn plan(relay_mode: Mode, test_tin: bool) -> Plan {
+    if test_tin {
+        Plan { mode: Mode::DryRun, given: Given::Blanked }
+    } else {
+        Plan { mode: relay_mode, given: Given::Relay }
+    }
+}
+
+/// One send, as [`Delivery`] gets it.
+pub struct Order<'a> {
+    pub tin: &'a Tin,
+    pub form_type: &'a str,
+    pub filename: &'a str,
+    pub xml: &'a [u8],
+    pub plan: Plan,
+}
+
+/// Hands one send to the BIR code, with the settings its plan says.
+pub trait Delivery: std::marker::Send + Sync {
+    fn deliver<'a>(
+        &'a self,
+        pipe: &'a Pipe,
+        relay: &'a RelaySettings,
+        order: Order<'a>,
+    ) -> BoxFuture<'a, Result<Sent, SendError>>;
+}
+
+/// The BIR relay.
+#[cfg(feature = "bir")]
+struct Bir;
+
+#[cfg(feature = "bir")]
+impl Delivery for Bir {
+    fn deliver<'a>(
+        &'a self,
+        pipe: &'a Pipe,
+        relay: &'a RelaySettings,
+        order: Order<'a>,
+    ) -> BoxFuture<'a, Result<Sent, SendError>> {
+        Box::pin(async move {
+            let job = crate::bir::Job {
+                tin_root: order.tin.root(),
+                form_type: order.form_type,
+                filename: order.filename,
+                xml: order.xml,
+            };
+            match order.plan.given {
+                Given::Relay => crate::bir::send(pipe, &job, relay).await,
+                Given::Blanked => crate::bir::send(pipe, &job, &blanked(relay)).await,
+            }
+        })
+    }
+}
+
+/// [`Given::Blanked`]: the relay's settings with nothing left to contact.
+/// It keeps the IAF passphrase: `bir::send` encrypts the return with it
+/// before it looks at the mode, to compute the `payload_sha256` that the
+/// dry run's receipt carries. The encryption happens in this process, and
+/// in a dry run nothing leaves it. A default-build test reads this body
+/// (`blanked_keeps_nothing_to_contact`), since the type is private.
+#[cfg(feature = "bir")]
+fn blanked(relay: &RelaySettings) -> RelaySettings {
+    crate::bir::Settings {
+        mode: Mode::DryRun,
+        iaf_passphrase: relay.iaf_passphrase.clone(),
+        dispatcher_passphrase: Zeroizing::new(String::new()),
+        dispatchers: Vec::new(),
+        sftp_hosts: Vec::new(),
+        pinned_keys: Vec::new(),
+        lab: None,
+        tls: relay.tls.clone(),
+        sftp_timeout: relay.sftp_timeout,
+    }
+}
+
+/// Built without the BIR relay: nothing is sent.
+#[cfg(not(feature = "bir"))]
+struct NotBuilt;
+
+#[cfg(not(feature = "bir"))]
+impl Delivery for NotBuilt {
+    fn deliver<'a>(
+        &'a self,
+        _pipe: &'a Pipe,
+        _relay: &'a RelaySettings,
+        _order: Order<'a>,
+    ) -> BoxFuture<'a, Result<Sent, SendError>> {
+        Box::pin(async { Err(SendError::NotSent(NOT_BUILT_IN.to_owned())) })
+    }
+}
+
 pub struct Sender {
     config: SenderConfig,
     /// Tickets already used, with their expiry. A ticket is useless after
     /// it expires, so expired entries are dropped.
     spent: Mutex<HashMap<Uuid, i64>>,
+    delivery: Arc<dyn Delivery>,
 }
 
 impl Sender {
     pub fn new(config: SenderConfig) -> Arc<Self> {
-        Arc::new(Self { config, spent: Mutex::default() })
+        #[cfg(feature = "bir")]
+        let delivery = Arc::new(Bir);
+        #[cfg(not(feature = "bir"))]
+        let delivery = Arc::new(NotBuilt);
+        Arc::new(Self { config, spent: Mutex::default(), delivery })
+    }
+
+    /// A Sender that hands its sends to `delivery`.
+    #[cfg(test)]
+    fn with_delivery(config: SenderConfig, delivery: Arc<dyn Delivery>) -> Arc<Self> {
+        Arc::new(Self { config, spent: Mutex::default(), delivery })
     }
 
     /// What the Gatekeeper publishes for apps: the receipt key and the
@@ -214,17 +357,23 @@ impl Sender {
                 let Ok(tin) = Tin::parse_any(&tin_root, &branch_code) else {
                     return failed("the job's TIN is not valid".into());
                 };
-                let named = format!("{}{}", tin.root(), tin.branch());
-                let expected =
-                    identity::Expected { tin: &named, form: &form_type, period: &period, named_by: "file name" };
-                if let Err(reason) = identity::check_against(&xml, &expected) {
-                    return mismatch("file name", &reason);
+                // The file name must name exactly the job's TIN: one that
+                // names another (a test TIN's included) is refused, never
+                // sent and never a dry run.
+                match parse_filename(&filename) {
+                    Ok(name) if name.tin == tin => {}
+                    Ok(_) => return mismatch("job", "the file name's TIN is not the job's TIN"),
+                    Err(_) => return mismatch("job", "the file name is not an eBIRForms file name"),
                 }
-                // The XML now names the job's TIN; a file name that names a
-                // test TIN makes it a dry run too.
-                let test = tin.is_test() || names_a_test_tin(&filename);
-                let mode = self.mode_for(test);
-                let send = Send { submission_id, account_id, tin, form_type, period, filename, xml, jti: None, mode };
+                let named = fourteen_digits(&tin);
+                let expected = identity::Expected { tin: &named, form: &form_type, period: &period, named_by: "job" };
+                if let Err(reason) = identity::check_against(&xml, &expected) {
+                    return mismatch("job", &reason);
+                }
+                // The job's TIN, which the file name and the XML were just
+                // tied to.
+                let plan = plan(self.config.relay.mode, tin.is_test());
+                let send = Send { submission_id, account_id, tin, form_type, period, filename, xml, jti: None, plan };
                 self.send(pipe, send).await
             }
             Job::V2 { submission_id, account_id, ticket, envelope } => {
@@ -239,6 +388,9 @@ impl Sender {
                 if !self.spend(claims.jti, claims.exp) {
                     return failed("the ticket was already used".into());
                 }
+                let Some(tin) = ticket_tin(&claims.tin) else {
+                    return failed("the ticket's TIN is not valid".into());
+                };
                 let xml = match self.config.sealing_key.open(&envelope, &claims.jti.to_string()) {
                     Ok(xml) => xml,
                     Err(reason) => return failed(reason.into()),
@@ -246,94 +398,90 @@ impl Sender {
                 if crypto::hex(&crypto::sha256(&xml)) != claims.payload_sha256 {
                     return failed("the sealed return is not the one the ticket names".into());
                 }
-                if let Err(reason) = identity::check(&xml, &claims) {
+                let named = fourteen_digits(&tin);
+                let expected =
+                    identity::Expected { tin: &named, form: &claims.form, period: &claims.period, named_by: "ticket" };
+                if let Err(reason) = identity::check_against(&xml, &expected) {
                     return mismatch("ticket", &reason);
                 }
-                let Ok(tin) = Tin::parse_any(&claims.tin[..9], &claims.tin[9..]) else {
-                    return failed("the ticket's TIN is not valid".into());
-                };
                 // The signed ticket's TIN, which the XML was just tied to.
-                let mode = self.mode_for(tin.is_test());
+                let plan = plan(self.config.relay.mode, tin.is_test());
                 let send = Send {
                     submission_id,
                     account_id,
-                    tin,
                     filename: claims.filename(),
+                    tin,
                     form_type: claims.form,
                     period: claims.period,
                     xml,
                     jti: Some(claims.jti),
-                    mode,
+                    plan,
                 };
                 self.send(pipe, send).await
             }
         }
     }
 
-    /// The mode of one send: `dry_run` for a test TIN's, whatever
-    /// `BIR_RELAY_MODE` says; the Sender's own mode for every other.
-    fn mode_for(&self, test_tin: bool) -> Mode {
-        if test_tin { Mode::DryRun } else { self.config.relay.mode }
+    /// The mode the job's `sender` frame says, before the job runs: the
+    /// mode [`Sender::handle`] sends it in, read from the job's TIN (v1) or
+    /// the ticket's (v2, once its signature checks). A job that fails its
+    /// checks sends nothing at all.
+    pub fn job_mode(&self, job: &Job) -> Mode {
+        plan(self.config.relay.mode, self.is_test_job(job)).mode
     }
 
-    /// The mode the job's `sender` frame says, before the job runs: the
-    /// mode [`Sender::handle`] sends it in, read from what the job names (a
-    /// v2 ticket's TIN once its signature checks). A job that names a test
-    /// TIN but fails its checks sends nothing at all.
-    pub fn job_mode(&self, job: &Job) -> Mode {
-        let test = match job {
-            Job::V1 { tin_root, branch_code, filename, .. } => {
-                Tin::parse_any(tin_root, branch_code).is_ok_and(|tin| tin.is_test()) || names_a_test_tin(filename)
+    /// Why a v2 job's ticket does not check (signature, expiry), if it
+    /// does not. `None` for a v1 job.
+    fn ticket_refusal(&self, job: &Job) -> Option<String> {
+        let Job::V2 { ticket, .. } = job else {
+            return None;
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        tickets::verify(&self.config.ticket_keys, ticket, now).err().map(|error| error.to_string())
+    }
+
+    /// Whether `job` is a test TIN's: its TIN (v1) or its ticket's (v2,
+    /// once its signature checks) has a reserved root.
+    fn is_test_job(&self, job: &Job) -> bool {
+        match job {
+            Job::V1 { tin_root, branch_code, .. } => {
+                Tin::parse_any(tin_root, branch_code).is_ok_and(|tin| tin.is_test())
             }
             Job::V2 { ticket, .. } => {
                 let now = OffsetDateTime::now_utc().unix_timestamp();
                 tickets::verify(&self.config.ticket_keys, ticket, now)
-                    .is_ok_and(|claims| claims.tin.get(..9) == Some(crate::account::tin::TEST_ROOT))
+                    .ok()
+                    .and_then(|claims| ticket_tin(&claims.tin))
+                    .is_some_and(|tin| tin.is_test())
             }
-        };
-        self.mode_for(test)
-    }
-
-    /// Hands the return to the BIR relay, in the send's own mode: a dry run
-    /// gets settings with no dispatcher, upload host or lab server at all.
-    #[cfg(feature = "bir")]
-    async fn deliver(&self, pipe: &Pipe, send: &Send) -> Result<Sent, SendError> {
-        let job = crate::bir::Job {
-            tin_root: send.tin.root(),
-            form_type: &send.form_type,
-            filename: &send.filename,
-            xml: &send.xml,
-        };
-        if send.mode == self.config.relay.mode {
-            return crate::bir::send(pipe, &job, &self.config.relay).await;
         }
-        let relay = &self.config.relay;
-        let dry_run = crate::bir::Settings {
-            mode: Mode::DryRun,
-            iaf_passphrase: relay.iaf_passphrase.clone(),
-            dispatcher_passphrase: Zeroizing::new(String::new()),
-            dispatchers: Vec::new(),
-            sftp_hosts: Vec::new(),
-            pinned_keys: Vec::new(),
-            lab: None,
-            tls: relay.tls.clone(),
-            sftp_timeout: relay.sftp_timeout,
-        };
-        crate::bir::send(pipe, &job, &dry_run).await
     }
 
-    /// Built without the BIR relay: nothing is sent.
-    #[cfg(not(feature = "bir"))]
-    async fn deliver(&self, _pipe: &Pipe, _send: &Send) -> Result<Sent, SendError> {
-        Err(SendError::NotSent(NOT_BUILT_IN.to_owned()))
+    /// Whether `job` reads as a test TIN's, for its `sender` frame on the
+    /// reserved route: [`Sender::is_test_job`], or a v2 job whose ticket
+    /// does not check but names a test TIN (read unverified). Only the
+    /// frame rests on the second: such a job is then refused with the
+    /// ticket's reason and sends nothing.
+    fn reads_as_test_job(&self, job: &Job) -> bool {
+        self.is_test_job(job)
+            || matches!(job, Job::V2 { ticket, .. } if jws::claims_unverified(ticket)
+                .and_then(|claims| claims["tin"].as_str().and_then(ticket_tin))
+                .is_some_and(|tin| tin.is_test()))
     }
 
     async fn send(&self, pipe: &Pipe, send: Send) -> Control {
-        let mode = send.mode;
-        if mode != self.config.relay.mode {
+        let mode = send.plan.mode;
+        if send.plan.given == Given::Blanked {
             tracing::info!(submission = %send.submission_id, "test TIN: dry run, not sent to BIR");
         }
-        match self.deliver(pipe, &send).await {
+        let order = Order {
+            tin: &send.tin,
+            form_type: &send.form_type,
+            filename: &send.filename,
+            xml: &send.xml,
+            plan: send.plan,
+        };
+        match self.delivery.deliver(pipe, &self.config.relay, order).await {
             Ok(sent) => {
                 let status = if mode == Mode::DryRun { "dry_run" } else { "sent" };
                 let mut claims = json!({
@@ -384,31 +532,51 @@ struct Send {
     filename: String,
     xml: Vec<u8>,
     jti: Option<Uuid>,
-    /// [`Sender::mode_for`] this send.
-    mode: Mode,
+    /// [`plan`] for this send.
+    plan: Plan,
 }
 
-/// Whether an eBIRForms file name names a test TIN.
-fn names_a_test_tin(filename: &str) -> bool {
-    parse_filename(filename).is_ok_and(|name| name.tin.is_test())
+/// A ticket's TIN: exactly 14 ASCII digits, root then branch. Anything
+/// else (short, long, dashed, other digits) is `None`. Read by characters,
+/// so no input can split a character.
+fn ticket_tin(raw: &str) -> Option<Tin> {
+    let root: String = raw.chars().take(9).collect();
+    let branch: String = raw.chars().skip(9).collect();
+    let tin = Tin::parse_any(&root, &branch).ok()?;
+    (fourteen_digits(&tin) == raw).then_some(tin)
+}
+
+/// Root and branch, as a return and a ticket write them.
+fn fourteen_digits(tin: &Tin) -> String {
+    format!("{}{}", tin.root(), tin.branch())
 }
 
 fn failed(reason: String) -> Control {
     Control::Result { status: "failed".to_owned(), error: Some(reason), receipt: None }
 }
 
-/// A return that is not the one its file name or ticket names: final, so
-/// it carries its code in brackets and the app does not retry it.
+/// A return that is not the one its job (v1) or ticket (v2) names: final,
+/// so it carries its code in brackets and the app does not retry it.
 fn mismatch(named_by: &str, reason: &str) -> Control {
     failed(format!("The return does not match its {named_by}: {reason}. (return_mismatch)"))
 }
 
-/// The Sender's routes: `/healthz`, `/internal/public`, `/internal/relay`.
+/// Where the Gatekeeper sends every job but a test TIN's.
+pub const RELAY_ROUTE: &str = "/internal/relay";
+
+/// Where the Gatekeeper sends a test TIN's job, and only that. A Sender
+/// from before reserved roots has no such route, so the Gatekeeper cannot
+/// connect and the job never leaves it.
+pub const RESERVED_RELAY_ROUTE: &str = "/internal/relay/reserved";
+
+/// The Sender's routes: `/healthz`, `/internal/public`, [`RELAY_ROUTE`]
+/// and [`RESERVED_RELAY_ROUTE`].
 pub fn router(sender: Arc<Sender>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/internal/public", get(public))
-        .route("/internal/relay", get(relay_job))
+        .route(RELAY_ROUTE, get(relay_job))
+        .route(RESERVED_RELAY_ROUTE, get(reserved_relay_job))
         .with_state(sender)
 }
 
@@ -430,10 +598,34 @@ async fn public(State(sender): State<Arc<Sender>>, headers: HeaderMap) -> Respon
 }
 
 async fn relay_job(State(sender): State<Arc<Sender>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
-    if !authorized(&sender, &headers) {
+    take_job(sender, &headers, upgrade, false)
+}
+
+async fn reserved_relay_job(
+    State(sender): State<Arc<Sender>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    take_job(sender, &headers, upgrade, true)
+}
+
+fn take_job(sender: Arc<Sender>, headers: &HeaderMap, upgrade: WebSocketUpgrade, reserved: bool) -> Response {
+    if !authorized(&sender, headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    upgrade.max_message_size(crate::filing::submissions::BODY_LIMIT).on_upgrade(move |socket| run_job(sender, socket))
+    upgrade
+        .max_message_size(crate::filing::submissions::BODY_LIMIT)
+        .on_upgrade(move |socket| run_job(sender, socket, reserved))
+}
+
+/// What a job that came on the wrong route ends with: a test TIN's on
+/// [`RELAY_ROUTE`], or another on [`RESERVED_RELAY_ROUTE`]. Nothing is sent.
+fn wrong_route(reserved: bool) -> Control {
+    if reserved {
+        failed("the Sender takes only a test TIN's job on its reserved route".into())
+    } else {
+        failed("the Sender takes a test TIN's job only on its reserved route".into())
+    }
 }
 
 /// The Sender's first text frame on a job's socket: the job's relay mode
@@ -444,20 +636,41 @@ pub fn sender_frame(mode: Mode) -> String {
     json!({ "type": "sender", "mode": mode.as_str() }).to_string()
 }
 
-async fn run_job(sender: Arc<Sender>, mut socket: WebSocket) {
+/// Runs one job's socket. `reserved`: the job came on
+/// [`RESERVED_RELAY_ROUTE`], so it must be a test TIN's; on
+/// [`RELAY_ROUTE`] it must not be. A job on the wrong route is refused
+/// before it runs.
+async fn run_job(sender: Arc<Sender>, mut socket: WebSocket, reserved: bool) {
     let job = match socket.recv().await {
         Some(Ok(Message::Text(text))) => serde_json::from_str::<Job>(&text).ok(),
         _ => None,
     };
-    let mode = job.as_ref().map_or(sender.config.relay.mode, |job| sender.job_mode(job));
+    // On the reserved route the `sender` frame says `dry_run` only for a
+    // job that reads as a test TIN's, so a test job refused there (a v2 one
+    // whose ticket does not check) ends with its own reason, not the
+    // Gatekeeper's. Any other job gets the mode `plan` gives it.
+    let mode = match &job {
+        Some(job) if reserved && sender.reads_as_test_job(job) => Mode::DryRun,
+        Some(job) => sender.job_mode(job),
+        None => sender.config.relay.mode,
+    };
     let _ = socket.send(Message::Text(sender_frame(mode).into())).await;
     let (to_app, from_server) = mpsc::channel(64);
     let (to_server, from_app) = mpsc::channel(64);
     let pump = tokio::spawn(relay::pump_socket(socket, from_server, to_server));
     let pipe = Pipe::new(to_app, from_app);
-    let result = match job {
-        Some(job) => sender.handle(&pipe, job).await,
-        None => failed("the Sender did not understand the job".into()),
+    // A test TIN's v2 job whose ticket does not check (so its TIN cannot
+    // be read) ends with the ticket's reason, as on the plain route.
+    let ticket_refused = job.as_ref().filter(|_| reserved).and_then(|job| sender.ticket_refusal(job));
+    let result = match (job, ticket_refused) {
+        (Some(_), Some(reason)) => failed(reason),
+        (Some(job), None) if sender.is_test_job(&job) != reserved => {
+            let (Job::V1 { submission_id, .. } | Job::V2 { submission_id, .. }) = &job;
+            tracing::error!(submission = %submission_id, reserved, "a job came on the wrong route; not sent");
+            wrong_route(reserved)
+        }
+        (Some(job), None) => sender.handle(&pipe, job).await,
+        (None, _) => failed("the Sender did not understand the job".into()),
     };
     pipe.finish(result).await;
     drop(pipe);
@@ -473,10 +686,15 @@ pub async fn serve(listener: tokio::net::TcpListener, sender: Arc<Sender>) -> an
 #[cfg(all(test, not(feature = "bir")))]
 mod tests {
     use super::*;
+    use crate::account::tin::TEST_ROOTS;
 
     fn config() -> SenderConfig {
+        config_in(Mode::Live)
+    }
+
+    fn config_in(mode: Mode) -> SenderConfig {
         SenderConfig {
-            relay: RelaySettings { mode: Mode::Live },
+            relay: RelaySettings { mode },
             sealing_key: SealingKey::from_bytes(&[7; 32]).unwrap(),
             receipt_key: SigningKey::from_bytes(&[8; 32]),
             ticket_keys: vec![SigningKey::from_bytes(&[9; 32]).verifying_key()],
@@ -518,6 +736,206 @@ mod tests {
         (result, from_server.try_recv().is_ok())
     }
 
+    /// A delivery that sends nothing: it records each send it is asked for
+    /// (the TIN, 14 digits, and the plan) and answers as a send that went.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(String, Plan)>>);
+
+    impl Delivery for Recorder {
+        fn deliver<'a>(
+            &'a self,
+            _pipe: &'a Pipe,
+            _relay: &'a RelaySettings,
+            order: Order<'a>,
+        ) -> BoxFuture<'a, Result<Sent, SendError>> {
+            self.0.lock().unwrap().push((fourteen_digits(order.tin), order.plan));
+            Box::pin(async { Ok(Sent { remote_path: "stub".into(), payload_sha256: "0".repeat(64) }) })
+        }
+    }
+
+    /// What a Sender in `relay` mode, with a [`Recorder`], answers `job`,
+    /// and what delivery was asked for.
+    async fn asked(relay: Mode, job: Job) -> (Control, Vec<(String, Plan)>) {
+        let recorder = Arc::new(Recorder::default());
+        let sender = Sender::with_delivery(config_in(relay), recorder.clone());
+        let (to_app, _from_server) = mpsc::channel(8);
+        let (_to_server, from_app) = mpsc::channel(8);
+        let pipe = Pipe::new(to_app, from_app);
+        let result = sender.handle(&pipe, job).await;
+        let asked = recorder.0.lock().unwrap().clone();
+        (result, asked)
+    }
+
+    /// The receipt's `mode` and `status`, checked against the receipt key.
+    fn receipt_says(result: &Control) -> (String, String) {
+        let Control::Result { status, error: None, receipt: Some(Value::String(receipt)) } = result else {
+            panic!("no receipt: {result:?}");
+        };
+        let keys = [SigningKey::from_bytes(&[8; 32]).verifying_key()];
+        let claims = jws::verify(&keys, RECEIPT_TYP, receipt).expect("signed with the receipt key");
+        assert_eq!(claims["status"], json!(status));
+        (claims["mode"].as_str().unwrap().to_owned(), status.clone())
+    }
+
+    const BLANKED: Plan = Plan { mode: Mode::DryRun, given: Given::Blanked };
+
+    /// Real roots that differ from a reserved one by one digit, and others.
+    const NEAR_MISSES: &[&str] = &[
+        "111111113",
+        "111111115",
+        "111111104",
+        "111111214",
+        "011111114",
+        "211111114",
+        "111111111",
+        "000000001",
+        "100000000",
+        "000000010",
+        "123456789",
+    ];
+
+    #[test]
+    fn the_plan_of_a_test_send_is_blanked_in_every_mode() {
+        for mode in [Mode::Live, Mode::Lab, Mode::DryRun] {
+            assert_eq!(plan(mode, true), BLANKED);
+            assert_eq!(plan(mode, false), Plan { mode, given: Given::Relay });
+        }
+    }
+
+    /// `handle` in `live`, v1 and v2: every reserved root at three branches
+    /// asks delivery for a dry run with blanked settings, and its receipt
+    /// says `dry_run`; a real root, a near miss included, asks for `live`
+    /// with the relay's own settings.
+    #[tokio::test]
+    async fn handle_asks_for_a_blanked_dry_run_for_a_test_tin_in_live_mode() {
+        for branch in ["00000", "00001", "00017"] {
+            for root in TEST_ROOTS {
+                let tin = format!("{root}{branch}");
+                let (v1, v2) = jobs_for(&tin);
+                for job in [v1, v2] {
+                    let (result, asked) = asked(Mode::Live, job).await;
+                    assert_eq!(asked, vec![(tin.clone(), BLANKED)], "{tin}");
+                    assert_eq!(receipt_says(&result), ("dry_run".into(), "dry_run".into()), "{tin}");
+                }
+            }
+            for root in NEAR_MISSES {
+                let tin = format!("{root}{branch}");
+                let (v1, v2) = jobs_for(&tin);
+                for job in [v1, v2] {
+                    let (result, asked) = asked(Mode::Live, job).await;
+                    assert_eq!(asked, vec![(tin.clone(), Plan { mode: Mode::Live, given: Given::Relay })], "{tin}");
+                    assert_eq!(receipt_says(&result), ("live".into(), "sent".into()), "{tin}");
+                }
+            }
+        }
+    }
+
+    /// In `dry_run` and `lab` too, a test send gets blanked settings; a
+    /// real one keeps the relay's own mode and settings, as before.
+    #[tokio::test]
+    async fn a_test_send_gets_blanked_settings_in_dry_run_and_lab_too() {
+        for relay in [Mode::DryRun, Mode::Lab] {
+            for root in TEST_ROOTS {
+                let tin = format!("{root}00000");
+                let (v1, v2) = jobs_for(&tin);
+                for job in [v1, v2] {
+                    let (result, asked) = asked(relay, job).await;
+                    assert_eq!(asked, vec![(tin.clone(), BLANKED)], "{relay:?} {tin}");
+                    assert_eq!(receipt_says(&result).0, "dry_run");
+                }
+            }
+            let tin = "12345678900000";
+            let (v1, v2) = jobs_for(tin);
+            for job in [v1, v2] {
+                let (result, asked) = asked(relay, job).await;
+                assert_eq!(asked, vec![(tin.to_owned(), Plan { mode: relay, given: Given::Relay })], "{relay:?}");
+                assert_eq!(receipt_says(&result).0, relay.as_str());
+            }
+        }
+    }
+
+    /// A v1 job whose file name names another TIN than the job's, a test
+    /// TIN's or a real one's, is refused as a mismatch: delivery is never
+    /// asked, so it is neither sent nor a dry run. The same TIN written with
+    /// the old 3-digit branch is the same TIN.
+    #[tokio::test]
+    async fn a_v1_file_name_must_name_the_jobs_tin() {
+        let refused = |words: &str| Control::Result {
+            status: "failed".into(),
+            error: Some(format!("The return does not match its job: {words}. (return_mismatch)")),
+            receipt: None,
+        };
+        let other = refused("the file name's TIN is not the job's TIN");
+        let mut cases: Vec<(String, String, Control)> = Vec::new();
+        for root in TEST_ROOTS {
+            // A real job, a test TIN's file name, and the other way round.
+            cases.push(("12345678900000".into(), format!("{root}00000"), other.clone()));
+            cases.push((format!("{root}00000"), "12345678900000".into(), other.clone()));
+            // The same test root at another branch.
+            cases.push((format!("{root}00000"), format!("{root}00001"), other.clone()));
+            for near in NEAR_MISSES {
+                cases.push((format!("{near}00000"), format!("{root}00000"), other.clone()));
+                cases.push((format!("{root}00000"), format!("{near}00000"), other.clone()));
+            }
+        }
+        // One reserved root's job, the other's file name.
+        cases.push(("00000000000000".into(), "11111111400000".into(), other.clone()));
+        for (job_tin, named, answer) in cases {
+            let (mut job, _) = jobs_for(&job_tin);
+            if let Job::V1 { filename, .. } = &mut job {
+                *filename = format!("{named}-1601Cv2018-062025#juan@example.com#.xml");
+            }
+            assert_eq!(asked(Mode::Live, job).await, (answer, vec![]), "{job_tin} named {named}");
+        }
+        // Not a file name at all.
+        let (mut job, _) = jobs_for("11111111400000");
+        if let Job::V1 { filename, .. } = &mut job {
+            *filename = "return.xml".into();
+        }
+        let answer = refused("the file name is not an eBIRForms file name");
+        assert_eq!(asked(Mode::Live, job).await, (answer, vec![]));
+        // The same TIN, the old 3-digit branch: sent as the job's TIN says.
+        for (tin, plan) in
+            [("12345678900000", Plan { mode: Mode::Live, given: Given::Relay }), ("11111111400000", BLANKED)]
+        {
+            let (mut job, _) = jobs_for(tin);
+            if let Job::V1 { filename, .. } = &mut job {
+                *filename = format!("{}-1601Cv2018-062025#juan@example.com#.xml", &tin[..12]);
+            }
+            assert_eq!(asked(Mode::Live, job).await.1, vec![(tin.to_owned(), plan)], "{tin}");
+        }
+    }
+
+    /// A v2 ticket whose TIN is short or not ASCII digits (here with a
+    /// return that names the same, so only the TIN can refuse it) fails
+    /// cleanly, and `job_mode` reads it as no test TIN.
+    #[tokio::test]
+    async fn a_short_or_non_ascii_ticket_tin_fails_cleanly() {
+        let line = |key: &str, value: &str| format!("<div>frm1601c:{key}={value}frm1601c:{key}=</div>");
+        for (tin, parts) in [
+            ("123", ["1", "2", "3"]),
+            ("11111111", ["111", "111", "11"]),
+            ("12345678\u{e9}0000", ["123", "456", "78\u{e9}0000"]),
+            ("111111114\u{e9}000", ["111", "111", "114\u{e9}000"]),
+            ("111-111-114-00000", ["111-", "111-", "114-00000"]),
+            ("111111114000000", ["111", "111", "114000000"]),
+        ] {
+            let xml: String =
+                [("txtYear", "2025"), ("txtTIN1", parts[0]), ("txtTIN2", parts[1]), ("txtTIN3", parts[2])]
+                    .into_iter()
+                    .map(|(key, value)| line(key, value))
+                    .collect();
+            let job = ticketed(tin, &xml);
+            assert_eq!(Sender::new(config()).job_mode(&job), Mode::Live, "{tin}");
+            let answer = Control::Result {
+                status: "failed".into(),
+                error: Some("the ticket's TIN is not valid".into()),
+                receipt: None,
+            };
+            assert_eq!(asked(Mode::Live, job).await, (answer, vec![]), "{tin}");
+        }
+    }
+
     #[test]
     fn the_sender_frame_says_the_mode_and_is_no_control() {
         for (mode, json) in [
@@ -545,15 +963,9 @@ mod tests {
         assert!(!opened, "nothing was opened through the pipe");
     }
 
-    /// A v1 job and a v2 one (ticket, sealed return) for the 1601C return
-    /// of `tin` (14 digits), whose ticket is signed with the trusted key.
-    fn jobs_for(tin: &str) -> (Job, Job) {
-        let xml = return_1601c([&tin[..3], &tin[3..6], &tin[6..9], &tin[9..]]);
-        let mut v1 = v1_job(&xml);
-        if let Job::V1 { tin_root, filename, .. } = &mut v1 {
-            *tin_root = tin[..9].into();
-            *filename = format!("{tin}-1601Cv2018-062025#juan@example.com#.xml");
-        }
+    /// A v2 job whose ticket, signed with the trusted key, names `tin`,
+    /// and whose sealed return is `xml`.
+    fn ticketed(tin: &str, xml: &str) -> Job {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let jti = Uuid::new_v4();
         let claims = tickets::TicketClaims {
@@ -576,35 +988,56 @@ mod tests {
         let envelope =
             crate::filing::envelope::seal(&sealing.public_bytes(), &sealing.kid(), &jti.to_string(), xml.as_bytes())
                 .unwrap();
-        (v1, Job::V2 { submission_id: Uuid::nil(), account_id: Uuid::nil(), ticket, envelope })
+        Job::V2 { submission_id: Uuid::nil(), account_id: Uuid::nil(), ticket, envelope }
     }
 
-    /// In `live`, a test TIN's job is a dry run, v1 or v2, and its `sender`
-    /// frame says so; a real TIN's keeps the Sender's mode. A ticket that
-    /// does not verify says the Sender's mode (it sends nothing anyway).
+    /// A v1 job and a v2 one (ticket, sealed return) for the 1601C return
+    /// of `tin` (14 digits), whose ticket is signed with the trusted key.
+    fn jobs_for(tin: &str) -> (Job, Job) {
+        let xml = return_1601c([&tin[..3], &tin[3..6], &tin[6..9], &tin[9..]]);
+        let mut v1 = v1_job(&xml);
+        if let Job::V1 { tin_root, branch_code, filename, .. } = &mut v1 {
+            *tin_root = tin[..9].into();
+            *branch_code = tin[9..].into();
+            *filename = format!("{tin}-1601Cv2018-062025#juan@example.com#.xml");
+        }
+        (v1, ticketed(tin, &xml))
+    }
+
+    /// In `live`, a test TIN's job is a dry run, v1 or v2, for every
+    /// reserved root at any branch, and its `sender` frame says so; a real
+    /// TIN's keeps the Sender's mode. A ticket that does not verify says
+    /// the Sender's mode (it sends nothing anyway), and so does a real
+    /// job whose file name names a test TIN (it is refused).
     #[test]
     fn a_test_tins_job_is_a_dry_run_in_live_mode() {
         let sender = Sender::new(config());
-        for (tin, mode) in
-            [("00000000000000", Mode::DryRun), ("00000000000017", Mode::DryRun), ("12345678900000", Mode::Live)]
-        {
+        let mut cases: Vec<(String, Mode)> = TEST_ROOTS
+            .iter()
+            .flat_map(|root| [(format!("{root}00000"), Mode::DryRun), (format!("{root}00017"), Mode::DryRun)])
+            .collect();
+        // Near misses of the reserved roots are real TINs.
+        for real in NEAR_MISSES {
+            cases.push((format!("{real}00000"), Mode::Live));
+        }
+        for (tin, mode) in &cases {
             let (v1, v2) = jobs_for(tin);
-            assert_eq!(sender.job_mode(&v1), mode, "{tin}");
-            assert_eq!(sender.job_mode(&v2), mode, "{tin}");
-            assert_eq!(sender.mode_for(tin.starts_with("000000000")), mode);
+            assert_eq!(sender.job_mode(&v1), *mode, "{tin}");
+            assert_eq!(sender.job_mode(&v2), *mode, "{tin}");
         }
-        let (_, mut forged) = jobs_for("00000000000000");
-        if let Job::V2 { ticket, .. } = &mut forged {
-            let claims = tickets::verify(&sender.config.ticket_keys, ticket, 0).unwrap();
-            *ticket = tickets::sign(&SigningKey::from_bytes(&[1; 32]), &claims);
+        for root in TEST_ROOTS {
+            let (_, mut forged) = jobs_for(&format!("{root}00000"));
+            if let Job::V2 { ticket, .. } = &mut forged {
+                let claims = tickets::verify(&sender.config.ticket_keys, ticket, 0).unwrap();
+                *ticket = tickets::sign(&SigningKey::from_bytes(&[1; 32]), &claims);
+            }
+            assert_eq!(sender.job_mode(&forged), Mode::Live, "{root}");
+            let (mut v1, _) = jobs_for("12345678900000");
+            if let Job::V1 { filename, .. } = &mut v1 {
+                *filename = format!("{root}00000-1601Cv2018-062025#juan@example.com#.xml");
+            }
+            assert_eq!(sender.job_mode(&v1), Mode::Live, "{root}");
         }
-        assert_eq!(sender.job_mode(&forged), Mode::Live);
-        // A real TIN's job whose file name names a test TIN: a dry run.
-        let (mut v1, _) = jobs_for("12345678900000");
-        if let Job::V1 { filename, .. } = &mut v1 {
-            *filename = "00000000000000-1601Cv2018-062025#juan@example.com#.xml".into();
-        }
-        assert_eq!(sender.job_mode(&v1), Mode::DryRun);
     }
 
     /// Without the `bir` feature a test TIN's send is not refused for its
@@ -612,25 +1045,168 @@ mod tests {
     #[tokio::test]
     async fn a_test_tin_is_not_refused_for_its_tin() {
         let unsent = Control::Result { status: "failed".into(), error: Some(NOT_BUILT_IN.into()), receipt: None };
-        let (v1, v2) = jobs_for("00000000000000");
-        for job in [v1, v2] {
-            assert_eq!(answer(job).await, (unsent.clone(), false));
+        for root in TEST_ROOTS {
+            let (v1, v2) = jobs_for(&format!("{root}00000"));
+            for job in [v1, v2] {
+                assert_eq!(answer(job).await, (unsent.clone(), false), "{root}");
+            }
         }
     }
 
+    /// The v1 identity check is against the job: its words say "job", not
+    /// "file name".
     #[tokio::test]
     async fn a_v1_return_for_another_tin_is_refused_before_sending() {
         for (xml, words) in [
-            (return_1601c(["123", "456", "780", "00000"]), "the TIN in the return is not the file name's TIN"),
-            (return_1601c(["123", "456", "789", "00001"]), "the TIN in the return is not the file name's TIN"),
+            (return_1601c(["123", "456", "780", "00000"]), "the TIN in the return is not the job's TIN"),
+            (return_1601c(["123", "456", "789", "00001"]), "the TIN in the return is not the job's TIN"),
+            (return_1601c(["111", "111", "114", "00000"]), "the TIN in the return is not the job's TIN"),
             ("<return/>".to_owned(), "the return has no form fields"),
         ] {
             let (result, opened) = answer(v1_job(&xml)).await;
             // Final, as the relay protocol says: a code in brackets.
-            let error = format!("The return does not match its file name: {words}. (return_mismatch)");
+            let error = format!("The return does not match its job: {words}. (return_mismatch)");
             assert_eq!(result, Control::Result { status: "failed".into(), error: Some(error), receipt: None });
             assert!(!opened);
         }
+    }
+
+    /// The Sender takes a test TIN's job only on its reserved route, and
+    /// only a test TIN's job there, v1 and v2. A job on the wrong route
+    /// gets its `sender` frame and then a refusal, and nothing is sent; one
+    /// on the right route runs (and, without the `bir` feature, ends unsent).
+    #[tokio::test]
+    async fn a_job_on_the_wrong_route_is_refused() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as Up;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Sender::new(config())));
+        let link = crate::filing::link::SenderLink::new(&format!("http://{address}"), Zeroizing::new("x".repeat(32)));
+        let unsent = failed(NOT_BUILT_IN.into());
+        let mut cases = Vec::new();
+        for (tin, test) in [("11111111400000", true), ("00000000000000", true), ("12345678900000", false)] {
+            let (v1, v2) = jobs_for(tin);
+            for job in [v1, v2] {
+                // The `sender` frame says `dry_run` for a test job only, on
+                // either route.
+                let mode = if test { Mode::DryRun } else { Mode::Live };
+                cases.push((tin, job.clone(), !test, mode, wrong_route(!test)));
+                cases.push((tin, job, test, mode, unsent.clone()));
+            }
+        }
+        for (tin, job, reserved, mode, answer) in cases {
+            let job = match job {
+                // A ticket is used once: each case gets its own.
+                Job::V2 { .. } => jobs_for(tin).1,
+                v1 => v1,
+            };
+            let mut socket = link.open(reserved).await.unwrap();
+            socket.send(Up::Text(serde_json::to_string(&job).unwrap().into())).await.unwrap();
+            let mut frames = Vec::new();
+            while let Some(Ok(Up::Text(text))) = socket.next().await {
+                frames.push(text.to_string());
+                if matches!(relay::Frame::decode_text(&text), Some(relay::Frame::Control(Control::Result { .. }))) {
+                    break;
+                }
+            }
+            let result = serde_json::to_string(&answer).unwrap();
+            assert_eq!(frames, [sender_frame(mode), result], "{tin} on reserved={reserved}");
+        }
+    }
+
+    /// A test TIN's v2 job whose ticket does not check, on the reserved
+    /// route: its `sender` frame says `dry_run` (so the Gatekeeper passes
+    /// it on) and its result gives the ticket's reason. A real TIN's job
+    /// with a bad ticket there, and a job the Sender cannot read, are not
+    /// test jobs: their `sender` frame says the Sender's own mode (`live`),
+    /// which the Gatekeeper refuses for a test TIN's try.
+    #[tokio::test]
+    async fn a_test_jobs_bad_ticket_says_why_on_the_reserved_route() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as Up;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = Sender::new(config());
+        let keys = sender.config.ticket_keys.clone();
+        tokio::spawn(serve(listener, sender));
+        let link = crate::filing::link::SenderLink::new(&format!("http://{address}"), Zeroizing::new("x".repeat(32)));
+        let forged = |tin: &str| {
+            let (_, mut forged) = jobs_for(tin);
+            if let Job::V2 { ticket, .. } = &mut forged {
+                let claims = tickets::verify(&keys, ticket, 0).unwrap();
+                *ticket = tickets::sign(&SigningKey::from_bytes(&[1; 32]), &claims);
+            }
+            let Job::V2 { ticket, .. } = &forged else { unreachable!() };
+            let reason =
+                tickets::verify(&keys, ticket, OffsetDateTime::now_utc().unix_timestamp()).unwrap_err().to_string();
+            (serde_json::to_string(&forged).unwrap(), failed(reason))
+        };
+        let (test, test_answer) = forged("11111111400000");
+        let (real, real_answer) = forged("12345678900000");
+        // A test TIN's ticket that ran out, signed by the right key.
+        let (_, mut expired) = jobs_for("11111111400000");
+        if let Job::V2 { ticket, .. } = &mut expired {
+            let mut claims = tickets::verify(&keys, ticket, 0).unwrap();
+            claims.exp = OffsetDateTime::now_utc().unix_timestamp() - 1;
+            *ticket = tickets::sign(&SigningKey::from_bytes(&[9; 32]), &claims);
+        }
+        let expired = serde_json::to_string(&expired).unwrap();
+        for (job, mode, answer) in [
+            (test, Mode::DryRun, test_answer),
+            (expired, Mode::DryRun, failed(tickets::TicketError::Expired.to_string())),
+            (real, Mode::Live, real_answer),
+            ("not a job".to_owned(), Mode::Live, failed("the Sender did not understand the job".into())),
+        ] {
+            let mut socket = link.open(true).await.unwrap();
+            socket.send(Up::Text(job.into())).await.unwrap();
+            let mut frames = Vec::new();
+            while let Some(Ok(Up::Text(text))) = socket.next().await {
+                frames.push(text.to_string());
+                if frames.len() == 2 {
+                    break;
+                }
+            }
+            assert_eq!(frames, [sender_frame(mode), serde_json::to_string(&answer).unwrap()]);
+        }
+    }
+
+    /// `blanked()` is built only with the `bir` feature (its settings type
+    /// is private), so this reads its body: every setting that could reach
+    /// the BIR is empty, the mode is `dry_run`, and it keeps only the IAF
+    /// passphrase (to compute the receipt's `payload_sha256`), the TLS
+    /// roots and the SFTP timeout. Any other shape fails, and so does a
+    /// `Bir` delivery that no longer blanks a test send.
+    #[test]
+    fn blanked_keeps_nothing_to_contact() {
+        let source = include_str!("mod.rs");
+        let signature = concat!("fn blanked(", "relay: &RelaySettings) -> RelaySettings {");
+        assert_eq!(source.matches(signature).count(), 1, "blanked() is there, once");
+        let body = &source[source.find(signature).unwrap()..];
+        let body = &body[..body.find("\n}\n").expect("the end of blanked()")];
+        let lines: Vec<&str> = body.lines().skip(1).map(str::trim).collect();
+        assert_eq!(
+            lines,
+            [
+                "crate::bir::Settings {",
+                "mode: Mode::DryRun,",
+                "iaf_passphrase: relay.iaf_passphrase.clone(),",
+                "dispatcher_passphrase: Zeroizing::new(String::new()),",
+                "dispatchers: Vec::new(),",
+                "sftp_hosts: Vec::new(),",
+                "pinned_keys: Vec::new(),",
+                "lab: None,",
+                "tls: relay.tls.clone(),",
+                "sftp_timeout: relay.sftp_timeout,",
+                "}",
+            ]
+        );
+        let blanks = concat!("Given::Blanked => ", "crate::bir::send(pipe, &job, &blanked(relay)).await,");
+        assert_eq!(source.matches(blanks).count(), 1, "a test send gets blanked settings");
+        let relay = concat!("Given::Relay => ", "crate::bir::send(pipe, &job, relay).await,");
+        assert_eq!(source.matches(relay).count(), 1, "only a real send gets the relay's");
     }
 }
 
@@ -746,27 +1322,45 @@ mod bir_tests {
         result
     }
 
-    /// A test TIN in `live`: a dry run, v1 and v2, with a `dry_run` receipt
-    /// under the receipt key, and the dispatcher never hears of it.
+    /// A test TIN in `live`, for every reserved root at head office: a dry
+    /// run, v1 and v2, with a `dry_run` receipt under the receipt key, and
+    /// the dispatcher never hears of it.
     #[tokio::test]
     async fn a_test_tin_is_a_dry_run_in_live_mode() {
         let (dispatcher, contacted) = counting().await;
         let sender = Sender::new(live(dispatcher));
-        for job in jobs_for("00000000000000") {
-            assert_eq!(sender.job_mode(&job), Mode::DryRun);
-            let Control::Result { status, error, receipt: Some(Value::String(receipt)) } =
-                run(&sender, job, dispatcher).await
-            else {
-                panic!("no receipt");
-            };
-            assert_eq!((status.as_str(), error), ("dry_run", None));
-            let keys = [sender.config.receipt_key.verifying_key()];
-            let claims = jws::verify(&keys, RECEIPT_TYP, &receipt).expect("signed with the receipt key");
-            assert_eq!((&claims["mode"], &claims["status"]), (&json!("dry_run"), &json!("dry_run")), "{claims}");
-            assert_eq!(claims["tin"], "000-000-000-00000");
-            assert_eq!(claims["payload_sha256"].as_str().map(str::len), Some(64));
+        for root in crate::account::tin::TEST_ROOTS {
+            for job in jobs_for(&format!("{root}00000")) {
+                assert_eq!(sender.job_mode(&job), Mode::DryRun, "{root}");
+                let Control::Result { status, error, receipt: Some(Value::String(receipt)) } =
+                    run(&sender, job, dispatcher).await
+                else {
+                    panic!("no receipt for {root}");
+                };
+                assert_eq!((status.as_str(), error), ("dry_run", None), "{root}");
+                let keys = [sender.config.receipt_key.verifying_key()];
+                let claims = jws::verify(&keys, RECEIPT_TYP, &receipt).expect("signed with the receipt key");
+                assert_eq!((&claims["mode"], &claims["status"]), (&json!("dry_run"), &json!("dry_run")), "{claims}");
+                let shown = format!("{}-{}-{}-00000", &root[..3], &root[3..6], &root[6..]);
+                assert_eq!(claims["tin"], json!(shown));
+                assert_eq!(claims["payload_sha256"].as_str().map(str::len), Some(64));
+            }
         }
         assert_eq!(contacted.load(Ordering::SeqCst), 0, "no dispatcher login");
+    }
+
+    /// What a test send hands the BIR code: `dry_run`, with nothing to
+    /// contact, whatever the relay's own settings.
+    #[test]
+    fn blanked_settings_have_nothing_to_contact() {
+        for mode in [Mode::Live, Mode::Lab, Mode::DryRun] {
+            let mut relay = live(1).relay;
+            relay.mode = mode;
+            let blank = blanked(&relay);
+            assert_eq!(blank.mode, Mode::DryRun);
+            assert!(blank.dispatchers.is_empty() && blank.sftp_hosts.is_empty() && blank.pinned_keys.is_empty());
+            assert!(blank.lab.is_none() && blank.dispatcher_passphrase.is_empty());
+        }
     }
 
     /// A real TIN in `live` goes to the dispatcher as before (this one

@@ -185,7 +185,7 @@ async fn call_tool(state: &AppState, bearer: &Bearer, params: &Value) -> Result<
                         // without them (or activated without them).
                         "sent_at": claim.submitted_at.map(OffsetDateTime::unix_timestamp),
                     });
-                    // A made-up TIN staff put on a test account: its sends are dry runs.
+                    // A test TIN (a reserved root) staff put on a test account: its sends are dry runs.
                     if claim.tin().is_test() {
                         row["test_only"] = json!(true);
                     }

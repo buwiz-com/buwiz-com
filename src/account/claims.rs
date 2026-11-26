@@ -1019,7 +1019,8 @@ pub async fn activate_without_papers(
 
 /// A test TIN an Admin adds to a test account.
 pub struct NewTestTin<'a> {
-    /// As typed: `000-000-000`, or with its branch.
+    /// As typed: a reserved root (`000-000-000` or `111-111-114`), or with
+    /// its branch.
     pub tin: &'a str,
     pub kind: ClaimKind,
     pub registered_name: &'a str,

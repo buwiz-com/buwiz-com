@@ -81,11 +81,35 @@ struct FakeSender {
     script: Arc<Mutex<Vec<Step>>>,
     /// The text frames it got from the bridge, newest job last.
     heard: Arc<Mutex<Vec<String>>>,
+    /// Each job's route and frame, as it came.
+    jobs: Arc<Mutex<Vec<(&'static str, String)>>>,
 }
 
 async fn fake_relay(State(fake): State<FakeSender>, upgrade: WebSocketUpgrade) -> Response {
+    run_script(fake, upgrade, sender::RELAY_ROUTE)
+}
+
+async fn fake_reserved_relay(State(fake): State<FakeSender>, upgrade: WebSocketUpgrade) -> Response {
+    run_script(fake, upgrade, sender::RESERVED_RELAY_ROUTE)
+}
+
+/// A fake Sender's routes: the plain one, and the reserved one unless it
+/// is an older Sender's (`reserved` false).
+fn fake_router(fake: FakeSender, reserved: bool) -> axum::Router {
+    let router = axum::Router::new().route(sender::RELAY_ROUTE, axum::routing::get(fake_relay));
+    let router = if reserved {
+        router.route(sender::RESERVED_RELAY_ROUTE, axum::routing::get(fake_reserved_relay))
+    } else {
+        router
+    };
+    router.with_state(fake)
+}
+
+fn run_script(fake: FakeSender, upgrade: WebSocketUpgrade, route: &'static str) -> Response {
     upgrade.on_upgrade(move |mut socket| async move {
-        let _job = socket.recv().await;
+        if let Some(Ok(WsMessage::Text(job))) = socket.recv().await {
+            fake.jobs.lock().unwrap().push((route, job.to_string()));
+        }
         let script = fake.script.lock().unwrap().clone();
         for step in script {
             match step {
@@ -234,10 +258,17 @@ impl Gatekeeper {
 
     /// With `ports` as the upload window's.
     async fn with_ports(world: &World, level: Level, ports: Vec<u16>) -> Self {
+        Self::fake(world, level, ports, true).await
+    }
+
+    /// Beside an older Sender, which has no reserved route.
+    async fn beside_an_older_sender(world: &World, level: Level) -> Self {
+        Self::fake(world, level, vec![22], false).await
+    }
+
+    async fn fake(world: &World, level: Level, ports: Vec<u16>, reserved: bool) -> Self {
         let sender = FakeSender::default();
-        let router =
-            axum::Router::new().route("/internal/relay", axum::routing::get(fake_relay)).with_state(sender.clone());
-        let sender_url = serve(router).await;
+        let sender_url = serve(fake_router(sender.clone(), reserved)).await;
         Self::at(world, Uptime::new(level, ports, false, OffsetDateTime::now_utc()), &sender_url, sender).await
     }
 
@@ -1407,19 +1438,22 @@ async fn a_test_tins_send_is_never_recorded(db: PgPool) {
         .execute(&db)
         .await
         .unwrap();
-    let test_claim: Uuid = sqlx::query_scalar(
-        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
-         VALUES ($1, 'business', '000000000', '00001', 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
-    )
-    .bind(world.account)
-    .fetch_one(&db)
-    .await
-    .unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
     let claims =
         json!({ "mode": "dry_run", "status": "dry_run", "remote_path": "/1601C/made-up.xml", "payload_sha256": "ab" });
     let dry_run = buwiz_cloud::filing::jws::sign(&key, sender::RECEIPT_TYP, &claims);
-    for v2 in [false, true] {
+    // Every reserved root, as the same path reads it.
+    for (root, v2) in buwiz_cloud::tin::TEST_ROOTS.iter().flat_map(|root| [(root, false), (root, true)]) {
+        let test_claim: Uuid = sqlx::query_scalar(
+            "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+             VALUES ($1, 'business', $2, $3, 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
+        )
+        .bind(world.account)
+        .bind(root)
+        .bind(if v2 { "00002" } else { "00001" })
+        .fetch_one(&db)
+        .await
+        .unwrap();
         let id = if v2 { world.v2(None).await } else { world.v1().await };
         sqlx::query("UPDATE submissions SET claim_id = $2 WHERE id = $1")
             .bind(id)
@@ -1434,7 +1468,7 @@ async fn a_test_tins_send_is_never_recorded(db: PgPool) {
         assert_eq!(
             result,
             json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run }),
-            "v2={v2}"
+            "{root} v2={v2}"
         );
         assert_eq!(status(&db, id).await, ("dry_run".to_owned(), Some("dry_run".to_owned())));
         let kept: Option<String> = sqlx::query_scalar("SELECT receipt_jws FROM submissions WHERE id = $1")
@@ -1445,6 +1479,444 @@ async fn a_test_tins_send_is_never_recorded(db: PgPool) {
         assert_eq!(kept.as_deref(), Some(dry_run.as_str()));
     }
     assert_eq!(tries(&db).await.len(), 1, "no row for a test TIN's send");
+}
+
+/// What a test TIN's try ends with when its Sender would not make it a dry
+/// run: a v1 one can be tried again, a v2 one needs a new ticket.
+const NOT_A_DRY_RUN: &str = "the sending service would not make this test send a dry run; try again later";
+const NOT_A_DRY_RUN_V2: &str =
+    "the sending service would not make this test send a dry run; ask for a new ticket and send again later";
+
+fn not_a_dry_run(v2: bool) -> &'static str {
+    if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }
+}
+
+/// A receipt as the Sender signs it, with these `mode` and `status`.
+fn receipt_saying(mode: &str, status: &str) -> String {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let claims = json!({ "mode": mode, "status": status, "remote_path": "/1601C/made-up.xml", "payload_sha256": "ab" });
+    buwiz_cloud::filing::jws::sign(&key, sender::RECEIPT_TYP, &claims)
+}
+
+/// A staff-made test TIN on root 111-111-114, as migrations 13 and 23
+/// allow it, on a test account.
+async fn test_root_claim(world: &World) -> Uuid {
+    test_claim_on(world, "111111114").await
+}
+
+/// A staff-made test TIN on `root` at head office, on a test account.
+async fn test_claim_on(world: &World, root: &str) -> Uuid {
+    sqlx::query("UPDATE accounts SET test_account = true WHERE id = $1")
+        .bind(world.account)
+        .execute(&world.db)
+        .await
+        .unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'personal', $2, '00000', 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
+    )
+    .bind(world.account)
+    .bind(root)
+    .fetch_one(&world.db)
+    .await
+    .unwrap()
+}
+
+/// A return waiting to be sent for `claim`.
+async fn waiting_for(world: &World, claim: Uuid, v2: bool) -> Uuid {
+    let id = if v2 { world.v2(None).await } else { world.v1().await };
+    sqlx::query("UPDATE submissions SET claim_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(claim)
+        .execute(&world.db)
+        .await
+        .unwrap();
+    id
+}
+
+/// The Gatekeeper's own guard for a test TIN: an older Sender knows fewer
+/// reserved roots and says `live` for a 111-111-114 job. Its first frame
+/// must be the `sender` frame saying `dry_run`, and the only frame after it
+/// a `result` that is `dry_run` (with a receipt whose mode and status say
+/// `dry_run`) or `failed`. Anything else (an `open`, binary, another frame,
+/// two `type` keys, a `sent` result, a live receipt, a dry run with no
+/// receipt or with one whose status is not `dry_run`) ends the try
+/// `failed` (a v1 one to be tried again, a v2 one with a new ticket), never
+/// `unknown`; the app hears only that, and the app's answer for the
+/// port is never used. A Sender that says `dry_run` and then a dry run's
+/// or a failed result passes as before
+/// ([`a_test_tins_send_is_never_recorded`]). A real TIN's live send is
+/// unchanged ([`apps_get_the_frames_they_got_before_but_for_the_added_fields`]).
+#[sqlx::test]
+async fn a_test_tins_send_that_is_not_a_dry_run_is_stopped(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::new(&world, Level::Public).await;
+    let claim = test_root_claim(&world).await;
+    let sent = result("sent", None, Some(receipt()));
+    let dry_run_then = |frame: &str| vec![hello(RelayMode::DryRun), text(frame), Step::Expect(1), sent.clone()];
+    let then_open = |first: Step| vec![first, open(1, "upload.test", 22), Step::Expect(1), sent.clone()];
+    let scripts = [
+        ("an older Sender", then_open(hello(RelayMode::Live))),
+        ("lab", then_open(hello(RelayMode::Lab))),
+        ("an unknown mode", then_open(text(r#"{"type":"sender","mode":"unknown"}"#))),
+        ("no mode", then_open(text(r#"{"type":"sender"}"#))),
+        ("no sender frame", vec![open(1, "upload.test", 22), Step::Expect(1), sent.clone()]),
+        ("a result first", vec![sent.clone()]),
+        ("dry_run, then an open", then_open(hello(RelayMode::DryRun))),
+        ("dry_run, then bytes", vec![hello(RelayMode::DryRun), Step::Binary(1, vec![0x16; 30]), sent.clone()]),
+        (
+            "dry_run, then a result that is an open too",
+            dry_run_then(
+                r#"{"type":"result","status":"dry_run","error":null,"receipt":null,"type":"open","stream":1,"host":"upload.test","port":22}"#,
+            ),
+        ),
+        (
+            "dry_run, then an open that is a result too",
+            dry_run_then(
+                r#"{"type":"open","stream":1,"host":"upload.test","port":22,"type":"result","status":"dry_run","error":null,"receipt":null}"#,
+            ),
+        ),
+        (
+            "dry_run, then an open to port 70000",
+            dry_run_then(r#"{"type":"open","stream":1,"host":"upload.test","port":70000}"#),
+        ),
+        ("dry_run, then another frame", dry_run_then(r#"{"type":"close","stream":1}"#)),
+        ("dry_run, then sent", vec![hello(RelayMode::DryRun), sent.clone()]),
+        ("dry_run, then a live receipt", vec![hello(RelayMode::DryRun), result("dry_run", None, Some(receipt()))]),
+        (
+            "dry_run, then a forged receipt",
+            vec![hello(RelayMode::DryRun), result("dry_run", None, Some("x.y.z".into()))],
+        ),
+        ("dry_run, then unknown", vec![hello(RelayMode::DryRun), result("unknown", Some("lost"), None)]),
+        ("dry_run, then a dry run with no receipt", vec![hello(RelayMode::DryRun), result("dry_run", None, None)]),
+        (
+            "dry_run, then a dry run whose receipt says status sent",
+            vec![hello(RelayMode::DryRun), result("dry_run", None, Some(receipt_saying("dry_run", "sent")))],
+        ),
+        (
+            "dry_run, then a dry run whose receipt's status is empty",
+            vec![hello(RelayMode::DryRun), result("dry_run", None, Some(receipt_saying("dry_run", "")))],
+        ),
+    ];
+    let jobs = 2 * scripts.len();
+    let answers = [(22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec()))];
+    for (name, script) in scripts {
+        for v2 in [false, true] {
+            let id = waiting_for(&world, claim, v2).await;
+            gatekeeper.sender.heard.lock().unwrap().clear();
+            let got = gatekeeper.send(&world, id, script.clone(), &answers, HOME).await;
+            let error = not_a_dry_run(v2);
+            let failed = json!({ "type": "result", "status": "failed", "error": error, "receipt": null });
+            assert_eq!((got.len(), texts(&got)), (1, vec![failed]), "{name}, v2 {v2}");
+            // Stored `failed` with that error, never `unknown`, and with
+            // nothing of a send: no receipt, no time sent, no remote path.
+            // A v1 return keeps its XML (it can be tried again); a v2 one
+            // loses its sealed return.
+            let stored: (String, Option<String>, bool, bool, bool, bool, bool) = sqlx::query_as(
+                "SELECT status, error, receipt_jws IS NULL, sent_at IS NULL, remote_path IS NULL,
+                        xml_ciphertext IS NOT NULL, envelope IS NULL
+                 FROM submissions WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                stored,
+                ("failed".to_owned(), Some(error.to_owned()), true, true, true, !v2, true),
+                "{name}, v2 {v2}"
+            );
+            let heard = gatekeeper.sender.heard.lock().unwrap().clone();
+            assert!(heard.iter().all(|frame| !frame.contains("opened")), "{name}, v2 {v2}: {heard:?}");
+        }
+    }
+    let routes: Vec<&str> = gatekeeper.sender.jobs.lock().unwrap().iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, vec![sender::RESERVED_RELAY_ROUTE; jobs], "a test TIN's job goes to the reserved route");
+
+    // A Sender that makes it a dry run, with a receipt whose mode and
+    // status say `dry_run`, passes as it is.
+    let dry_run = receipt_saying("dry_run", "dry_run");
+    for v2 in [false, true] {
+        let id = waiting_for(&world, claim, v2).await;
+        let script = vec![hello(RelayMode::DryRun), result("dry_run", None, Some(dry_run.clone()))];
+        let got = gatekeeper.send(&world, id, script, &[], HOME).await;
+        let passed = json!({ "type": "result", "status": "dry_run", "error": null, "receipt": dry_run });
+        assert_eq!((got.len(), texts(&got)), (1, vec![passed]), "v2 {v2}");
+        assert_eq!(status(&db, id).await, ("dry_run".to_owned(), Some("dry_run".to_owned())));
+    }
+    // And so does a failed result, with its reason (a ticket's, here).
+    for v2 in [false, true] {
+        let id = waiting_for(&world, claim, v2).await;
+        let script = vec![hello(RelayMode::DryRun), result("failed", Some("the ticket has expired"), None)];
+        let got = gatekeeper.send(&world, id, script, &[], HOME).await;
+        let passed =
+            json!({ "type": "result", "status": "failed", "error": "the ticket has expired", "receipt": null });
+        assert_eq!((got.len(), texts(&got)), (1, vec![passed]), "v2 {v2}");
+        assert_eq!(status(&db, id).await.0, "failed");
+    }
+    assert!(tries(&db).await.is_empty(), "no row for a test TIN's send");
+}
+
+/// An older Sender has no reserved route: a test TIN's job, v1 or v2,
+/// never reaches it (on any route), and the try ends as for a Sender that
+/// is not reachable. A real TIN's job still goes to the plain route and
+/// runs as before.
+#[sqlx::test]
+async fn a_test_tins_job_never_reaches_an_older_sender(db: PgPool) {
+    let world = World::new(db.clone()).await;
+    let gatekeeper = Gatekeeper::beside_an_older_sender(&world, Level::Public).await;
+    let claim = test_root_claim(&world).await;
+    let older = vec![
+        hello(RelayMode::Live),
+        open(1, "upload.test", 22),
+        Step::Expect(1),
+        result("sent", None, Some(receipt())),
+    ];
+    let answers = [(22, Answer::Open(b"SSH-2.0-made-up\r\n".to_vec()))];
+    for v2 in [false, true] {
+        let id = waiting_for(&world, claim, v2).await;
+        let got = gatekeeper.send(&world, id, older.clone(), &answers, HOME).await;
+        let unreachable = json!({
+            "type": "result", "status": "failed", "error": "the sending service is not reachable; try again later",
+            "receipt": null,
+        });
+        assert_eq!((got.len(), texts(&got)), (1, vec![unreachable]), "v2 {v2}");
+        assert_eq!(status(&db, id).await.0, "failed", "v2 {v2}");
+    }
+    assert!(gatekeeper.sender.jobs.lock().unwrap().is_empty(), "no job reached the older Sender");
+    assert!(gatekeeper.sender.heard.lock().unwrap().is_empty());
+    assert!(tries(&db).await.is_empty(), "no row for a test TIN's send");
+
+    // A real TIN's job: the plain route, its frames as before.
+    let (script, answers) = landed();
+    let got = gatekeeper.send(&world, world.v1().await, script, &answers, HOME).await;
+    assert!(texts(&got).iter().any(|frame| frame["type"] == "open"));
+    assert_eq!(the_result(&got).unwrap()["status"], "sent");
+    let routes: Vec<&str> = gatekeeper.sender.jobs.lock().unwrap().iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, [sender::RELAY_ROUTE]);
+}
+
+/// The upkeep ends a send stuck in `sending` for 10 minutes as `unknown`.
+/// A test TIN's, v1 or v2, on every reserved root, gets words that say it
+/// was a dry run and nothing reached the BIR; a real TIN's keeps "the
+/// server stopped while sending". A send under 10 minutes old is left.
+#[sqlx::test]
+async fn a_stuck_test_send_is_not_called_a_possible_filing(db: PgPool) {
+    const TEST_WORDS: &str =
+        "the server stopped during this test send; it was a dry run, so nothing was sent to the BIR";
+    let world = World::new(db.clone()).await;
+    let mut cases = Vec::new();
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        let claim = test_claim_on(&world, root).await;
+        for v2 in [false, true] {
+            cases.push((waiting_for(&world, claim, v2).await, TEST_WORDS, format!("{root} v2 {v2}")));
+        }
+    }
+    for v2 in [false, true] {
+        let id = if v2 { world.v2(None).await } else { world.v1().await };
+        cases.push((id, "the server stopped while sending", format!("real v2 {v2}")));
+    }
+    let ids: Vec<Uuid> = cases.iter().map(|(id, ..)| *id).collect();
+    sqlx::query(
+        "UPDATE submissions SET status = 'sending', sending_since = now() - interval '11 minutes' WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .execute(&db)
+    .await
+    .unwrap();
+    let recent = waiting_for(&world, test_root_claim_at(&world, "00001").await, false).await;
+    sqlx::query("UPDATE submissions SET status = 'sending', sending_since = now() WHERE id = $1")
+        .bind(recent)
+        .execute(&db)
+        .await
+        .unwrap();
+    buwiz_cloud::submissions::upkeep(&db).await.unwrap();
+    for (id, words, name) in cases {
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM submissions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), error.as_deref()), ("unknown", Some(words)), "{name}");
+    }
+    assert_eq!(status(&db, recent).await.0, "sending");
+}
+
+/// A staff-made test TIN on root 111-111-114 at `branch`.
+async fn test_root_claim_at(world: &World, branch: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO tin_claims (account_id, kind, tin_root, branch_code, registered_name, status, decided_at, verified_by)
+         VALUES ($1, 'personal', '111111114', $2, 'TEST TAXPAYER', 'approved', now(), 'admin') RETURNING id",
+    )
+    .bind(world.account)
+    .bind(branch)
+    .fetch_one(&world.db)
+    .await
+    .unwrap()
+}
+
+/// A 1601C return for `tin` (14 digits) in 2025, as the Sender reads it.
+#[cfg(feature = "bir")]
+fn return_1601c(tin: &str) -> String {
+    let line = |key: &str, value: &str| format!("<div>frm1601c:{key}={value}frm1601c:{key}=</div>");
+    [
+        ("txtYear", "2025"),
+        ("txtTIN1", &tin[..3]),
+        ("txtTIN2", &tin[3..6]),
+        ("txtTIN3", &tin[6..9]),
+        ("txtBranchCode", &tin[9..]),
+    ]
+    .into_iter()
+    .map(|(key, value)| line(key, value))
+    .collect()
+}
+
+/// A listener that counts the connections it gets and drops each.
+#[cfg(feature = "bir")]
+async fn counting() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = count.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    (port, count)
+}
+
+/// With the BIR relay: a test TIN's send through this Gatekeeper's bridge
+/// to the real Sender (its router on loopback), in `live`, with a
+/// dispatcher and an upload host set. On 111-111-114 and on 000-000-000,
+/// v1 and v2, it ends `dry_run` with a `dry_run` receipt, never with the
+/// guard's refusal, and nothing is contacted. If a real dry run ever opened
+/// a stream, the guard would fail every test send, and only this shows it.
+#[cfg(feature = "bir")]
+#[sqlx::test]
+async fn a_test_tins_send_to_the_real_sender_is_a_dry_run(db: PgPool) {
+    use buwiz_cloud::bir::DispatcherTarget;
+    use buwiz_cloud::filing::{envelope, tickets};
+
+    let world = World::new(db.clone()).await;
+    let (dispatcher, contacted) = counting().await;
+    let ticket_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let mut config = sender::SenderConfig::embedded(ticket_key.verifying_key(), common::ORIGIN).unwrap();
+    config.relay.mode = RelayMode::Live;
+    config.relay.iaf_passphrase = zeroize::Zeroizing::new("a made-up IAF passphrase".into());
+    config.relay.dispatcher_passphrase = zeroize::Zeroizing::new("a made-up dispatcher passphrase".into());
+    config.relay.dispatchers = vec![DispatcherTarget { host: "127.0.0.1".into(), port: dispatcher, tls: false }];
+    config.relay.sftp_hosts = vec!["127.0.0.1".into()];
+    config.relay.pinned_keys = vec!["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()];
+    let secret = config.secret.to_string();
+    let (sealing_public, sealing_kid) = (config.sealing_key.public_bytes(), config.sealing_key.kid());
+    let receipt_keys = [config.receipt_key.verifying_key()];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(sender::serve(listener, sender::Sender::new(config)));
+    let uptime = Uptime::new(Level::Public, vec![22], false, OffsetDateTime::now_utc());
+    let site = Site::with_sender(db.clone(), &url, &secret, uptime);
+    let base = serve(site.router).await;
+    let gatekeeper =
+        Gatekeeper { base, sender: FakeSender::default(), state: site.state, result_after: Mutex::new(None) };
+
+    for root in ["111111114", "000000000"] {
+        let claim = test_claim_on(&world, root).await;
+        let tin = format!("{root}00000");
+        let xml = return_1601c(&tin);
+        let filename = format!("{tin}-1601Cv2018-062025#{EMAIL}#.xml");
+        for v2 in [false, true] {
+            let id = Uuid::new_v4();
+            if v2 {
+                let jti = Uuid::new_v4();
+                let now = OffsetDateTime::now_utc().unix_timestamp();
+                let claims = tickets::TicketClaims {
+                    iss: common::ORIGIN.into(),
+                    aud: tickets::AUDIENCE.into(),
+                    sub: world.account,
+                    account_id: world.account,
+                    device_id: world.device.device_id,
+                    tin: tin.clone(),
+                    form: "1601Cv2018".into(),
+                    period: "062025".into(),
+                    payload_sha256: buwiz_cloud::base::crypto::hex(&crypto::sha256(xml.as_bytes())),
+                    email: EMAIL.into(),
+                    jti,
+                    iat: now,
+                    exp: now + 300,
+                };
+                let ticket = tickets::sign(&ticket_key, &claims);
+                let sealed = envelope::seal(&sealing_public, &sealing_kid, &jti.to_string(), xml.as_bytes()).unwrap();
+                sqlx::query(
+                    "INSERT INTO tickets (jti, account_id, device_id, claim_id, form_type, period, payload_sha256,
+                         email, idempotency_key, jws, expires_at, used_at)
+                     VALUES ($1, $2, $3, $4, '1601Cv2018', '062025', $5, $6, $7, $8, now() + interval '5 minutes', now())",
+                )
+                .bind(jti)
+                .bind(world.account)
+                .bind(world.device.device_id)
+                .bind(claim)
+                .bind(crypto::sha256(xml.as_bytes()))
+                .bind(EMAIL)
+                .bind(jti.to_string())
+                .bind(&ticket)
+                .execute(&db)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO submissions (id, account_id, claim_id, form_type, period, filename, xml_sha256,
+                         status, ticket_jti, device_id, envelope)
+                     VALUES ($1, $2, $3, '1601Cv2018', '062025', $4, $5, 'ready', $6, $7, $8)",
+                )
+                .bind(id)
+                .bind(world.account)
+                .bind(claim)
+                .bind(&filename)
+                .bind(crypto::sha256(xml.as_bytes()))
+                .bind(jti)
+                .bind(world.device.device_id)
+                .bind(serde_json::to_string(&sealed).unwrap())
+                .execute(&db)
+                .await
+                .unwrap();
+            } else {
+                let (nonce, ciphertext) =
+                    crypto::seal(&[7; 32], format!("submission/{id}").as_bytes(), xml.as_bytes()).unwrap();
+                sqlx::query(
+                    "INSERT INTO submissions (id, account_id, claim_id, form_type, period, filename, xml_sha256,
+                         xml_nonce, xml_ciphertext, status)
+                     VALUES ($1, $2, $3, '1601Cv2018', '062025', $4, $5, $6, $7, 'ready')",
+                )
+                .bind(id)
+                .bind(world.account)
+                .bind(claim)
+                .bind(&filename)
+                .bind(crypto::sha256(xml.as_bytes()))
+                .bind(nonce)
+                .bind(ciphertext)
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+            let got = gatekeeper.send(&world, id, vec![], &[], HOME).await;
+            assert_eq!(texts(&got).len(), 1, "{root} v2 {v2}: the result alone: {got:?}");
+            assert!(got.iter().all(|got| matches!(got, Got::Text(_))), "{root} v2 {v2}: no binary");
+            let result = the_result(&got).unwrap();
+            assert_eq!(
+                (&result["status"], &result["error"]),
+                (&json!("dry_run"), &Value::Null),
+                "{root} v2 {v2}: {result}"
+            );
+            let receipt = result["receipt"].as_str().expect("a receipt");
+            let claims = buwiz_cloud::filing::jws::verify(&receipt_keys, sender::RECEIPT_TYP, receipt).unwrap();
+            assert_eq!((&claims["mode"], &claims["status"]), (&json!("dry_run"), &json!("dry_run")), "{claims}");
+            assert_eq!(status(&db, id).await, ("dry_run".to_owned(), Some("dry_run".to_owned())), "{root} v2 {v2}");
+        }
+    }
+    assert_eq!(contacted.load(std::sync::atomic::Ordering::SeqCst), 0, "no dispatcher login");
+    assert!(tries(&db).await.is_empty(), "no row for a test TIN's send");
 }
 
 /// The hourly upkeep deletes tries older than 90 days.

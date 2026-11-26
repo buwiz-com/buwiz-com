@@ -34,9 +34,11 @@
 //! - a change of roles that leaves no Admin, or that leaves only Admins who
 //!   never signed in where one who had was left before.
 //!
-//! A TIN that is not valid (000-000-000, or not 9 digits) is refused on its
-//! own: it is reported and left out, and its login is still made. A test
-//! TIN (000-000-000, at any branch) goes in only when its entry says
+//! A TIN that is not valid (a reserved root such as 000-000-000, or not 9
+//! digits) is refused on its own: it is reported and left out, and its
+//! login is still made. A test TIN (a reserved root, `TEST_ROOTS` in
+//! src/account/tin.rs: 000-000-000 or 111-111-114, at any branch) goes in
+//! only when its entry says
 //! `test_tin = true`, active, on a login with the test label; such an
 //! entry for a real TIN refuses the file, as does taking the label off a
 //! login that holds a test TIN or has a fixed sign-in code. The file never
@@ -117,7 +119,8 @@ struct TinEntry {
     /// paused.
     #[serde(default)]
     reapply: bool,
-    /// A made-up test TIN (000-000-000), on purpose: never implied.
+    /// A test TIN (a reserved root, [`Tin::is_test`]), on purpose: never
+    /// implied.
     #[serde(default)]
     test_tin: bool,
 }
@@ -305,8 +308,9 @@ fn plan(file: &[u8], full: bool) -> Result<(Vec<PlannedLogin>, Vec<RefusedTin>),
             let shown = shown(&tin, full);
             if entry.test_tin && !tin.is_test() {
                 problems.push(format!(
-                    "TIN {shown} for {email}: test_tin = true is only for a made-up TIN (000-000-000); a real TIN \
-                     is added without it"
+                    "TIN {shown} for {email}: test_tin = true is only for a made-up TIN (a reserved root: {}); a \
+                     real TIN is added without it",
+                    crate::account::tin::test_roots_shown()
                 ));
                 continue;
             }

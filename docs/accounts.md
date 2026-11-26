@@ -125,13 +125,24 @@ banned. A banned account can't delete itself either: `/delete` sends it to
 support (see "Deleting an account"). The **test label** is for staff only: they see and filter it, and
 sends work as usual.
 
-A **test TIN** is a made-up one: its root is `000-000-000`, at any branch,
-which is exactly what the TIN check refuses on every form (a TIN must have
-9 digits, not all zeros, and a branch of 3 or 5 digits). An Admin adds one
+A **test TIN** is one whose root is a **reserved root**, at any branch.
+The reserved roots are a short list in code, `TEST_ROOTS` in
+`src/account/tin.rs`: `000-000-000` and `111-111-114`. The eBIRForms app
+refuses all zeros everywhere, so no release build of it can queue a return
+for one; `111-111-114` passes the app's check digit like any TIN, so the
+app takes it as an ordinary taxpayer. Every form people use refuses every
+reserved root: all zeros with "That TIN is not valid." (`tin_zero`), as it
+always did, any other with "This TIN is reserved for testing. If it is
+yours, write to support@buwiz.com." (`tin_reserved`). That covers adding a
+TIN (with papers or without, and the apps' "Add it" link, which never
+fills one in); the fix, papers and automatic-check paths act on a row that
+already exists, which the database check below keeps from ever holding a
+reserved root. An Admin adds one
 on the staff page of an account with the test label ("Add a test TIN":
-the TIN, its name and kind, a reason), active at once and without papers
-(`verified_by = 'admin'`, an `activated` line with the reason). A real TIN
-is refused there (it is added the usual way, and verified), and so is any
+the TIN, its name and kind, a reason; any reserved root at any branch),
+active at once and without papers (`verified_by = 'admin'`, an `activated`
+line with the reason). A TIN that is not a reserved root is refused there
+(`not_test_tin`) (it is added the usual way, and verified), and so is any
 account without the label, and one in `ADMIN_EMAILS` (their page has no
 test-label controls, so the label a test TIN holds in place could not come
 off; the form is not shown there). An Admin whose own account another Admin
@@ -153,9 +164,35 @@ list and the licence list, and in an AI agent's list of TIN claims (each
 with `test_only: true`; the TIN list's `message` says it sends as a dry
 run). The
 label cannot come off an account while it holds one that has not ended
-(`test_tins_held`): revoke it first. Migration 13 keeps it so in the
-database: such a row is only ever an Admin's or the seed tool's, active
-or ended (`approved`, `removed`, `revoked`).
+(`test_tins_held`): revoke it first. Migrations 13 and 23 keep it so in
+the database (`tin_claims_test_tin_check`, over the same list): a row with
+a reserved root is only ever an Admin's or the seed tool's, active or
+ended (`approved`, `removed`, `revoked`).
+
+**Why a list in code, not a flag.** A flag on a claim or an account is a
+value someone sets, and a wrong one would turn a real filing into a dry
+run that reports success and files nothing: the failure would be silent.
+A fixed list of roots cannot be set on a real TIN by mistake. The only
+way it can go wrong is the other way round: a person whose real TIN has a
+reserved root cannot register it. That failure is loud (the form says so
+and sends them to support), never "filed as a dry run".
+
+**The honest limit.** A reserved root could be a real taxpayer's: the BIR
+issues TINs, not Buwiz, and `111-111-114` is a valid one by the check
+digit. That person cannot add it on Buwiz, and is sent to
+support@buwiz.com. There is no override; support can only tell them why.
+
+**Adding a root.** It must be one the app accepts (its check digit), and
+one no account holds: check first with
+`SELECT id, account_id, status, verified_by FROM tin_claims WHERE tin_root = '<root>'`
+(expected no rows). Then, in one pull request: add it to `TEST_ROOTS`,
+and add a new migration that, like 0023, refuses any row with the new
+root and puts `tin_claims_test_tin_check` back over the new list (once
+0023 has run anywhere, its file cannot change: sqlx refuses a migration
+that changed after it ran). The unit test
+`the_migrations_list_is_test_roots` in `src/account/tin.rs` reads the
+newest such migration's lists; point it at the new file. Every other
+place reads `TEST_ROOTS` or `Tin::is_test`.
 
 <a id="the-store-review-login"></a>
 

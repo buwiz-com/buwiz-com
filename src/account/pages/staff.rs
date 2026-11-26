@@ -1418,7 +1418,7 @@ pub async fn users_page(cx: &Cx) -> Result<impl View> {
                 .collect();
             let role = user_role(config, &user);
             // A test TIN proves no identity.
-            let real = own.iter().filter(|claim| claim.tin_root != crate::account::tin::TEST_ROOT);
+            let real = own.iter().filter(|claim| !crate::account::tin::is_test_root(&claim.tin_root));
             let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
             let badge = role_badge(role);
             let open = list_params(&user.id.to_string());
@@ -1583,7 +1583,7 @@ async fn user_summary_data(
         claims.iter().filter(|claim| claim.account_id == account_id).cloned().collect();
     let role = user_role(&state(cx).config, &user);
     // A test TIN proves no identity.
-    let real = claims.iter().filter(|claim| claim.tin_root != crate::account::tin::TEST_ROOT);
+    let real = claims.iter().filter(|claim| !crate::account::tin::is_test_root(&claim.tin_root));
     let id_status = IdStatus::of(role.is_some(), real.map(|claim| claim.status.as_str()));
     let live_sessions = queries::sessions(db, account_id).await?.iter().filter(|(_, live)| *live).count();
     let apps = queries::apps(db, account_id).await?.into_iter().filter(|app| app.signed_in).collect();
@@ -2248,13 +2248,16 @@ async fn fixed_code_fact(account_id: Uuid, email: String, fixed: FixedCode, may:
     })
 }
 
-/// An Admin adds a made-up TIN to a test account: active at once, it never
-/// sends.
+/// An Admin adds a test TIN (a reserved root, [`crate::account::tin::TEST_ROOTS`])
+/// to a test account: active at once, it never sends.
 #[component]
 async fn test_tin_form(account_id: Uuid) -> Result<impl View> {
     Ok(view! {
         act(id: "act-testtin".to_owned(), label: "Add a test TIN", sym: "plus", small: true, question: "Add a test TIN",
-            detail: "A made-up TIN, 000-000-000 at any branch, active at once for trying the apps. Buwiz never sends its returns to the BIR.".to_owned(),
+            detail: format!(
+                "A TIN reserved for testing, {} at any branch, active at once for trying the apps. Buwiz never sends its returns to the BIR.",
+                crate::account::tin::test_roots_shown()
+            ),
             <form class="sx-form" method="post" action=(format!("/staff/users/{account_id}/test-tin"))>
                 <label class="sx-field">
                     <span>"TIN"</span>

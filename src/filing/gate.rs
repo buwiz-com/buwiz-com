@@ -9,7 +9,7 @@
 //! `tin_not_active`: a refusal never tells whether someone else has the
 //! TIN.
 //!
-//! A test TIN (root `000-000-000`, [`Tin::is_test`]) stands as any TIN
+//! A test TIN (a reserved root, [`Tin::is_test`]) stands as any TIN
 //! does: an active, unpaused one is [`Standing::Sendable`], a paused one
 //! [`Standing::Paused`]. Its send is a dry run, whatever `BIR_RELAY_MODE`
 //! says: the Sender itself forces it from the TIN in the ticket or the

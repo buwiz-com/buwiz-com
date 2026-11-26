@@ -972,7 +972,8 @@ streams: a plain-HTTP answer can come from a middlebox.
 
 Tries in `lab`, `dry_run` and mode `unknown` are recorded with their mode
 and stages, no class or kind (but for an unreachable Sender, above), and
-never counted. A send for a test TIN (root `000-000-000`) is not recorded
+never counted. A send for a test TIN (a reserved root, `000-000-000` or
+`111-111-114`) is not recorded
 at all: the Sender makes it a dry run whatever its mode, so it never
 touches the BIR. It writes no `bir_tries` row, is never counted, and never
 moves the sign or the upload hosts' key sightings; its `result` carries no

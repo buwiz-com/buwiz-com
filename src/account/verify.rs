@@ -507,14 +507,14 @@ pub async fn consider(db: &PgPool, verification: Verification, document_id: Uuid
     // TIN masked (its last three digits and branch), so they are matched
     // on that: another TIN with the same last digits only leaves more
     // claims for staff. `$5` matches any branch of the root, `$6` this one.
-    // A test TIN's lines (root 000-000-000, masked ***-***-000-…) are left
-    // out by their claim, whose row stays (it was active, so only the
+    // A test TIN's lines (a reserved root, such as 000-000-000 masked
+    // ***-***-000-…) are left out by their claim, whose row stays (it was active, so only the
     // rollback of migration 13 deletes it): they would cast doubt on every
     // real TIN ending in 000.
     let any_branch = format!("***-***-{}-%", &tin.root()[6..]);
     let not_test = format!(
-        "NOT EXISTS (SELECT 1 FROM tin_claims t WHERE t.id = claim_audit.claim_id AND t.tin_root = '{}')",
-        crate::account::tin::TEST_ROOT
+        "NOT EXISTS (SELECT 1 FROM tin_claims t WHERE t.id = claim_audit.claim_id AND t.tin_root IN ({}))",
+        crate::account::tin::test_roots_sql()
     );
     let (other_account, refused_before, sent_back_elsewhere, business_before, another_unconfirmed, today): (
         bool,

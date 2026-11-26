@@ -1,17 +1,54 @@
 //! TIN root + branch code: the key BIR files returns under.
 //!
-//! A TIN is valid when its root has 9 digits, not all zeros, and its branch
-//! code 5 (or the old 3, or none for head office). A root of all zeros is a
-//! test TIN: staff put one on a test account only, and it never sends
+//! A TIN is valid when its root has 9 digits and its branch code 5 (or the
+//! old 3, or none for head office). A root in [`TEST_ROOTS`] is a test TIN,
+//! at any branch: staff put one on a test account only, and it never sends
 //! ([`crate::filing::gate`]). The `_any` readers take one; the others
-//! refuse it with [`Notice::TinZero`], as people's forms always did.
+//! refuse it, as people's forms must: the all-zero root with
+//! [`Notice::TinZero`], as they always did, any other reserved root with
+//! [`Notice::TinReserved`].
+//!
+//! The list lives in code, not in a column, so no one can mark a real TIN
+//! as a test one by mistake: a real filing never silently becomes a dry
+//! run. Adding a root is this list plus the one in
+//! `migrations/0023_test_roots.up.sql`, which must match (a test below
+//! reads it). docs/accounts.md says how.
 
 use std::fmt::{self, Display, Formatter};
 
 use crate::account::notice::Notice;
 
-/// The root of every test TIN: `000-000-000`, at any branch.
-pub const TEST_ROOT: &str = "000000000";
+/// The reserved roots: a TIN with one of these roots, at any branch, is a
+/// test TIN. `111-111-114` is one the eBIRForms app accepts as an
+/// ordinary TIN, so a release build of the app can queue a test return.
+pub const TEST_ROOTS: &[&str] = &["000000000", "111111114"];
+
+/// [`TEST_ROOTS`] as an SQL list for `IN (…)`: `'000000000', '111111114'`.
+/// The roots are digits only, so they are safe to write into a query.
+pub fn test_roots_sql() -> String {
+    TEST_ROOTS.iter().map(|root| format!("'{root}'")).collect::<Vec<_>>().join(", ")
+}
+
+/// [`TEST_ROOTS`] as people read them: `000-000-000 or 111-111-114`.
+pub fn test_roots_shown() -> String {
+    let shown: Vec<String> =
+        TEST_ROOTS.iter().map(|root| format!("{}-{}-{}", &root[..3], &root[3..6], &root[6..])).collect();
+    match shown.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// Whether `root` (9 digits) is a reserved root.
+pub fn is_test_root(root: &str) -> bool {
+    TEST_ROOTS.contains(&root)
+}
+
+/// The refusal a person's form gives a reserved root.
+fn reserved(root: &str) -> Notice {
+    if root.bytes().all(|byte| byte == b'0') { Notice::TinZero } else { Notice::TinReserved }
+}
 
 /// A BIR registration: 9-digit TIN root and 5-digit branch code
 /// (head office `00000`).
@@ -24,12 +61,13 @@ pub struct Tin {
 impl Tin {
     /// Accepts dashes and spaces. A 3-digit branch is the old form and gets
     /// `00` in front; an empty branch means head office. A test TIN is
-    /// refused ([`Notice::TinZero`]).
+    /// refused ([`Notice::TinZero`] or [`Notice::TinReserved`]).
     pub fn parse(root: &str, branch: &str) -> Result<Self, Notice> {
-        // Before the branch, as it always was: a zero root with a bad
+        // Before the branch, as it always was: a reserved root with a bad
         // branch says the root is the problem.
-        if digits(root) == TEST_ROOT {
-            return Err(Notice::TinZero);
+        let root_digits = digits(root);
+        if is_test_root(&root_digits) {
+            return Err(reserved(&root_digits));
         }
         Self::parse_any(root, branch)
     }
@@ -86,13 +124,13 @@ impl Tin {
     }
 
     fn not_test(self) -> Result<Self, Notice> {
-        if self.is_test() { Err(Notice::TinZero) } else { Ok(self) }
+        if self.is_test() { Err(reserved(&self.root)) } else { Ok(self) }
     }
 
-    /// A made-up TIN for testing: its root is all zeros. BIR has no such
-    /// TIN, and nothing is ever sent for it.
+    /// A TIN for testing: its root is one of [`TEST_ROOTS`]. Nothing is
+    /// ever sent to the BIR for it: its sends are dry runs.
     pub fn is_test(&self) -> bool {
-        self.root == TEST_ROOT
+        is_test_root(&self.root)
     }
 
     pub fn root(&self) -> &str {
@@ -174,6 +212,47 @@ mod tests {
         assert_eq!(Tin::parse_fields("000-000-000", "12"), Err(Notice::TinZero));
         assert_eq!(Tin::parse("00000000", "12"), Err(Notice::TinDigits));
         assert!(!Tin::parse_any("000123453", "").unwrap().is_test());
+    }
+
+    #[test]
+    fn every_reserved_root_is_a_test_tin_and_refused_on_peoples_forms() {
+        for root in TEST_ROOTS {
+            let zeros = root.bytes().all(|byte| byte == b'0');
+            let refusal = if zeros { Notice::TinZero } else { Notice::TinReserved };
+            let dashed = format!("{}-{}-{}", &root[..3], &root[3..6], &root[6..]);
+            for (raw, branch) in [(dashed.clone(), ""), (root.to_string(), "00001"), (format!("{dashed}-00000"), "")] {
+                assert!(Tin::parse_fields_any(&raw, branch).unwrap().is_test(), "{raw}");
+                assert_eq!(Tin::parse_fields(&raw, branch), Err(refusal), "{raw}");
+            }
+            assert_eq!(Tin::parse(root, "12"), Err(refusal), "{root}");
+            assert_eq!(Tin::parse_combined(&format!("{root}00002")), Err(refusal), "{root}");
+            assert!(Tin::parse_combined_any(&format!("{root}00002")).unwrap().is_test());
+        }
+        assert_eq!(Tin::parse("111-111-114", ""), Err(Notice::TinReserved));
+        assert_eq!(Tin::parse("000-000-000", ""), Err(Notice::TinZero));
+        // Near misses are ordinary TINs.
+        for root in ["111111111", "111111113", "011111114", "000000001"] {
+            assert!(!Tin::parse(root, "").unwrap().is_test(), "{root}");
+        }
+    }
+
+    /// The migration's literal list is [`TEST_ROOTS`], in the same order.
+    #[test]
+    fn the_migrations_list_is_test_roots() {
+        let up = include_str!("../../migrations/0023_test_roots.up.sql");
+        let check = up.split("tin_root NOT IN (").nth(1).expect("the check's list");
+        let list: Vec<&str> =
+            check[..check.find(')').unwrap()].split(',').map(|item| item.trim().trim_matches('\'')).collect();
+        assert_eq!(list, TEST_ROOTS);
+        // The refusal before it uses the same list.
+        let guard = up.split("c.tin_root IN (").nth(1).expect("the guard's list");
+        let guard: Vec<&str> =
+            guard[..guard.find(')').unwrap()].split(',').map(|item| item.trim().trim_matches('\'')).collect();
+        assert_eq!(guard, TEST_ROOTS);
+        assert_eq!(
+            test_roots_sql(),
+            check[..check.find(')').unwrap()].split_whitespace().collect::<Vec<_>>().join(" ")
+        );
     }
 
     #[test]

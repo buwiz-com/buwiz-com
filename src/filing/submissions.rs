@@ -534,7 +534,7 @@ async fn run_relay(
     // A test TIN's send is a dry run (the Sender forces it) and never
     // touches the BIR: it gets no uptime record, so it is never counted and
     // never moves the sign or the host-key sightings.
-    let test_tin = locked.tin_root == crate::account::tin::TEST_ROOT;
+    let test_tin = crate::account::tin::is_test_root(&locked.tin_root);
     let recording = context.filter(|_| !test_tin).map(|context| RelayTry {
         account_id,
         network: context.network,
@@ -542,7 +542,7 @@ async fn run_relay(
         admission: locked.admission.clone().unwrap_or_else(|| "open".to_owned()),
         started_at: OffsetDateTime::now_utc(),
     });
-    bridge(&state, socket, &job, id, v2, recording).await?;
+    bridge(&state, socket, &job, id, v2, test_tin, recording).await?;
     Ok(())
 }
 
@@ -711,16 +711,68 @@ async fn settle(
     Ok(())
 }
 
+/// What a test TIN's v1 try ends with when its Sender would not make it a
+/// dry run ([`dry_run_frame_passes`]). Its XML is kept, so it can be tried
+/// again.
+const NOT_A_DRY_RUN: &str = "the sending service would not make this test send a dry run; try again later";
+
+/// The same for a v2 try. Its ticket is spent and its sealed return is
+/// deleted, so it needs a new ticket.
+const NOT_A_DRY_RUN_V2: &str =
+    "the sending service would not make this test send a dry run; ask for a new ticket and send again later";
+
+/// For a test TIN's send, whether the Sender's text frame may pass. An
+/// allow-list: the first must be its `sender` frame, saying `dry_run`;
+/// every later one must be the `result`, and nothing else (a dry run opens
+/// no stream). That result must be `dry_run` or `failed`. A `dry_run`
+/// result must carry a receipt whose `mode` and `status` both say
+/// `dry_run`; a receipt on a `failed` one must say mode `dry_run`. Each is
+/// read unverified, as [`record`] reads it. Neither frame is forwarded as
+/// it came: the `sender` frame stops here, and the app hears the result as
+/// [`conclude`] writes it. An older Sender, which knows fewer reserved
+/// roots, says `live` for the others: this is the Gatekeeper's guard
+/// against it.
+fn dry_run_frame_passes(text: &str, first: bool) -> bool {
+    let Ok(frame) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if first {
+        return frame["type"] == "sender" && frame["mode"] == Mode::DryRun.as_str();
+    }
+    // Both readings must say `result`: serde_json keeps the last of two
+    // `type` keys, so a frame that names another type too is refused.
+    if frame["type"] != "result" {
+        return false;
+    }
+    let Some(Frame::Control(Control::Result { status, receipt, .. })) = Frame::decode_text(text) else {
+        return false;
+    };
+    let claims = receipt.as_ref().map(|receipt| receipt.as_str().and_then(jws::claims_unverified));
+    let dry_run = Mode::DryRun.as_str();
+    match (status.as_str(), claims) {
+        // A dry run with no receipt would be stored `unknown` by `record`.
+        ("dry_run", Some(Some(claims))) => claims["mode"] == dry_run && claims["status"] == dry_run,
+        ("failed", None) => true,
+        ("failed", Some(Some(claims))) => claims["mode"] == dry_run,
+        _ => false,
+    }
+}
+
 /// Hands `job` to the Sender and forwards frames between it and the app
 /// until the Sender's `result`, which it records, then passes on. The
 /// Sender's `sender` frame stops here. With `recording`, the try's frames
-/// are watched for its uptime record ([`crate::uptime::observe`]).
+/// are watched for its uptime record ([`crate::uptime::observe`]). With
+/// `test_tin`, the job goes to the Sender's reserved route
+/// ([`crate::sender::RESERVED_RELAY_ROUTE`]), no frame of the Sender's is
+/// forwarded as it came, and the try ends `failed` at the first frame that
+/// is not a dry run's ([`dry_run_frame_passes`]), or at any binary frame.
 async fn bridge(
     state: &AppState,
     socket: WebSocket,
     job: &Job,
     id: Uuid,
     v2: bool,
+    test_tin: bool,
     recording: Option<RelayTry>,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message as Up;
@@ -729,7 +781,9 @@ async fn bridge(
     let mut observer = recording.as_ref().map(|_| TryObserver::new(&state.uptime.upload_ports));
     let finish =
         |status: &str, error: String| Control::Result { status: status.to_owned(), error: Some(error), receipt: None };
-    let upstream = match state.sender.open().await {
+    // A test TIN's job goes only to the Sender's reserved route, which an
+    // older Sender does not have: the open fails and the job never leaves.
+    let upstream = match state.sender.open(test_tin).await {
         Ok(upstream) => upstream,
         Err(error) => {
             tracing::error!(error = ?error, "the Sender is not reachable");
@@ -754,6 +808,8 @@ async fn bridge(
     let mut app_gone = false;
     let mut result = None;
     let mut deadline_passed = false;
+    let mut first_text = true;
+    let mut not_a_dry_run = false;
     let deadline = tokio::time::sleep(Duration::from_secs(24 * 3600));
     tokio::pin!(deadline);
     loop {
@@ -796,6 +852,11 @@ async fn bridge(
             }
             message = up_rx.next() => match message {
                 Some(Ok(Up::Text(text))) => {
+                    if test_tin && !dry_run_frame_passes(&text, first_text) {
+                        not_a_dry_run = true;
+                        break;
+                    }
+                    first_text = false;
                     // The `sender` frame (its mode) is for this side only.
                     let forward = match observer.as_mut() {
                         Some(observer) => observer.sender_text(&text),
@@ -814,6 +875,10 @@ async fn bridge(
                     }
                 }
                 Some(Ok(Up::Binary(bytes))) => {
+                    if test_tin {
+                        not_a_dry_run = true;
+                        break;
+                    }
                     if !app_gone {
                         let _ = app_tx.send(Message::Binary(bytes)).await;
                     }
@@ -828,6 +893,11 @@ async fn bridge(
         }
     }
     let _ = up_tx.send(Up::Close(None)).await;
+    if not_a_dry_run {
+        tracing::error!(submission = %id, "the Sender did not make a test TIN's send a dry run; stopped it");
+        let result = finish("failed", if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }.into());
+        return settle(state, &mut app_tx, id, v2, &result, observer, recording, app_gone).await;
+    }
     if result.is_none()
         && let Some(observer) = observer.as_mut()
     {
@@ -866,16 +936,28 @@ pub async fn hpke_key(State(state): State<AppState>) -> Result<Json<Value>, ApiE
     Ok(Json(public["hpke"].clone()))
 }
 
+/// What the upkeep stores for a test TIN's send stuck in `sending`. A test
+/// TIN's send is a dry run and opens no stream, so nothing of it reached
+/// the BIR.
+pub const STOPPED_TEST_SEND: &str =
+    "the server stopped during this test send; it was a dry run, so nothing was sent to the BIR";
+
 /// Startup and hourly upkeep: a send stuck in `sending` for 10 minutes
 /// ended with its server, so its outcome is unknown; XML older than 24 hours
 /// is deleted, and so is a sealed return whose ticket ran out unsent. (BIR
-/// uptime's retention runs beside it, [`crate::uptime::hourly`].)
+/// uptime's retention runs beside it, [`crate::uptime::hourly`].) A test
+/// TIN's send stuck in `sending` gets [`STOPPED_TEST_SEND`], not the words
+/// of a send that may have reached the BIR.
 pub async fn upkeep(db: &PgPool) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE submissions SET status = 'unknown', error = 'the server stopped while sending',
+    sqlx::query(&format!(
+        "UPDATE submissions s SET status = 'unknown',
+             error = CASE WHEN EXISTS (SELECT 1 FROM tin_claims c WHERE c.id = s.claim_id AND c.tin_root IN ({}))
+                          THEN $1 ELSE 'the server stopped while sending' END,
              xml_nonce = NULL, xml_ciphertext = NULL, envelope = NULL, purged_at = now()
          WHERE status = 'sending' AND sending_since < now() - interval '10 minutes'",
-    )
+        crate::account::tin::test_roots_sql()
+    ))
+    .bind(STOPPED_TEST_SEND)
     .execute(db)
     .await?;
     sqlx::query(

@@ -245,8 +245,8 @@ pub async fn counts(db: &PgPool, admin_emails: &[String]) -> sqlx::Result<Counts
     .await
 }
 
-/// The Overview's numbers. Test TINs (`000-000-000`) are left out of the
-/// active TINs: they are made up and never send.
+/// The Overview's numbers. Test TINs (a reserved root, `TEST_ROOTS`) are
+/// left out of the active TINs: they are made up and never send.
 #[derive(Clone, Copy, Debug, sqlx::FromRow)]
 pub struct Overview {
     pub waiting: i64,
@@ -275,16 +275,16 @@ pub async fn overview(db: &PgPool) -> sqlx::Result<Overview> {
              (SELECT min(coalesce(resent_at, submitted_at, created_at)) FROM tin_claims WHERE status = 'pending')
                  AS oldest_waiting,
              (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NULL
-                 AND tin_root <> '{test}') AS active,
+                 AND tin_root NOT IN ({test})) AS active,
              (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NULL
-                 AND tin_root <> '{test}' AND decided_at > now() - interval '7 days') AS active_week,
+                 AND tin_root NOT IN ({test}) AND decided_at > now() - interval '7 days') AS active_week,
              (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND paused_at IS NOT NULL
-                 AND tin_root <> '{test}') AS paused,
-             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND tin_root = '{test}') AS test,
+                 AND tin_root NOT IN ({test})) AS paused,
+             (SELECT count(*) FROM tin_claims WHERE status = 'approved' AND tin_root IN ({test})) AS test,
              (SELECT count(*) FROM accounts) AS accounts,
              (SELECT count(*) FROM accounts WHERE created_at > now() - interval '7 days') AS accounts_week,
              (SELECT count(*) FROM tin_claims WHERE verified_by = 'auto' AND auto_confirmed_at IS NULL) AS auto",
-        test = crate::account::tin::TEST_ROOT
+        test = crate::account::tin::test_roots_sql()
     ))
     .fetch_one(db)
     .await
@@ -555,7 +555,7 @@ pub async fn users(
                                            WHERE c.account_id = a.id AND c.status IN ('pending', 'needs_fix'))
                WHEN 'verified' THEN EXISTS (SELECT 1 FROM tin_claims c
                                             WHERE c.account_id = a.id AND c.status = 'approved'
-                                              AND c.tin_root <> '{test_root}')
+                                              AND c.tin_root NOT IN ({test_root}))
                WHEN 'no_tin' THEN NOT EXISTS (SELECT 1 FROM tin_claims c WHERE c.account_id = a.id
                                               AND c.{LIVE_SQL})
                WHEN 'staff' THEN {staff}
@@ -566,7 +566,7 @@ pub async fn users(
          ORDER BY last_active DESC NULLS LAST, a.created_at DESC
          LIMIT $5",
         staff = crate::account::roles::is_staff_sql("a", "$4"),
-        test_root = crate::account::tin::TEST_ROOT
+        test_root = crate::account::tin::test_roots_sql()
     ))
     .bind(contains(search))
     .bind(tin_digits(search))

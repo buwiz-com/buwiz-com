@@ -562,7 +562,8 @@ always checked by staff" holds only for claims that say they are one. The
 limits (one unconfirmed per account, 20 a day, a clean history for the
 TIN, papers kept, a pause after 30 days unconfirmed) bound the damage; they
 do not prevent it. And whether a claim is activated or left for staff
-tells the claimant whether any other account ever had that TIN.
+tells the claimant whether any other account ever sent papers for that
+TIN or had it active.
 
 Before turning it on, decide whether an automatically activated TIN may
 send before a person confirms it (as built, it may), and keep someone

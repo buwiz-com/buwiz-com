@@ -412,13 +412,21 @@ head-office TIN waiting for its first review (never sent back, on this
 claim or an earlier one); exactly one TIN ID, a JPEG, PNG or WebP photo
 read by OCR (never a PDF, nor HEIC); TIN and name a full match with what is
 typed, each at least 90% sure, and a name of two words or more; the
-account not banned; no other account ever had a row for the TIN's root, at
-any branch; this account never had it rejected, revoked or deleted, or
-removed it after an automatic activation; sending for the TIN was never
-paused, on any account; the TIN never had a business claim, on any
-account; no other automatic activation of the account waiting for a
+account not banned; no other account ever sent papers for the TIN's root
+or had it active, at any branch; this account never had it rejected,
+revoked or deleted, or removed it after an automatic activation; sending
+for the TIN was never paused, on any account; the TIN never had a
+business claim (on this account, or on another that sent its papers or
+had it active); no other automatic activation of the account waiting for a
 person; fewer than 20 automatic activations in the last 24 hours. The
 limits are counted under one lock.
+
+Another account's claim saved without papers, live or deleted, does not
+count: anyone can save any TIN that way, on the site or from the app, so
+it is no evidence of anyone, and counting it would let anyone keep a
+stranger's TIN from ever activating by itself. The price: a real owner who
+only saved their TIN without papers does not hold off a claim with a
+drawn card.
 
 A deleted claim leaves only its audit line, which keeps the TIN masked
 (last three digits and branch) and, from this release, the claim's kind.

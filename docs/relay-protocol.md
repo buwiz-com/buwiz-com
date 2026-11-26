@@ -72,6 +72,11 @@ Answer `201`:
 {"id": "…", "status": "ready", "relay_path": "/api/submissions/…/relay", …}
 ```
 
+A submission for a test TIN ([Test TINs](#test-tins)) also has
+`"test_only": true`, here, in an idempotent replay, in
+`GET /api/submissions/{id}` and in each item of `GET /api/submissions`.
+Any other submission has no such field, and reads as before.
+
 The server keeps the XML, encrypted, until it is sent or 24 hours pass.
 
 ### Refusals
@@ -262,7 +267,12 @@ A send the server finds stuck in `sending` for 10 minutes (it stopped
 mid-send) becomes `unknown` with the error "the server stopped while
 sending". For a test TIN's send the error is instead "the server stopped
 during this test send; it was a dry run, so nothing was sent to the BIR":
-a test TIN's send is a dry run and never reaches the BIR.
+a test TIN's send is a dry run and never reaches the BIR. Likewise a send
+whose Sender ends after opening a stream but without a result is
+`unknown` with "the send ended without an outcome; BIR may have received
+this return", and for a test TIN "the send ended without an outcome; it
+was a test send, a dry run, so nothing was sent to the BIR" (a test TIN's
+send opens no stream, so today it ends `failed` before that).
 
 Fields a `result` may carry besides these, each optional
 ([bir-uptime.md](bir-uptime.md)):
@@ -272,6 +282,7 @@ Fields a `result` may carry besides these, each optional
 | `class` | On `failed` and `unknown`: whose side it failed on, `bir`, `user_network` or `ours`. An `ours` failure is not one of the return's tries; an unknown value reads as `bir`. Sent from `BIR_UPTIME=public` (absent for a try that got in, and when the Sender's mode is `lab`, `dry_run` or unknown). |
 | `bir` | **Planned, not sent yet.** The sign right after this try ([bir-uptime.md](bir-uptime.md#22-the-sign-object)). |
 | `hold` | **Planned, not sent yet.** On a v1 send held for the BIR's state: `{"code":"bir_offline","wait_until":"…"}`. |
+| `test_only` | `true` on the result of a test TIN's send ([Test TINs](#test-tins)), v1 and v2, after the other fields; absent for any other send. |
 
 The server checks the account and the TIN again when the socket opens,
 after the token check. If the account was banned, or the TIN stopped being

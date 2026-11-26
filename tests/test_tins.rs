@@ -514,3 +514,69 @@ async fn a_person_cannot_register_a_reserved_root(db: PgPool) {
         }
     }
 }
+
+/// A v1 return's `POST /api/submissions` request for the 14-digit `tin`.
+fn v1_return(token: &str, tin: &str, key: &str) -> Request<Body> {
+    let body = json!({
+        "filename": format!("{tin}-1701Qv2018-2026Q1#ana@example.test#.xml"),
+        "xml": iaf_return("frm1701q", tin, "2026"),
+        "idempotency_key": key,
+    });
+    Request::post("/api/submissions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// `path` read with `token`, as JSON.
+async fn read(site: &Site, token: &str, path: String) -> Value {
+    let request =
+        Request::get(path).header(header::AUTHORIZATION, format!("Bearer {token}")).body(Body::empty()).unwrap();
+    serde_json::from_str(&text(site.send(request).await).await).unwrap()
+}
+
+/// A test TIN's submission says `"test_only": true` wherever the app reads
+/// it: the `POST /api/submissions` answer and its idempotent replay,
+/// `GET /api/submissions/{id}` and its item in `GET /api/submissions`, for
+/// every reserved root, to other clients too. Another TIN's has no such
+/// field, so it reads as before.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_test_tins_submission_says_test_only(db: PgPool) {
+    let site = Site::new(db);
+    let (_, staff) = site.person(STAFF).await;
+    let (ana, _) = test_account(&site, "ana@example.test").await;
+    for root in buwiz_cloud::tin::TEST_ROOTS {
+        let form = FORM.replace("000-000-000-00000", &format!("{}-00000", dashed(root)));
+        site.post(&format!("/staff/users/{ana}/test-tin"), &staff, &form).await;
+    }
+    add_claim(&site.db, ana, "000123453", "approved").await;
+    let app = app_token(&site.db, ana).await;
+    let books = common::token(&site.db, ana, "buwiz-books", "books").await;
+    let mut ids = Vec::new();
+    for (root, test_only) in [("000000000", true), ("111111114", true), ("000123453", false)] {
+        let tin = format!("{root}00000");
+        let response = site.send(v1_return(&app, &tin, &format!("k-{root}"))).await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{root}");
+        let created: Value = serde_json::from_str(&text(response).await).unwrap();
+        let replay: Value =
+            serde_json::from_str(&text(site.send(v1_return(&app, &tin, &format!("k-{root}"))).await).await).unwrap();
+        let id = created["id"].as_str().unwrap().to_owned();
+        let shown = read(&site, &app, format!("/api/submissions/{id}")).await;
+        let shown_to_books = read(&site, &books, format!("/api/submissions/{id}")).await;
+        for (name, view) in [("create", &created), ("replay", &replay), ("show", &shown), ("books", &shown_to_books)] {
+            assert_eq!(view["id"], json!(id), "{root} {name}");
+            if test_only {
+                assert_eq!(view["test_only"], json!(true), "{root} {name}: {view}");
+            } else {
+                assert!(view.get("test_only").is_none(), "{root} {name}: {view}");
+            }
+        }
+        ids.push((id, test_only));
+    }
+    let listed = read(&site, &app, "/api/submissions".to_owned()).await;
+    for (id, test_only) in ids {
+        let item = listed["submissions"].as_array().unwrap().iter().find(|item| item["id"] == json!(id)).unwrap();
+        assert_eq!(item.get("test_only").cloned(), test_only.then_some(json!(true)), "{item}");
+    }
+}

@@ -925,7 +925,13 @@ async fn bridge(
         // After the app went away the deadline is the 60 s outcome wait.
         if deadline_passed && app_gone { observer.wait_expired() } else { observer.sender_lost() }
     }
-    let result = result.unwrap_or_else(|| without_outcome(!streams.is_empty(), test_tin));
+    let result = result.unwrap_or_else(|| {
+        let opened = !streams.is_empty();
+        if opened && test_tin {
+            tracing::error!(submission = %id, "a test TIN's send opened a stream and ended without an outcome");
+        }
+        without_outcome(opened, test_tin, v2)
+    });
     settle(state, &mut app_tx, id, v2, test_tin, &result, observer, recording, app_gone).await
 }
 
@@ -933,20 +939,17 @@ async fn bridge(
 /// stream: BIR may have the return.
 pub const ENDED_WITHOUT_OUTCOME: &str = "the send ended without an outcome; BIR may have received this return";
 
-/// The same for a test TIN's send, which is a dry run (the same spirit as
-/// [`STOPPED_TEST_SEND`]). The status stays `unknown`.
-pub const ENDED_TEST_SEND: &str =
-    "the send ended without an outcome; it was a test send, a dry run, so nothing was sent to the BIR";
-
 /// The result of a try the Sender ended without one: `failed` when it
-/// opened no stream (nothing reached the BIR), else `unknown`, with
-/// [`ENDED_TEST_SEND`] for a test TIN's and [`ENDED_WITHOUT_OUTCOME`] for
-/// any other. (Today a test TIN's send opens no stream, so it ends
-/// `failed`; the words are there should one ever open.)
-fn without_outcome(opened: bool, test_tin: bool) -> Control {
+/// opened no stream (nothing reached the BIR), else `unknown` with
+/// [`ENDED_WITHOUT_OUTCOME`]. A test TIN's send that opened a stream is
+/// not a dry run, whatever came of it: it fails as the bridge fails one
+/// ([`NOT_A_DRY_RUN`], [`NOT_A_DRY_RUN_V2`]), and never says what reached
+/// the BIR. (The bridge stops a test send at its first `open`, so this is a
+/// second guard; the caller logs it at error level.)
+fn without_outcome(opened: bool, test_tin: bool, v2: bool) -> Control {
     let (status, error) = match (opened, test_tin) {
         (false, _) => ("failed", "the sending service stopped before connecting to BIR"),
-        (true, true) => ("unknown", ENDED_TEST_SEND),
+        (true, true) => ("failed", if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN }),
         (true, false) => ("unknown", ENDED_WITHOUT_OUTCOME),
     };
     Control::Result { status: status.to_owned(), error: Some(error.to_owned()), receipt: None }
@@ -1061,17 +1064,22 @@ mod tests {
     }
 
     #[test]
-    fn a_send_without_an_outcome_says_whether_it_was_a_test_send() {
+    fn a_send_without_an_outcome_never_reassures_about_a_test_send() {
         let error = |control: Control| match control {
             Control::Result { status, error, receipt: None } => (status, error.unwrap()),
             other => panic!("{other:?}"),
         };
-        assert_eq!(error(without_outcome(true, false)), ("unknown".to_owned(), ENDED_WITHOUT_OUTCOME.to_owned()));
-        assert_eq!(error(without_outcome(true, true)), ("unknown".to_owned(), ENDED_TEST_SEND.to_owned()));
-        assert!(ENDED_TEST_SEND.contains("nothing was sent to the BIR") && !ENDED_TEST_SEND.contains("may have"));
-        for test_tin in [false, true] {
-            let stopped = ("failed".to_owned(), "the sending service stopped before connecting to BIR".to_owned());
-            assert_eq!(error(without_outcome(false, test_tin)), stopped);
+        for v2 in [false, true] {
+            let unknown = ("unknown".to_owned(), ENDED_WITHOUT_OUTCOME.to_owned());
+            assert_eq!(error(without_outcome(true, false, v2)), unknown);
+            // A test send that opened a stream is not a dry run: it fails as
+            // one, and says nothing about what reached the BIR.
+            let not_a_dry_run = if v2 { NOT_A_DRY_RUN_V2 } else { NOT_A_DRY_RUN };
+            assert_eq!(error(without_outcome(true, true, v2)), ("failed".to_owned(), not_a_dry_run.to_owned()));
+            for test_tin in [false, true] {
+                let stopped = ("failed".to_owned(), "the sending service stopped before connecting to BIR".to_owned());
+                assert_eq!(error(without_outcome(false, test_tin, v2)), stopped);
+            }
         }
     }
 

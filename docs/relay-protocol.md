@@ -267,12 +267,13 @@ A send the server finds stuck in `sending` for 10 minutes (it stopped
 mid-send) becomes `unknown` with the error "the server stopped while
 sending". For a test TIN's send the error is instead "the server stopped
 during this test send; it was a dry run, so nothing was sent to the BIR":
-a test TIN's send is a dry run and never reaches the BIR. Likewise a send
-whose Sender ends after opening a stream but without a result is
-`unknown` with "the send ended without an outcome; BIR may have received
-this return", and for a test TIN "the send ended without an outcome; it
-was a test send, a dry run, so nothing was sent to the BIR" (a test TIN's
-send opens no stream, so today it ends `failed` before that).
+a test TIN's send is a dry run and never reaches the BIR. A send whose
+Sender ends after opening a stream but without a result is `unknown` with
+"the send ended without an outcome; BIR may have received this return". A
+test TIN's send never opens a stream: the server stops one at its first
+`open`, as not a dry run ([section 6](#6-the-sender)). Should one still end that way, it is
+`failed` with the same words as a test send that is not a dry run, never
+words that say nothing reached the BIR.
 
 Fields a `result` may carry besides these, each optional
 ([bir-uptime.md](bir-uptime.md)):

@@ -1024,7 +1024,7 @@ async fn verify_inner(state: &AppState, request: Request) -> Result<Response, Re
     // or a code from the web, are wrong here. Every live request has its
     // code, mailed or not, and both are tried the same way.
     let tried = match stored.code_id {
-        Some(code_id) => accounts::try_code_row(&mut tx, code_id, &email, &asked.code).await?,
+        Some(code_id) => accounts::try_code_row(&mut tx, code_id, &email, Purpose::AppSignIn, &asked.code).await?,
         None => Tried::NoCode,
     };
     let attempts_left = match tried {

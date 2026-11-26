@@ -58,11 +58,14 @@ pub(crate) fn required_reason(reason: &str) -> Result<String, DecideError> {
     reason_text(reason).map_err(DecideError::Refused)
 }
 
-/// Where an account change came from: the staff pages or the seed tool.
+/// Where an account change came from: the staff pages or the seed tool,
+/// or the BIR app (the person's own PIN reset,
+/// [`crate::account::pin_reset`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Web,
     Seed,
+    App,
 }
 
 impl Source {
@@ -70,6 +73,7 @@ impl Source {
         match self {
             Self::Web => "web",
             Self::Seed => "seed",
+            Self::App => "app",
         }
     }
 }

@@ -1105,6 +1105,92 @@ one app out (Support may not sign out an Admin): the device is removed,
 its sign-in ended (`signed_out_by_staff`), and the history gets an
 `app_signed_out` line naming the app.
 
+## Resetting a forgotten app PIN
+
+The eBIRForms app locks with a PIN that lives on the device; the server
+never sees it. A person who forgot it proves they can read the account's
+mail, on this device, and the account is told. Two routes on the API host,
+for the BIR app's bearer only (`403 insufficient_scope` for any other;
+`src/account/pin_reset.rs`). Every refusal has the API's usual shape,
+`{"error": {"code", "message"}}`, and no answer is cached.
+
+**Which device.** For a real account, the token's sign-in must have a live
+device row (`409 device_not_registered` otherwise), and a request is bound
+to that device. A practice account (a store reviewer's, with a fixed code:
+`practice` on `GET /me`) registers no device, so its request is bound to
+the token's sign-in (app grant) instead; it never gets
+`device_not_registered`. A request made on one device (or sign-in) is
+refused on another, and refused once used.
+
+**`POST /api/pin-reset/start`.** The body is empty, `{}`, or
+`{"device_name": "..."}` (at most 100 characters; only a practice
+account's notice uses it). A code of the purpose `pin_reset` is mailed to
+the account's own address ("Your eBIRForms PIN reset code": the in-app
+sign-in code's mail with words for a PIN reset, the code its only number).
+It lasts `APP_SIGN_IN_MINUTES`. Answer: `200 {"request_id", "expires_in"}`.
+A practice account is mailed nothing: its fixed code is accepted at
+verify. Refusals: `400 bad_request`; `409 device_not_registered`; `429
+code_already_sent` while this device's last code still works
+(`Retry-After` until it expires); `429 rate_limited` (with `Retry-After`)
+past 3 starts per device an hour or 5 per account an hour across its
+devices (in memory), 10 per account a day (counted in `pin_resets` under
+the account's lock, so a restart does not reset it), or the address's five
+codes an hour (every purpose together); `503 busy`; `503
+mail_unavailable` when the code could not be mailed (nothing is kept, and
+the start does not count).
+
+**`POST /api/pin-reset/verify`** `{"request_id", "code"}`. In this order,
+which the app relies on:
+1. In one transaction, the account is locked and the code taken. It must
+   be the request's own code, of the purpose `pin_reset`, the request this
+   account's and this device's (or sign-in's), unused and unexpired, with
+   tries left; a wrong try is counted and committed, as on the sign-in
+   page.
+2. In the same transaction, the request is marked used and one
+   `account_audit` line written: action `pin_reset_verified`, source
+   `app`, the account as actor, reason `device <name> (<device id>)` or,
+   for a practice account, `grant <grant id>`. It commits.
+3. Then the notice is mailed to the account's own address, waiting at
+   most 10 seconds. Never before the commit.
+4. Only once the mail service took it: the request's `notified_at` is
+   set (its own statement; if that write fails it is logged, and the
+   answer is still the `200`, as the account was told), then `200
+   {"verified": true, "device": "<name>", "at": <unix seconds of the
+   verification>}`. Otherwise (refused, or no answer in 10 s) `503
+   mail_unavailable`, `notified_at` stays NULL, and staff are mailed an
+   alert (ids only). The spent code stays spent and the line stays; the
+   person asks for a new code.
+
+**The app changes the PIN only after verify's `200`.** Any other answer,
+`503 mail_unavailable` included, leaves the PIN as it is.
+
+Refusals: `400 bad_request`; `400 code_invalid` (a wrong code, an unknown
+request, another device's, one already used, or a code of another
+purpose: one answer for all); `400 code_expired`; `429 too_many_tries`
+(the code had its five wrong tries; ask for a new one); `429
+rate_limited` past 10 tries per device an hour (in memory, with
+`Retry-After`); `409 device_not_registered`; `503 busy` (nothing was
+taken); `503 mail_unavailable`.
+
+A code works only for its own purpose: a sign-in or deletion code never
+resets a PIN, and a PIN reset code never signs in (on the web or in the
+app) or deletes an account.
+
+**The notice** ("A PIN reset was asked for in eBIRForms"), plain text,
+with no code and no link: "A PIN reset was asked for on <device> on <date
+and time>, Manila time (<UTC time>)." Then "If this was you, there is
+nothing to do." and "If it was not you: sign in at account.buwiz.com, open
+My devices, and remove <device>. Removing it signs it out and stops it
+from sending returns." `<device>` is the device row's name, or for a
+practice account the name its app reported at start, else "this device".
+It is sent for every verified reset, practice accounts included. "Asked
+for", not "was reset": the person can still cancel setting the new PIN.
+
+The account's history on the staff pages shows the line as the person's
+own, and it is not staff activity. Deleting the account deletes its
+requests; the lines stay, by id, without the address. The hourly upkeep
+deletes requests 30 days after they expired.
+
 ## Known limits of in-app sign-in
 
 Reviewed and accepted for now (PR 81's review):

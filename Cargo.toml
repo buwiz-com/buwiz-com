@@ -127,6 +127,8 @@ lto = "thin"
 
 [dev-dependencies]
 font8x8 = "0.3"
+# Paused time, for the PIN reset notice's timeout (tests/pin_reset.rs).
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 # oar-ocr 0.10.2 with zip raised to 9.0.5 (vendor/oar-ocr/VENDORED.md): upstream

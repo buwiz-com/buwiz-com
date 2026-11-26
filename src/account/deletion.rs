@@ -6,8 +6,8 @@
 //!
 //! Deleting the `accounts` row takes every row that names the account with
 //! it (`ON DELETE CASCADE`: TINs and their files and readings, returns and
-//! tickets, devices, sign-ins and their tokens, the BIR queue and outage
-//! records). This also deletes its codes and in-app sign-in requests,
+//! tickets, devices, sign-ins and their tokens, PIN reset requests, the BIR
+//! queue and outage records). This also deletes its codes and in-app sign-in requests,
 //! which have no foreign key, and the stored objects of files that were
 //! still kept. Audit lines stay; the account's own actions in them lose
 //! its address.

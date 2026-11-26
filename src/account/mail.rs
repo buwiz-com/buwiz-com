@@ -69,6 +69,11 @@ pub struct Mailer {
     failing_pin_reset_codes: AtomicBool,
     /// Tests only: a recording mailer that fails every PIN reset notice.
     failing_pin_reset_notices: AtomicBool,
+    /// Tests only: PIN reset notices wait at their start while this is set
+    /// ([`Mailer::hold_pin_reset_notices`]).
+    holding_pin_reset_notices: AtomicBool,
+    /// How many PIN reset notices a [`Mailer::recording`] began to send.
+    pin_reset_notices_begun: AtomicUsize,
     /// How many new-device checks have finished, mail or not: tests wait
     /// on it, as the check runs on its own task.
     new_device_checks: AtomicUsize,
@@ -166,6 +171,8 @@ impl Mailer {
             failing_app_codes: AtomicBool::new(false),
             failing_pin_reset_codes: AtomicBool::new(false),
             failing_pin_reset_notices: AtomicBool::new(false),
+            holding_pin_reset_notices: AtomicBool::new(false),
+            pin_reset_notices_begun: AtomicUsize::new(0),
             failing_new_devices: AtomicBool::new(false),
             holding_new_devices: AtomicBool::new(false),
             new_device_checks: AtomicUsize::new(0),
@@ -242,6 +249,18 @@ impl Mailer {
     /// while `fail`.
     pub fn fail_pin_reset_notices(&self, fail: bool) {
         self.failing_pin_reset_notices.store(fail, Ordering::SeqCst);
+    }
+
+    /// Tests only: a [`Mailer::recording`] holds every PIN reset notice at
+    /// its start while `hold`, as a mail service that does not answer.
+    pub fn hold_pin_reset_notices(&self, hold: bool) {
+        self.holding_pin_reset_notices.store(hold, Ordering::SeqCst);
+    }
+
+    /// How many PIN reset notices a [`Mailer::recording`] began to send,
+    /// held or not.
+    pub fn pin_reset_notices_begun(&self) -> usize {
+        self.pin_reset_notices_begun.load(Ordering::SeqCst)
     }
 
     /// The new-device mails a [`Mailer::recording`] kept, oldest first.
@@ -507,6 +526,10 @@ impl Mailer {
     pub async fn send_pin_reset_notice(&self, to: &str, device: &str, at: time::OffsetDateTime) -> anyhow::Result<()> {
         let (subject, text) = pin_reset_notice_message(device, at, &self.site_origin);
         if let Some(mails) = &self.pin_reset_notices {
+            self.pin_reset_notices_begun.fetch_add(1, Ordering::SeqCst);
+            while self.holding_pin_reset_notices.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             if self.failing_pin_reset_notices.load(Ordering::SeqCst) {
                 anyhow::bail!("made-up mail failure");
             }

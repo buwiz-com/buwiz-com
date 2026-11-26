@@ -215,6 +215,8 @@ async fn the_code_is_mailed_and_verify_answers_only_once_the_account_is_told(db:
     assert_eq!(lines, [("pin_reset_verified".into(), None, None, ANA.into(), "app".into(), Some(reason))]);
     assert_eq!(count(&site.db, "SELECT count(*) FROM pin_resets WHERE used_at IS NOT NULL").await, 1);
     assert_eq!(count(&site.db, "SELECT count(*) FROM email_codes WHERE consumed_at IS NOT NULL").await, 1);
+    // Told: notified_at is set, after the verification.
+    assert_eq!(count(&site.db, "SELECT count(*) FROM pin_resets WHERE notified_at >= used_at").await, 1);
 
     // The line reads as the person's own on the staff pages, and is not
     // staff activity.
@@ -240,6 +242,8 @@ async fn a_notice_the_mail_service_does_not_take_gives_no_200(db: PgPool) {
     assert_eq!(account_audit_lines(&site.db, ana).await.len(), 1);
     assert_eq!(count(&site.db, "SELECT count(*) FROM pin_resets WHERE used_at IS NOT NULL").await, 1);
     assert!(site.state.mailer.pin_reset_notices().is_empty());
+    // Not told: notified_at stays NULL.
+    assert_eq!(count(&site.db, "SELECT count(*) FROM pin_resets WHERE notified_at IS NOT NULL").await, 0);
 
     // The spent code stays spent: the person asks for a new one.
     site.state.mailer.fail_pin_reset_notices(false);
@@ -719,4 +723,65 @@ async fn deleting_the_account_takes_its_requests_and_keeps_the_line(db: PgPool) 
     let actions: Vec<(&str, &str, &str)> =
         lines.iter().map(|line| (line.0.as_str(), line.3.as_str(), line.4.as_str())).collect();
     assert_eq!(actions, [("pin_reset_verified", "", "app"), ("deleted", "", "web")]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_mail_service_that_does_not_answer_in_ten_seconds_gives_no_200(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, _) = site.person(ANA).await;
+    let phone = TestDevice::new(&site.db, ana).await;
+    let request_id = started(&site, &phone.token).await;
+    let code = last_code(&site);
+
+    // The notice is held at its start, as a mail service that does not
+    // answer; the clock is paused only once it is, so the database work
+    // before it runs on real time.
+    site.state.mailer.hold_pin_reset_notices(true);
+    let verifying = {
+        let same = Site { db: site.db.clone(), router: site.router.clone(), state: site.state.clone() };
+        let (token, request_id) = (phone.token.clone(), request_id.clone());
+        tokio::spawn(async move { verify(&same, &token, &request_id, &code).await })
+    };
+    while site.state.mailer.pin_reset_notices_begun() == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!verifying.is_finished(), "verify answered before its 10 seconds");
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let answer = verifying.await.unwrap();
+    assert_eq!(answer.refused(), (503, "mail_unavailable"));
+
+    // Verified and logged, not told.
+    assert_eq!(account_audit_lines(&site.db, ana).await.len(), 1);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM pin_resets WHERE used_at IS NOT NULL").await, 1);
+    assert_eq!(count(&site.db, "SELECT count(*) FROM pin_resets WHERE notified_at IS NOT NULL").await, 0);
+    let alerts = staff_alerts(&site, "PIN reset: the notice to the account was not mailed").await;
+    assert_eq!(alerts.len(), 1);
+    assert!(alerts[0].text.contains(&format!("request {request_id}")), "{}", alerts[0].text);
+    site.state.mailer.hold_pin_reset_notices(false);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_verify_past_the_limit_never_waits_for_the_accounts_lock(db: PgPool) {
+    let site = Site::with_mailbox(db);
+    let (ana, _) = site.person(ANA).await;
+    let phone = TestDevice::new(&site.db, ana).await;
+    for _ in 0..10 {
+        let unknown = Uuid::new_v4().to_string();
+        assert_eq!(verify(&site, &phone.token, &unknown, "123456").await.refused(), (400, "code_invalid"));
+    }
+    // Someone holds the account's row.
+    let mut holding = site.db.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(ana).execute(&mut *holding).await.unwrap();
+    let begun = std::time::Instant::now();
+    let unknown = Uuid::new_v4().to_string();
+    assert_eq!(verify(&site, &phone.token, &unknown, "123456").await.refused(), (429, "rate_limited"));
+    // Well under the 3 s a locked row is waited for before 503 busy.
+    assert!(begun.elapsed() < std::time::Duration::from_secs(2), "{:?}", begun.elapsed());
+    holding.rollback().await.unwrap();
 }

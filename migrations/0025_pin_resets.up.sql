@@ -15,10 +15,13 @@
 -- - `pin_resets` holds each request: the account, the device it was made
 --   on (NULL for a practice account, a store reviewer's with a fixed code,
 --   which registers no device), the sign-in (app grant) it was made with,
---   the device's name for the notice, its code, when it stops working and
---   when it was used. Whether a row may have no device depends on its
---   account, which a CHECK cannot read; the code enforces it, and tests
---   pin it. The index serves the day's count per account.
+--   the device's name for the notice, its code, when it stops working,
+--   when it was used (verified), and when the mail service took the
+--   notice that told the account (`notified_at`; NULL when it did not, so
+--   staff can see which verified resets the owner was not told of).
+--   Whether a row may have no device depends on its account, which a
+--   CHECK cannot read; the code enforces it, and tests pin it. The index
+--   serves the day's count per account.
 --
 -- Each wider check is added NOT VALID and validated before the old one is
 -- dropped, so no column is ever without a check, and then takes the old
@@ -71,7 +74,11 @@ CREATE TABLE pin_resets (
     created_at  timestamptz NOT NULL DEFAULT now(),
     -- When its code stops working.
     expires_at  timestamptz NOT NULL,
-    used_at     timestamptz
+    -- When its code was verified.
+    used_at     timestamptz,
+    -- When the mail service took the notice to the account, after
+    -- used_at; NULL if it never did (verify then answered 503).
+    notified_at timestamptz
 );
 CREATE INDEX pin_resets_account ON pin_resets (account_id, created_at);
 CREATE INDEX pin_resets_code_id ON pin_resets (code_id);

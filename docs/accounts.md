@@ -1152,10 +1152,14 @@ which the app relies on:
    for a practice account, `grant <grant id>`. It commits.
 3. Then the notice is mailed to the account's own address, waiting at
    most 10 seconds. Never before the commit.
-4. Only once the mail service took it: `200 {"verified": true, "device":
-   "<name>", "at": <unix seconds of the verification>}`. Otherwise `503
-   mail_unavailable`, and staff are mailed an alert (ids only). The spent
-   code stays spent and the line stays; the person asks for a new code.
+4. Only once the mail service took it: the request's `notified_at` is
+   set (its own statement; if that write fails it is logged, and the
+   answer is still the `200`, as the account was told), then `200
+   {"verified": true, "device": "<name>", "at": <unix seconds of the
+   verification>}`. Otherwise (refused, or no answer in 10 s) `503
+   mail_unavailable`, `notified_at` stays NULL, and staff are mailed an
+   alert (ids only). The spent code stays spent and the line stays; the
+   person asks for a new code.
 
 **The app changes the PIN only after verify's `200`.** Any other answer,
 `503 mail_unavailable` included, leaves the PIN as it is.

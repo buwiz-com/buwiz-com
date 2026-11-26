@@ -2498,7 +2498,12 @@ async fn going_back_to_24_is_refused(db: &PgPool, what: &str) {
     let schema_25 = schema(db).await;
     let refused = MIGRATOR.undo(db, 24).await.unwrap_err().to_string();
     assert!(refused.contains(what), "{what}: {refused}");
-    for words in ["Stop the rollback", "Do not delete or change these rows", "Go forward instead"] {
+    for words in [
+        "The way back is forward only once the first reset is verified; unverified starts age out in 30 days.",
+        "Stop the rollback",
+        "Do not delete or change these rows",
+        "Go forward instead",
+    ] {
         assert!(refused.contains(words), "{words}: {refused}");
     }
     let mut tx = db.begin().await.unwrap();
@@ -2512,12 +2517,13 @@ async fn going_back_to_24_is_refused(db: &PgPool, what: &str) {
 
 /// Migration 25: a code may be for a PIN reset, an account's history may
 /// have a `pin_reset_verified` line from the app, and `pin_resets` holds
-/// the requests, deleted with their account, device or sign-in. The
-/// release before (at 24) never starts on it. Going back to 24 refuses
-/// while any request, such line, any line from the app or any such code
-/// exists, by sqlx and by hand, deleting and changing nothing; with none,
-/// it puts back 24's checks exactly and drops the table, and the release
-/// before starts. The way up works again.
+/// the requests (with `notified_at`), deleted with their account, device or
+/// sign-in. The release before (at 24) never starts on it. Going back to 24
+/// refuses once a reset was verified (a verified request, such a line, any
+/// line from the app, or a used reset code), by sqlx and by hand, deleting
+/// and changing nothing; starts never verified do not block, and go with
+/// it. It then puts back 24's checks exactly and drops the table, and the
+/// release before starts. The way up works again.
 #[sqlx::test(migrations = false)]
 async fn pin_resets_block_going_back_to_24(db: PgPool) {
     release_24().run(&db).await.unwrap();
@@ -2587,21 +2593,23 @@ async fn pin_resets_block_going_back_to_24(db: PgPool) {
     let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM pin_resets").fetch_all(&db).await.unwrap();
     assert_eq!(left, [practice], "{on_device} went with its device");
 
-    // Back to 24: refused while any of it is recorded.
-    going_back_to_24_is_refused(&db, "1 pin_resets row(s)").await;
-    exec(&db, &format!("DELETE FROM oauth_grants WHERE id = '{grant}'")).await;
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pin_resets").fetch_one(&db).await.unwrap(), 0);
+    // Back to 24: refused once a reset was verified, and only then.
+    exec(&db, "UPDATE pin_resets SET used_at = now(), notified_at = now()").await;
+    going_back_to_24_is_refused(&db, "1 verified pin_resets row(s)").await;
+    // (The test's own clean-ups below; the runbook never deletes or
+    // changes a blocking row.)
+    exec(&db, "UPDATE pin_resets SET used_at = NULL, notified_at = NULL").await;
     exec(&db, &account_line(ana, "pin_reset_verified", "app")).await;
     going_back_to_24_is_refused(&db, "1 account_audit line(s) of a PIN reset").await;
-    // (The test's own clean-up; the runbook never deletes an audit line.)
     exec(&db, "DELETE FROM account_audit WHERE action = 'pin_reset_verified'").await;
     exec(&db, &account_line(ana, "signed_out", "app")).await;
     going_back_to_24_is_refused(&db, "1 account_audit line(s) of a PIN reset").await;
     exec(&db, "DELETE FROM account_audit WHERE source = 'app'").await;
     exec(&db, &code_of("pin_reset")).await;
-    going_back_to_24_is_refused(&db, "1 email_codes row(s) of purpose pin_reset").await;
-    exec(&db, "DELETE FROM email_codes WHERE purpose = 'pin_reset'").await;
-    // An account deleted with its requests leaves none to refuse.
+    exec(&db, "UPDATE email_codes SET consumed_at = now() WHERE purpose = 'pin_reset'").await;
+    going_back_to_24_is_refused(&db, "1 used email_codes row(s) of purpose pin_reset").await;
+    exec(&db, "UPDATE email_codes SET consumed_at = NULL WHERE purpose = 'pin_reset'").await;
+    // An account deleted with its requests leaves none.
     let bob = id(&db, "INSERT INTO accounts (email) VALUES ('bob@example.test') RETURNING id").await;
     let bobs = id(
         &db,
@@ -2611,18 +2619,28 @@ async fn pin_resets_block_going_back_to_24(db: PgPool) {
     exec(
         &db,
         &format!(
-            "INSERT INTO pin_resets (account_id, grant_id, device_name, expires_at)
-             VALUES ('{bob}', '{bobs}', 'this device', now())"
+            "INSERT INTO pin_resets (account_id, grant_id, device_name, expires_at, used_at)
+             VALUES ('{bob}', '{bobs}', 'this device', now(), now())"
         ),
     )
     .await;
     exec(&db, &format!("DELETE FROM accounts WHERE id = '{bob}'")).await;
+    // Left: a start never verified, and its unused code. They do not block,
+    // and go with the way back.
+    let unverified: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM pin_resets WHERE used_at IS NULL),
+                (SELECT count(*) FROM email_codes WHERE purpose = 'pin_reset' AND consumed_at IS NULL)",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(unverified, (1, 1));
 
     MIGRATOR.undo(&db, 24).await.unwrap();
     assert_eq!(versions(&db).await, (1..=24).collect::<Vec<_>>());
     assert_eq!(schema(&db).await, schema_24, "the schema is migration 24's");
     assert_eq!(pin_reset_checks(&db).await, checks_24);
-    // The rows already there stay.
+    // The rows already there stay; the unused reset code went.
     let purposes: Vec<String> = sqlx::query_scalar("SELECT purpose FROM email_codes").fetch_all(&db).await.unwrap();
     assert_eq!(purposes, ["app_sign_in"]);
     release_24().run(&db).await.unwrap();

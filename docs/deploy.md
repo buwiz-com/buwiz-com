@@ -1436,7 +1436,7 @@ order:
    `systemctl is-active buwiz.service` prints `inactive`.
 2. On a database at 25, run 25's down file first, as
    [below](#migration-25-pin-resets) says (it refuses once a PIN reset was
-   asked for); on one at 24, run 24's down file next, as
+   verified); on one at 24, run 24's down file next, as
    [below](#migration-24-audit-lines-from-the-app) says (it refuses once
    the app has added a TIN). Then run this down file, with a lock timeout
    set first:
@@ -1497,7 +1497,7 @@ order:
    `systemctl is-active buwiz.service` prints `inactive`.
 2. On a database at 25, run 25's down file first, as
    [below](#migration-25-pin-resets) says (it refuses once a PIN reset was
-   asked for). Then run this down file, with a lock timeout set first:
+   verified). Then run this down file, with a lock timeout set first:
    ```sh
    python3 /root/buwiz-psql.py down migrations/0024_app_audit_source.down.sql
    python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 23
@@ -1530,7 +1530,9 @@ name, so no column is ever without a check):
 
 It adds the table `pin_resets` (one row per request: the account, its
 device, NULL for a practice account, its sign-in, the device's name, its
-code, `created_at`, `expires_at`, `used_at`), deleted with its account,
+code, `created_at`, `expires_at`, `used_at` when it was verified, and
+`notified_at` when the mail service took the notice that told the
+account, NULL if it never did), deleted with its account,
 device or sign-in, with an index on `(account_id, created_at)` for the
 day's count. No existing row changes. In one transaction that saves no
 lock: the ACCESS EXCLUSIVE locks on `email_codes` and `account_audit` are
@@ -1553,17 +1555,24 @@ SELECT max(version) FROM _sqlx_migrations;                           -- 24
 ```
 Then deploy as above (keep the previous binaries, check 6, `deploy.sh`).
 
-**Rolling back to 24.** The release before this one cannot hold a PIN reset
-request, its code, or its audit line, and the line is the only record that
-a reset was verified, on which device, and that the account was told. So
-once any exists (once a PIN reset was asked for), rolling back below 25 is
-refused, and the way is forward only: the down file refuses, and deletes
-and changes nothing. Do not delete or change those rows to get past it; a
-fix goes forward, in a new release. First, read-only:
+**Rolling back to 24.** The way back is forward only once the first
+reset is verified; unverified starts age out in 30 days. The release
+before this one cannot hold a verified reset's audit line, and that line
+is the only record that a reset was verified, and on which device (whether
+the account was told is `pin_resets.notified_at`). Precisely, the down file
+refuses, deleting and changing nothing, while any of these exists: a
+`pin_resets` row with `used_at` set, an `account_audit` line with action
+`pin_reset_verified` or source `app`, or a used (`consumed_at` set)
+`email_codes` row of purpose `pin_reset`. Audit lines are kept forever, so
+after one verified reset the refusal is for good. Starts never verified do
+not block: the down file deletes them (their `pin_resets` rows and their
+unused codes; the app asks again after the way up), as the hourly upkeep
+would 30 days on. Do not delete or change the blocking rows to get past
+it; a fix goes forward, in a new release. First, read-only:
 ```sql
-SELECT (SELECT count(*) FROM pin_resets)
+SELECT (SELECT count(*) FROM pin_resets WHERE used_at IS NOT NULL)
      + (SELECT count(*) FROM account_audit WHERE action = 'pin_reset_verified' OR source = 'app')
-     + (SELECT count(*) FROM email_codes WHERE purpose = 'pin_reset');  -- 0
+     + (SELECT count(*) FROM email_codes WHERE purpose = 'pin_reset' AND consumed_at IS NOT NULL);  -- 0
 ```
 If it is not 0, the rollback to 24 is not available: stop. With 0, in this
 order:
@@ -1575,8 +1584,9 @@ order:
    python3 /root/buwiz-psql.py ro "SELECT max(version) FROM _sqlx_migrations"   # must be 24
    ```
    (In the root shell, from the folder that holds `migrations/`: see [Running psql on the instance](#running-psql-on-the-instance).)
-   It drops `pin_resets` and puts back 17's, 16's and 12's checks exactly.
-   If it refuses (a reset was asked for since the query), stop as above.
+   It drops `pin_resets`, deletes the unused `pin_reset` codes, and puts
+   back 17's, 16's and 12's checks exactly. If it refuses (a reset was
+   verified since the query), stop as above.
 3. Put the previous binaries back and start them, as
    [above](#putting-the-previous-binaries-back). If this release's binary
    starts instead, it runs migration 25 again, and the rollback starts

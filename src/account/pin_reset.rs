@@ -228,18 +228,30 @@ const BOUND_SQL: &str = "(CASE WHEN $2::uuid IS NULL THEN r.device_id IS NULL AN
                               ELSE r.device_id = $2 END)";
 
 /// In the caller's transaction: locks the account (released at its end),
-/// then finds what a request of this token is bound to. `None`: a real
-/// account whose sign-in has no live device. A practice account is one with
-/// a working fixed code ([`roles::fixed_code_sql`]), as `GET /me` tells the
-/// app.
+/// then finds what a request of this token is bound to ([`bind`]).
 async fn lock_and_bind(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &AppState,
     bearer: &Bearer,
 ) -> Result<Option<Bound>, Refusal> {
+    bind(tx, state, bearer, true).await
+}
+
+/// In the caller's transaction: what a request of this token is bound to,
+/// with the account's row locked (`lock`) or not. `None`: a real account
+/// whose sign-in has no live device. A practice account is one with a
+/// working fixed code ([`roles::fixed_code_sql`]), as `GET /me` tells the
+/// app.
+async fn bind(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state: &AppState,
+    bearer: &Bearer,
+    lock: bool,
+) -> Result<Option<Bound>, Refusal> {
     let practice: Option<bool> = sqlx::query_scalar(&format!(
-        "SELECT {} FROM accounts a WHERE a.id = $1 FOR UPDATE",
-        roles::fixed_code_sql("a", "$2")
+        "SELECT {} FROM accounts a WHERE a.id = $1{}",
+        roles::fixed_code_sql("a", "$2"),
+        if lock { " FOR UPDATE" } else { "" }
     ))
     .bind(bearer.account.id)
     .bind(&state.config.admin_emails)
@@ -509,7 +521,9 @@ struct Stored {
 /// `app`, the account as actor, reason `device <name> (<id>)` or, for a
 /// practice account, `grant <id>`); it commits. Then the notice is mailed
 /// to the account's own address, waiting at most [`NOTICE_TIMEOUT`]: the
-/// `200` comes only once the mail service took it. Otherwise `503
+/// `200` comes only once the mail service took it, and the request's
+/// `notified_at` is then set (a failure to write it is logged; the `200`
+/// stands). Otherwise `503
 /// mail_unavailable` (the code stays spent, the line stays), staff are
 /// alerted, and the app must not change the PIN. Nothing is mailed before
 /// the commit.
@@ -519,7 +533,9 @@ struct Stored {
 /// purpose: one answer for all); `400 code_expired`; `429 too_many_tries`
 /// (the code had [`CODE_ATTEMPTS`] wrong tries); `429 rate_limited` past
 /// [`VERIFIES_PER_DEVICE`] tries an hour; `409 device_not_registered`;
-/// `503 busy` (nothing was taken).
+/// `503 busy` (nothing was taken). The device and the limit are checked
+/// before the account is locked, so tries past the limit never take the
+/// lock.
 pub async fn verify(State(state): State<AppState>, bearer: Bearer, body: Bytes) -> Response {
     match verify_inner(&state, &bearer, &body).await {
         Ok(response) => response,
@@ -534,8 +550,12 @@ async fn verify_inner(state: &AppState, bearer: &Bearer, body: &[u8]) -> Result<
     let account = &bearer.account;
 
     let mut tx = begin(state).await?;
+    // The device and the limit before the account's lock, so tries past
+    // the limit never take it.
+    let unlocked = bind(&mut tx, state, bearer, false).await?.ok_or_else(not_registered)?;
+    state.pin_reset_limits.verifies.check(unlocked.key(), OffsetDateTime::now_utc()).map_err(ApiError::rate_limited)?;
+    // Again under the lock: what holds is what the lock saw.
     let bound = lock_and_bind(&mut tx, state, bearer).await?.ok_or_else(not_registered)?;
-    state.pin_reset_limits.verifies.check(bound.key(), OffsetDateTime::now_utc()).map_err(ApiError::rate_limited)?;
     let stored: Option<Stored> = sqlx::query_as(&format!(
         "SELECT device_name, code_id, expires_at, used_at FROM pin_resets r
          WHERE r.id = $1 AND r.account_id = $4 AND {BOUND_SQL} FOR UPDATE"
@@ -608,8 +628,23 @@ async fn verify_inner(state: &AppState, bearer: &Bearer, body: &[u8]) -> Result<
         tokio::spawn(alert_staff(state.clone(), account.id, asked.request_id));
         return Err(notice_not_mailed());
     }
+    // The record that the account was told. The mail went out, so a failure
+    // here is logged and the answer stays the 200: a 503 would tell the app
+    // not to change the PIN after the account was told, with the code spent.
+    if let Err(error) = notified(state, asked.request_id).await {
+        tracing::error!(%error, request_id = %asked.request_id, "a PIN reset's notified_at could not be written");
+    }
     tracing::info!(request_id = %asked.request_id, account = %account.id, "PIN reset verified and the account told");
     Ok(answer(json!({ "verified": true, "device": device, "at": at.unix_timestamp() })))
+}
+
+/// Records that the mail service took the notice of `request_id`, in a
+/// transaction of its own, waiting at most a few seconds for a connection
+/// and the row.
+async fn notified(state: &AppState, request_id: Uuid) -> sqlx::Result<()> {
+    let mut tx = begin_waiting(&state.db).await?;
+    sqlx::query("UPDATE pin_resets SET notified_at = now() WHERE id = $1").bind(request_id).execute(&mut *tx).await?;
+    tx.commit().await
 }
 
 /// Mails staff that a verified reset's notice was not mailed: ids only, no

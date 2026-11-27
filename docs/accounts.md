@@ -426,7 +426,17 @@ count: anyone can save any TIN that way, on the site or from the app, so
 it is no evidence of anyone, and counting it would let anyone keep a
 stranger's TIN from ever activating by itself. The price: a real owner who
 only saved their TIN without papers does not hold off a claim with a
-drawn card.
+drawn card. The same goes for a business: one that only saved its TIN
+without papers, as a business, no longer keeps a stranger's personal
+claim for that TIN from activating by itself.
+
+**For whoever turns `AUTO_VERIFY` on:** that price is accepted because
+what a wrong automatic activation can do is bounded. Each account has at
+most one automatic activation waiting for a person; there are at most 20
+in any 24 hours across Buwiz; and one that no one at Buwiz confirms
+within 30 days is paused by the hourly upkeep (`CONFIRM_WITHIN_DAYS`),
+its papers kept. Staff should confirm or undo each one well within those
+30 days. If those bounds change, look at this trade-off again.
 
 A deleted claim leaves only its audit line, which keeps the TIN masked
 (last three digits and branch) and, from this release, the claim's kind.
